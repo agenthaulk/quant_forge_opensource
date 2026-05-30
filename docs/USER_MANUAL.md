@@ -2,9 +2,12 @@
 
 This manual is written for both human users and LLM coding agents. It explains
 how to configure, run, debug, and safely publish Quant Forge OpenSource.
+The public release is source-available under BUSL-1.1 until 2027-12-31, then
+changes to Apache-2.0.
 
 本文档同时面向下载用户和 LLM 编程助手，说明如何配置、运行、排错并安全发布
-Quant Forge OpenSource。
+Quant Forge OpenSource。本公开版本在 2027-12-31 前采用 BUSL-1.1 source-available
+许可证，之后转为 Apache-2.0。
 
 ## 1. Project Shape / 项目结构
 
@@ -20,7 +23,7 @@ scripts/                  Local maintenance scripts
 configs/                  运行配置与 RD 配置
 docs/                     架构、配置、发布文档
 src/quant_forge/          公开 Python 包
-tests/                    回归测试与开源安全测试
+tests/                    回归测试与发布安全测试
 scripts/                  本地维护脚本
 ```
 
@@ -316,11 +319,24 @@ neutralization: none
 truncation: null
 ```
 
-## 9. Release Safety / 开源发布安全
+## 9. License And Release Safety / 许可证与发布安全
 
-Before publishing:
+License summary:
 
-发布前：
+许可证摘要：
+
+```text
+Current license: BUSL-1.1
+Allowed before Change Date: non-commercial research, education, personal
+evaluation, internal non-commercial experimentation, and non-production use
+Change Date: 2027-12-31
+Change License: Apache License, Version 2.0
+Community contributions: see CONTRIBUTING.md and CLA.md
+```
+
+Before publishing or tagging a release:
+
+发布或打 tag 前：
 
 ```bash
 python3 scripts/release_safety_scan.py
@@ -340,11 +356,12 @@ artifacts, caches, and local data.
 - Do not write directly to `factor_root`, `data_root`, or `artifact_root`.
 - Do not store API keys in YAML, tests, docs, or source code.
 - Do not add silent fallbacks for missing fields or provider settings.
-- Do not add production trading behavior to this open-source workbench.
+- Do not add production trading behavior to this source-available public
+  workbench.
 - Do not commit generated outputs, local paths, or local data.
 
 - 不要直接写 `factor_root`、`data_root` 或 `artifact_root`。
 - 不要把 API key 写入 YAML、测试、文档或源码。
 - 不要为缺失字段或供应商配置添加静默兜底。
-- 不要把生产交易行为加入此开源工作台。
+- 不要把生产交易行为加入此 source-available 公开工作台。
 - 不要提交生成产物、本机路径或本地数据。

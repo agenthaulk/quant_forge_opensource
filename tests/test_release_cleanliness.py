@@ -7,8 +7,13 @@ import subprocess
 PUBLIC_ROOTS = [
     Path("README.md"),
     Path("AGENTS.md"),
+    Path("LICENSE"),
+    Path("LICENSE-APACHE-2.0"),
+    Path("CLA.md"),
+    Path("CONTRIBUTING.md"),
     Path("pyproject.toml"),
     Path(".env.example"),
+    Path(".github"),
     Path("configs"),
     Path("docs"),
     Path("scripts"),
@@ -99,3 +104,12 @@ def test_public_source_has_no_internal_platform_imports() -> None:
 def test_no_large_public_files() -> None:
     offenders = [str(path) for path in iter_public_files() if path.stat().st_size > 500_000]
     assert offenders == []
+
+
+def test_license_files_define_delayed_open_source_path() -> None:
+    license_text = Path("LICENSE").read_text(encoding="utf-8")
+    apache_text = Path("LICENSE-APACHE-2.0").read_text(encoding="utf-8")
+    assert "SPDX-License-Identifier: BUSL-1.1" in license_text
+    assert "Change Date: 2027-12-31" in license_text
+    assert "Change License: Apache License, Version 2.0" in license_text
+    assert "Apache License" in apache_text

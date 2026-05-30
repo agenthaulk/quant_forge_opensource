@@ -1,8 +1,8 @@
-# Open-Source Security Review / 开源安全审阅
+# Public Release Security Review / 公开发布安全审阅
 
 Status: release-candidate clean.
 
-状态：待开源候选版本已完成清理。
+状态：公开发布候选版本已完成清理。
 
 ## Review Summary / 审阅摘要
 
@@ -40,9 +40,16 @@ PYTHONPATH=src python3 -m quant_forge.apps.cli.main --help
 git diff --check
 ```
 
-## Remaining Release Decision / 剩余发布决策
+## License Decision / 许可证决策
 
-A license file has not been added because license choice is a project-owner
-decision. Add a license before making the repository public.
+The repository now uses BUSL-1.1 with Apache-2.0 as the Change License.
 
-尚未添加 license 文件，因为许可证选择应由项目所有者决定。正式公开仓库前请先补充许可证。
+```text
+Current license: BUSL-1.1
+Change Date: 2027-12-31
+Change License: Apache License, Version 2.0
+Contribution terms: CONTRIBUTING.md and CLA.md
+```
+
+本仓库当前采用 BUSL-1.1，并约定在 2027-12-31 自动转为 Apache-2.0。社区贡献条款见
+`CONTRIBUTING.md` 和 `CLA.md`。

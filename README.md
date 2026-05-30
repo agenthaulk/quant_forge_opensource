@@ -4,10 +4,13 @@ Quant Forge OpenSource is a clean, local-first factor research workbench. It
 turns a natural-language idea or report text into a validated factor draft,
 evaluates the factor on local panel data, runs a lightweight research backtest,
 and can run a bounded research-development loop to compare improved candidates.
+This public repository is source-available under BUSL-1.1 until 2027-12-31,
+then automatically changes to Apache-2.0.
 
 Quant Forge OpenSource 是一个干净、面向本地运行的因子研究工作台。它可以把自然语言观点
 或研报文本解析成经过校验的因子草稿，在本地面板数据上完成因子评价、轻量回测，并通过
-可控的 RD 研究循环比较候选因子的改进效果。
+可控的 RD 研究循环比较候选因子的改进效果。本公开仓库在 2027-12-31 前采用 BUSL-1.1
+source-available 许可证，之后自动转为 Apache-2.0。
 
 ## What This Project Does / 项目能力
 
@@ -147,7 +150,7 @@ Use `qf data validate` before running evaluation or backtests.
 
 运行评价或回测前，请先执行 `qf data validate`。
 
-## Release Safety / 开源安全
+## Release Safety / 发布安全
 
 Run the safety checks before publishing:
 
@@ -166,7 +169,29 @@ release scan 会检查已跟踪和未忽略文件中的常见密钥标记、本�
 
 ## License / 许可证
 
-No license file is included yet. Add a license before publishing the repository
-publicly.
+This repository uses the Business Source License 1.1 (`BUSL-1.1`) with a
+planned Apache-2.0 change license.
 
-当前尚未包含 license 文件。正式公开仓库前请先补充许可证。
+```text
+Current license: BUSL-1.1
+Allowed before Change Date: non-commercial research, education, personal
+evaluation, internal non-commercial experimentation, and non-production use
+Change Date: 2027-12-31
+Change License: Apache License, Version 2.0
+```
+
+The maintainers may release any version under Apache-2.0 before the Change
+Date. Community pull requests are accepted under the contributor terms in
+`CONTRIBUTING.md` and `CLA.md`.
+
+本仓库采用 Business Source License 1.1，并约定未来转为 Apache-2.0。
+
+```text
+当前许可证：BUSL-1.1
+Change Date 前允许：非商业研究、教育、个人评估、内部非商业实验，以及非生产用途
+Change Date：2027-12-31
+Change License：Apache License, Version 2.0
+```
+
+维护者可以在 Change Date 前提前将任意版本按 Apache-2.0 发布。社区 PR 按
+`CONTRIBUTING.md` 和 `CLA.md` 中的贡献条款接收。

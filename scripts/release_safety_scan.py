@@ -11,8 +11,13 @@ from pathlib import Path
 PUBLIC_ROOTS = (
     Path("README.md"),
     Path("AGENTS.md"),
+    Path("LICENSE"),
+    Path("LICENSE-APACHE-2.0"),
+    Path("CLA.md"),
+    Path("CONTRIBUTING.md"),
     Path("pyproject.toml"),
     Path(".env.example"),
+    Path(".github"),
     Path("configs"),
     Path("docs"),
     Path("scripts"),
