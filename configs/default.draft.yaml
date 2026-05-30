@@ -1,0 +1,76 @@
+# Quant Forge runtime config draft.
+# Copy this file and edit the copy:
+#   cp configs/default.draft.yaml configs/my_default.yaml
+#
+# Do not commit machine-local copies if they contain private paths or runtime
+# choices. Put real API keys in environment variables, never in YAML.
+
+paths:
+  # Local panel data root. The demo workspace creates data/panel.parquet here.
+  data_root: data
+  # Factor definitions. This is the factor source of truth.
+  factor_root: factor_root
+  # Evaluation, backtest, and RD reports.
+  artifact_root: artifacts
+  # Optional command outputs.
+  output_root: outputs
+
+web:
+  # The public web adapter is local-only.
+  host: 127.0.0.1
+  port: 8765
+
+research:
+  # Used by simple parser defaults and lightweight workflows.
+  default_horizon_days: 5
+  default_top_quantile: 0.3
+
+simulation:
+  market: local
+  instrument_type: equity
+  universe: local_panel
+  # 1 means signal today, earliest entry on next trading day.
+  execution_delay_days: 1
+  top_quantile: 0.3
+  # First public version supports only these values:
+  nan_policy: drop
+  neutralization: none
+  truncation: null
+  # 0 or 1 means no EWMA smoothing. Larger values apply EWMA score decay.
+  decay_days: 0
+  test_period:
+    # Use YYYY-MM-DD strings or null.
+    start: null
+    end: null
+
+llm:
+  # Use "rule" for deterministic local parsing with no external API call.
+  # Other supported names: openai, openai_compatible, glm, deepseek, minimax, claude.
+  provider: rule
+  timeout_seconds: 30
+  providers:
+    deepseek:
+      model: deepseek-chat
+      base_url: https://api.deepseek.com
+      api_key_env: DEEPSEEK_API_KEY
+    glm:
+      model: glm-5.1
+      base_url: https://open.bigmodel.cn/api/paas/v4
+      api_key_env: GLM_API_KEY
+    openai:
+      model: gpt-4o-mini
+      base_url: https://api.openai.com/v1
+      api_key_env: OPENAI_API_KEY
+    minimax:
+      model: MiniMax-M2
+      base_url: https://api.minimax.io/v1
+      api_key_env: MINIMAX_API_KEY
+    claude:
+      model: claude-sonnet-4-5
+      base_url: https://api.anthropic.com
+      api_key_env: ANTHROPIC_API_KEY
+    openai_compatible:
+      provider: openai_compatible
+      model: <model-name>
+      base_url: <https://host.example/v1>
+      api_key_env: OPENAI_COMPATIBLE_API_KEY

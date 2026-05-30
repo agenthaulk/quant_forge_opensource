@@ -1,0 +1,51 @@
+paths:
+  data_root: data
+  factor_root: factor_root
+  artifact_root: artifacts
+  output_root: outputs
+web:
+  host: 127.0.0.1
+  port: 8765
+research:
+  default_horizon_days: 5
+  default_top_quantile: 0.3
+simulation:
+  market: cn_a
+  instrument_type: equity
+  universe: local_panel
+  execution_delay_days: 1
+  top_quantile: 0.3
+  nan_policy: drop
+  neutralization: none
+  truncation: null
+  decay_days: 0
+  test_period:
+    start: null
+    end: null
+llm:
+  # Supported providers: rule, openai, openai_compatible, glm, deepseek, minimax, claude.
+  # Keep real API keys in environment variables, not in config files.
+  # The web UI lets users choose one of llm.providers below.
+  provider: deepseek
+  timeout_seconds: 30
+  providers:
+    deepseek:
+      model: deepseek-chat
+      base_url: https://api.deepseek.com
+      api_key_env: DEEPSEEK_API_KEY
+    glm:
+      model: glm-5.1
+      base_url: https://open.bigmodel.cn/api/paas/v4
+      api_key_env: GLM_API_KEY
+    openai:
+      model: gpt-4o-mini
+      base_url: https://api.openai.com/v1
+      api_key_env: OPENAI_API_KEY
+    minimax:
+      model: MiniMax-M2
+      base_url: https://api.minimax.io/v1
+      api_key_env: MINIMAX_API_KEY
+    claude:
+      model: claude-sonnet-4-5
+      base_url: https://api.anthropic.com
+      api_key_env: ANTHROPIC_API_KEY

@@ -1,0 +1,89 @@
+# Quant Forge RD config draft.
+# Copy this file and edit the copy:
+#   cp configs/rd.draft.yaml configs/my_rd.yaml
+
+# One of: balanced, rank_ic, rank_icir, annualized_return.
+objective: balanced
+
+# Public local RD keeps candidate generation bounded and readable.
+default_max_candidates: 3
+
+# Web scheduler options. The scheduler is an in-process local convenience tool.
+default_interval_days: 1
+allowed_interval_days: [1, 5, 15, 30]
+
+simulation:
+  execution_delay_days: 1
+  top_quantile: 0.3
+  nan_policy: drop
+  neutralization: none
+  truncation: null
+  decay_days: 0
+  test_period:
+    start: null
+    end: null
+
+# Optional formula/profile search. Enable only when local data is ready.
+parameter_search:
+  enabled: false
+  method: successive_halving
+  max_profile_variants: 6
+  keep_ratio: 0.34
+  min_survivors: 2
+  quick_horizon_days_matrix: [5, 21]
+  quick_sample_splits:
+    - name: IS
+      fraction: 1.0
+      score_weight: 1.0
+  top_quantile: [0.2, 0.3]
+  decay_days: [0, 5]
+
+# Evidence matrix for full evaluation.
+horizon_days_matrix: [5, 10, 21, 63]
+
+# Chronological sample splits. Fractions are applied over usable dates.
+sample_splits:
+  - name: IS
+    fraction: 0.5
+    score_weight: 0.5
+  - name: OOS1
+    fraction: 0.3
+    score_weight: 0.3
+  - name: OOS2
+    fraction: 0.2
+    score_weight: 0.2
+
+gate:
+  min_ic_days: 5
+  min_coverage: 0.5
+  min_score: 0.0
+  min_backtest_periods: 1
+
+# Default objective weights for objective: balanced.
+weights:
+  weighted_split_icir: 0.4
+  rank_ic_mean: 0.25
+  rank_icir: 0.2
+  annualized_return: 0.1
+  max_drawdown: 0.05
+
+# Named profiles used when objective selects a non-balanced target.
+weight_profiles:
+  rank_ic:
+    weighted_split_icir: 0.2
+    rank_ic_mean: 0.6
+    rank_icir: 0.1
+    annualized_return: 0.1
+    max_drawdown: 0.0
+  rank_icir:
+    weighted_split_icir: 0.5
+    rank_ic_mean: 0.1
+    rank_icir: 0.3
+    annualized_return: 0.05
+    max_drawdown: 0.05
+  annualized_return:
+    weighted_split_icir: 0.2
+    rank_ic_mean: 0.15
+    rank_icir: 0.15
+    annualized_return: 0.4
+    max_drawdown: 0.1

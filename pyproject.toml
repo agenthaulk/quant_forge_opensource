@@ -1,0 +1,37 @@
+[project]
+name = "quant-forge"
+version = "0.2.0"
+description = "Clean local-first factor research workbench"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "Quant Forge contributors" }
+]
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "pyarrow>=14.0.1",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+qf = "quant_forge.apps.cli.main:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
