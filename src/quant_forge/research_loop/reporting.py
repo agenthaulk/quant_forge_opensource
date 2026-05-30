@@ -59,16 +59,19 @@ def render_research_report(result: ResearchLoopResult, *, generated_at: datetime
         [
             "## Candidate Comparison",
             "",
-            "| Factor | Profile | Status | Score | Split ICIR | Rank IC | ICIR | Return "
-            "| LS Sharpe | Turnover | Gate |",
-            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+            "| Factor | Profile | Status | Score | Split ICIR | Rank IC | ICIR | Gross Return "
+            "| Net Return | Net LS Sharpe | Rebalance Rate | Turnover Rate | Gate |",
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
         ]
     )
     if result.candidates:
         for candidate in result.candidates:
             lines.append(_candidate_row(candidate))
     else:
-        lines.append("| none | - | - | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.00% | 0.0000 | 0.00% | - |")
+        lines.append(
+            "| none | - | - | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.00% "
+            "| 0.00% | 0.0000 | 0.00% | 0.00% | - |"
+        )
     lines.extend(["", "## Iteration Trace", ""])
     if result.candidates:
         for index, candidate in enumerate(result.candidates, start=1):
@@ -97,7 +100,9 @@ def render_research_report(result: ResearchLoopResult, *, generated_at: datetime
             "",
             "- This report is a local research artifact, not an investment recommendation.",
             "- Active promotion remains a separate user decision.",
-            "- Turnover is a lightweight rebalance-overlap metric, not a production transaction-cost model.",
+            "- Rebalance rate measures long/short membership changes per rebalance.",
+            "- Turnover rate estimates true portfolio turnover from weight changes.",
+            "- Net returns apply configured research cost assumptions only; they are not production execution results.",
             "- Evaluation labels use future returns for research scoring; backtests keep next-trading-day "
             "entry semantics.",
             "",
@@ -116,9 +121,11 @@ def _candidate_summary(candidate: ResearchCandidateResult) -> list[str]:
         f"- Weighted Split ICIR: {_fmt(candidate.split_weighted_icir)}",
         f"- Rank IC: {_fmt(candidate.evaluation.rank_ic_mean)}",
         f"- Rank ICIR: {_fmt(candidate.evaluation.rank_icir)}",
-        f"- Annualized Return: {_pct(candidate.backtest.annualized_return)}",
-        f"- Long-Short Sharpe: {_fmt(candidate.backtest.long_short_sharpe)}",
-        f"- Average Turnover: {_pct(candidate.backtest.average_turnover)}",
+        f"- Gross Annualized Return: {_pct(candidate.backtest.annualized_return)}",
+        f"- Net Annualized Return: {_pct(candidate.backtest.net_annualized_return)}",
+        f"- Net Long-Short Sharpe: {_fmt(candidate.backtest.net_long_short_sharpe)}",
+        f"- Rebalance Rate: {_pct(candidate.backtest.rebalance_rate)}",
+        f"- Turnover Rate: {_pct(candidate.backtest.turnover_rate)}",
         f"- Simulation Profile: {_profile_label(candidate)}",
         "",
     ]
@@ -148,7 +155,9 @@ def _candidate_row(candidate: ResearchCandidateResult) -> str:
         f"| {_fmt(candidate.score)} "
         f"| {_fmt(candidate.split_weighted_icir)} | {_fmt(candidate.evaluation.rank_ic_mean)} "
         f"| {_fmt(candidate.evaluation.rank_icir)} | {_pct(candidate.backtest.annualized_return)} "
-        f"| {_fmt(candidate.backtest.long_short_sharpe)} | {_pct(candidate.backtest.average_turnover)} | {gate} |"
+        f"| {_pct(candidate.backtest.net_annualized_return)} | {_fmt(candidate.backtest.net_long_short_sharpe)} "
+        f"| {_pct(candidate.backtest.rebalance_rate)} "
+        f"| {_pct(candidate.backtest.turnover_rate)} | {gate} |"
     )
 
 
@@ -162,6 +171,8 @@ def _candidate_detail(candidate: ResearchCandidateResult) -> list[str]:
         f"- Simulation Profile: {_profile_label(candidate)}",
         f"- Evaluation Artifact: `{candidate.evaluation.artifact_path}`",
         f"- Backtest Artifact: `{candidate.backtest.artifact_path}`",
+        f"- Backtest Warnings: {_sentence_list(candidate.backtest.warnings)}",
+        f"- Research Assumptions: {_sentence_list(candidate.backtest.assumptions)}",
         "",
         "#### Self Review",
         "",
@@ -194,6 +205,22 @@ def _candidate_detail(candidate: ResearchCandidateResult) -> list[str]:
         lines.append(
             f"| {metric.horizon_days} | {metric.observations} | {_pct(metric.coverage)} "
             f"| {_fmt(metric.rank_ic_mean)} | {_fmt(metric.rank_icir)} | {metric.ic_days} |"
+        )
+    lines.extend(
+        [
+            "",
+            "#### Backtest Segments",
+            "",
+            "| Segment | Dates | Periods | Gross Return | Net Return | Gross Sharpe | Net Sharpe | Net Drawdown |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for metric in candidate.backtest.segment_metrics:
+        lines.append(
+            f"| {metric.name} | {metric.start_date} to {metric.end_date} | {metric.periods} "
+            f"| {_pct(metric.gross_annualized_return)} | {_pct(metric.net_annualized_return)} "
+            f"| {_fmt(metric.gross_long_short_sharpe)} | {_fmt(metric.net_long_short_sharpe)} "
+            f"| {_pct(metric.net_max_drawdown)} |"
         )
     lines.extend(
         [

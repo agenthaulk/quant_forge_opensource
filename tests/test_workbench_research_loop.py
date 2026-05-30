@@ -5,9 +5,15 @@ import time
 
 from quant_forge.data.local import create_demo_workspace
 from quant_forge.factor_library.repository import FactorRepository
-from quant_forge.core.contracts import SimulationProfile
+from quant_forge.core.contracts import (
+    BacktestResult,
+    BacktestSegmentMetric,
+    EvaluationResult,
+    SimulationProfile,
+    TransactionCostModel,
+)
 from quant_forge.research_loop.scheduler import ResearchLoopScheduler, ResearchScheduleRequest
-from quant_forge.research_loop.service import ResearchGate, ResearchLoopService
+from quant_forge.research_loop.service import ResearchGate, ResearchLoopService, apply_gate
 from quant_forge.workbench.service import WorkbenchService
 
 
@@ -22,6 +28,15 @@ def test_workbench_and_research_loop(tmp_path: Path) -> None:
     assert factor.formula == "-rank(market_cap)"
     evaluation = workbench.evaluate(factor.factor_id)
     assert evaluation.observations > 0
+    cost_aware_backtest = WorkbenchService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        transaction_costs=TransactionCostModel(commission_bps=5.0),
+    ).run_backtest("FTR_DEMO_SMALL_CAP")
+    assert cost_aware_backtest.transaction_costs.commission_bps == 5.0
+    assert cost_aware_backtest.net_annualized_return < cost_aware_backtest.annualized_return
+    assert cost_aware_backtest.segment_metrics
 
     loop = ResearchLoopService(
         factor_root=paths["factor_root"],
@@ -37,6 +52,10 @@ def test_workbench_and_research_loop(tmp_path: Path) -> None:
     assert first.factor.status == "candidate"
     assert first.evaluation.observations > 0
     assert first.backtest.periods > 0
+    assert first.backtest.net_annualized_return == first.backtest.annualized_return
+    assert first.backtest.rebalance_rate >= 0
+    assert first.backtest.turnover_rate > 0
+    assert {metric.name for metric in first.backtest.segment_metrics} == {"IS", "OOS1", "OOS2"}
     assert first.gate_passed is True
     assert first.gate_reasons == ("passed smoke research gate",)
     assert first.score > 0
@@ -57,6 +76,10 @@ def test_workbench_and_research_loop(tmp_path: Path) -> None:
     assert first.factor.factor_id in report
     assert first.factor.formula in report
     assert "Simulation Profile" in report
+    assert "Rebalance Rate" in report
+    assert "Backtest Segments" in report
+    assert "Net Annualized Return" in report
+    assert "research artifact" in report
 
 
 def test_research_loop_scheduler_runs_immediately(tmp_path: Path) -> None:
@@ -110,6 +133,84 @@ def test_research_loop_preserves_existing_candidate_status_on_later_gate_failure
     assert failing.candidates[0].gate_passed is False
     assert "existing candidate status preserved" in failing.candidates[0].gate_reasons
     assert FactorRepository(paths["factor_root"]).get(candidate_id).status == "candidate"
+
+
+def test_research_loop_gate_can_reject_high_turnover_candidate(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    loop = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+    )
+
+    failing = loop.run_once(
+        "FTR_DEMO_SMALL_CAP",
+        max_candidates=1,
+        gate=ResearchGate(max_turnover_rate=0.0),
+    )
+
+    assert failing.candidates[0].gate_passed is False
+    assert any("turnover_rate" in reason for reason in failing.candidates[0].gate_reasons)
+    assert failing.accepted_candidate_ids == ()
+
+
+def test_research_gate_detects_oos_decay_from_losing_is_baseline(tmp_path: Path) -> None:
+    evaluation = EvaluationResult(
+        factor_id="FTR_SYNTH",
+        observations=10,
+        coverage=1.0,
+        rank_ic_mean=0.1,
+        rank_ic_std=0.1,
+        rank_icir=1.0,
+        ic_days=5,
+        artifact_path=tmp_path / "eval.json",
+    )
+    backtest = BacktestResult(
+        factor_id="FTR_SYNTH",
+        periods=2,
+        holding_days=5,
+        cumulative_return=-0.1,
+        annualized_return=-0.1,
+        annualized_volatility=0.0,
+        max_drawdown=-0.1,
+        artifact_path=tmp_path / "backtest.json",
+        net_annualized_return=-0.1,
+        segment_metrics=(
+            BacktestSegmentMetric(
+                name="IS",
+                start_date="2024-01-01",
+                end_date="2024-01-05",
+                periods=1,
+                gross_cumulative_return=-0.1,
+                gross_annualized_return=-0.1,
+                gross_long_short_sharpe=0.0,
+                gross_max_drawdown=-0.1,
+                net_cumulative_return=-0.1,
+                net_annualized_return=-0.1,
+                net_long_short_sharpe=0.0,
+                net_max_drawdown=-0.1,
+            ),
+            BacktestSegmentMetric(
+                name="OOS1",
+                start_date="2024-01-08",
+                end_date="2024-01-12",
+                periods=1,
+                gross_cumulative_return=-0.2,
+                gross_annualized_return=-0.2,
+                gross_long_short_sharpe=0.0,
+                gross_max_drawdown=-0.2,
+                net_cumulative_return=-0.2,
+                net_annualized_return=-0.2,
+                net_long_short_sharpe=0.0,
+                net_max_drawdown=-0.2,
+            ),
+        ),
+    )
+
+    passed, reasons = apply_gate(evaluation, backtest, 0.1, ResearchGate(max_oos_net_return_decay=0.5))
+
+    assert passed is False
+    assert "OOS net return decay exceeds 0.500000" in reasons
 
 
 def test_research_loop_can_score_profile_variants(tmp_path: Path) -> None:

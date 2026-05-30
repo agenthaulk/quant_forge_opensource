@@ -62,6 +62,8 @@ def run_idea_workflow(
         artifact_root=config.paths.artifact_root,
         simulation_profile=research_config.simulation_profile,
         holding_days=parsed.factor.horizon_days,
+        transaction_costs=research_config.transaction_costs,
+        sample_splits=research_config.sample_splits,
     )
     return _workflow_payload(parsed, evaluation, backtest)
 
@@ -250,6 +252,7 @@ def _run_research_once(
         quick_sample_splits=rd_config.parameter_search.quick_sample_splits,
         horizon_days_matrix=rd_config.horizon_days_matrix,
         sample_splits=rd_config.sample_splits,
+        transaction_costs=rd_config.transaction_costs,
     )
     weights = weights_for_objective(rd_config, objective)
     return service.run_once(
@@ -568,36 +571,50 @@ function render(payload) {{
   const groupRows = (backtest.group_returns || []).map(metric =>
     `<span class="pill">${{esc(metric.group)}} ${{pct(metric.mean_return)}}</span>`
   ).join('');
+  const segmentRows = (backtest.segment_metrics || []).map(metric =>
+    `<span class="pill">${{esc(metric.name)}} net ${{pct(metric.net_annualized_return)}} · sharpe ${{num(metric.net_long_short_sharpe || 0, 2)}}</span>`
+  ).join('');
+  const warningRows = (backtest.warnings || []).map(item =>
+    `<span class="pill">${{esc(item)}}</span>`
+  ).join('');
   resultEl.innerHTML = `
     <div class="panel">
       <h3>${{esc(factor.factor_id)}} · ${{esc(payload.parser.source)}} / ${{esc(payload.parser.provider)}} / ${{esc(payload.parser.model)}}</h3>
       <div class="formula">${{esc(factor.formula)}}</div>
       <p>${{esc(factor.description || '')}}</p>
       <p class="meta">horizon_days: ${{factor.horizon_days}} · filters: ${{esc((factor.universe_filters || []).join(', ') || 'none')}}</p>
+      <p class="meta">研究口径，不是生产交易口径。</p>
     </div>
     <div class="grid">
       <div class="tile">Rank IC<b>${{num(evaluation.rank_ic_mean)}}</b></div>
       <div class="tile">ICIR<b>${{num(evaluation.rank_icir, 2)}}</b></div>
       <div class="tile">覆盖率<b>${{pct(evaluation.coverage)}}</b></div>
       <div class="tile">IC Days<b>${{evaluation.ic_days}}</b></div>
-      <div class="tile">累计收益<b>${{pct(backtest.cumulative_return)}}</b></div>
-      <div class="tile">年化收益<b>${{pct(backtest.annualized_return)}}</b></div>
+      <div class="tile">毛累计收益<b>${{pct(backtest.gross_cumulative_return ?? backtest.cumulative_return)}}</b></div>
+      <div class="tile">净累计收益<b>${{pct(backtest.net_cumulative_return || 0)}}</b></div>
+      <div class="tile">毛年化收益<b>${{pct(backtest.gross_annualized_return ?? backtest.annualized_return)}}</b></div>
+      <div class="tile">净年化收益<b>${{pct(backtest.net_annualized_return || 0)}}</b></div>
       <div class="tile">年化波动<b>${{pct(backtest.annualized_volatility)}}</b></div>
       <div class="tile">最大回撤<b>${{pct(backtest.max_drawdown)}}</b></div>
 	      <div class="tile">持有期<b>${{backtest.holding_days}}日</b></div>
 	      <div class="tile">Decay<b>${{profile.decay_days || 0}}</b></div>
 	      <div class="tile">Top Quantile<b>${{num(profile.top_quantile || backtest.top_quantile || 0, 2)}}</b></div>
 	      <div class="tile">Delay<b>${{profile.execution_delay_days || 1}}日</b></div>
-	      <div class="tile">多空Sharpe<b>${{num(backtest.long_short_sharpe || 0, 2)}}</b></div>
-      <div class="tile">换手率<b>${{pct(backtest.average_turnover || 0)}}</b></div>
+	      <div class="tile">净多空Sharpe<b>${{num(backtest.net_long_short_sharpe || backtest.long_short_sharpe || 0, 2)}}</b></div>
+      <div class="tile">调仓率<b>${{pct(backtest.rebalance_rate || 0)}}</b></div>
+      <div class="tile">换手率<b>${{pct(backtest.turnover_rate || 0)}}</b></div>
     </div>
     <div class="panel">
       <h3>三段验证</h3>
       <p>${{splitRows || '<span class="pill">暂无</span>'}}</p>
+      <h3>回测分段</h3>
+      <p>${{segmentRows || '<span class="pill">暂无</span>'}}</p>
       <h3>多周期评价</h3>
       <p>${{horizonRows || '<span class="pill">暂无</span>'}}</p>
       <h3>分组收益</h3>
       <p>${{groupRows || '<span class="pill">暂无</span>'}}</p>
+      <h3>风险提示</h3>
+      <p>${{warningRows || '<span class="pill">研究口径，不是生产交易口径</span>'}}</p>
     </div>
     <div class="panel">
       <h3>Artifacts</h3>
@@ -620,6 +637,7 @@ function renderResearch(payload) {{
         <div class="formula">${{esc(factor.formula)}}</div>
         <p>${{esc(candidate.hypothesis.text)}}</p>
         <p class="meta">${{esc(candidate.hypothesis.rationale)}}</p>
+        <p class="meta">研究口径，不是生产交易口径。</p>
 	        <p>
 	          <span class="pill">score ${{num(candidate.score, 4)}}</span>
 	          <span class="pill">split ICIR ${{num(candidate.split_weighted_icir || 0, 2)}}</span>
@@ -627,10 +645,14 @@ function renderResearch(payload) {{
 	          <span class="pill">ICIR ${{num(evaluation.rank_icir, 2)}}</span>
 	          <span class="pill">decay ${{profile.decay_days || 0}}</span>
 	          <span class="pill">top ${{num(profile.top_quantile || backtest.top_quantile || 0, 2)}}</span>
-	          <span class="pill">LS Sharpe ${{num(backtest.long_short_sharpe || 0, 2)}}</span>
-	          <span class="pill">turnover ${{pct(backtest.average_turnover || 0)}}</span>
+	          <span class="pill">net LS Sharpe ${{num(backtest.net_long_short_sharpe || backtest.long_short_sharpe || 0, 2)}}</span>
+	          <span class="pill">gross ${{pct(backtest.gross_annualized_return ?? backtest.annualized_return)}}</span>
+	          <span class="pill">net ${{pct(backtest.net_annualized_return || 0)}}</span>
+	          <span class="pill">rebalance rate ${{pct(backtest.rebalance_rate || 0)}}</span>
+	          <span class="pill">turnover rate ${{pct(backtest.turnover_rate || 0)}}</span>
 	        </p>
         <p class="meta">${{esc((candidate.self_review && candidate.self_review.summary) || '')}}</p>
+        <p class="meta">${{esc((backtest.warnings || []).join('; ') || 'research semantics, not production trading semantics')}}</p>
         <p class="meta">${{esc((candidate.gate_reasons || []).join('; '))}}</p>
       </div>`;
   }}).join('');

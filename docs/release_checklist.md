@@ -8,7 +8,7 @@
 - [ ] RD parameter-search reports include a quick-stage trace when successive halving is enabled
 - [ ] Evaluation artifacts include IS/OOS1/OOS2 splits and the configured horizon matrix
 - [ ] Evaluation and backtest artifacts include the effective simulation profile
-- [ ] Backtest artifacts include group returns, long-short Sharpe, and turnover
+- [ ] Backtest artifacts include group returns, gross/net metrics, rebalance rate, turnover rate, costs, and IS/OOS segments
 - [ ] `git diff --check`
 - [ ] No tracked secrets
 - [ ] No tracked local absolute paths

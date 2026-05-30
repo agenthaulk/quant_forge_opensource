@@ -179,6 +179,15 @@ gate:
   min_coverage: 0.5
   min_score: 0.0
   min_backtest_periods: 1
+  min_oos_net_annualized_return: null
+  max_rebalance_rate: null
+  max_turnover_rate: null
+  min_net_return_retention: null
+  max_oos_net_return_decay: null
+transaction_costs:
+  commission_bps: 0.0
+  slippage_bps: 0.0
+  short_borrow_bps_annual: 0.0
 weights:
   weighted_split_icir: 0.4
   rank_ic_mean: 0.25
@@ -210,9 +219,9 @@ The default FactorLab-style evaluation runs a 5/10/21/63-day horizon matrix and
 splits the usable dates chronologically into IS/OOS1/OOS2 at 50%/30%/20%.
 `score_weight` controls the weighted split ICIR score. The default RD score
 keeps IC and ICIR dominant by combining weighted split ICIR, whole-sample Rank
-IC, whole-sample ICIR, backtest return, and drawdown. The score is for local
-research ordering only. It is not an investment recommendation and it does not
-move factors to `active`.
+IC, whole-sample ICIR, net-of-cost backtest return, and net drawdown. The score
+is for local research ordering only. It is not an investment recommendation and
+it does not move factors to `active`.
 
 Every RD run writes one Markdown research report under
 `artifact_root/research_reports` and returns its `report_path` from CLI and web
@@ -226,10 +235,19 @@ applies when a user temporarily selects another objective from CLI or web, so
 objective changes remain explicit and reproducible instead of falling back to
 hidden code defaults.
 
-Turnover is a lightweight rebalance-overlap metric for the public backtest: for
-each rebalance after the first, it compares the long and short selected
-instruments with the previous rebalance and averages the leg-level changes. It
-is not an execution-cost model.
+`transaction_costs` configures lightweight research assumptions in basis
+points. Commission and slippage are charged against estimated traded notional
+from portfolio weight changes, while `short_borrow_bps_annual` is prorated by
+the holding period. Backtests report gross and net metrics side by side.
+
+Backtests expose only two turnover-style research metrics: `rebalance_rate`
+for long/short membership changes per rebalance, and `turnover_rate` for the
+true portfolio turnover estimate from weight changes.
+
+Backtest segment metrics split returns, Sharpe, and drawdown across the same
+configured IS/OOS sample split names. Optional gate fields can reject RD
+candidates for weak OOS net return, excessive rebalance rate, excessive
+turnover rate, low net/gross retention, or OOS net-return decay.
 
 `simulation` is the effective profile shared by evaluation, backtesting, web
 idea workflows, and RD. First-version score preparation applies `test_period`,

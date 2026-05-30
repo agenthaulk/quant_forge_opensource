@@ -96,9 +96,13 @@ qf run-backtest FTR_DEMO_SMALL_CAP --workspace ./qf-demo --rd-config configs/rd.
 ```
 
 The public backtest uses signal date to next-trading-day entry semantics. It is
-for local research triage, not production execution.
+for local research triage, not production execution. It reports gross and
+net-of-cost returns, rebalance rate, true turnover rate from portfolio weights,
+and IS/OOS backtest segments.
 
 公开版回测采用 signal date 后的下一个交易日入场语义。它用于本地研究筛选，不是生产交易系统。
+回测会输出扣费前/扣费后收益、调仓率、基于组合权重变化估算的真实换手率，以及
+IS/OOS 分段表现。
 
 ### 4.4 RD Run Once / RD 单次研究
 
@@ -160,6 +164,8 @@ Purpose:
 - `sample_splits`: IS/OOS split fractions and score weights.
 - `horizon_days_matrix`: horizons evaluated for evidence.
 - `gate`: minimum quality threshold for candidates.
+- `transaction_costs`: commission, slippage, and short-borrow research
+  assumptions in basis points.
 - `weights`: scoring weights for the default objective.
 - `weight_profiles`: named scoring presets.
 - `parameter_search`: optional profile search settings.
@@ -170,6 +176,7 @@ Purpose:
 - `sample_splits`：IS/OOS 切分比例与评分权重。
 - `horizon_days_matrix`：评价证据使用的周期矩阵。
 - `gate`：候选因子最低质量门槛。
+- `transaction_costs`：手续费、滑点和融券/借券成本的研究口径假设，单位为 bps。
 - `weights`：默认目标的评分权重。
 - `weight_profiles`：命名评分预设。
 - `parameter_search`：可选参数搜索配置。
