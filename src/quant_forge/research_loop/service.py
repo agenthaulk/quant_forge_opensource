@@ -10,10 +10,12 @@ from typing import Protocol
 from quant_forge.backtesting.service import run_factor_backtest
 from quant_forge.core.contracts import (
     BacktestResult,
+    BacktestSegmentMetric,
     EvaluationResult,
     FactorDefinition,
     SampleSplitSpec,
     SimulationProfile,
+    TransactionCostModel,
 )
 from quant_forge.evaluation.service import evaluate_factor
 from quant_forge.factor_library.repository import FactorRepository, parse_idea_to_definition
@@ -51,6 +53,11 @@ class ResearchGate:
     min_coverage: float = 0.5
     min_score: float = 0.0
     min_backtest_periods: int = 1
+    min_oos_net_annualized_return: float | None = None
+    max_rebalance_rate: float | None = None
+    max_turnover_rate: float | None = None
+    min_net_return_retention: float | None = None
+    max_oos_net_return_decay: float | None = None
 
     def __post_init__(self) -> None:
         if self.min_ic_days < 0:
@@ -59,6 +66,14 @@ class ResearchGate:
             raise ValueError("min_coverage must be in [0, 1]")
         if self.min_backtest_periods < 0:
             raise ValueError("min_backtest_periods must be non-negative")
+        if self.max_rebalance_rate is not None and self.max_rebalance_rate < 0:
+            raise ValueError("max_rebalance_rate must be non-negative")
+        if self.max_turnover_rate is not None and self.max_turnover_rate < 0:
+            raise ValueError("max_turnover_rate must be non-negative")
+        if self.min_net_return_retention is not None and self.min_net_return_retention < 0:
+            raise ValueError("min_net_return_retention must be non-negative")
+        if self.max_oos_net_return_decay is not None and not 0 <= self.max_oos_net_return_decay <= 1:
+            raise ValueError("max_oos_net_return_decay must be in [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -150,20 +165,28 @@ class LocalSelfReviewGenerator:
             strengths.append("positive weighted split ICIR")
         else:
             risks.append("weighted split ICIR is not positive")
-        if backtest.long_short_sharpe > 0:
-            strengths.append("positive long-short Sharpe")
+        if backtest.net_long_short_sharpe > 0:
+            strengths.append("positive net long-short Sharpe")
         else:
-            risks.append("long-short Sharpe is not positive")
-        if backtest.average_turnover > 0.8:
-            risks.append("high average rebalance turnover")
-            next_hypotheses.append(f"smooth or slow down {candidate.name} to reduce turnover")
-        if backtest.max_drawdown < -0.2:
-            risks.append("large drawdown in lightweight backtest")
+            risks.append("net long-short Sharpe is not positive")
+        if backtest.rebalance_rate > 0.8:
+            risks.append("high rebalance rate")
+            next_hypotheses.append(f"smooth or slow down {candidate.name} to reduce rebalance rate")
+        if backtest.turnover_rate > 1.5:
+            risks.append("high turnover rate")
+            next_hypotheses.append(f"smooth or slow down {candidate.name} to reduce turnover rate")
+        if _cost_sensitive(backtest):
+            risks.append("net performance is sensitive to transaction costs")
+        if backtest.net_max_drawdown < -0.2:
+            risks.append("large net drawdown in lightweight backtest")
         if _oos_decay(evaluation):
             risks.append("OOS2 ICIR decays versus IS")
             next_hypotheses.append(f"test a simpler or more robust variant of {candidate.name}")
+        if _oos_net_decay(backtest):
+            risks.append("OOS net return decays versus IS")
+            next_hypotheses.append(f"validate {candidate.name} on a later OOS period")
         if not next_hypotheses:
-            next_hypotheses.append(f"compare {candidate.name} against a lower-turnover variant")
+            next_hypotheses.append(f"compare {candidate.name} against a lower-cost, lower-turnover variant")
 
         status = "passed" if gate_passed else "did not pass"
         summary = (
@@ -253,6 +276,7 @@ class ResearchLoopService:
         parameter_search_min_survivors: int = 2,
         quick_horizon_days_matrix: tuple[int, ...] | None = None,
         quick_sample_splits: tuple[SampleSplitSpec, ...] | None = None,
+        transaction_costs: TransactionCostModel | None = None,
         hypothesis_generator: HypothesisGenerator | None = None,
         review_generator: ResearchReviewGenerator | None = None,
     ) -> None:
@@ -274,6 +298,7 @@ class ResearchLoopService:
         self.parameter_search_min_survivors = parameter_search_min_survivors
         self.quick_horizon_days_matrix = quick_horizon_days_matrix or DEFAULT_QUICK_HORIZON_DAYS
         self.quick_sample_splits = quick_sample_splits or DEFAULT_QUICK_SAMPLE_SPLITS
+        self.transaction_costs = transaction_costs or TransactionCostModel()
         _validate_search_settings(
             enabled=parameter_search_enabled,
             method=parameter_search_method,
@@ -405,6 +430,8 @@ class ResearchLoopService:
             artifact_root=self.artifact_root,
             holding_days=trial.factor.horizon_days,
             simulation_profile=trial.simulation_profile,
+            transaction_costs=self.transaction_costs,
+            sample_splits=sample_splits,
         )
         split_weighted_icir = weighted_split_icir(evaluation)
         score = score_candidate(evaluation, backtest, objective_weights, split_weighted_icir)
@@ -496,8 +523,8 @@ def score_candidate(
         split_component * weights.weighted_split_icir
         + evaluation.rank_ic_mean * weights.rank_ic_mean
         + normalized_icir * weights.rank_icir
-        + backtest.annualized_return * weights.annualized_return
-        + backtest.max_drawdown * weights.max_drawdown
+        + backtest.net_annualized_return * weights.annualized_return
+        + backtest.net_max_drawdown * weights.max_drawdown
     )
 
 
@@ -527,6 +554,26 @@ def apply_gate(
         reasons.append(f"backtest_periods {backtest.periods} < {gate.min_backtest_periods}")
     if score < gate.min_score:
         reasons.append(f"score {score:.6f} < {gate.min_score:.6f}")
+    if gate.min_oos_net_annualized_return is not None:
+        for metric in _oos_segments(backtest):
+            if metric.net_annualized_return < gate.min_oos_net_annualized_return:
+                reasons.append(
+                    f"{metric.name} net_annualized_return {metric.net_annualized_return:.6f} "
+                    f"< {gate.min_oos_net_annualized_return:.6f}"
+                )
+    if gate.max_rebalance_rate is not None and backtest.rebalance_rate > gate.max_rebalance_rate:
+        reasons.append(
+            f"rebalance_rate {backtest.rebalance_rate:.6f} "
+            f"> {gate.max_rebalance_rate:.6f}"
+        )
+    if gate.max_turnover_rate is not None and backtest.turnover_rate > gate.max_turnover_rate:
+        reasons.append(f"turnover_rate {backtest.turnover_rate:.6f} > {gate.max_turnover_rate:.6f}")
+    if gate.min_net_return_retention is not None:
+        retention = _net_return_retention(backtest)
+        if retention < gate.min_net_return_retention:
+            reasons.append(f"net_return_retention {retention:.6f} < {gate.min_net_return_retention:.6f}")
+    if gate.max_oos_net_return_decay is not None and _oos_net_decay(backtest, gate.max_oos_net_return_decay):
+        reasons.append(f"OOS net return decay exceeds {gate.max_oos_net_return_decay:.6f}")
     if not reasons:
         reasons.append("passed smoke research gate")
     return len(reasons) == 1 and reasons[0] == "passed smoke research gate", tuple(reasons)
@@ -598,3 +645,34 @@ def _oos_decay(evaluation: EvaluationResult) -> bool:
     if is_metric.ic_days == 0 or oos2_metric.ic_days == 0:
         return False
     return oos2_metric.rank_icir < is_metric.rank_icir * 0.5
+
+
+def _oos_segments(backtest: BacktestResult) -> tuple[BacktestSegmentMetric, ...]:
+    return tuple(metric for metric in backtest.segment_metrics if metric.name.upper().startswith("OOS"))
+
+
+def _cost_sensitive(backtest: BacktestResult) -> bool:
+    return backtest.annualized_return > 0 and backtest.net_annualized_return < backtest.annualized_return * 0.5
+
+
+def _net_return_retention(backtest: BacktestResult) -> float:
+    if backtest.annualized_return <= 0:
+        return 1.0 if backtest.net_annualized_return >= backtest.annualized_return else 0.0
+    return float(backtest.net_annualized_return / backtest.annualized_return)
+
+
+def _oos_net_decay(backtest: BacktestResult, max_decay: float = 0.5) -> bool:
+    split_by_name = {metric.name.upper(): metric for metric in backtest.segment_metrics}
+    is_metric = split_by_name.get("IS")
+    if is_metric is None or is_metric.periods == 0:
+        return False
+    for name, metric in split_by_name.items():
+        if name.startswith("OOS") and metric.periods > 0:
+            if is_metric.net_annualized_return <= 0:
+                if metric.net_annualized_return < is_metric.net_annualized_return:
+                    return True
+                continue
+            ratio = metric.net_annualized_return / is_metric.net_annualized_return
+            if ratio < max_decay:
+                return True
+    return False

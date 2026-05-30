@@ -216,6 +216,8 @@ def _cmd_run_backtest(args: argparse.Namespace) -> int:
         artifact_root=paths.artifact_root,
         simulation_profile=profile,
         holding_days=args.holding_days,
+        transaction_costs=rd_config.transaction_costs,
+        sample_splits=rd_config.sample_splits,
     )
     _print_dataclass(result)
     return 0
@@ -239,6 +241,7 @@ def _cmd_research_run_once(args: argparse.Namespace) -> int:
         quick_sample_splits=rd_config.parameter_search.quick_sample_splits,
         horizon_days_matrix=rd_config.horizon_days_matrix,
         sample_splits=rd_config.sample_splits,
+        transaction_costs=rd_config.transaction_costs,
     )
     objective = args.objective or rd_config.objective
     weights = weights_for_objective(rd_config, objective)

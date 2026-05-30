@@ -148,6 +148,37 @@ class BacktestGroupMetric:
 
 
 @dataclass(frozen=True)
+class TransactionCostModel:
+    commission_bps: float = 0.0
+    slippage_bps: float = 0.0
+    short_borrow_bps_annual: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.commission_bps < 0:
+            raise ValueError("commission_bps must be non-negative")
+        if self.slippage_bps < 0:
+            raise ValueError("slippage_bps must be non-negative")
+        if self.short_borrow_bps_annual < 0:
+            raise ValueError("short_borrow_bps_annual must be non-negative")
+
+
+@dataclass(frozen=True)
+class BacktestSegmentMetric:
+    name: str
+    start_date: str
+    end_date: str
+    periods: int
+    gross_cumulative_return: float
+    gross_annualized_return: float
+    gross_long_short_sharpe: float
+    gross_max_drawdown: float
+    net_cumulative_return: float
+    net_annualized_return: float
+    net_long_short_sharpe: float
+    net_max_drawdown: float
+
+
+@dataclass(frozen=True)
 class BacktestResult:
     factor_id: str
     periods: int
@@ -158,10 +189,25 @@ class BacktestResult:
     max_drawdown: float
     artifact_path: Path
     long_short_sharpe: float = 0.0
-    average_turnover: float = 0.0
+    gross_cumulative_return: float = 0.0
+    gross_annualized_return: float = 0.0
+    gross_annualized_volatility: float = 0.0
+    gross_long_short_sharpe: float = 0.0
+    gross_max_drawdown: float = 0.0
+    rebalance_rate: float = 0.0
+    turnover_rate: float = 0.0
+    net_cumulative_return: float = 0.0
+    net_annualized_return: float = 0.0
+    net_annualized_volatility: float = 0.0
+    net_long_short_sharpe: float = 0.0
+    net_max_drawdown: float = 0.0
     top_quantile: float = 0.3
+    transaction_costs: TransactionCostModel = field(default_factory=TransactionCostModel)
     simulation_profile: SimulationProfile = field(default_factory=SimulationProfile)
     group_returns: tuple[BacktestGroupMetric, ...] = field(default_factory=tuple)
+    segment_metrics: tuple[BacktestSegmentMetric, ...] = field(default_factory=tuple)
+    warnings: tuple[str, ...] = field(default_factory=tuple)
+    assumptions: tuple[str, ...] = field(default_factory=tuple)
 
 
 def _optional_iso_date(value: str | None, label: str) -> date | None:

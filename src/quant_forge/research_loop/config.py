@@ -9,7 +9,7 @@ from typing import Any
 import yaml
 
 from quant_forge.config import ResearchSettings, simulation_profile_from_mapping
-from quant_forge.core.contracts import SampleSplitSpec, SimulationProfile
+from quant_forge.core.contracts import SampleSplitSpec, SimulationProfile, TransactionCostModel
 from quant_forge.evaluation.service import DEFAULT_HORIZON_DAYS, DEFAULT_SAMPLE_SPLITS
 from quant_forge.research_loop.service import ResearchGate, ResearchObjectiveWeights, objective_weights_for
 
@@ -102,6 +102,7 @@ class ResearchLoopConfig:
     weights: ResearchObjectiveWeights = field(default_factory=ResearchObjectiveWeights)
     weight_profiles: tuple[ResearchWeightProfile, ...] = field(default_factory=default_research_weight_profiles)
     parameter_search: ResearchParameterSearchConfig = field(default_factory=ResearchParameterSearchConfig)
+    transaction_costs: TransactionCostModel = field(default_factory=TransactionCostModel)
 
     def __post_init__(self) -> None:
         if self.default_max_candidates < 1 or self.default_max_candidates > 10:
@@ -178,10 +179,41 @@ def load_research_loop_config(
             min_backtest_periods=int(
                 _nested(loaded, "gate", "min_backtest_periods", base.gate.min_backtest_periods)
             ),
+            min_oos_net_annualized_return=_optional_float(
+                _nested(
+                    loaded,
+                    "gate",
+                    "min_oos_net_annualized_return",
+                    base.gate.min_oos_net_annualized_return,
+                )
+            ),
+            max_rebalance_rate=_optional_float(
+                _nested(
+                    loaded,
+                    "gate",
+                    "max_rebalance_rate",
+                    _nested(loaded, "gate", "max_component_replacement", base.gate.max_rebalance_rate),
+                )
+            ),
+            max_turnover_rate=_optional_float(
+                _nested(
+                    loaded,
+                    "gate",
+                    "max_turnover_rate",
+                    _nested(loaded, "gate", "max_single_side_turnover", base.gate.max_turnover_rate),
+                )
+            ),
+            min_net_return_retention=_optional_float(
+                _nested(loaded, "gate", "min_net_return_retention", base.gate.min_net_return_retention)
+            ),
+            max_oos_net_return_decay=_optional_float(
+                _nested(loaded, "gate", "max_oos_net_return_decay", base.gate.max_oos_net_return_decay)
+            ),
         ),
         weights=_load_weights(loaded.get("weights"), default_weights),
         weight_profiles=_load_weight_profiles(loaded.get("weight_profiles"), base.weight_profiles),
         parameter_search=_load_parameter_search(loaded.get("parameter_search"), base.parameter_search),
+        transaction_costs=_load_transaction_costs(loaded.get("transaction_costs"), base.transaction_costs),
     )
 
 
@@ -202,6 +234,12 @@ def _nested(raw: dict[str, Any], section: str, key: str, default: Any) -> Any:
     if not isinstance(section_value, dict):
         raise ValueError(f"RD config section must be a mapping: {section}")
     return section_value.get(key, default)
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return float(value)
 
 
 def _load_sample_splits(raw: Any, default: tuple[SampleSplitSpec, ...]) -> tuple[SampleSplitSpec, ...]:
@@ -240,6 +278,18 @@ def _load_parameter_search(raw: Any, default: ResearchParameterSearchConfig) -> 
         quick_sample_splits=_load_sample_splits(raw.get("quick_sample_splits"), default.quick_sample_splits),
         top_quantile=tuple(float(item) for item in raw.get("top_quantile", default.top_quantile)),
         decay_days=tuple(int(item) for item in raw.get("decay_days", default.decay_days)),
+    )
+
+
+def _load_transaction_costs(raw: Any, default: TransactionCostModel) -> TransactionCostModel:
+    if raw is None:
+        return default
+    if not isinstance(raw, dict):
+        raise ValueError("RD config transaction_costs must be a mapping")
+    return TransactionCostModel(
+        commission_bps=float(raw.get("commission_bps", default.commission_bps)),
+        slippage_bps=float(raw.get("slippage_bps", default.slippage_bps)),
+        short_borrow_bps_annual=float(raw.get("short_borrow_bps_annual", default.short_borrow_bps_annual)),
     )
 
 

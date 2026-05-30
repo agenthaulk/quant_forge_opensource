@@ -28,6 +28,12 @@ def test_web_workbench_rule_workflow_runs_end_to_end(tmp_path) -> None:
     assert result["factor"]["universe_filters"] == ["is_st == false"]
     assert result["evaluation"]["observations"] > 0
     assert result["backtest"]["periods"] > 0
+    assert "gross_annualized_return" in result["backtest"]
+    assert "net_annualized_return" in result["backtest"]
+    assert "rebalance_rate" in result["backtest"]
+    assert "turnover_rate" in result["backtest"]
+    assert {metric["name"] for metric in result["backtest"]["segment_metrics"]} == {"IS", "OOS1", "OOS2"}
+    assert result["backtest"]["assumptions"]
     assert paths["factor_root"].exists()
 
 
@@ -41,6 +47,11 @@ def test_web_research_once_workflow_runs_end_to_end(tmp_path) -> None:
     assert result["candidates"][0]["factor"]["formula"] == "-rank(market_cap)"
     assert result["candidates"][0]["factor"]["status"] == "candidate"
     assert result["accepted_candidate_ids"]
+    backtest = result["candidates"][0]["backtest"]
+    assert "net_annualized_return" in backtest
+    assert "rebalance_rate" in backtest
+    assert "turnover_rate" in backtest
+    assert backtest["segment_metrics"]
     assert Path(result["report_path"]).exists()
     assert paths["factor_root"].exists()
 
@@ -96,6 +107,12 @@ allowed_interval_days: [5]
     assert "LLM: deepseek / fake-deepseek" in html
     assert '<option value="deepseek" selected>deepseek / fake-deepseek · env QF_TEST_DEEPSEEK_KEY</option>' in html
     assert '<option value="glm">glm / fake-glm · env QF_TEST_GLM_KEY</option>' in html
+    assert "毛年化收益" in html
+    assert "净年化收益" in html
+    assert "调仓率" in html
+    assert "换手率" in html
+    assert "风险提示" in html
+    assert "研究口径，不是生产交易口径" in html
 
 
 def test_web_research_scheduler_http_start_stop_and_validation(tmp_path) -> None:
@@ -203,15 +220,30 @@ def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
             max_drawdown=0.0,
             artifact_path=Path(artifact_root) / "backtests" / f"{factor_id}.json",
             simulation_profile=simulation_profile,
+            net_annualized_return=0.01,
+            net_long_short_sharpe=0.5,
+            rebalance_rate=0.25,
+            turnover_rate=1.0,
+            warnings=("research semantics",),
         )
 
     monkeypatch.setattr(web_server, "parse_factor_idea", fake_parse_factor_idea)
     monkeypatch.setattr(web_server, "evaluate_factor", fake_evaluate_factor)
 
     def fake_run_factor_backtest_with_holding(
-        factor_id, *, factor_root, data_root, artifact_root, simulation_profile, holding_days
+        factor_id,
+        *,
+        factor_root,
+        data_root,
+        artifact_root,
+        simulation_profile,
+        holding_days,
+        transaction_costs,
+        sample_splits,
     ):
         assert holding_days == 11
+        assert transaction_costs.commission_bps == 0.0
+        assert len(sample_splits) == 3
         captured["top_quantile_basis_points"] = int(simulation_profile.top_quantile * 10000)
         return fake_run_factor_backtest(
             factor_id,

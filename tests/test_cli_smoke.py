@@ -80,6 +80,10 @@ def test_cli_smoke_path(tmp_path: Path) -> None:
     )
     assert backtest["periods"] > 0
     assert Path(backtest["artifact_path"]).exists()
+    assert "gross_annualized_return" in backtest
+    assert "net_annualized_return" in backtest
+    assert "rebalance_rate" in backtest
+    assert "turnover_rate" in backtest
 
     rd_config = workspace / "rd.yaml"
     rd_config.write_text(
@@ -160,6 +164,9 @@ def test_run_backtest_uses_rd_config_top_quantile(tmp_path: Path) -> None:
         """simulation:
   top_quantile: 0.2
   decay_days: 2
+transaction_costs:
+  commission_bps: 5.0
+  slippage_bps: 3.0
 """,
         encoding="utf-8",
     )
@@ -185,5 +192,8 @@ def test_run_backtest_uses_rd_config_top_quantile(tmp_path: Path) -> None:
 
     assert configured["top_quantile"] == 0.2
     assert configured["simulation_profile"]["decay_days"] == 2
+    assert configured["transaction_costs"]["commission_bps"] == 5.0
+    assert configured["net_annualized_return"] < configured["gross_annualized_return"]
     assert overridden["top_quantile"] == 0.4
     assert overridden["simulation_profile"]["decay_days"] == 2
+    assert overridden["transaction_costs"]["slippage_bps"] == 3.0

@@ -70,11 +70,15 @@ The public backtest also emits FactorLab-style research diagnostics:
 
 - quintile group returns, with Q1 as the lowest factor scores and Q5 as the
   highest factor scores;
-- long-short Sharpe from non-overlapping period returns;
-- average turnover from rebalance-to-rebalance long/short membership overlap.
+- gross and net long-short metrics from non-overlapping period returns;
+- rebalance rate from long/short membership changes per rebalance;
+- turnover rate from portfolio weight changes;
+- IS/OOS1/OOS2 backtest segments for return, Sharpe, and drawdown;
+- configurable research cost assumptions for commission, slippage, and short
+  borrow cost.
 
-The turnover metric is a local research feasibility signal, not a production
-transaction-cost model.
+Rebalance rate is not true traded turnover. Turnover rate and net
+returns are still local research estimates, not production execution results.
 
 ## Signal Preparation
 
@@ -124,7 +128,7 @@ One run-once cycle:
 7. Runs full evaluation and lightweight backtest with the candidate horizon and
    effective simulation profile.
 8. Scores the candidate with explicit objective weights from RD config,
-   including weighted split ICIR by default.
+   including weighted split ICIR and net-of-cost backtest metrics by default.
 9. Generates a bounded self-review summary with strengths, risks, and next
    hypotheses through a review adapter.
 10. Promotes only full-stage smoke-gate-passing candidates to `candidate`.
@@ -137,8 +141,11 @@ The local web scheduler is an in-process convenience scheduler for one local
 server. Long-running distributed workers and non-public platform rebinding remain
 未指定 for the public clean branch.
 
-RD weights, gate thresholds, allowed schedule intervals, and bounded
-parameter-search profile variants are loaded from `configs/rd.yaml` by default
-in the release docs, or from a user-supplied `--rd-config` file at runtime.
-The public parameter search supports `full_grid` and `successive_halving`;
-successive halving is a two-stage budget strategy, not reinforcement learning.
+RD weights, gate thresholds, cost assumptions, allowed schedule intervals, and
+bounded parameter-search profile variants are loaded from `configs/rd.yaml` by
+default in the release docs, or from a user-supplied `--rd-config` file at
+runtime. Gates can remain permissive for smoke demos or be tightened against
+OOS net return, rebalance rate, turnover rate, net/gross retention, and OOS
+decay. The public parameter search supports `full_grid` and
+`successive_halving`; successive halving is a two-stage budget strategy, not
+reinforcement learning.

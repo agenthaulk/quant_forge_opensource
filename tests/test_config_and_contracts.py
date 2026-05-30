@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from quant_forge.config import load_config, simulation_profile_from_mapping
-from quant_forge.core.contracts import FactorDefinition, SimulationProfile
+from quant_forge.core.contracts import FactorDefinition, SimulationProfile, TransactionCostModel
 from quant_forge.research_loop.config import load_research_loop_config, weights_for_objective
 
 
@@ -42,6 +42,9 @@ def test_rd_config_loads_defaults_and_overrides(tmp_path: Path) -> None:
     assert default_config.weights.rank_ic_mean == 0.25
     assert default_config.simulation_profile.decay_days == 0
     assert default_config.simulation_profile.top_quantile == 0.3
+    assert default_config.transaction_costs.commission_bps == 0.0
+    assert default_config.transaction_costs.slippage_bps == 0.0
+    assert default_config.gate.max_turnover_rate is None
     assert default_config.simulation_profiles == (default_config.simulation_profile,)
     assert default_config.horizon_days_matrix == (5, 10, 21, 63)
     assert [split.name for split in default_config.sample_splits] == ["IS", "OOS1", "OOS2"]
@@ -66,6 +69,15 @@ sample_splits:
     score_weight: 0.5
 gate:
   min_ic_days: 3
+  min_oos_net_annualized_return: -0.05
+  max_rebalance_rate: 0.9
+  max_turnover_rate: 1.5
+  min_net_return_retention: 0.5
+  max_oos_net_return_decay: 0.25
+transaction_costs:
+  commission_bps: 3.0
+  slippage_bps: 5.0
+  short_borrow_bps_annual: 120.0
 weights:
   weighted_split_icir: 0.5
   rank_icir: 0.6
@@ -101,10 +113,30 @@ parameter_search:
     assert custom_config.horizon_days_matrix == (5, 21)
     assert [split.name for split in custom_config.sample_splits] == ["IS", "OOS"]
     assert custom_config.gate.min_ic_days == 3
+    assert custom_config.gate.min_oos_net_annualized_return == -0.05
+    assert custom_config.gate.max_rebalance_rate == 0.9
+    assert custom_config.gate.max_turnover_rate == 1.5
+    assert custom_config.gate.min_net_return_retention == 0.5
+    assert custom_config.gate.max_oos_net_return_decay == 0.25
+    assert custom_config.transaction_costs.commission_bps == 3.0
+    assert custom_config.transaction_costs.slippage_bps == 5.0
+    assert custom_config.transaction_costs.short_borrow_bps_annual == 120.0
     assert custom_config.weights.weighted_split_icir == 0.5
     assert custom_config.weights.rank_icir == 0.6
     assert weights_for_objective(custom_config, "rank_icir").weighted_split_icir == 0.5
     assert weights_for_objective(custom_config, "rank_ic").weighted_split_icir == 0.9
+
+    legacy_path = tmp_path / "rd-legacy.yaml"
+    legacy_path.write_text(
+        """gate:
+  max_component_replacement: 0.7
+  max_single_side_turnover: 1.2
+""",
+        encoding="utf-8",
+    )
+    legacy_config = load_research_loop_config(legacy_path)
+    assert legacy_config.gate.max_rebalance_rate == 0.7
+    assert legacy_config.gate.max_turnover_rate == 1.2
 
 
 def test_factor_status_validation() -> None:
@@ -120,6 +152,10 @@ def test_simulation_profile_validation() -> None:
         SimulationProfile(neutralization="industry")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="truncation is not supported"):
         SimulationProfile(truncation="winsorize")
+    with pytest.raises(ValueError, match="commission_bps must be non-negative"):
+        TransactionCostModel(commission_bps=-1.0)
+    with pytest.raises(ValueError, match="slippage_bps must be non-negative"):
+        TransactionCostModel(slippage_bps=-1.0)
 
 
 def test_config_reports_missing_required_llm_provider_fields(tmp_path: Path) -> None:
