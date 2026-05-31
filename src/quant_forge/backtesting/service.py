@@ -246,13 +246,18 @@ def _with_period_return(close: pd.DataFrame, entry_date: pd.Timestamp, exit_date
 
 
 def _return_summary(returns: np.ndarray, holding_days: int) -> dict[str, float]:
-    equity = np.cumprod(1.0 + returns) if len(returns) else np.array([], dtype=float)
+    periods = len(returns)
+    equity = np.cumprod(1.0 + returns) if periods else np.array([], dtype=float)
     cumulative_return = float(equity[-1] - 1.0) if len(equity) else 0.0
-    annualized_return = (
-        float((1.0 + cumulative_return) ** (252 / (holding_days * len(returns))) - 1.0) if len(returns) else 0.0
-    )
+    terminal_equity = 1.0 + cumulative_return
+    if periods == 0:
+        annualized_return = 0.0
+    elif terminal_equity <= 0.0:
+        annualized_return = -1.0
+    else:
+        annualized_return = float(terminal_equity ** (252 / (holding_days * periods)) - 1.0)
     annualized_volatility = (
-        float(np.std(returns, ddof=1) * np.sqrt(252 / holding_days)) if len(returns) > 1 else 0.0
+        float(np.std(returns, ddof=1) * np.sqrt(252 / holding_days)) if periods > 1 else 0.0
     )
     return {
         "cumulative_return": cumulative_return,
