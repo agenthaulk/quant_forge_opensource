@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from quant_forge.backtesting.service import _max_drawdown, run_factor_backtest
+from quant_forge.backtesting.service import _max_drawdown, _return_summary, run_factor_backtest
 from quant_forge.core.contracts import SampleSplitSpec, SimulationProfile, TransactionCostModel
 from quant_forge.data.local import create_demo_workspace
 
@@ -140,3 +140,11 @@ def test_backtest_does_not_emit_fake_empty_group_returns(tmp_path: Path) -> None
 def test_max_drawdown_includes_initial_capital() -> None:
     assert np.isclose(_max_drawdown(np.array([0.90])), -0.10)
     assert np.isclose(_max_drawdown(np.array([1.10, 0.88, 1.20])), -0.20)
+
+
+def test_return_summary_handles_net_loss_beyond_total_capital() -> None:
+    summary = _return_summary(np.array([-1.25]), holding_days=5)
+
+    assert summary["cumulative_return"] == -1.25
+    assert summary["annualized_return"] == -1.0
+    assert np.isfinite(summary["annualized_return"])
