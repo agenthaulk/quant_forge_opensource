@@ -234,9 +234,21 @@ def _restrict_to_panel(scores: pd.DataFrame, target_keys: pd.DataFrame) -> pd.Da
 def _complete_cached_dates(target_keys: pd.DataFrame, cached: pd.DataFrame) -> set[pd.Timestamp]:
     if target_keys.empty or cached.empty:
         return set()
-    target_counts = target_keys.groupby("trade_date")["instrument"].nunique()
-    cached_counts = cached.dropna(subset=["score"]).groupby("trade_date")["instrument"].nunique()
-    return {date for date, count in cached_counts.items() if count >= target_counts.get(date, -1)}
+    required_by_date = _instrument_sets_by_date(target_keys)
+    cached_non_null = _dedupe_scores(cached).dropna(subset=["score"])
+    available_by_date = _instrument_sets_by_date(cached_non_null)
+    return {
+        date
+        for date, required in required_by_date.items()
+        if required.issubset(available_by_date.get(date, frozenset()))
+    }
+
+
+def _instrument_sets_by_date(keys: pd.DataFrame) -> pd.Series:
+    if keys.empty:
+        return pd.Series(dtype="object")
+    normalized = _score_keys(keys)
+    return normalized.groupby("trade_date")["instrument"].agg(frozenset)
 
 
 def _apply_universe_filters(

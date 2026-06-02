@@ -163,6 +163,43 @@ def test_prepare_factor_scores_recomputes_dates_with_bad_cached_values(tmp_path)
     assert list(result.scores["score"]) == [0.5, 1.0, 30.0, 40.0]
 
 
+def test_prepare_factor_scores_recomputes_when_filtered_instruments_are_missing(tmp_path) -> None:
+    panel = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(["2025-01-02"] * 4),
+            "instrument": ["AAA", "BBB", "CCC", "DDD"],
+            "close": [10.0, 11.0, 12.0, 13.0],
+            "market_cap": [100.0, 200.0, 300.0, 400.0],
+            "is_st": [False, False, True, True],
+        }
+    )
+    factor_dir = tmp_path / "FTR_FILTERED_CACHE"
+    factor_dir.mkdir()
+    pd.DataFrame(
+        {
+            "trade_date": ["2025-01-02", "2025-01-02"],
+            "instrument": ["CCC", "DDD"],
+            "factor_value": [30.0, 40.0],
+        }
+    ).to_parquet(factor_dir / "2025.parquet", index=False)
+
+    result = prepare_factor_scores_result(
+        panel,
+        "rank(market_cap)",
+        universe_filters=("is_st == false",),
+        factor_id="FTR_FILTERED_CACHE",
+        factor_name="FTR_FILTERED_CACHE",
+        factor_values_root=tmp_path,
+    )
+
+    assert result.source == "factor_values_incremental"
+    assert result.cached_rows == 0
+    assert result.computed_rows == 4
+    assert list(result.scores["instrument"]) == ["AAA", "BBB", "CCC", "DDD"]
+    assert list(result.scores["score"].iloc[:2]) == [0.25, 0.5]
+    assert result.scores["score"].iloc[2:].isna().all()
+
+
 def test_prepare_factor_scores_ignores_incremental_cache_with_different_formula(tmp_path) -> None:
     panel = _two_day_panel()
     factor_dir = tmp_path / "FTR_SIGNATURE"
