@@ -2,6 +2,30 @@
 
 Default public configuration lives in `configs/default.yaml`.
 
+## Runtime Env Files
+
+Quant Forge does not rely on macOS shell inheritance for local LLM keys. A
+config may explicitly declare local env files:
+
+```yaml
+runtime:
+  env_files:
+    - default.local.env
+```
+
+Paths must be relative to the YAML config file and stay under that config
+directory. These files must be ignored by git and must contain only plain
+`KEY=value` lines with no whitespace or shell metacharacters in the value. The
+loader does not execute shell syntax, does not scan parent directories, and does
+not print loaded values.
+For example, the local ignored file can define the variable name used below:
+
+```env
+DEEPSEEK_API_KEY=
+```
+
+Fill the value only in the ignored local file. Do not commit that file.
+
 All runtime paths may be overridden through CLI flags:
 
 ```bash
@@ -16,7 +40,31 @@ docs.
 Explicit root flags remain available for advanced workflows:
 
 ```bash
-qf eval-factor FTR_DEMO_SMALL_CAP --data-root ./demo/data --factor-root ./demo/factor_root --artifact-root ./demo/artifacts
+qf eval-factor FTR_DEMO_SMALL_CAP --data-root ./demo/data --factor-root ./demo/factor_root --artifact-root ./demo/artifacts --factor-values-root ./demo/factor_values
+```
+
+## Factor Value Cache
+
+`paths.factor_values_root` is optional. When it is set, evaluation, backtest,
+Workbench, Web, and RD first look for existing factor scores under that root.
+If a factor has complete cached values for a trade date, Quant Forge reuses
+those values and does not execute the formula for that date.
+
+If only part of the requested panel is cached, Quant Forge computes the missing
+dates only and writes them to `incremental/YYYY.parquet` sidecars inside the
+matched factor directory. Existing canonical yearly files are not overwritten.
+Quant Forge-owned incremental sidecars include a formula/filter signature, so
+changing a local factor formula recomputes that sidecar instead of reusing stale
+incremental values.
+
+WorldQuant-style names are matched by aliases such as `WQ_ALPHA_003`,
+`alpha_003`, and `worldquant_alpha_003`, so a configured WQ Alpha daily factor
+library can be reused without recomputing those factors.
+
+```yaml
+paths:
+  factor_values_root: factor_values
+  factor_values_manifest_root: manifests/factor_values
 ```
 
 ## Local LLM Parsing
@@ -25,8 +73,8 @@ The local web adapter switches LLM access by the provider selected in the
 front-end. `llm.provider` is the default selection, while `llm.providers`
 declares every provider that may appear in the Web UI.
 
-Store only environment variable names in configuration. The actual key must
-stay in the user shell, a local secret manager, or an ignored local env file.
+Store only environment variable names in configuration. For the local Web
+workbench, the actual key should stay in a declared ignored local env file.
 `api_key_env` is the name of the variable, not the API key value.
 
 ```yaml
@@ -119,14 +167,15 @@ For configured providers, `model`, `base_url`, and `api_key_env` are required.
 If one is missing, config loading fails with a provider-specific message such
 as `llm.providers.deepseek.base_url`. If the selected provider's environment
 variable is not set when parsing starts, the parser fails with a message like
-`Missing API key for LLM provider deepseek. Set one of these environment
-variables: DEEPSEEK_API_KEY.`
+`Missing API key for active LLM provider deepseek. Expected environment
+variable: DEEPSEEK_API_KEY.`
 
-Example shell setup:
+Example local setup:
 
 ```bash
-export DEEPSEEK_API_KEY="<your-deepseek-api-key>"
-qf web --workspace ./demo --config configs/default.yaml --rd-config configs/rd.yaml
+printf 'DEEPSEEK_API_KEY=<your-deepseek-api-key>\n' > configs/default.local.env
+chmod 600 configs/default.local.env
+qf web --config configs/default.local.yaml --rd-config configs/rd.yaml
 ```
 
 ## Research Loop

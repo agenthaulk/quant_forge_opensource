@@ -18,7 +18,7 @@ from quant_forge.core.contracts import (
 from quant_forge.data.local import LocalPanelDataProvider
 from quant_forge.factor_engine.signal_processing import (
     apply_test_period,
-    prepare_factor_scores,
+    prepare_factor_scores_result,
     simulation_profile_suffix,
 )
 from quant_forge.factor_library.repository import FactorRepository
@@ -42,6 +42,7 @@ def evaluate_factor(
     horizon_days_matrix: tuple[int, ...] | None = None,
     sample_splits: tuple[SampleSplitSpec, ...] | None = None,
     simulation_profile: SimulationProfile | None = None,
+    factor_values_root: Path | None = None,
 ) -> EvaluationResult:
     profile = simulation_profile or SimulationProfile()
     factor = FactorRepository(factor_root).get(factor_id)
@@ -50,11 +51,21 @@ def evaluate_factor(
         raise ValueError("horizon_days must be positive")
     panel = LocalPanelDataProvider(data_root).load_panel()
     working_panel = apply_test_period(panel, profile)
-    scores = prepare_factor_scores(working_panel, factor.formula, factor.universe_filters, profile=profile)
+    score_result = prepare_factor_scores_result(
+        working_panel,
+        factor.formula,
+        factor.universe_filters,
+        profile=profile,
+        factor_id=factor.factor_id,
+        factor_name=factor.name,
+        factor_values_root=factor_values_root,
+    )
+    scores = score_result.scores
     split_specs = _validate_sample_splits(sample_splits or DEFAULT_SAMPLE_SPLITS)
     horizons = _unique_horizons(horizon, horizon_days_matrix or DEFAULT_HORIZON_DAYS)
     horizon_metrics = tuple(_evaluate_horizon(working_panel, scores, item, split_specs) for item in horizons)
     primary = next(metric for metric in horizon_metrics if metric.horizon_days == horizon)
+    warnings = _evaluation_warnings(primary.split_metrics)
 
     artifact_path = artifact_root.expanduser() / "evaluations" / f"{factor_id}{simulation_profile_suffix(profile)}.json"
     write_json(
@@ -64,6 +75,10 @@ def evaluate_factor(
             "formula": factor.formula,
             "horizon_days": horizon,
             "simulation_profile": asdict(profile),
+            "score_source": score_result.source,
+            "score_cached_rows": score_result.cached_rows,
+            "score_computed_rows": score_result.computed_rows,
+            "factor_values_path": str(score_result.factor_values_path) if score_result.factor_values_path else None,
             "observations": primary.observations,
             "coverage": primary.coverage,
             "rank_ic_mean": primary.rank_ic_mean,
@@ -73,6 +88,7 @@ def evaluate_factor(
             "sample_splits": [asdict(split) for split in split_specs],
             "split_metrics": [asdict(metric) for metric in primary.split_metrics],
             "horizon_matrix": [asdict(metric) for metric in horizon_metrics],
+            "warnings": list(warnings),
         },
     )
     return EvaluationResult(
@@ -87,6 +103,11 @@ def evaluate_factor(
         split_metrics=primary.split_metrics,
         horizon_metrics=horizon_metrics,
         simulation_profile=profile,
+        score_source=score_result.source,
+        score_cached_rows=score_result.cached_rows,
+        score_computed_rows=score_result.computed_rows,
+        factor_values_path=score_result.factor_values_path,
+        warnings=warnings,
     )
 
 
@@ -142,6 +163,29 @@ def _split_metric(
         ic_days=summary["ic_days"],
         score_weight=spec.score_weight,
     )
+
+
+def _evaluation_warnings(split_metrics: tuple[EvaluationSplitMetric, ...]) -> tuple[str, ...]:
+    by_name = {metric.name.upper(): metric for metric in split_metrics}
+    is_metric = by_name.get("IS")
+    oos_metrics = [metric for name, metric in by_name.items() if name.startswith("OOS")]
+    if is_metric is None or not oos_metrics:
+        return ()
+    warnings: list[str] = []
+    is_abs_icir = abs(is_metric.rank_icir)
+    if is_abs_icir >= 1.0:
+        weak = [
+            metric.name
+            for metric in oos_metrics
+            if abs(metric.rank_icir) < is_abs_icir * 0.5
+            or metric.rank_ic_mean * is_metric.rank_ic_mean < 0
+        ]
+        if weak:
+            warnings.append(
+                "OOS decay warning: IS ICIR is materially stronger than "
+                f"{', '.join(weak)}; do not rely on full-sample metrics only."
+            )
+    return tuple(warnings)
 
 
 def _ic_summary(labeled: pd.DataFrame) -> dict[str, float | int]:

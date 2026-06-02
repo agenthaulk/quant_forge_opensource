@@ -208,6 +208,7 @@ def _resolved_llm_settings(llm: LLMSettings) -> tuple[LLMSettings, str, str]:
             base_url=base_url,
             api_key_env=api_key_env,
             timeout_seconds=llm.timeout_seconds,
+            api_key_required=llm.api_key_required,
         ),
         credential,
         str(defaults["protocol"]),
@@ -237,7 +238,10 @@ def _read_api_key(provider: str, configured_env_name: str, default_env_names: tu
         if credential:
             return credential, env_name
     expected = ", ".join(env_names)
-    raise RuntimeError(f"Missing API key for LLM provider {provider}. Set one of these environment variables: {expected}.")
+    raise RuntimeError(
+        f"Missing API key for active LLM provider {provider}. Expected environment variable: {expected}. "
+        "Declare runtime.env_files in the local config before starting Quant Forge."
+    )
 
 
 def _messages(text: str) -> list[dict[str, str]]:

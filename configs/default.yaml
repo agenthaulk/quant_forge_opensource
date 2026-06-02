@@ -1,8 +1,12 @@
 paths:
   data_root: data
   factor_root: factor_root
+  factor_values_root: null
+  factor_values_manifest_root: null
   artifact_root: artifacts
   output_root: outputs
+runtime:
+  env_files: []
 web:
   host: 127.0.0.1
   port: 8765

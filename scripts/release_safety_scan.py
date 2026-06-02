@@ -36,6 +36,23 @@ SECRET_PATTERNS = {
     "password_assignment": re.compile(r"\b(passwd|password|client_secret)\s*[:=]\s*\S+", re.IGNORECASE),
 }
 
+ENV_SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"(?m)^[^\S\n]*(?:export[^\S\n]+)?"
+    r"(?P<name>[A-Z0-9_]*(?:API_KEY|ACCESS_TOKEN|SECRET|PASSWORD))"
+    r"[^\S\n]*=[^\S\n]*(?P<value>[^\n#]*)",
+    re.IGNORECASE,
+)
+
+PLACEHOLDER_SECRET_VALUES = {
+    "changeme",
+    "dummy",
+    "example",
+    "placeholder",
+    "test",
+    "test-value",
+    "your-api-key",
+}
+
 FORBIDDEN_TEXT_MARKERS = (
     "/" + "Users/",
     "/" + "Volumes/",
@@ -63,6 +80,8 @@ def main() -> int:
         for name, pattern in SECRET_PATTERNS.items():
             if pattern.search(text):
                 offenders.append(f"{path}: matches secret pattern {name}")
+        if _contains_env_secret_assignment(text):
+            offenders.append(f"{path}: matches secret pattern env_secret_assignment")
         if _contains_non_loopback_ip(text):
             offenders.append(f"{path}: contains non-loopback IPv4 address")
 
@@ -134,6 +153,33 @@ def _contains_non_loopback_ip(text: str) -> bool:
             continue
         return True
     return False
+
+
+def _contains_env_secret_assignment(text: str) -> bool:
+    for match in ENV_SECRET_ASSIGNMENT_PATTERN.finditer(text):
+        value = _strip_matching_quotes(match.group("value").strip())
+        if not value or _is_placeholder_secret_value(value):
+            continue
+        if any(marker in value for marker in ("$(", "`")):
+            continue
+        if value.startswith(("sk-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_")):
+            return True
+        if len(value) >= 16 and re.search(r"[A-Za-z]", value) and re.search(r"\d", value):
+            return True
+    return False
+
+
+def _strip_matching_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1].strip()
+    return value
+
+
+def _is_placeholder_secret_value(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in PLACEHOLDER_SECRET_VALUES:
+        return True
+    return normalized.startswith("<") and normalized.endswith(">")
 
 
 if __name__ == "__main__":

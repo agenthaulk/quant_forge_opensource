@@ -50,6 +50,7 @@ PYTHONPATH=src python3 -m quant_forge.apps.cli.main --help
 
 ```bash
 qf init --workspace ./qf-demo
+qf doctor --workspace ./qf-demo
 qf data validate --workspace ./qf-demo
 qf factor list --workspace ./qf-demo
 qf idea-to-factor --text "small non-st stocks perform better" --workspace ./qf-demo
@@ -68,27 +69,40 @@ RD 命令会输出 `report_path`。Markdown 研究报告默认写入工作区的
 
 ```bash
 qf init --workspace ./qf-demo
-qf web --workspace ./qf-demo --config configs/default.yaml --rd-config configs/rd.yaml
+qf doctor --workspace ./qf-demo
+qf web --workspace ./qf-demo --rd-config configs/rd.yaml
 ```
 
 Open the printed local URL in your browser. The web adapter is local-only.
+This starts with the deterministic rule parser. For LLM parsing, configure a
+local ignored config and env file first, then run `qf doctor --config ...`.
+If `llm.provider` remains `rule`, missing external LLM keys are reported only
+as optional readiness warnings.
 
 在浏览器打开命令行打印的本地地址。本项目 Web 适配器只面向本地运行。
+上述命令使用确定性规则解析器。若要使用 LLM 解析，请先配置本地忽略的 config
+和 env 文件，再运行 `qf doctor --config ...`。
+如果 `llm.provider` 仍为 `rule`，缺少外部 LLM key 只会作为可选 readiness
+提示展示。
 
 ## LLM Provider Setup / 大模型配置
 
 Configuration files store provider metadata and environment variable names
-only. Real API keys must stay in your shell, secret manager, or ignored local
-environment file.
+only. For the local Web workbench, real API keys should stay in an ignored
+local env file declared by `runtime.env_files`.
 
-配置文件只保存供应商元信息和环境变量名。真实 API key 必须放在用户自己的 shell、
-密钥管理器或被忽略的本地环境文件中。
+配置文件只保存供应商元信息和环境变量名。对于本地 Web 工作台，真实 API key
+应放在 `runtime.env_files` 显式声明、且被 git 忽略的本地 env 文件中。
 
 Example:
 
 ```bash
-export DEEPSEEK_API_KEY="<your-api-key>"
-qf web --workspace ./qf-demo --config configs/default.yaml --rd-config configs/rd.yaml
+cp configs/default.draft.yaml configs/default.local.yaml
+printf 'DEEPSEEK_API_KEY=<your-api-key>\n' > configs/default.local.env
+chmod 600 configs/default.local.env
+# edit configs/default.local.yaml paths.* and runtime.env_files as needed
+qf doctor --config configs/default.local.yaml --rd-config configs/rd.yaml
+qf web --config configs/default.local.yaml --rd-config configs/rd.yaml
 ```
 
 If a selected provider is missing `model`, `base_url`, `api_key_env`, or the
@@ -99,7 +113,7 @@ named environment variable, Quant Forge raises a precise error such as:
 
 ```text
 llm.providers.deepseek.base_url is required
-Missing API key for LLM provider deepseek. Set one of these environment variables: DEEPSEEK_API_KEY.
+Missing API key for active LLM provider deepseek. Expected environment variable: DEEPSEEK_API_KEY.
 ```
 
 ## Configuration Files / 配置文件
@@ -127,6 +141,7 @@ Read the full bilingual guide:
 - [User Manual / 使用手册](docs/USER_MANUAL.md)
 - [Architecture / 架构说明](docs/architecture.md)
 - [Configuration Reference / 配置参考](docs/configuration.md)
+- [Integration Workflow / 联调流程](docs/integration_workflow.md)
 
 ## Data Contract / 数据契约
 

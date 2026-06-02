@@ -29,3 +29,19 @@ def test_agent_tools_do_not_mutate_factor_root_directly(tmp_path: Path) -> None:
     assert decision["status"] == "requires_user_decision"
     with pytest.raises(FileNotFoundError):
         FactorRepository(paths["factor_root"]).get(proposed["factor_id"])
+
+
+def test_agent_tools_can_use_factor_value_cache_root(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    factor_values_root = tmp_path / "factor_values"
+    tools = AgentWorkspaceTools(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        factor_values_root=factor_values_root,
+    )
+
+    result = tools.evaluate_factor("FTR_DEMO_SMALL_CAP")
+
+    assert result["observations"] > 0
+    assert (factor_values_root / "demo_small_cap" / "incremental" / "2024.parquet").exists()

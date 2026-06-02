@@ -20,7 +20,7 @@ from quant_forge.data.local import LocalPanelDataProvider
 from quant_forge.evaluation.service import DEFAULT_SAMPLE_SPLITS
 from quant_forge.factor_engine.signal_processing import (
     apply_test_period,
-    prepare_factor_scores,
+    prepare_factor_scores_result,
     simulation_profile_suffix,
 )
 from quant_forge.factor_library.repository import FactorRepository
@@ -39,6 +39,7 @@ def run_factor_backtest(
     simulation_profile: SimulationProfile | None = None,
     transaction_costs: TransactionCostModel | None = None,
     sample_splits: tuple[SampleSplitSpec, ...] | None = None,
+    factor_values_root: Path | None = None,
 ) -> BacktestResult:
     profile = simulation_profile or SimulationProfile()
     costs = transaction_costs or TransactionCostModel()
@@ -65,7 +66,16 @@ def run_factor_backtest(
         raise ValueError("holding_days must be positive")
     panel = LocalPanelDataProvider(data_root).load_panel()
     working_panel = apply_test_period(panel, profile)
-    scores = prepare_factor_scores(working_panel, factor.formula, factor.universe_filters, profile=profile)
+    score_result = prepare_factor_scores_result(
+        working_panel,
+        factor.formula,
+        factor.universe_filters,
+        profile=profile,
+        factor_id=factor.factor_id,
+        factor_name=factor.name,
+        factor_values_root=factor_values_root,
+    )
+    scores = score_result.scores
     close = working_panel[["trade_date", "instrument", "close"]].copy()
     dates = sorted(working_panel["trade_date"].drop_duplicates())
     rows: list[dict[str, object]] = []
@@ -180,6 +190,10 @@ def run_factor_backtest(
             "holding_days": holding,
             "top_quantile": top_quantile,
             "simulation_profile": asdict(profile),
+            "score_source": score_result.source,
+            "score_cached_rows": score_result.cached_rows,
+            "score_computed_rows": score_result.computed_rows,
+            "factor_values_path": str(score_result.factor_values_path) if score_result.factor_values_path else None,
             "transaction_costs": asdict(costs),
             "periods": len(rows),
             "cumulative_return": gross_summary["cumulative_return"],
@@ -234,6 +248,10 @@ def run_factor_backtest(
         segment_metrics=segment_metrics,
         warnings=warnings,
         assumptions=assumptions,
+        score_source=score_result.source,
+        score_cached_rows=score_result.cached_rows,
+        score_computed_rows=score_result.computed_rows,
+        factor_values_path=score_result.factor_values_path,
     )
 
 

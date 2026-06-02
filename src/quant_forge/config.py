@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
+import re
+import subprocess
 from typing import Any
 
 import yaml
@@ -15,6 +18,8 @@ from quant_forge.core.contracts import SimulationProfile
 class PathSettings:
     data_root: Path = Path("data")
     factor_root: Path = Path("factor_root")
+    factor_values_root: Path | None = None
+    factor_values_manifest_root: Path | None = None
     artifact_root: Path = Path("artifacts")
     output_root: Path = Path("outputs")
 
@@ -32,12 +37,18 @@ class ResearchSettings:
 
 
 @dataclass(frozen=True)
+class RuntimeSettings:
+    env_files: tuple[Path, ...] = ()
+
+
+@dataclass(frozen=True)
 class LLMProviderSettings:
     provider: str = "rule"
     model: str = "deterministic"
     base_url: str = ""
     api_key_env: str = ""
     timeout_seconds: float = 30.0
+    api_key_required: bool = True
 
 
 @dataclass(frozen=True)
@@ -47,6 +58,7 @@ class LLMSettings:
     base_url: str = ""
     api_key_env: str = ""
     timeout_seconds: float = 30.0
+    api_key_required: bool = True
     providers: dict[str, LLMProviderSettings] = field(default_factory=dict)
 
     def select_provider(self, provider: str | None = None) -> "LLMSettings":
@@ -56,6 +68,7 @@ class LLMSettings:
                 provider="rule",
                 model="deterministic",
                 timeout_seconds=self.timeout_seconds,
+                api_key_required=False,
                 providers=self.providers,
             )
 
@@ -67,6 +80,7 @@ class LLMSettings:
                 base_url=self.base_url,
                 api_key_env=self.api_key_env,
                 timeout_seconds=self.timeout_seconds,
+                api_key_required=self.api_key_required,
             )
         if configured is None:
             available = ", ".join(sorted(self.providers)) or "none"
@@ -81,6 +95,7 @@ class LLMSettings:
             base_url=configured.base_url,
             api_key_env=configured.api_key_env,
             timeout_seconds=configured.timeout_seconds,
+            api_key_required=configured.api_key_required,
             providers=self.providers,
         )
 
@@ -105,6 +120,7 @@ class QuantForgeConfig:
     paths: PathSettings = PathSettings()
     web: WebSettings = WebSettings()
     research: ResearchSettings = ResearchSettings()
+    runtime: RuntimeSettings = RuntimeSettings()
     simulation: SimulationProfile = SimulationProfile()
     llm: LLMSettings = LLMSettings()
 
@@ -116,11 +132,14 @@ class QuantForgeConfig:
             paths=PathSettings(
                 data_root=_under(root, self.paths.data_root),
                 factor_root=_under(root, self.paths.factor_root),
+                factor_values_root=_optional_under(root, self.paths.factor_values_root),
+                factor_values_manifest_root=_optional_under(root, self.paths.factor_values_manifest_root),
                 artifact_root=_under(root, self.paths.artifact_root),
                 output_root=_under(root, self.paths.output_root),
             ),
             web=self.web,
             research=self.research,
+            runtime=self.runtime,
             simulation=self.simulation,
             llm=self.llm,
         )
@@ -130,19 +149,25 @@ def load_config(config_path: Path | None = None, workspace: Path | None = None) 
     """Load config from YAML, falling back only to documented public defaults."""
 
     raw: dict[str, Any] = {}
+    config_dir = Path.cwd()
     if config_path is not None:
         path = config_path.expanduser()
         if not path.exists():
             raise FileNotFoundError(f"config file does not exist: {path}")
+        config_dir = path.parent
         loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         if not isinstance(loaded, dict):
             raise ValueError("config file must contain a mapping")
         raw = loaded
 
+    runtime = runtime_settings_from_mapping(raw.get("runtime"), base_dir=config_dir)
+    load_runtime_env_files(runtime.env_files)
     config = QuantForgeConfig(
         paths=PathSettings(
             data_root=_path_setting(raw, "data_root", default="data"),
             factor_root=_path_setting(raw, "factor_root", default="factor_root"),
+            factor_values_root=_optional_path_setting(raw, "factor_values_root"),
+            factor_values_manifest_root=_optional_path_setting(raw, "factor_values_manifest_root"),
             artifact_root=_path_setting(raw, "artifact_root", default="artifacts"),
             output_root=_path_setting(raw, "output_root", default="outputs"),
         ),
@@ -154,10 +179,64 @@ def load_config(config_path: Path | None = None, workspace: Path | None = None) 
             default_horizon_days=int(_nested(raw, "research", "default_horizon_days", default=5)),
             default_top_quantile=float(_nested(raw, "research", "default_top_quantile", default=0.3)),
         ),
+        runtime=runtime,
         simulation=simulation_profile_from_mapping(raw.get("simulation"), SimulationProfile()),
         llm=llm_settings_from_mapping(raw.get("llm")),
     )
     return config.resolve(workspace)
+
+
+def runtime_settings_from_mapping(raw: Any, *, base_dir: Path | None = None) -> RuntimeSettings:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("runtime config section must be a mapping")
+    env_files_raw = raw.get("env_files", ())
+    if env_files_raw is None:
+        env_files_raw = ()
+    if not isinstance(env_files_raw, (list, tuple)):
+        raise ValueError("runtime.env_files must be a list")
+    root = (base_dir or Path.cwd()).expanduser()
+    env_files = tuple(
+        _runtime_env_file_path(item, root=root)
+        for item in env_files_raw
+        if str(item).strip()
+    )
+    return RuntimeSettings(env_files=env_files)
+
+
+def load_runtime_env_files(env_files: tuple[Path, ...]) -> None:
+    for env_file in env_files:
+        if not env_file.exists():
+            raise FileNotFoundError(f"runtime env file does not exist: {env_file}")
+        _require_git_ignored_runtime_env_file(env_file)
+        for line_number, line in enumerate(env_file.read_text(encoding="utf-8").splitlines(), start=1):
+            parsed = _parse_env_line(line, env_file=env_file, line_number=line_number)
+            if parsed is None:
+                continue
+            name, value = parsed
+            os.environ[name] = value
+
+
+def validate_llm_runtime(llm: LLMSettings, provider: str | None = None) -> None:
+    selected = llm.select_provider(provider)
+    if not selected.api_key_required:
+        return
+    if not selected.api_key_env.strip():
+        raise RuntimeError(f"LLM provider {selected.provider} requires api_key_env in config")
+    if not os.environ.get(selected.api_key_env):
+        raise RuntimeError(
+            f"Missing API key for active LLM provider {selected.provider}. "
+            f"Expected environment variable: {selected.api_key_env}. "
+            "Declare runtime.env_files in the local config before starting Quant Forge."
+        )
+
+
+def validate_any_llm_runtime(llm: LLMSettings) -> None:
+    selected = llm.select_provider()
+    if not selected.api_key_required:
+        return
+    validate_llm_runtime(llm)
 
 
 def llm_settings_from_mapping(raw: Any) -> LLMSettings:
@@ -174,10 +253,16 @@ def llm_settings_from_mapping(raw: Any) -> LLMSettings:
         base_url=str(raw.get("base_url", "")),
         api_key_env=str(raw.get("api_key_env", "")),
         timeout_seconds=default_timeout,
+        api_key_required=bool(raw.get("require_api_key", True)),
     )
 
     providers: dict[str, LLMProviderSettings] = {
-        "rule": LLMProviderSettings(provider="rule", model="deterministic", timeout_seconds=default_timeout)
+        "rule": LLMProviderSettings(
+            provider="rule",
+            model="deterministic",
+            timeout_seconds=default_timeout,
+            api_key_required=False,
+        )
     }
     providers_raw = raw.get("providers", {})
     if providers_raw is None:
@@ -201,6 +286,7 @@ def llm_settings_from_mapping(raw: Any) -> LLMSettings:
         base_url=legacy_settings.base_url,
         api_key_env=legacy_settings.api_key_env,
         timeout_seconds=default_timeout,
+        api_key_required=legacy_settings.api_key_required,
         providers=providers,
     )
     return settings
@@ -248,9 +334,15 @@ def _llm_provider_from_mapping(
         base_url=str(raw.get("base_url", "")),
         api_key_env=str(raw.get("api_key_env", "")),
         timeout_seconds=float(raw.get("timeout_seconds", default_timeout_seconds)),
+        api_key_required=bool(raw.get("require_api_key", True)),
     )
     if _normalize_provider_name(provider) in {"rule", "deterministic"}:
-        return LLMProviderSettings(provider="rule", model="deterministic", timeout_seconds=settings.timeout_seconds)
+        return LLMProviderSettings(
+            provider="rule",
+            model="deterministic",
+            timeout_seconds=settings.timeout_seconds,
+            api_key_required=False,
+        )
     return settings
 
 
@@ -277,6 +369,83 @@ def _normalize_provider_name(value: object) -> str:
     return str(value).strip().lower()
 
 
+def _parse_env_line(line: str, *, env_file: Path, line_number: int) -> tuple[str, str] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    if stripped.startswith("export "):
+        raise ValueError(f"{env_file}:{line_number}: runtime env files use KEY=value syntax, not shell export")
+    if "=" not in stripped:
+        raise ValueError(f"{env_file}:{line_number}: runtime env line must be KEY=value")
+    name, value = stripped.split("=", 1)
+    name = name.strip()
+    value = value.strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise ValueError(f"{env_file}:{line_number}: invalid environment variable name")
+    if any(marker in value for marker in ("$", "`", ";", "&", "|", "<", ">")):
+        raise ValueError(f"{env_file}:{line_number}: shell syntax is not allowed in runtime env files")
+    if any(character.isspace() for character in value):
+        raise ValueError(f"{env_file}:{line_number}: whitespace is not allowed in runtime env values")
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    if not value:
+        raise ValueError(f"{env_file}:{line_number}: runtime env values must not be empty")
+    return name, value
+
+
+def _runtime_env_file_path(value: object, *, root: Path) -> Path:
+    raw = str(value).strip()
+    if raw.startswith("~"):
+        raise ValueError("runtime.env_files entries must be relative to the config file")
+    path = Path(raw)
+    if path.is_absolute():
+        raise ValueError("runtime.env_files entries must be relative to the config file")
+    candidate = root / path
+    try:
+        candidate.resolve(strict=False).relative_to(root.resolve(strict=False))
+    except ValueError as exc:
+        raise ValueError("runtime.env_files entries must stay under the config file directory") from exc
+    return candidate
+
+
+def _require_git_ignored_runtime_env_file(env_file: Path) -> None:
+    git_root = _git_worktree_root(env_file.parent)
+    if git_root is None:
+        return
+    try:
+        relative = env_file.resolve().relative_to(git_root)
+    except ValueError as exc:
+        raise ValueError(f"runtime env file must stay inside the git worktree: {env_file}") from exc
+    tracked = subprocess.run(
+        ["git", "-C", str(git_root), "ls-files", "--error-unmatch", "--", str(relative)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if tracked.returncode == 0:
+        raise ValueError(f"runtime env file must not be tracked by git: {env_file}")
+    ignored = subprocess.run(
+        ["git", "-C", str(git_root), "check-ignore", "-q", "--", str(relative)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if ignored.returncode != 0:
+        raise ValueError(f"runtime env file must be ignored by git: {env_file}")
+
+
+def _git_worktree_root(path: Path) -> Path | None:
+    result = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return Path(result.stdout.strip()).resolve()
+
+
 def _nested(raw: dict[str, Any], section: str, key: str, *, default: Any) -> Any:
     section_value = raw.get(section, {})
     if section_value is None:
@@ -294,6 +463,14 @@ def _path_setting(raw: dict[str, Any], key: str, *, default: str) -> Path:
     return Path(normalized)
 
 
+def _optional_path_setting(raw: dict[str, Any], key: str) -> Path | None:
+    value = _nested(raw, "paths", key, default=None)
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return Path(normalized) if normalized else None
+
+
 def _optional_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -304,3 +481,9 @@ def _under(root: Path, child: Path) -> Path:
     if child.is_absolute():
         return child
     return root / child
+
+
+def _optional_under(root: Path, child: Path | None) -> Path | None:
+    if child is None:
+        return None
+    return _under(root, child)

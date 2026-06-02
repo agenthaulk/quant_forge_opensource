@@ -5,11 +5,13 @@ from __future__ import annotations
 from dataclasses import asdict
 import hashlib
 import json
+from pathlib import Path
 
 import pandas as pd
 
 from quant_forge.core.contracts import SimulationProfile
 from quant_forge.factor_engine.executor import execute_factor_formula
+from quant_forge.factor_engine.value_store import FactorScoreResult, FactorValueStore
 
 
 def prepare_factor_scores(
@@ -18,17 +20,66 @@ def prepare_factor_scores(
     universe_filters: tuple[str, ...] = (),
     *,
     profile: SimulationProfile | None = None,
+    factor_id: str | None = None,
+    factor_name: str | None = None,
+    factor_values_root: Path | None = None,
 ) -> pd.DataFrame:
+    return prepare_factor_scores_result(
+        panel,
+        formula,
+        universe_filters,
+        profile=profile,
+        factor_id=factor_id,
+        factor_name=factor_name,
+        factor_values_root=factor_values_root,
+    ).scores
+
+
+def prepare_factor_scores_result(
+    panel: pd.DataFrame,
+    formula: str,
+    universe_filters: tuple[str, ...] = (),
+    *,
+    profile: SimulationProfile | None = None,
+    factor_id: str | None = None,
+    factor_name: str | None = None,
+    factor_values_root: Path | None = None,
+) -> FactorScoreResult:
     simulation_profile = profile or SimulationProfile()
     _validate_profile(simulation_profile)
     working_panel = apply_test_period(panel, simulation_profile)
-    scores = execute_factor_formula(working_panel, formula, universe_filters)
+    if factor_values_root is not None and factor_id is not None:
+        score_result = FactorValueStore(factor_values_root).prepare_scores(
+            working_panel,
+            factor_id=factor_id,
+            factor_name=factor_name or factor_id,
+            formula=formula,
+            universe_filters=universe_filters,
+        )
+        scores = score_result.scores
+        source = score_result.source
+        cached_rows = score_result.cached_rows
+        computed_rows = score_result.computed_rows
+        factor_values_path = score_result.factor_values_path
+    else:
+        scores = execute_factor_formula(working_panel, formula, universe_filters)
+        source = "computed_formula"
+        cached_rows = 0
+        computed_rows = int(len(scores))
+        factor_values_path = None
     if simulation_profile.decay_days > 1:
         scores = _apply_ewma_decay(scores, simulation_profile.decay_days)
-    return (
+    prepared = (
         scores[["trade_date", "instrument", "score"]]
         .sort_values(["trade_date", "instrument"])
         .reset_index(drop=True)
+    )
+    return FactorScoreResult(
+        scores=prepared,
+        source=source,
+        cached_rows=cached_rows,
+        computed_rows=computed_rows,
+        factor_values_path=factor_values_path,
     )
 
 

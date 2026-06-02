@@ -52,6 +52,7 @@ PYTHONPATH=src python3 -m quant_forge.apps.cli.main --help
 
 ```bash
 qf init --workspace ./qf-demo
+qf doctor --workspace ./qf-demo
 qf data validate --workspace ./qf-demo
 qf factor list --workspace ./qf-demo
 ```
@@ -60,9 +61,12 @@ Expected result:
 
 预期结果：
 
-- `data validate` reports the required local panel fields.
+- `doctor` reports config, data, factor roots, factor-value cache readiness,
+  RD settings, LLM readiness, and next commands.
+- `data validate` reports the required local panel fields and date range.
 - `factor list` shows demo factors under the demo `factor_root`.
-- `data validate` 会报告本地面板字段。
+- `doctor` 会报告配置、数据、因子目录、因子值缓存、RD 设置、LLM readiness 和下一步命令。
+- `data validate` 会报告本地面板字段和日期范围。
 - `factor list` 会显示 demo 工作区中的示例因子。
 
 ## 4. Main Workflows / 主要流程
@@ -119,13 +123,19 @@ RD 循环会生成有限候选假设，评价候选因子，应用 smoke gate，
 ### 4.5 Local Web / 本地 Web
 
 ```bash
-qf web --workspace ./qf-demo --config configs/default.yaml --rd-config configs/rd.yaml
+qf web --workspace ./qf-demo --rd-config configs/rd.yaml
 ```
 
 The web adapter is local-only. Use it for idea parsing, evaluation, backtest,
-and RD triggering from a browser.
+and RD triggering from a browser. This minimal command uses the deterministic
+rule parser. Use a local config plus `runtime.env_files` when enabling an LLM
+provider. If `llm.provider` is `rule`, missing external LLM keys are optional
+readiness warnings.
 
 Web 适配器仅面向本地。可在浏览器里完成观点解析、评价、回测和 RD 触发。
+这个最小命令使用确定性规则解析器。启用 LLM provider 时，请使用本地 config 和
+`runtime.env_files`。如果 `llm.provider` 是 `rule`，缺少外部 LLM key 只会作为
+可选 readiness 提示。
 
 ## 5. Configuration Files / 配置文件
 
@@ -219,13 +229,17 @@ llm:
       api_key_env: DEEPSEEK_API_KEY
 ```
 
-Runtime shell:
+Local ignored env file:
 
-运行时 shell：
+本地忽略 env 文件：
 
 ```bash
-export DEEPSEEK_API_KEY="<your-api-key>"
-qf web --workspace ./qf-demo --config configs/default.yaml --rd-config configs/rd.yaml
+cp configs/default.draft.yaml configs/default.local.yaml
+printf 'DEEPSEEK_API_KEY=<your-api-key>\n' > configs/default.local.env
+chmod 600 configs/default.local.env
+# edit configs/default.local.yaml paths.* and runtime.env_files as needed
+qf doctor --config configs/default.local.yaml --rd-config configs/rd.yaml
+qf web --config configs/default.local.yaml --rd-config configs/rd.yaml
 ```
 
 If parsing fails with a missing key error, check:
@@ -235,12 +249,14 @@ If parsing fails with a missing key error, check:
 1. The selected provider name in `llm.provider`.
 2. The provider entry under `llm.providers.<provider>`.
 3. The spelling of `api_key_env`.
-4. Whether the environment variable is set in the same shell that starts `qf`.
+4. Whether the ignored env file is listed in `runtime.env_files`.
+5. Whether `qf doctor --config <local-config>` reports an LLM error.
 
 1. `llm.provider` 选择的供应商名。
 2. `llm.providers.<provider>` 中是否有对应配置。
 3. `api_key_env` 拼写是否正确。
-4. 启动 `qf` 的同一个 shell 是否设置了该环境变量。
+4. 被忽略的 env 文件是否列在 `runtime.env_files` 中。
+5. `qf doctor --config <local-config>` 是否报告 LLM 错误。
 
 ## 7. Data Configuration / 数据配置
 
@@ -298,7 +314,7 @@ Fix the named field in the config file.
 ### Missing API key environment variable
 
 ```text
-Missing API key for LLM provider deepseek
+Missing API key for active LLM provider deepseek. Expected environment variable: DEEPSEEK_API_KEY.
 ```
 
 Fix:
@@ -306,7 +322,8 @@ Fix:
 修复：
 
 ```bash
-export DEEPSEEK_API_KEY="<your-api-key>"
+printf 'DEEPSEEK_API_KEY=<your-api-key>\n' > configs/default.local.env
+qf doctor --config configs/default.local.yaml --rd-config configs/rd.yaml
 ```
 
 ### Unsupported simulation option

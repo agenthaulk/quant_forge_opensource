@@ -265,6 +265,7 @@ class ResearchLoopService:
         factor_root: Path,
         data_root: Path,
         artifact_root: Path,
+        factor_values_root: Path | None = None,
         top_quantile: float | None = None,
         simulation_profile: SimulationProfile | None = None,
         simulation_profiles: tuple[SimulationProfile, ...] | None = None,
@@ -283,6 +284,7 @@ class ResearchLoopService:
         self.factor_root = factor_root
         self.data_root = data_root
         self.artifact_root = artifact_root
+        self.factor_values_root = factor_values_root
         profile = simulation_profile or SimulationProfile()
         if top_quantile is not None:
             profile = replace(profile, top_quantile=top_quantile)
@@ -422,6 +424,7 @@ class ResearchLoopService:
             horizon_days_matrix=horizon_days_matrix,
             sample_splits=sample_splits,
             simulation_profile=trial.simulation_profile,
+            factor_values_root=self.factor_values_root,
         )
         backtest = run_factor_backtest(
             trial.factor.factor_id,
@@ -432,6 +435,7 @@ class ResearchLoopService:
             simulation_profile=trial.simulation_profile,
             transaction_costs=self.transaction_costs,
             sample_splits=sample_splits,
+            factor_values_root=self.factor_values_root,
         )
         split_weighted_icir = weighted_split_icir(evaluation)
         score = score_candidate(evaluation, backtest, objective_weights, split_weighted_icir)

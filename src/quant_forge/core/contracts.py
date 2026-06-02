@@ -42,6 +42,10 @@ class DataValidationResult:
     instruments: int
     date_count: int
     missing_columns: tuple[str, ...] = field(default_factory=tuple)
+    panel_path: Path | None = None
+    start_date: str = ""
+    end_date: str = ""
+    optional_columns: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -138,6 +142,11 @@ class EvaluationResult:
     split_metrics: tuple[EvaluationSplitMetric, ...] = field(default_factory=tuple)
     horizon_metrics: tuple[HorizonEvaluationMetric, ...] = field(default_factory=tuple)
     simulation_profile: SimulationProfile = field(default_factory=SimulationProfile)
+    score_source: str = "computed"
+    score_cached_rows: int = 0
+    score_computed_rows: int = 0
+    factor_values_path: Path | None = None
+    warnings: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -208,6 +217,10 @@ class BacktestResult:
     segment_metrics: tuple[BacktestSegmentMetric, ...] = field(default_factory=tuple)
     warnings: tuple[str, ...] = field(default_factory=tuple)
     assumptions: tuple[str, ...] = field(default_factory=tuple)
+    score_source: str = "computed"
+    score_cached_rows: int = 0
+    score_computed_rows: int = 0
+    factor_values_path: Path | None = None
 
 
 def _optional_iso_date(value: str | None, label: str) -> date | None:

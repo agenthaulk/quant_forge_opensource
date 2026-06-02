@@ -12,6 +12,7 @@ from quant_forge.factor_library.repository import FactorRepository
 
 PANEL_FILE = "panel.parquet"
 REQUIRED_COLUMNS = ("trade_date", "instrument", "close", "market_cap", "is_st")
+OPTIONAL_COLUMNS = ("volume", "return_1d", "return_5d", "volatility_5d")
 
 
 class LocalPanelDataProvider:
@@ -33,9 +34,11 @@ class LocalPanelDataProvider:
                 instruments=0,
                 date_count=0,
                 missing_columns=REQUIRED_COLUMNS,
+                panel_path=self.panel_path,
             )
         panel = pd.read_parquet(self.panel_path)
         missing = tuple(column for column in REQUIRED_COLUMNS if column not in panel.columns)
+        dates = pd.to_datetime(panel["trade_date"]) if "trade_date" in panel.columns and not panel.empty else None
         return DataValidationResult(
             data_root=self.data_root,
             ok=not missing and not panel.empty,
@@ -43,6 +46,10 @@ class LocalPanelDataProvider:
             instruments=int(panel["instrument"].nunique()) if "instrument" in panel.columns else 0,
             date_count=int(panel["trade_date"].nunique()) if "trade_date" in panel.columns else 0,
             missing_columns=missing,
+            panel_path=self.panel_path,
+            start_date=dates.min().date().isoformat() if dates is not None else "",
+            end_date=dates.max().date().isoformat() if dates is not None else "",
+            optional_columns=tuple(column for column in OPTIONAL_COLUMNS if column in panel.columns),
         )
 
     def load_panel(self) -> pd.DataFrame:

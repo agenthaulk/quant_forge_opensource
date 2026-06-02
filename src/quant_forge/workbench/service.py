@@ -25,6 +25,7 @@ class WorkbenchService:
         factor_root: Path,
         data_root: Path,
         artifact_root: Path,
+        factor_values_root: Path | None = None,
         simulation_profile: SimulationProfile | None = None,
         transaction_costs: TransactionCostModel | None = None,
         sample_splits: tuple[SampleSplitSpec, ...] | None = None,
@@ -32,6 +33,7 @@ class WorkbenchService:
         self.factor_root = factor_root
         self.data_root = data_root
         self.artifact_root = artifact_root
+        self.factor_values_root = factor_values_root
         self.simulation_profile = simulation_profile or SimulationProfile()
         self.transaction_costs = transaction_costs or TransactionCostModel()
         self.sample_splits = sample_splits
@@ -54,6 +56,7 @@ class WorkbenchService:
             artifact_root=self.artifact_root,
             horizon_days=horizon_days,
             simulation_profile=simulation_profile or self.simulation_profile,
+            factor_values_root=self.factor_values_root,
         )
 
     def run_backtest(
@@ -71,4 +74,5 @@ class WorkbenchService:
             holding_days=holding_days,
             transaction_costs=self.transaction_costs,
             sample_splits=self.sample_splits,
+            factor_values_root=self.factor_values_root,
         )

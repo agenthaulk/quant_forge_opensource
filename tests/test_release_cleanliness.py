@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 
+from scripts.release_safety_scan import _contains_env_secret_assignment
+
 
 PUBLIC_ROOTS = [
     Path("README.md"),
@@ -113,3 +115,18 @@ def test_license_files_define_delayed_open_source_path() -> None:
     assert "Change Date: 2027-12-31" in license_text
     assert "Change License: Apache License, Version 2.0" in license_text
     assert "Apache License" in apache_text
+
+
+def test_release_scan_allows_public_env_placeholders() -> None:
+    text = """
+DEEPSEEK_API_KEY=
+DEEPSEEK_API_KEY="<your-deepseek-api-key>"
+QF_TEST_API_KEY="test-value"
+"""
+    assert not _contains_env_secret_assignment(text)
+
+
+def test_release_scan_flags_real_env_secret_values() -> None:
+    fake_value = "abc1234567890" + "secret"
+    assert _contains_env_secret_assignment(f"DEEPSEEK_API_KEY={fake_value}\n")
+    assert _contains_env_secret_assignment(f'deepseek_api_key="{fake_value}" # local only\n')

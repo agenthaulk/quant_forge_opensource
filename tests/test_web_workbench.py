@@ -10,7 +10,7 @@ import pytest
 
 import quant_forge.apps.web.server as web_server
 from quant_forge.apps.web.server import create_local_web_server, run_idea_workflow, run_research_once_workflow
-from quant_forge.config import LLMProviderSettings, LLMSettings, QuantForgeConfig
+from quant_forge.config import LLMProviderSettings, LLMSettings, PathSettings, QuantForgeConfig
 from quant_forge.core.contracts import BacktestResult, EvaluationResult, FactorDefinition
 from quant_forge.data.local import create_demo_workspace
 from quant_forge.llm_factor_parser import ParsedFactor
@@ -65,6 +65,8 @@ def test_web_research_once_rejects_invalid_explicit_candidate_count(tmp_path) ->
 
 
 def test_web_html_uses_default_rd_config_file(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("QF_TEST_DEEPSEEK_KEY", "set")
+    monkeypatch.setenv("QF_TEST_GLM_KEY", "set")
     config = QuantForgeConfig(
         llm=LLMSettings(
             provider="deepseek",
@@ -193,7 +195,9 @@ def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
         horizon_days_matrix,
         sample_splits,
         simulation_profile,
+        factor_values_root,
     ):
+        assert factor_values_root == config.paths.factor_values_root
         captured["horizon_days"] = horizon_days
         captured["horizon_count"] = len(horizon_days_matrix)
         captured["split_count"] = len(sample_splits)
@@ -240,10 +244,12 @@ def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
         holding_days,
         transaction_costs,
         sample_splits,
+        factor_values_root,
     ):
         assert holding_days == 11
         assert transaction_costs.commission_bps == 0.0
         assert len(sample_splits) == 3
+        assert factor_values_root == config.paths.factor_values_root
         captured["top_quantile_basis_points"] = int(simulation_profile.top_quantile * 10000)
         return fake_run_factor_backtest(
             factor_id,
@@ -268,6 +274,7 @@ def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
 
 
 def test_web_workbench_uses_selected_llm_provider(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("QF_TEST_GLM_KEY", "set")
     create_demo_workspace(tmp_path / "demo")
     config = QuantForgeConfig(
         llm=LLMSettings(
@@ -308,6 +315,83 @@ def test_web_workbench_uses_selected_llm_provider(monkeypatch, tmp_path) -> None
 
     assert captured == {"provider": "glm", "model": "fake-glm"}
     assert result["parser"]["provider"] == "glm"
+
+
+def test_web_html_only_exposes_runtime_ready_llm_providers(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("QF_TEST_DEEPSEEK_KEY", raising=False)
+    monkeypatch.setenv("QF_TEST_GLM_KEY", "set")
+    config = QuantForgeConfig(
+        llm=LLMSettings(
+            provider="deepseek",
+            providers={
+                "deepseek": LLMProviderSettings(
+                    provider="deepseek",
+                    model="fake-deepseek",
+                    base_url="http://localhost/deepseek",
+                    api_key_env="QF_TEST_DEEPSEEK_KEY",
+                ),
+                "glm": LLMProviderSettings(
+                    provider="glm",
+                    model="fake-glm",
+                    base_url="http://localhost/glm",
+                    api_key_env="QF_TEST_GLM_KEY",
+                ),
+            },
+        )
+    ).resolve(tmp_path / "demo")
+
+    html = web_server._index_html(config)
+
+    assert "LLM: glm / fake-glm" in html
+    assert '<option value="deepseek"' not in html
+    assert '<option value="glm" selected>glm / fake-glm · env QF_TEST_GLM_KEY</option>' in html
+
+
+def test_web_html_uses_existing_factor_as_default_rd_seed(tmp_path) -> None:
+    factor_root = tmp_path / "factor_root"
+    web_server.FactorRepository(factor_root).save(
+        FactorDefinition(
+            factor_id="FTR_CUSTOM_SEED",
+            name="custom_seed",
+            formula="rank(return_5d)",
+            source="test",
+        )
+    )
+    config = QuantForgeConfig(
+        paths=PathSettings(
+            data_root=tmp_path / "data",
+            factor_root=factor_root,
+            artifact_root=tmp_path / "artifacts",
+        )
+    )
+
+    html = web_server._index_html(config)
+
+    assert 'id="rd-seed" value="FTR_CUSTOM_SEED"' in html
+
+
+def test_web_html_does_not_fake_rd_seed_when_factor_root_empty(tmp_path) -> None:
+    factor_root = tmp_path / "factor_root"
+    factor_root.mkdir()
+    config = QuantForgeConfig(
+        paths=PathSettings(
+            data_root=tmp_path / "data",
+            factor_root=factor_root,
+            artifact_root=tmp_path / "artifacts",
+        )
+    )
+
+    html = web_server._index_html(config)
+
+    assert 'id="rd-seed" value="FTR_DEMO_SMALL_CAP"' not in html
+    assert 'placeholder="先创建或配置一个因子"' in html
+
+
+def test_web_research_cards_include_cache_paths_and_artifacts() -> None:
+    html = web_server._index_html(QuantForgeConfig())
+
+    assert "factor_values:" in html
+    assert "artifacts:" in html
 
 
 def _post_json(url: str, payload: dict) -> dict:

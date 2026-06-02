@@ -40,7 +40,22 @@ def test_evaluation_writes_artifact(tmp_path: Path) -> None:
     assert payload["split_metrics"]
     assert payload["horizon_matrix"]
     assert payload["simulation_profile"]["decay_days"] == 0
+    assert "warnings" in payload
+    assert isinstance(result.warnings, tuple)
     assert result.simulation_profile.decay_days == 0
+
+
+def test_evaluation_warns_when_oos_decays(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    result = evaluate_factor(
+        "FTR_DEMO_SMALL_CAP",
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+    )
+
+    assert result.warnings
+    assert "OOS decay warning" in result.warnings[0]
 
 
 def test_evaluation_records_non_default_simulation_profile(tmp_path: Path) -> None:

@@ -10,10 +10,22 @@ paths:
   data_root: data
   # Factor definitions. This is the factor source of truth.
   factor_root: factor_root
+  # Optional factor value cache. Existing complete daily values are reused;
+  # missing dates are computed into incremental/*.parquet sidecars.
+  factor_values_root: null
+  # Optional external manifest/catalog pointer for local operators.
+  factor_values_manifest_root: null
   # Evaluation, backtest, and RD reports.
   artifact_root: artifacts
   # Optional command outputs.
   output_root: outputs
+
+runtime:
+  # Optional local secret env files. Paths are relative to this config file,
+  # must stay under this directory, must be ignored by git, and must use
+  # plain KEY=value lines.
+  env_files:
+    # - default.local.env
 
 web:
   # The public web adapter is local-only.

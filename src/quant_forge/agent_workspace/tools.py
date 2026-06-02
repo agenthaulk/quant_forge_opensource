@@ -11,8 +11,20 @@ from quant_forge.workbench.service import WorkbenchService
 
 
 class AgentWorkspaceTools:
-    def __init__(self, *, factor_root: Path, data_root: Path, artifact_root: Path) -> None:
-        self.workbench = WorkbenchService(factor_root=factor_root, data_root=data_root, artifact_root=artifact_root)
+    def __init__(
+        self,
+        *,
+        factor_root: Path,
+        data_root: Path,
+        artifact_root: Path,
+        factor_values_root: Path | None = None,
+    ) -> None:
+        self.workbench = WorkbenchService(
+            factor_root=factor_root,
+            data_root=data_root,
+            artifact_root=artifact_root,
+            factor_values_root=factor_values_root,
+        )
         self.factor_root = factor_root
         self.artifact_root = artifact_root
 

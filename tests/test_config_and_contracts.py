@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 import pytest
 
-from quant_forge.config import load_config, simulation_profile_from_mapping
+from quant_forge.config import (
+    LLMProviderSettings,
+    LLMSettings,
+    QuantForgeConfig,
+    load_config,
+    simulation_profile_from_mapping,
+    validate_any_llm_runtime,
+    validate_llm_runtime,
+)
 from quant_forge.core.contracts import FactorDefinition, SimulationProfile, TransactionCostModel
 from quant_forge.research_loop.config import load_research_loop_config, weights_for_objective
 
@@ -32,6 +41,269 @@ def test_config_workspace_resolves_paths(tmp_path: Path) -> None:
     config = load_config(Path("configs/default.yaml"), workspace=tmp_path)
     assert config.paths.data_root == tmp_path / "data"
     assert config.paths.factor_root == tmp_path / "factor_root"
+    assert config.paths.factor_values_root is None
+
+
+def test_config_resolves_optional_factor_value_paths(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+paths:
+  factor_values_root: factor_values
+  factor_values_manifest_root: manifests/factor_values
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path, workspace=tmp_path)
+
+    assert config.paths.factor_values_root == tmp_path / "factor_values"
+    assert config.paths.factor_values_manifest_root == tmp_path / "manifests" / "factor_values"
+
+
+def test_config_loads_explicit_runtime_env_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("QF_TEST_API_KEY", raising=False)
+    config_path = tmp_path / "config.yaml"
+    env_path = tmp_path / "local.env"
+    env_path.write_text(
+        """
+# Plain KEY=value syntax only.
+QF_TEST_API_KEY="test-value"
+""",
+        encoding="utf-8",
+    )
+    config_path.write_text(
+        """
+runtime:
+  env_files:
+    - local.env
+llm:
+  provider: openai_compatible
+  providers:
+    openai_compatible:
+      provider: openai_compatible
+      model: test-model
+      base_url: https://example.invalid/v1
+      api_key_env: QF_TEST_API_KEY
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.runtime.env_files == (env_path,)
+    validate_llm_runtime(config.llm)
+
+
+def test_runtime_env_files_reject_absolute_or_home_paths(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+runtime:
+  env_files:
+    - ~/secret.env
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="relative to the config file"):
+        load_config(config_path)
+
+    config_path.write_text(
+        f"""
+runtime:
+  env_files:
+    - {tmp_path / "secret.env"}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="relative to the config file"):
+        load_config(config_path)
+
+
+def test_runtime_env_files_reject_parent_traversal(tmp_path: Path) -> None:
+    config_dir = tmp_path / "nested"
+    config_dir.mkdir()
+    config_path = config_dir / "config.yaml"
+    config_path.write_text(
+        """
+runtime:
+  env_files:
+    - ../secret.env
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="under the config file directory"):
+        load_config(config_path)
+
+
+def test_runtime_env_files_require_git_ignore_inside_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    env_path = tmp_path / "local.env"
+    env_path.write_text("QF_TEST_API_KEY=test-value\n", encoding="utf-8")
+    config_path.write_text(
+        """
+runtime:
+  env_files:
+    - local.env
+""",
+        encoding="utf-8",
+    )
+
+    def fake_run(command, check=False, capture_output=False, text=False):
+        if command[3:5] == ["rev-parse", "--show-toplevel"]:
+            return subprocess.CompletedProcess(command, 0, stdout=f"{tmp_path}\n", stderr="")
+        if command[3] == "ls-files":
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="")
+        if command[3] == "check-ignore":
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="")
+        raise AssertionError(f"unexpected git command: {command}")
+
+    monkeypatch.setattr("quant_forge.config.subprocess.run", fake_run)
+
+    with pytest.raises(ValueError, match="must be ignored by git"):
+        load_config(config_path)
+
+
+def test_runtime_env_files_reject_shell_syntax(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    env_path = tmp_path / "local.env"
+    env_path.write_text("QF_TEST_API_KEY=$(security find-generic-password)\n", encoding="utf-8")
+    config_path.write_text(
+        """
+runtime:
+  env_files:
+    - local.env
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="shell syntax is not allowed"):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "QF_TEST_API_KEY=${DEEPSEEK_API_KEY}\n",
+        "QF_TEST_API_KEY=value&&other\n",
+        "QF_TEST_API_KEY=value|other\n",
+        "QF_TEST_API_KEY=value # comment\n",
+    ],
+)
+def test_runtime_env_files_reject_non_plain_values(tmp_path: Path, line: str) -> None:
+    config_path = tmp_path / "config.yaml"
+    env_path = tmp_path / "local.env"
+    env_path.write_text(line, encoding="utf-8")
+    config_path.write_text(
+        """
+runtime:
+  env_files:
+    - local.env
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="shell syntax|whitespace"):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize("line", ["QF_TEST_API_KEY=\n", 'QF_TEST_API_KEY=""\n'])
+def test_runtime_env_files_reject_empty_values(tmp_path: Path, line: str) -> None:
+    config_path = tmp_path / "config.yaml"
+    env_path = tmp_path / "local.env"
+    env_path.write_text(line, encoding="utf-8")
+    config_path.write_text(
+        """
+runtime:
+  env_files:
+    - local.env
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        load_config(config_path)
+
+
+def test_validate_llm_runtime_reports_missing_active_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("QF_MISSING_API_KEY", raising=False)
+    config = load_config(Path("configs/default.yaml"))
+    provider = config.llm.providers["deepseek"]
+    config = QuantForgeConfig(
+        paths=config.paths,
+        web=config.web,
+        research=config.research,
+        runtime=config.runtime,
+        simulation=config.simulation,
+        llm=LLMSettings(
+            provider="deepseek",
+            model=provider.model,
+            base_url=provider.base_url,
+            api_key_env="QF_MISSING_API_KEY",
+            providers={
+                **config.llm.providers,
+                "deepseek": LLMProviderSettings(
+                    provider=provider.provider,
+                    model=provider.model,
+                    base_url=provider.base_url,
+                    api_key_env="QF_MISSING_API_KEY",
+                ),
+            },
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="QF_MISSING_API_KEY"):
+        validate_llm_runtime(config.llm)
+
+
+def test_validate_any_llm_runtime_allows_active_rule_with_optional_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "DEEPSEEK_API_KEY",
+        "GLM_API_KEY",
+        "OPENAI_API_KEY",
+        "MINIMAX_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_COMPATIBLE_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    config = load_config(Path("configs/default.draft.yaml"))
+
+    validate_any_llm_runtime(config.llm)
+
+
+def test_validate_any_llm_runtime_requires_active_non_rule_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("QF_MISSING_ACTIVE_KEY", raising=False)
+    monkeypatch.setenv("QF_READY_OPTIONAL_KEY", "set")
+    llm = LLMSettings(
+        provider="deepseek",
+        providers={
+            "deepseek": LLMProviderSettings(
+                provider="deepseek",
+                model="deepseek-chat",
+                base_url="https://api.deepseek.com",
+                api_key_env="QF_MISSING_ACTIVE_KEY",
+            ),
+            "glm": LLMProviderSettings(
+                provider="glm",
+                model="glm-test",
+                base_url="https://example.invalid/glm",
+                api_key_env="QF_READY_OPTIONAL_KEY",
+            ),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="QF_MISSING_ACTIVE_KEY"):
+        validate_any_llm_runtime(llm)
 
 
 def test_rd_config_loads_defaults_and_overrides(tmp_path: Path) -> None:
