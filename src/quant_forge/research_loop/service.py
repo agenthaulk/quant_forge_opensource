@@ -18,6 +18,7 @@ from quant_forge.core.contracts import (
     TransactionCostModel,
 )
 from quant_forge.evaluation.service import evaluate_factor
+from quant_forge.factor_library.catalog import FactorCatalog
 from quant_forge.factor_library.repository import FactorRepository, parse_idea_to_definition
 
 
@@ -325,7 +326,7 @@ class ResearchLoopService:
         if max_candidates < 1 or max_candidates > 10:
             raise ValueError("max_candidates must be between 1 and 10")
         repo = FactorRepository(self.factor_root)
-        seed = repo.get(seed_factor_id)
+        seed = FactorCatalog(self.factor_root, factor_values_root=self.factor_values_root).get(seed_factor_id)
         objective_weights = weights or objective_weights_for(objective)
         candidate_gate = gate or ResearchGate()
         planned = hypotheses or self.hypothesis_generator.generate(

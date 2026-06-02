@@ -23,7 +23,7 @@ from quant_forge.factor_engine.signal_processing import (
     prepare_factor_scores_result,
     simulation_profile_suffix,
 )
-from quant_forge.factor_library.repository import FactorRepository
+from quant_forge.factor_library.catalog import FactorCatalog
 from quant_forge.utils import write_json
 
 
@@ -60,7 +60,7 @@ def run_factor_backtest(
     top_quantile = profile.top_quantile
     if group_count < 2:
         raise ValueError("group_count must be at least 2")
-    factor = FactorRepository(factor_root).get(factor_id)
+    factor = FactorCatalog(factor_root, factor_values_root=factor_values_root).get(factor_id)
     holding = holding_days or factor.horizon_days
     if holding < 1:
         raise ValueError("holding_days must be positive")

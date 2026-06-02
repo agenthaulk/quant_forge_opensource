@@ -21,7 +21,7 @@ from quant_forge.factor_engine.signal_processing import (
     prepare_factor_scores_result,
     simulation_profile_suffix,
 )
-from quant_forge.factor_library.repository import FactorRepository
+from quant_forge.factor_library.catalog import FactorCatalog
 from quant_forge.utils import write_json
 
 DEFAULT_HORIZON_DAYS = (5, 10, 21, 63)
@@ -45,7 +45,7 @@ def evaluate_factor(
     factor_values_root: Path | None = None,
 ) -> EvaluationResult:
     profile = simulation_profile or SimulationProfile()
-    factor = FactorRepository(factor_root).get(factor_id)
+    factor = FactorCatalog(factor_root, factor_values_root=factor_values_root).get(factor_id)
     horizon = horizon_days or factor.horizon_days
     if horizon < 1:
         raise ValueError("horizon_days must be positive")

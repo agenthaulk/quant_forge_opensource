@@ -26,13 +26,14 @@ class AgentWorkspaceTools:
             factor_values_root=factor_values_root,
         )
         self.factor_root = factor_root
+        self.factor_values_root = factor_values_root
         self.artifact_root = artifact_root
 
     def read_catalog(self) -> dict[str, object]:
         return {
             "fields": read_models.list_available_fields(),
             "operators": read_models.list_available_operators(),
-            "factors": read_models.list_factors(self.factor_root),
+            "factors": read_models.list_factors(self.factor_root, self.factor_values_root),
             "artifacts": read_models.list_artifacts(self.artifact_root),
         }
 

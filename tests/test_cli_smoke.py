@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pandas as pd
+
 from quant_forge.data.local import create_demo_workspace
 
 
@@ -48,6 +50,34 @@ def test_cli_smoke_path(tmp_path: Path) -> None:
 
     factors = run_cli("factor", "list", "--factor-root", str(workspace / "factor_root"))
     assert {factor["factor_id"] for factor in factors} >= {"FTR_DEMO_SMALL_CAP", "FTR_DEMO_MOMENTUM"}
+
+    mounted_factor_values = workspace / "mounted_factor_values" / "worldquant_alpha_003"
+    mounted_factor_values.mkdir(parents=True)
+    (mounted_factor_values / "2024.metadata.json").write_text(
+        json.dumps({"factor_id": "WQ_ALPHA_003", "factor_name": "worldquant_alpha_003"}),
+        encoding="utf-8",
+    )
+    pd.DataFrame(
+        {
+            "trade_date": ["20240102"],
+            "instrument": ["STK001"],
+            "factor_id": ["WQ_ALPHA_003"],
+            "factor_value": [0.1],
+        }
+    ).to_parquet(mounted_factor_values / "2024.parquet", index=False)
+    factors_with_mounted_values = run_cli(
+        "factor",
+        "list",
+        "--factor-root",
+        str(workspace / "factor_root"),
+        "--factor-values-root",
+        str(workspace / "mounted_factor_values"),
+    )
+    assert {factor["factor_id"] for factor in factors_with_mounted_values} >= {
+        "FTR_DEMO_SMALL_CAP",
+        "FTR_DEMO_MOMENTUM",
+        "WQ_ALPHA_003",
+    }
 
     doctor = run_cli("doctor", "--workspace", str(workspace))
     assert doctor["ok"] is True

@@ -43,6 +43,35 @@ Explicit root flags remain available for advanced workflows:
 qf eval-factor FTR_DEMO_SMALL_CAP --data-root ./demo/data --factor-root ./demo/factor_root --artifact-root ./demo/artifacts --factor-values-root ./demo/factor_values
 ```
 
+## Mounted Database Discovery
+
+Quant Forge treats the configured roots as a portable local database. When the
+same mounted drive is attached on another machine, point the local config at the
+mounted roots and run `qf doctor` before starting Web or RD.
+
+`paths.data_root` may point to a directory containing `panel.parquet`, to a
+workspace directory containing `data/panel.parquet`, directly to a parquet panel
+file, or to a mounted source snapshot root containing `price/` and
+`daily_basic/`. The source snapshot adapter builds the lightweight public panel
+from close, volume, and market-value fields; deeper PIT and provider-specific
+ETL remain outside the lightweight core.
+
+`paths.factor_root` remains the writable source of truth for user-created factor
+definitions. `paths.factor_values_root` is read as an additional mounted factor
+database. `qf factor list`, evaluation, backtest, Web, MCP catalog, and RD seed
+loading merge both sources at read time without copying mounted factors into
+`factor_root`.
+
+`paths.factor_values_root` may point directly at a canonical factor-value root,
+or at a mounted data root containing `canonical/factor=cn_a`. Both canonical
+directories such as `worldquant_alpha_003/2025.parquet` and Hive-style
+directories such as `factor_id=WQ_ALPHA_003/2025Q1.parquet` are recognized.
+
+Discovered precomputed factors use a lightweight formula marker such as
+`precomputed:worldquant_alpha_003`. They are cache-only: Quant Forge reads the
+available values, leaves uncovered instruments as missing values, and does not
+attempt to recompute external or complex DSL formulas in the public kernel.
+
 ## Factor Value Cache
 
 `paths.factor_values_root` is optional. When it is set, evaluation, backtest,

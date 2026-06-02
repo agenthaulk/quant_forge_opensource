@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from quant_forge.factor_engine.executor import SUPPORTED_OPERATORS
-from quant_forge.factor_library.repository import FactorRepository
+from quant_forge.factor_library.catalog import FactorCatalog
 
 AVAILABLE_FIELDS = {
     "close": "Adjusted close or close-like local demo price.",
@@ -30,7 +30,7 @@ def list_available_operators() -> list[dict[str, str]]:
     return [{"name": name, "description": descriptions[name]} for name in sorted(SUPPORTED_OPERATORS)]
 
 
-def list_factors(factor_root: Path) -> list[dict[str, object]]:
+def list_factors(factor_root: Path, factor_values_root: Path | None = None) -> list[dict[str, object]]:
     return [
         {
             "factor_id": factor.factor_id,
@@ -40,7 +40,7 @@ def list_factors(factor_root: Path) -> list[dict[str, object]]:
             "horizon_days": factor.horizon_days,
             "universe_filters": list(factor.universe_filters),
         }
-        for factor in FactorRepository(factor_root).list()
+        for factor in FactorCatalog(factor_root, factor_values_root=factor_values_root).list()
     ]
 
 

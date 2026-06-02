@@ -15,6 +15,7 @@ from quant_forge.core.contracts import (
     TransactionCostModel,
 )
 from quant_forge.evaluation.service import evaluate_factor
+from quant_forge.factor_library.catalog import FactorCatalog
 from quant_forge.factor_library.repository import FactorRepository, parse_idea_to_definition
 
 
@@ -39,7 +40,7 @@ class WorkbenchService:
         self.sample_splits = sample_splits
 
     def list_factors(self) -> list[FactorDefinition]:
-        return FactorRepository(self.factor_root).list()
+        return FactorCatalog(self.factor_root, factor_values_root=self.factor_values_root).list()
 
     def idea_to_factor(self, text: str) -> FactorDefinition:
         factor = parse_idea_to_definition(text)

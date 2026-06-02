@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 
+import pandas as pd
 import pytest
 
 from quant_forge.config import (
@@ -15,6 +16,7 @@ from quant_forge.config import (
     validate_llm_runtime,
 )
 from quant_forge.core.contracts import FactorDefinition, SimulationProfile, TransactionCostModel
+from quant_forge.data.local import LocalPanelDataProvider, create_demo_workspace
 from quant_forge.research_loop.config import load_research_loop_config, weights_for_objective
 
 
@@ -412,10 +414,64 @@ parameter_search:
 
 
 def test_factor_status_validation() -> None:
+    assert FactorDefinition(factor_id="WQ_ALPHA_003", name="wq_alpha_003", formula="precomputed:worldquant_alpha_003")
     with pytest.raises(ValueError, match="invalid factor status"):
         FactorDefinition(
             factor_id="FTR_BAD", name="bad", formula="rank(close)", status="unknown"  # type: ignore[arg-type]
         )
+
+
+def test_data_root_can_point_to_workspace_with_nested_panel(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    provider = LocalPanelDataProvider(paths["workspace"])
+
+    assert provider.panel_path == paths["data_root"] / "panel.parquet"
+    assert provider.validate().ok is True
+
+
+def test_data_root_can_point_to_source_snapshot(tmp_path: Path) -> None:
+    snapshot = tmp_path / "lakehouse" / "source_snapshot" / "provider=test" / "market=cn_a"
+    price_dir = snapshot / "price"
+    basic_dir = snapshot / "daily_basic"
+    price_dir.mkdir(parents=True)
+    basic_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "ts_code": ["AAA", "BBB", "AAA", "BBB", "AAA", "BBB"],
+            "trade_date": ["20250102", "20250102", "20250103", "20250103", "20250106", "20250106"],
+            "close": [10.0, 20.0, 11.0, 19.0, 12.0, 21.0],
+            "vol": [100.0, 200.0, 110.0, 190.0, 120.0, 210.0],
+        }
+    ).to_parquet(price_dir / "2025.parquet", index=False)
+    pd.DataFrame(
+        {
+            "ts_code": ["AAA", "BBB", "AAA", "BBB", "AAA", "BBB"],
+            "trade_date": ["20250102", "20250102", "20250103", "20250103", "20250106", "20250106"],
+            "total_mv": [1000.0, 2000.0, 1100.0, 1900.0, 1200.0, 2100.0],
+            "circ_mv": [900.0, 1800.0, 990.0, 1710.0, 1080.0, 1890.0],
+        }
+    ).to_parquet(basic_dir / "2025.parquet", index=False)
+
+    provider = LocalPanelDataProvider(tmp_path / "lakehouse")
+    validation = provider.validate()
+    panel = provider.load_panel()
+
+    assert validation.ok is True
+    assert validation.panel_path == snapshot
+    assert validation.optional_columns[0] == "source_snapshot"
+    assert len(panel) == 6
+    assert list(panel.columns) == [
+        "trade_date",
+        "instrument",
+        "close",
+        "market_cap",
+        "is_st",
+        "volume",
+        "return_1d",
+        "return_5d",
+        "volatility_5d",
+    ]
+    assert panel["market_cap"].tolist() == [1000.0, 2000.0, 1100.0, 1900.0, 1200.0, 2100.0]
 
 
 def test_simulation_profile_validation() -> None:

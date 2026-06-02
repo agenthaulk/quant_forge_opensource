@@ -65,6 +65,14 @@ qf doctor --config configs/default.local.yaml --rd-config configs/rd.yaml
 当 active provider 是 `rule` 或 `deterministic` 时，未配置外部 LLM key 也不应成为
 error；程序应继续使用本地规则解析，并把外部 LLM readiness 作为可选提示展示。
 
+如果配置了挂载盘因子值库，`doctor` 还应展示：
+
+- `factor_root.local_factor_count`
+- `factor_root.precomputed_factor_count`
+- `factor_values.configured_path`
+- `factor_values.path`，即程序最终识别到的 canonical 或 Hive-style 因子值根目录
+- `factor_values.precomputed_factor_count`
+
 ### 3.2 数据校验反馈
 
 正常反馈应包含：

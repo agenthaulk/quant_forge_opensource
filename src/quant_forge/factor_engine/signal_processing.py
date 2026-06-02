@@ -12,6 +12,7 @@ import pandas as pd
 from quant_forge.core.contracts import SimulationProfile
 from quant_forge.factor_engine.executor import execute_factor_formula
 from quant_forge.factor_engine.value_store import FactorScoreResult, FactorValueStore
+from quant_forge.factor_library.catalog import is_precomputed_formula
 
 
 def prepare_factor_scores(
@@ -48,6 +49,7 @@ def prepare_factor_scores_result(
     simulation_profile = profile or SimulationProfile()
     _validate_profile(simulation_profile)
     working_panel = apply_test_period(panel, simulation_profile)
+    cache_only = is_precomputed_formula(formula)
     if factor_values_root is not None and factor_id is not None:
         score_result = FactorValueStore(factor_values_root).prepare_scores(
             working_panel,
@@ -55,12 +57,15 @@ def prepare_factor_scores_result(
             factor_name=factor_name or factor_id,
             formula=formula,
             universe_filters=universe_filters,
+            cache_only=cache_only,
         )
         scores = score_result.scores
         source = score_result.source
         cached_rows = score_result.cached_rows
         computed_rows = score_result.computed_rows
         factor_values_path = score_result.factor_values_path
+    elif cache_only:
+        raise ValueError("precomputed factors require factor_values_root")
     else:
         scores = execute_factor_formula(working_panel, formula, universe_filters)
         source = "computed_formula"

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+import re
 from typing import Literal
 
 
@@ -28,8 +29,8 @@ class FactorDefinition:
         allowed: set[str] = {"draft", "candidate", "active", "inactive", "archived"}
         if self.status not in allowed:
             raise ValueError(f"invalid factor status: {self.status}")
-        if not self.factor_id.startswith("FTR_"):
-            raise ValueError("factor_id must start with FTR_")
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_=-]*", self.factor_id):
+            raise ValueError("factor_id must start with a letter and contain only letters, digits, underscores, =, or -")
         if self.horizon_days < 1:
             raise ValueError("horizon_days must be positive")
 

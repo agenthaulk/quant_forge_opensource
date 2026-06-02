@@ -18,6 +18,7 @@ from quant_forge.config import (
 )
 from quant_forge.data.local import create_demo_workspace, validate_data_root
 from quant_forge.evaluation.service import evaluate_factor
+from quant_forge.factor_library.catalog import FactorCatalog, discover_precomputed_factors, resolve_factor_values_root
 from quant_forge.factor_library.repository import FactorRepository, parse_idea_to_definition
 from quant_forge.research_loop.config import DEFAULT_RD_CONFIG_PATH, load_research_loop_config, weights_for_objective
 from quant_forge.research_loop.service import ResearchLoopService
@@ -58,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     list_cmd = factor_subcommands.add_parser("list", help="list factors")
     _add_config_options(list_cmd)
     list_cmd.add_argument("--factor-root", type=Path)
+    list_cmd.add_argument("--factor-values-root", type=Path)
     list_cmd.set_defaults(handler=_cmd_factor_list)
     promote = factor_subcommands.add_parser("promote", help="promote or demote a factor")
     promote.add_argument("factor_id")
@@ -161,7 +163,12 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _cmd_factor_list(args: argparse.Namespace) -> int:
-    factors = FactorRepository(_runtime_paths(args).factor_root).list()
+    paths = _runtime_paths(args)
+    factors = FactorCatalog(
+        paths.factor_root,
+        factor_values_root=paths.factor_values_root,
+        factor_values_manifest_root=paths.factor_values_manifest_root,
+    ).list()
     _print_json([asdict(factor) for factor in factors])
     return 0
 
@@ -362,7 +369,7 @@ def _doctor_payload(args: argparse.Namespace) -> dict[str, Any]:
     payload["data"] = data_status["payload"]
     checks.append(data_status["check"])
 
-    factor_status = _doctor_factor_status(paths.factor_root)
+    factor_status = _doctor_factor_status(paths)
     payload["factor_root"] = factor_status["payload"]
     checks.append(factor_status["check"])
     seed_factor_id = _doctor_seed_factor_id(factor_status["payload"])
@@ -407,10 +414,19 @@ def _doctor_data_status(data_root: Path) -> dict[str, Any]:
     }
 
 
-def _doctor_factor_status(factor_root: Path) -> dict[str, Any]:
-    root = factor_root.expanduser()
+def _doctor_factor_status(paths: PathSettings) -> dict[str, Any]:
+    root = paths.factor_root.expanduser()
     try:
-        factors = FactorRepository(root).list() if root.exists() else []
+        local_factors = FactorRepository(root).list() if root.exists() else []
+        precomputed_factors = discover_precomputed_factors(
+            paths.factor_values_root,
+            manifest_root=paths.factor_values_manifest_root,
+        )
+        factors = FactorCatalog(
+            root,
+            factor_values_root=paths.factor_values_root,
+            factor_values_manifest_root=paths.factor_values_manifest_root,
+        ).list()
     except Exception as exc:
         return {
             "payload": {"path": str(root), "exists": root.exists(), "error": str(exc)},
@@ -420,23 +436,37 @@ def _doctor_factor_status(factor_root: Path) -> dict[str, Any]:
         "path": str(root),
         "exists": root.exists(),
         "factor_count": len(factors),
+        "local_factor_count": len(local_factors),
+        "precomputed_factor_count": len(precomputed_factors),
         "sample_factor_ids": [factor.factor_id for factor in factors[:10]],
     }
-    if root.exists() and factors:
-        return {"payload": payload, "check": _doctor_check("factor_root", "ok", "factor repository is readable", payload)}
+    if factors:
+        message = "factor catalog is readable"
+        if not local_factors and precomputed_factors:
+            message = "factor catalog is readable from factor_values_root"
+        return {"payload": payload, "check": _doctor_check("factor_root", "ok", message, payload)}
     return {
         "payload": payload,
-        "check": _doctor_check("factor_root", "error", f"no factors found under factor_root {root}", payload),
+        "check": _doctor_check(
+            "factor_root",
+            "error",
+            f"no factors found under factor_root {root} or factor_values_root {paths.factor_values_root or ''}",
+            payload,
+        ),
     }
 
 
 def _doctor_factor_values_status(paths: PathSettings) -> dict[str, Any]:
-    root = paths.factor_values_root.expanduser() if paths.factor_values_root is not None else None
+    configured_root = paths.factor_values_root.expanduser() if paths.factor_values_root is not None else None
+    root = resolve_factor_values_root(configured_root)
+    precomputed_count = len(discover_precomputed_factors(root, manifest_root=paths.factor_values_manifest_root))
     payload = {
-        "configured": root is not None,
+        "configured": configured_root is not None,
+        "configured_path": str(configured_root or ""),
         "path": str(root or ""),
         "exists": root.exists() if root is not None else False,
         "manifest_root": str(paths.factor_values_manifest_root or ""),
+        "precomputed_factor_count": precomputed_count,
     }
     if root is None:
         return {

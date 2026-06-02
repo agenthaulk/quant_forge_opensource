@@ -13,6 +13,7 @@ from quant_forge.backtesting.service import run_factor_backtest
 from quant_forge.config import QuantForgeConfig, validate_llm_runtime
 from quant_forge.core.contracts import BacktestResult, EvaluationResult
 from quant_forge.evaluation.service import evaluate_factor
+from quant_forge.factor_library.catalog import FactorCatalog
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.llm_factor_parser import ParsedFactor, parse_factor_idea
 from quant_forge.mcp.read_models import list_available_fields, list_available_operators
@@ -328,7 +329,7 @@ def _default_runtime_ready_llm(config: QuantForgeConfig) -> Any:
 
 def _default_seed_factor_id(config: QuantForgeConfig) -> str:
     try:
-        factors = FactorRepository(config.paths.factor_root).list()
+        factors = FactorCatalog(config.paths.factor_root, factor_values_root=config.paths.factor_values_root).list()
     except Exception:
         return ""
     factor_ids = [factor.factor_id for factor in factors]

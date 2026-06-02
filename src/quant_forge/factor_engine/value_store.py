@@ -10,6 +10,7 @@ import re
 
 import pandas as pd
 
+from quant_forge.factor_library.catalog import resolve_factor_values_root
 from quant_forge.factor_engine.executor import execute_factor_formula
 
 
@@ -24,7 +25,7 @@ class FactorScoreResult:
 
 class FactorValueStore:
     def __init__(self, root: Path) -> None:
-        self.root = root.expanduser()
+        self.root = (resolve_factor_values_root(root) or root).expanduser()
 
     def prepare_scores(
         self,
@@ -34,6 +35,7 @@ class FactorValueStore:
         factor_name: str,
         formula: str,
         universe_filters: tuple[str, ...],
+        cache_only: bool = False,
     ) -> FactorScoreResult:
         factor_dir = self._resolve_factor_dir(factor_id=factor_id, factor_name=factor_name)
         formula_signature = _formula_signature(factor_id, formula, universe_filters)
@@ -45,6 +47,17 @@ class FactorValueStore:
         panel_keys = _score_keys(panel)
         required_keys = _required_score_keys(panel, universe_filters)
         cached_for_panel = _restrict_to_panel(cached, panel_keys)
+        if cache_only:
+            combined = _apply_universe_filters(panel, cached_for_panel, universe_filters)
+            combined = combined.sort_values(["trade_date", "instrument"]).reset_index(drop=True)
+            cached_rows = int(len(combined))
+            return FactorScoreResult(
+                scores=combined,
+                source=_cache_only_source(cached_rows, int(len(required_keys))),
+                cached_rows=cached_rows,
+                computed_rows=0,
+                factor_values_path=factor_dir,
+            )
         complete_dates = _complete_cached_dates(required_keys, cached_for_panel)
         cached_complete = cached_for_panel[cached_for_panel["trade_date"].isin(complete_dates)]
         missing_panel = panel[~panel["trade_date"].isin(complete_dates)]
@@ -319,7 +332,8 @@ def _factor_dir_candidates(*, factor_id: str, factor_name: str) -> list[str]:
     for value in raw_candidates:
         aliases.extend(_worldquant_aliases(value))
     candidates = aliases + raw_candidates
-    return list(dict.fromkeys(candidate for candidate in candidates if candidate))
+    partition_candidates = [f"factor_id={candidate}" for candidate in candidates if candidate]
+    return list(dict.fromkeys(candidate for candidate in [*candidates, *partition_candidates] if candidate))
 
 
 def _worldquant_aliases(value: str) -> list[str]:
@@ -360,3 +374,11 @@ def _score_source(cached_rows: int, computed_rows: int) -> str:
     if cached_rows:
         return "factor_values_cached"
     return "computed_formula"
+
+
+def _cache_only_source(cached_rows: int, required_rows: int) -> str:
+    if cached_rows <= 0:
+        return "factor_values_missing"
+    if required_rows > 0 and cached_rows < required_rows:
+        return "factor_values_cached_partial"
+    return "factor_values_cached"
