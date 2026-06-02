@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 import re
 from typing import Any
 
 from quant_forge.core.contracts import FactorDefinition
+from quant_forge.core.contracts import FactorStatus
 from quant_forge.factor_library.repository import FactorRepository
 
 PRECOMPUTED_FORMULA_PREFIX = "precomputed:"
@@ -77,6 +79,28 @@ def discover_precomputed_factors(
         if factor is not None:
             factors.append(factor)
     return _dedupe_factors(factors)
+
+
+def import_precomputed_factors(
+    factor_root: Path,
+    *,
+    factor_values_root: Path | None,
+    manifest_root: Path | None = None,
+    factor_ids: tuple[str, ...] = (),
+    import_all: bool = False,
+    status: FactorStatus = "candidate",
+) -> list[FactorDefinition]:
+    if not import_all and not factor_ids:
+        raise ValueError("provide factor ids or pass --all")
+    discovered = discover_precomputed_factors(factor_values_root, manifest_root=manifest_root)
+    selected = _select_precomputed_factors(discovered, factor_ids=factor_ids, import_all=import_all)
+    repo = FactorRepository(factor_root)
+    imported: list[FactorDefinition] = []
+    for factor in selected:
+        registered = replace(factor, status=status, source="precomputed")
+        repo.save(registered)
+        imported.append(registered)
+    return imported
 
 
 def resolve_factor_values_root(root: Path | None) -> Path | None:
@@ -196,6 +220,32 @@ def _dedupe_factors(factors: list[FactorDefinition]) -> list[FactorDefinition]:
         seen.add(key)
         result.append(factor)
     return result
+
+
+def _select_precomputed_factors(
+    factors: list[FactorDefinition],
+    *,
+    factor_ids: tuple[str, ...],
+    import_all: bool,
+) -> list[FactorDefinition]:
+    if import_all:
+        return factors
+    requested = {item: _factor_id_values(item) for item in factor_ids}
+    selected: list[FactorDefinition] = []
+    matched: set[str] = set()
+    for factor in factors:
+        aliases = _factor_id_values(factor.factor_id)
+        aliases.update(_factor_id_values(factor.name))
+        for requested_id, requested_aliases in requested.items():
+            if requested_id in matched:
+                continue
+            if aliases.intersection(requested_aliases):
+                selected.append(factor)
+                matched.add(requested_id)
+    missing = [factor_id for factor_id in factor_ids if factor_id not in matched]
+    if missing:
+        raise ValueError(f"precomputed factors not found: {', '.join(missing)}")
+    return selected
 
 
 def _canonical_factor_id(value: str) -> str:

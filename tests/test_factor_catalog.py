@@ -7,7 +7,7 @@ import pandas as pd
 
 from quant_forge.core.contracts import FactorDefinition
 from quant_forge.factor_engine.signal_processing import prepare_factor_scores_result
-from quant_forge.factor_library.catalog import FactorCatalog
+from quant_forge.factor_library.catalog import FactorCatalog, import_precomputed_factors
 from quant_forge.factor_library.repository import FactorRepository
 
 
@@ -59,6 +59,24 @@ def test_precomputed_scores_use_partial_cache_without_recomputing(tmp_path: Path
     assert result.computed_rows == 0
     assert list(result.scores["instrument"]) == ["AAA"]
     assert list(result.scores["score"]) == [0.3]
+
+
+def test_import_precomputed_registers_selected_factors_without_mount_paths(tmp_path: Path) -> None:
+    factor_root = tmp_path / "factor_root"
+    factor_values_root = _mounted_wq_factor_values(tmp_path)
+
+    imported = import_precomputed_factors(
+        factor_root,
+        factor_values_root=factor_values_root,
+        factor_ids=("alpha_003",),
+    )
+    registered = FactorRepository(factor_root).get("WQ_ALPHA_003")
+    payload = (factor_root / "inactive_factors" / "WQ_ALPHA_003" / "factor.yaml").read_text(encoding="utf-8")
+
+    assert [factor.factor_id for factor in imported] == ["WQ_ALPHA_003"]
+    assert registered.formula == "precomputed:worldquant_alpha_003"
+    assert registered.source == "precomputed"
+    assert str(factor_values_root) not in payload
 
 
 def _mounted_wq_factor_values(tmp_path: Path) -> Path:

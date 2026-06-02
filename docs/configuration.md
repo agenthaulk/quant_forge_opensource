@@ -72,6 +72,18 @@ Discovered precomputed factors use a lightweight formula marker such as
 available values, leaves uncovered instruments as missing values, and does not
 attempt to recompute external or complex DSL formulas in the public kernel.
 
+To make mounted precomputed factors part of the local project registry, import
+them explicitly:
+
+```bash
+qf factor import-precomputed --config configs/default.local.yaml --all
+qf factor import-precomputed WQ_ALPHA_003 --config configs/default.local.yaml
+```
+
+The import writes `factor.yaml` files under `factor_root` with
+`source: precomputed` and `formula: precomputed:<store_key>`. It does not store
+mounted absolute paths in those factor definitions.
+
 ## Factor Value Cache
 
 `paths.factor_values_root` is optional. When it is set, evaluation, backtest,

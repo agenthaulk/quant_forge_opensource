@@ -78,6 +78,18 @@ def test_cli_smoke_path(tmp_path: Path) -> None:
         "FTR_DEMO_MOMENTUM",
         "WQ_ALPHA_003",
     }
+    imported_precomputed = run_cli(
+        "factor",
+        "import-precomputed",
+        "alpha_003",
+        "--factor-root",
+        str(workspace / "factor_root"),
+        "--factor-values-root",
+        str(workspace / "mounted_factor_values"),
+    )
+    assert imported_precomputed["imported_count"] == 1
+    assert imported_precomputed["factor_ids"] == ["WQ_ALPHA_003"]
+    assert (workspace / "factor_root" / "inactive_factors" / "WQ_ALPHA_003" / "factor.yaml").exists()
 
     doctor = run_cli("doctor", "--workspace", str(workspace))
     assert doctor["ok"] is True

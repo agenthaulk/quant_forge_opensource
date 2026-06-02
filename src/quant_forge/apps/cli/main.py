@@ -18,7 +18,12 @@ from quant_forge.config import (
 )
 from quant_forge.data.local import create_demo_workspace, validate_data_root
 from quant_forge.evaluation.service import evaluate_factor
-from quant_forge.factor_library.catalog import FactorCatalog, discover_precomputed_factors, resolve_factor_values_root
+from quant_forge.factor_library.catalog import (
+    FactorCatalog,
+    discover_precomputed_factors,
+    import_precomputed_factors,
+    resolve_factor_values_root,
+)
 from quant_forge.factor_library.repository import FactorRepository, parse_idea_to_definition
 from quant_forge.research_loop.config import DEFAULT_RD_CONFIG_PATH, load_research_loop_config, weights_for_objective
 from quant_forge.research_loop.service import ResearchLoopService
@@ -61,6 +66,17 @@ def build_parser() -> argparse.ArgumentParser:
     list_cmd.add_argument("--factor-root", type=Path)
     list_cmd.add_argument("--factor-values-root", type=Path)
     list_cmd.set_defaults(handler=_cmd_factor_list)
+    import_precomputed = factor_subcommands.add_parser(
+        "import-precomputed",
+        help="register mounted precomputed factor values into factor_root",
+    )
+    import_precomputed.add_argument("factor_ids", nargs="*")
+    import_precomputed.add_argument("--all", action="store_true", help="import every discovered precomputed factor")
+    import_precomputed.add_argument("--to", choices=["draft", "candidate"], default="candidate")
+    _add_config_options(import_precomputed)
+    import_precomputed.add_argument("--factor-root", type=Path)
+    import_precomputed.add_argument("--factor-values-root", type=Path)
+    import_precomputed.set_defaults(handler=_cmd_factor_import_precomputed)
     promote = factor_subcommands.add_parser("promote", help="promote or demote a factor")
     promote.add_argument("factor_id")
     promote.add_argument("--to", required=True, choices=["draft", "candidate", "active", "inactive", "archived"])
@@ -170,6 +186,26 @@ def _cmd_factor_list(args: argparse.Namespace) -> int:
         factor_values_manifest_root=paths.factor_values_manifest_root,
     ).list()
     _print_json([asdict(factor) for factor in factors])
+    return 0
+
+
+def _cmd_factor_import_precomputed(args: argparse.Namespace) -> int:
+    paths = _runtime_paths(args)
+    imported = import_precomputed_factors(
+        paths.factor_root,
+        factor_values_root=paths.factor_values_root,
+        manifest_root=paths.factor_values_manifest_root,
+        factor_ids=tuple(args.factor_ids),
+        import_all=bool(args.all),
+        status=args.to,
+    )
+    _print_json(
+        {
+            "imported_count": len(imported),
+            "factor_root": str(paths.factor_root),
+            "factor_ids": [factor.factor_id for factor in imported],
+        }
+    )
     return 0
 
 
