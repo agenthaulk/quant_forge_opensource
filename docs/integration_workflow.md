@@ -5,7 +5,7 @@
 ## 1. 联调原则
 
 - 所有路径、时间范围、成本假设、LLM provider、RD 参数都应来自 config、CLI 参数或环境变量。
-- Web、CLI、RD、报告生成应共享同一套 `data_root`、`factor_root`、`artifact_root`。
+- Web、CLI、RD、报告生成应共享同一套 `data_root`、`factor_root`、`factor_values_root`、`factor_values_overlay_root`、`factor_values_manifest_root`、`artifact_root`。
 - 程序反馈必须包含可追溯的 artifact 路径，不只说“完成”。
 - 研究回测指标应明确区分研究口径与生产交易口径。
 - LLM API key 只读环境变量，不写入配置文件、日志或报告。
@@ -18,7 +18,7 @@
 | 运行前自诊断 | `qf doctor --config <local-config> --rd-config configs/rd.yaml` | 返回 `ok`、逐项 `checks`、生效路径、数据摘要、LLM readiness、下一步命令 | 先修复 error，再进入 Web/CLI 联调 |
 | 配置加载 | 指定 `--config`、`--rd-config`、`--workspace` | 打印或接口返回 `data_root`、`factor_root`、`artifact_root`、web host/port、LLM provider | 路径指向预期工作区或挂载盘 |
 | 数据校验 | `qf data validate` 或 Web 状态检查 | 显示必需字段、行数、标的数、日期范围、缺失字段 | 至少包含 `trade_date, instrument, close, market_cap, is_st` |
-| 因子来源 | 因子列表、自然语言解析、研报解析或已有 factor id | 返回 `factor_id`、`name`、`formula`、`status`、`source` | 公式、过滤条件、预测周期符合预期 |
+| 因子来源 | 因子列表、自然语言解析、研报解析或已有 factor id | 返回 `factor_id`、`name`、`formula`、`status`、`source` | 公式、过滤条件、预测周期符合预期；预计算因子应使用 `precomputed:factor_id=<FACTOR_ID>` |
 | LLM 解析 | 在 Web 或 CLI 选择 provider | 成功时返回 provider/model；失败时明确提示缺少哪个 env key | 不泄露真实 API key |
 | 因子计算 | 执行 factor engine | 返回计算行数、覆盖率、缺失率、缓存/落盘路径 | 如果已有因子值，应提示复用或增量补齐 |
 | 因子评价 | `eval-factor` 或 Web 评价 | 返回 Rank IC、ICIR、coverage、IC days、horizon matrix、IS/OOS split | OOS 是否衰减应显式展示 |
@@ -40,6 +40,8 @@
 - `factor_root`
 - `artifact_root`
 - `factor_values_root`
+- `factor_values_overlay_root`
+- `factor_values_manifest_root`
 - `output_root`
 - `simulation.test_period`
 - `llm.provider`
@@ -71,7 +73,24 @@ error；程序应继续使用本地规则解析，并把外部 LLM readiness 作
 - `factor_root.precomputed_factor_count`
 - `factor_values.configured_path`
 - `factor_values.path`，即程序最终识别到的 canonical 或 Hive-style 因子值根目录
+- `factor_values.overlay_root`，即新增增量值的写入 overlay
 - `factor_values.precomputed_factor_count`
+
+如果挂载盘里有历史旧命名目录，或前序研究把 WQ/GTJA/FTR 因子值存在其他
+`factor_values` 根下，应先做一次非破坏性规范化：
+
+```bash
+qf factor normalize-store --config configs/default.local.yaml --dry-run
+qf factor normalize-store --config configs/default.local.yaml \
+  --scan-root <MOUNT_ROOT>/QuantForgeData \
+  --link-files
+qf factor import-precomputed --config configs/default.local.yaml --all
+```
+
+规范化后，新增和注册的预计算因子都应使用 `factor_id=<FACTOR_ID>` 目录；旧的
+`worldquant_alpha_*`、中文名、风格名等目录只作为可读兼容资产保留。跨来源合并
+只向 configured `factor_values_root` 写入规范目录，不删除源目录。运行时补算缺失日期时，
+如果配置了 `factor_values_overlay_root`，新增增量只写 overlay，不写回 canonical 根。
 
 ### 3.2 数据校验反馈
 

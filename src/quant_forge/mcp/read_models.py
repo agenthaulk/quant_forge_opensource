@@ -30,7 +30,11 @@ def list_available_operators() -> list[dict[str, str]]:
     return [{"name": name, "description": descriptions[name]} for name in sorted(SUPPORTED_OPERATORS)]
 
 
-def list_factors(factor_root: Path, factor_values_root: Path | None = None) -> list[dict[str, object]]:
+def list_factors(
+    factor_root: Path,
+    factor_values_root: Path | None = None,
+    factor_values_manifest_root: Path | None = None,
+) -> list[dict[str, object]]:
     return [
         {
             "factor_id": factor.factor_id,
@@ -40,7 +44,11 @@ def list_factors(factor_root: Path, factor_values_root: Path | None = None) -> l
             "horizon_days": factor.horizon_days,
             "universe_filters": list(factor.universe_filters),
         }
-        for factor in FactorCatalog(factor_root, factor_values_root=factor_values_root).list()
+        for factor in FactorCatalog(
+            factor_root,
+            factor_values_root=factor_values_root,
+            factor_values_manifest_root=factor_values_manifest_root,
+        ).list()
     ]
 
 

@@ -40,6 +40,8 @@ def run_factor_backtest(
     transaction_costs: TransactionCostModel | None = None,
     sample_splits: tuple[SampleSplitSpec, ...] | None = None,
     factor_values_root: Path | None = None,
+    factor_values_overlay_root: Path | None = None,
+    factor_values_manifest_root: Path | None = None,
 ) -> BacktestResult:
     profile = simulation_profile or SimulationProfile()
     costs = transaction_costs or TransactionCostModel()
@@ -60,7 +62,11 @@ def run_factor_backtest(
     top_quantile = profile.top_quantile
     if group_count < 2:
         raise ValueError("group_count must be at least 2")
-    factor = FactorCatalog(factor_root, factor_values_root=factor_values_root).get(factor_id)
+    factor = FactorCatalog(
+        factor_root,
+        factor_values_root=factor_values_root,
+        factor_values_manifest_root=factor_values_manifest_root,
+    ).get(factor_id)
     holding = holding_days or factor.horizon_days
     if holding < 1:
         raise ValueError("holding_days must be positive")
@@ -74,6 +80,7 @@ def run_factor_backtest(
         factor_id=factor.factor_id,
         factor_name=factor.name,
         factor_values_root=factor_values_root,
+        factor_values_overlay_root=factor_values_overlay_root,
     )
     scores = score_result.scores
     close = working_panel[["trade_date", "instrument", "close"]].copy()
@@ -194,6 +201,9 @@ def run_factor_backtest(
             "score_cached_rows": score_result.cached_rows,
             "score_computed_rows": score_result.computed_rows,
             "factor_values_path": str(score_result.factor_values_path) if score_result.factor_values_path else None,
+            "factor_values_write_path": (
+                str(score_result.factor_values_write_path) if score_result.factor_values_write_path else None
+            ),
             "transaction_costs": asdict(costs),
             "periods": len(rows),
             "cumulative_return": gross_summary["cumulative_return"],
@@ -252,6 +262,7 @@ def run_factor_backtest(
         score_cached_rows=score_result.cached_rows,
         score_computed_rows=score_result.computed_rows,
         factor_values_path=score_result.factor_values_path,
+        factor_values_write_path=score_result.factor_values_write_path,
     )
 
 

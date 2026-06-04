@@ -267,6 +267,8 @@ class ResearchLoopService:
         data_root: Path,
         artifact_root: Path,
         factor_values_root: Path | None = None,
+        factor_values_overlay_root: Path | None = None,
+        factor_values_manifest_root: Path | None = None,
         top_quantile: float | None = None,
         simulation_profile: SimulationProfile | None = None,
         simulation_profiles: tuple[SimulationProfile, ...] | None = None,
@@ -286,6 +288,8 @@ class ResearchLoopService:
         self.data_root = data_root
         self.artifact_root = artifact_root
         self.factor_values_root = factor_values_root
+        self.factor_values_overlay_root = factor_values_overlay_root
+        self.factor_values_manifest_root = factor_values_manifest_root
         profile = simulation_profile or SimulationProfile()
         if top_quantile is not None:
             profile = replace(profile, top_quantile=top_quantile)
@@ -326,7 +330,11 @@ class ResearchLoopService:
         if max_candidates < 1 or max_candidates > 10:
             raise ValueError("max_candidates must be between 1 and 10")
         repo = FactorRepository(self.factor_root)
-        seed = FactorCatalog(self.factor_root, factor_values_root=self.factor_values_root).get(seed_factor_id)
+        seed = FactorCatalog(
+            self.factor_root,
+            factor_values_root=self.factor_values_root,
+            factor_values_manifest_root=self.factor_values_manifest_root,
+        ).get(seed_factor_id)
         objective_weights = weights or objective_weights_for(objective)
         candidate_gate = gate or ResearchGate()
         planned = hypotheses or self.hypothesis_generator.generate(
@@ -426,6 +434,8 @@ class ResearchLoopService:
             sample_splits=sample_splits,
             simulation_profile=trial.simulation_profile,
             factor_values_root=self.factor_values_root,
+            factor_values_overlay_root=self.factor_values_overlay_root,
+            factor_values_manifest_root=self.factor_values_manifest_root,
         )
         backtest = run_factor_backtest(
             trial.factor.factor_id,
@@ -437,6 +447,8 @@ class ResearchLoopService:
             transaction_costs=self.transaction_costs,
             sample_splits=sample_splits,
             factor_values_root=self.factor_values_root,
+            factor_values_overlay_root=self.factor_values_overlay_root,
+            factor_values_manifest_root=self.factor_values_manifest_root,
         )
         split_weighted_icir = weighted_split_icir(evaluation)
         score = score_candidate(evaluation, backtest, objective_weights, split_weighted_icir)

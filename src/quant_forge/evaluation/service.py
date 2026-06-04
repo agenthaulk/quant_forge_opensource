@@ -43,9 +43,15 @@ def evaluate_factor(
     sample_splits: tuple[SampleSplitSpec, ...] | None = None,
     simulation_profile: SimulationProfile | None = None,
     factor_values_root: Path | None = None,
+    factor_values_overlay_root: Path | None = None,
+    factor_values_manifest_root: Path | None = None,
 ) -> EvaluationResult:
     profile = simulation_profile or SimulationProfile()
-    factor = FactorCatalog(factor_root, factor_values_root=factor_values_root).get(factor_id)
+    factor = FactorCatalog(
+        factor_root,
+        factor_values_root=factor_values_root,
+        factor_values_manifest_root=factor_values_manifest_root,
+    ).get(factor_id)
     horizon = horizon_days or factor.horizon_days
     if horizon < 1:
         raise ValueError("horizon_days must be positive")
@@ -59,6 +65,7 @@ def evaluate_factor(
         factor_id=factor.factor_id,
         factor_name=factor.name,
         factor_values_root=factor_values_root,
+        factor_values_overlay_root=factor_values_overlay_root,
     )
     scores = score_result.scores
     split_specs = _validate_sample_splits(sample_splits or DEFAULT_SAMPLE_SPLITS)
@@ -79,6 +86,9 @@ def evaluate_factor(
             "score_cached_rows": score_result.cached_rows,
             "score_computed_rows": score_result.computed_rows,
             "factor_values_path": str(score_result.factor_values_path) if score_result.factor_values_path else None,
+            "factor_values_write_path": (
+                str(score_result.factor_values_write_path) if score_result.factor_values_write_path else None
+            ),
             "observations": primary.observations,
             "coverage": primary.coverage,
             "rank_ic_mean": primary.rank_ic_mean,
@@ -107,6 +117,7 @@ def evaluate_factor(
         score_cached_rows=score_result.cached_rows,
         score_computed_rows=score_result.computed_rows,
         factor_values_path=score_result.factor_values_path,
+        factor_values_write_path=score_result.factor_values_write_path,
         warnings=warnings,
     )
 

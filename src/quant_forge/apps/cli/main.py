@@ -20,8 +20,10 @@ from quant_forge.data.local import create_demo_workspace, validate_data_root
 from quant_forge.evaluation.service import evaluate_factor
 from quant_forge.factor_library.catalog import (
     FactorCatalog,
+    discover_factor_value_roots,
     discover_precomputed_factors,
     import_precomputed_factors,
+    normalize_precomputed_factor_store,
     resolve_factor_values_root,
 )
 from quant_forge.factor_library.repository import FactorRepository, parse_idea_to_definition
@@ -65,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_options(list_cmd)
     list_cmd.add_argument("--factor-root", type=Path)
     list_cmd.add_argument("--factor-values-root", type=Path)
+    list_cmd.add_argument("--factor-values-manifest-root", type=Path)
     list_cmd.set_defaults(handler=_cmd_factor_list)
     import_precomputed = factor_subcommands.add_parser(
         "import-precomputed",
@@ -76,7 +79,32 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_options(import_precomputed)
     import_precomputed.add_argument("--factor-root", type=Path)
     import_precomputed.add_argument("--factor-values-root", type=Path)
+    import_precomputed.add_argument("--factor-values-manifest-root", type=Path)
     import_precomputed.set_defaults(handler=_cmd_factor_import_precomputed)
+    normalize_store = factor_subcommands.add_parser(
+        "normalize-store",
+        help="create canonical factor_id=<FACTOR_ID> entries for mounted factor values",
+    )
+    _add_config_options(normalize_store)
+    normalize_store.add_argument("--factor-values-root", type=Path)
+    normalize_store.add_argument("--factor-values-manifest-root", type=Path)
+    normalize_store.add_argument(
+        "--source-factor-values-root",
+        action="append",
+        type=Path,
+        default=[],
+        help="additional mounted factor-value root to merge into factor_values_root",
+    )
+    normalize_store.add_argument(
+        "--scan-root",
+        action="append",
+        type=Path,
+        default=[],
+        help="mounted data tree to scan for factor-value roots before normalization",
+    )
+    normalize_store.add_argument("--dry-run", action="store_true")
+    normalize_store.add_argument("--link-files", action="store_true", help="hardlink files when possible")
+    normalize_store.set_defaults(handler=_cmd_factor_normalize_store)
     promote = factor_subcommands.add_parser("promote", help="promote or demote a factor")
     promote.add_argument("factor_id")
     promote.add_argument("--to", required=True, choices=["draft", "candidate", "active", "inactive", "archived"])
@@ -146,6 +174,8 @@ def _add_runtime_roots(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--factor-root", type=Path)
     parser.add_argument("--data-root", type=Path)
     parser.add_argument("--factor-values-root", type=Path)
+    parser.add_argument("--factor-values-overlay-root", type=Path)
+    parser.add_argument("--factor-values-manifest-root", type=Path)
     parser.add_argument("--artifact-root", type=Path)
 
 
@@ -209,6 +239,19 @@ def _cmd_factor_import_precomputed(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_factor_normalize_store(args: argparse.Namespace) -> int:
+    paths = _runtime_paths(args)
+    result = normalize_precomputed_factor_store(
+        paths.factor_values_root,
+        manifest_root=paths.factor_values_manifest_root,
+        source_roots=_normalization_source_roots(args),
+        dry_run=bool(args.dry_run),
+        link_files=bool(args.link_files),
+    )
+    _print_dataclass(result)
+    return 0
+
+
 def _cmd_factor_promote(args: argparse.Namespace) -> int:
     factor = FactorRepository(_runtime_paths(args).factor_root).promote(args.factor_id, args.to, args.reason)
     _print_dataclass(factor)
@@ -259,6 +302,8 @@ def _cmd_eval_factor(args: argparse.Namespace) -> int:
         sample_splits=rd_config.sample_splits,
         simulation_profile=rd_config.simulation_profile,
         factor_values_root=paths.factor_values_root,
+        factor_values_overlay_root=paths.factor_values_overlay_root,
+        factor_values_manifest_root=paths.factor_values_manifest_root,
     )
     _print_dataclass(result)
     return 0
@@ -281,6 +326,8 @@ def _cmd_run_backtest(args: argparse.Namespace) -> int:
         transaction_costs=rd_config.transaction_costs,
         sample_splits=rd_config.sample_splits,
         factor_values_root=paths.factor_values_root,
+        factor_values_overlay_root=paths.factor_values_overlay_root,
+        factor_values_manifest_root=paths.factor_values_manifest_root,
     )
     _print_dataclass(result)
     return 0
@@ -306,6 +353,8 @@ def _cmd_research_run_once(args: argparse.Namespace) -> int:
         sample_splits=rd_config.sample_splits,
         transaction_costs=rd_config.transaction_costs,
         factor_values_root=paths.factor_values_root,
+        factor_values_overlay_root=paths.factor_values_overlay_root,
+        factor_values_manifest_root=paths.factor_values_manifest_root,
     )
     objective = args.objective or rd_config.objective
     weights = weights_for_objective(rd_config, objective)
@@ -334,10 +383,28 @@ def _runtime_paths_from_config(args: argparse.Namespace, config: QuantForgeConfi
         data_root=getattr(args, "data_root", None) or paths.data_root,
         factor_root=getattr(args, "factor_root", None) or paths.factor_root,
         factor_values_root=getattr(args, "factor_values_root", None) or paths.factor_values_root,
-        factor_values_manifest_root=paths.factor_values_manifest_root,
+        factor_values_overlay_root=getattr(args, "factor_values_overlay_root", None)
+        or paths.factor_values_overlay_root,
+        factor_values_manifest_root=getattr(args, "factor_values_manifest_root", None)
+        or paths.factor_values_manifest_root,
         artifact_root=getattr(args, "artifact_root", None) or paths.artifact_root,
         output_root=paths.output_root,
     )
+
+
+def _normalization_source_roots(args: argparse.Namespace) -> tuple[Path, ...]:
+    roots: list[Path] = list(getattr(args, "source_factor_values_root", ()) or ())
+    for scan_root in getattr(args, "scan_root", ()) or ():
+        roots.extend(discover_factor_value_roots(scan_root))
+    seen: set[Path] = set()
+    result: list[Path] = []
+    for root in roots:
+        key = root.expanduser().resolve() if root.expanduser().exists() else root.expanduser()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(root)
+    return tuple(result)
 
 
 def _cmd_web(args: argparse.Namespace) -> int:
@@ -380,6 +447,7 @@ def _doctor_payload(args: argparse.Namespace) -> dict[str, Any]:
             "data_root": str(paths.data_root),
             "factor_root": str(paths.factor_root),
             "factor_values_root": str(paths.factor_values_root or ""),
+            "factor_values_overlay_root": str(paths.factor_values_overlay_root or ""),
             "factor_values_manifest_root": str(paths.factor_values_manifest_root or ""),
             "artifact_root": str(paths.artifact_root),
             "output_root": str(paths.output_root),
@@ -496,11 +564,14 @@ def _doctor_factor_values_status(paths: PathSettings) -> dict[str, Any]:
     configured_root = paths.factor_values_root.expanduser() if paths.factor_values_root is not None else None
     root = resolve_factor_values_root(configured_root)
     precomputed_count = len(discover_precomputed_factors(root, manifest_root=paths.factor_values_manifest_root))
+    overlay_root = paths.factor_values_overlay_root.expanduser() if paths.factor_values_overlay_root is not None else None
     payload = {
         "configured": configured_root is not None,
         "configured_path": str(configured_root or ""),
         "path": str(root or ""),
         "exists": root.exists() if root is not None else False,
+        "overlay_root": str(overlay_root or ""),
+        "overlay_exists": overlay_root.exists() if overlay_root is not None else False,
         "manifest_root": str(paths.factor_values_manifest_root or ""),
         "precomputed_factor_count": precomputed_count,
     }
@@ -575,18 +646,33 @@ def _doctor_next_commands(args: argparse.Namespace, *, seed_factor_id: str | Non
     config_arg = f" --config {args.config}" if getattr(args, "config", None) else ""
     workspace_arg = f" --workspace {args.workspace}" if getattr(args, "workspace", None) else ""
     rd_config_arg = f" --rd-config {getattr(args, 'rd_config', DEFAULT_RD_CONFIG_PATH)}"
+    factor_list_root_args = "".join(
+        [
+            f" --factor-root {args.factor_root}" if getattr(args, "factor_root", None) else "",
+            f" --factor-values-root {args.factor_values_root}" if getattr(args, "factor_values_root", None) else "",
+            f" --factor-values-manifest-root {args.factor_values_manifest_root}"
+            if getattr(args, "factor_values_manifest_root", None)
+            else "",
+        ]
+    )
     root_args = "".join(
         [
             f" --data-root {args.data_root}" if getattr(args, "data_root", None) else "",
             f" --factor-root {args.factor_root}" if getattr(args, "factor_root", None) else "",
             f" --factor-values-root {args.factor_values_root}" if getattr(args, "factor_values_root", None) else "",
+            f" --factor-values-overlay-root {args.factor_values_overlay_root}"
+            if getattr(args, "factor_values_overlay_root", None)
+            else "",
+            f" --factor-values-manifest-root {args.factor_values_manifest_root}"
+            if getattr(args, "factor_values_manifest_root", None)
+            else "",
             f" --artifact-root {args.artifact_root}" if getattr(args, "artifact_root", None) else "",
         ]
     )
     runtime_args = f"{config_arg}{workspace_arg}{root_args}"
     commands = [
         f"qf data validate{config_arg}{workspace_arg}{f' --data-root {args.data_root}' if getattr(args, 'data_root', None) else ''}",
-        f"qf factor list{config_arg}{workspace_arg}{f' --factor-root {args.factor_root}' if getattr(args, 'factor_root', None) else ''}",
+        f"qf factor list{config_arg}{workspace_arg}{factor_list_root_args}",
         f"qf web{config_arg}{workspace_arg}{rd_config_arg}",
     ]
     if seed_factor_id:

@@ -91,6 +91,34 @@ def test_cli_smoke_path(tmp_path: Path) -> None:
     assert imported_precomputed["factor_ids"] == ["WQ_ALPHA_003"]
     assert (workspace / "factor_root" / "inactive_factors" / "WQ_ALPHA_003" / "factor.yaml").exists()
 
+    prior_factor_values = workspace / "prior_wq" / "factor_values" / "factor_id=WQ_ALPHA_004"
+    prior_factor_values.mkdir(parents=True)
+    (prior_factor_values / "2024.metadata.json").write_text(
+        json.dumps({"factor_id": "WQ_ALPHA_004", "factor_name": "worldquant_alpha_004"}),
+        encoding="utf-8",
+    )
+    pd.DataFrame(
+        {
+            "trade_date": ["20240102"],
+            "instrument": ["STK001"],
+            "factor_id": ["WQ_ALPHA_004"],
+            "factor_value": [0.4],
+        }
+    ).to_parquet(prior_factor_values / "2024.parquet", index=False)
+    normalized = run_cli(
+        "factor",
+        "normalize-store",
+        "--factor-values-root",
+        str(workspace / "portable_factor_values"),
+        "--factor-values-manifest-root",
+        str(workspace / "portable_manifests"),
+        "--source-factor-values-root",
+        str(workspace / "prior_wq" / "factor_values"),
+    )
+    assert normalized["created_count"] == 1
+    assert normalized["source_roots"] == [str(workspace / "prior_wq" / "factor_values")]
+    assert (workspace / "portable_factor_values" / "factor_id=WQ_ALPHA_004" / "2024.parquet").exists()
+
     doctor = run_cli("doctor", "--workspace", str(workspace))
     assert doctor["ok"] is True
     assert doctor["data"]["ok"] is True
@@ -127,7 +155,7 @@ def test_cli_smoke_path(tmp_path: Path) -> None:
     assert evaluation["score_source"] == "factor_values_incremental"
     assert evaluation["score_computed_rows"] > 0
     assert evaluation["factor_values_path"]
-    assert (factor_values_root / "demo_small_cap" / "incremental" / "2024.parquet").exists()
+    assert (factor_values_root / "factor_id=FTR_DEMO_SMALL_CAP" / "incremental" / "2024.parquet").exists()
 
     backtest = run_cli(
         "run-backtest",
@@ -220,6 +248,60 @@ llm:
     assert payload["ok"] is False
     assert payload["llm"]["missing_providers"][0]["api_key_env"] == "QF_DOCTOR_MISSING_KEY"
     assert "QF_DOCTOR_MISSING_KEY" in payload["llm"]["missing_providers"][0]["error"]
+
+
+def test_cli_evaluation_writes_incremental_values_to_overlay(tmp_path: Path) -> None:
+    workspace = tmp_path / "demo"
+    create_demo_workspace(workspace)
+    read_root = workspace / "factor_values_read"
+    overlay_root = workspace / "factor_values_overlay"
+
+    evaluation = run_cli(
+        "eval-factor",
+        "FTR_DEMO_SMALL_CAP",
+        "--factor-root",
+        str(workspace / "factor_root"),
+        "--data-root",
+        str(workspace / "data"),
+        "--artifact-root",
+        str(workspace / "artifacts"),
+        "--factor-values-root",
+        str(read_root),
+        "--factor-values-overlay-root",
+        str(overlay_root),
+    )
+
+    overlay_factor_dir = overlay_root / "factor_id=FTR_DEMO_SMALL_CAP"
+    assert evaluation["observations"] > 0
+    assert evaluation["score_source"] == "factor_values_incremental"
+    assert evaluation["factor_values_path"] == str(overlay_factor_dir)
+    assert evaluation["factor_values_write_path"] == str(overlay_factor_dir)
+    assert (overlay_factor_dir / "incremental" / "2024.parquet").exists()
+    assert not (read_root / "factor_id=FTR_DEMO_SMALL_CAP" / "incremental").exists()
+    artifact = json.loads(Path(evaluation["artifact_path"]).read_text(encoding="utf-8"))
+    assert artifact["factor_values_write_path"] == str(overlay_factor_dir)
+
+
+def test_doctor_next_commands_do_not_pass_overlay_to_factor_list(tmp_path: Path) -> None:
+    workspace = tmp_path / "demo"
+    create_demo_workspace(workspace)
+
+    doctor = run_cli(
+        "doctor",
+        "--workspace",
+        str(workspace),
+        "--factor-values-overlay-root",
+        str(workspace / "factor_values_overlay"),
+    )
+
+    factor_list_commands = [command for command in doctor["next_commands"] if command.startswith("qf factor list")]
+    assert len(factor_list_commands) == 1
+    assert "--factor-values-overlay-root" not in factor_list_commands[0]
+    assert any(
+        "--factor-values-overlay-root" in command
+        for command in doctor["next_commands"]
+        if command.startswith("qf eval-factor")
+    )
 
 
 def test_doctor_allows_rule_config_with_unready_optional_llms(tmp_path: Path, monkeypatch) -> None:

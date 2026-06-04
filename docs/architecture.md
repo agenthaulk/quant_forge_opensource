@@ -25,8 +25,8 @@ Local Data Provider
 | --- | --- |
 | `quant_forge.config` | Load config and resolve user-supplied paths. |
 | `quant_forge.data` | Local panel data contract, demo data generation, validation. |
-| `quant_forge.factor_library` | `factor_root` source of truth and lifecycle operations. |
-| `quant_forge.factor_engine` | Safe formula execution and shared score preparation over local panels. |
+| `quant_forge.factor_library` | `factor_root` source of truth, mounted precomputed factor discovery, and factor-value store normalization. |
+| `quant_forge.factor_engine` | Safe formula execution, mounted daily factor-value reuse, and shared score preparation over local panels. |
 | `quant_forge.evaluation` | Deterministic single-factor metrics. |
 | `quant_forge.backtesting` | Lightweight next-day factor backtest. |
 | `quant_forge.research_loop` | Local RD loop: hypotheses, candidate scoring, smoke gates, Markdown reports, and in-process web scheduling. |
@@ -45,14 +45,21 @@ local machine paths.
 
 1. `qf init` writes demo parquet data and demo factor definitions.
 2. `qf idea-to-factor` creates a draft factor under `factor_root`.
-3. Evaluation and backtesting load factor definitions through the repository.
-4. The factor engine compiles the formula and shared signal preparation applies
-   the effective simulation profile.
-5. Artifacts are written under `artifact_root`.
-6. `qf research run-once` can generate bounded hypotheses from a seed factor,
+3. Evaluation and backtesting load factor definitions through `FactorCatalog`,
+   which merges local `factor_root` entries with mounted `factor_values_root`
+   manifests.
+4. The factor engine reuses complete daily factor values from
+   `factor_values_root/factor_id=<FACTOR_ID>`. If
+   `factor_values_overlay_root` is configured, missing local formula dates are
+   written to overlay incremental sidecars instead of the read-base store.
+5. The factor engine compiles formulas only when cached values are incomplete or
+   unavailable; shared signal preparation applies the effective simulation
+   profile.
+6. Artifacts are written under `artifact_root`.
+7. `qf research run-once` can generate bounded hypotheses from a seed factor,
    evaluate/backtest candidates, score them, and move only smoke-gate-passing
    factors to `candidate`.
-7. The same run writes a local Markdown research report under
+8. The same run writes a local Markdown research report under
    `artifact_root/research_reports`.
 
 ## Backtest Semantics

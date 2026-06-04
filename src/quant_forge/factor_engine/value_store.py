@@ -21,11 +21,23 @@ class FactorScoreResult:
     cached_rows: int
     computed_rows: int
     factor_values_path: Path | None = None
+    factor_values_write_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class _ResolvedFactorValuePaths:
+    read_dirs: tuple[Path, ...]
+    write_dir: Path
+    primary_dir: Path
 
 
 class FactorValueStore:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, write_root: Path | None = None) -> None:
         self.root = (resolve_factor_values_root(root) or root).expanduser()
+        if write_root is None:
+            self.write_root = self.root
+        else:
+            self.write_root = (resolve_factor_values_root(write_root) or write_root).expanduser()
 
     def prepare_scores(
         self,
@@ -37,10 +49,10 @@ class FactorValueStore:
         universe_filters: tuple[str, ...],
         cache_only: bool = False,
     ) -> FactorScoreResult:
-        factor_dir = self._resolve_factor_dir(factor_id=factor_id, factor_name=factor_name)
+        factor_paths = self._resolve_factor_paths(factor_id=factor_id, factor_name=factor_name)
         formula_signature = _formula_signature(factor_id, formula, universe_filters)
-        cached = self._load_cached_scores(
-            factor_dir,
+        cached = self.read_factor_values(
+            factor_paths.read_dirs,
             factor_id=factor_id,
             formula_signature=formula_signature,
         )
@@ -56,7 +68,8 @@ class FactorValueStore:
                 source=_cache_only_source(cached_rows, int(len(required_keys))),
                 cached_rows=cached_rows,
                 computed_rows=0,
-                factor_values_path=factor_dir,
+                factor_values_path=factor_paths.primary_dir,
+                factor_values_write_path=factor_paths.write_dir,
             )
         complete_dates = _complete_cached_dates(required_keys, cached_for_panel)
         cached_complete = cached_for_panel[cached_for_panel["trade_date"].isin(complete_dates)]
@@ -68,8 +81,8 @@ class FactorValueStore:
             else _empty_scores()
         )
         if not computed.empty:
-            self._write_incremental_scores(
-                factor_dir,
+            self.write_incremental_values(
+                factor_paths.write_dir,
                 factor_id=factor_id,
                 factor_name=factor_name,
                 formula_signature=formula_signature,
@@ -92,31 +105,47 @@ class FactorValueStore:
             source=source,
             cached_rows=cached_rows,
             computed_rows=computed_rows,
-            factor_values_path=factor_dir,
+            factor_values_path=factor_paths.primary_dir,
+            factor_values_write_path=factor_paths.write_dir,
         )
 
-    def _resolve_factor_dir(self, *, factor_id: str, factor_name: str) -> Path:
+    def _resolve_factor_paths(self, *, factor_id: str, factor_name: str) -> _ResolvedFactorValuePaths:
         candidates = _factor_dir_candidates(factor_id=factor_id, factor_name=factor_name)
-        existing = _find_existing_factor_dir(self.root, candidates)
-        return existing or self.root / _safe_dir_name(factor_name or factor_id)
+        existing_read_dir = _find_existing_factor_dir(self.root, candidates)
+        existing_write_dir = _find_existing_factor_dir(self.write_root, candidates)
+        write_dir = existing_write_dir or self.write_root / _canonical_factor_dir_name(factor_id or factor_name)
+        read_dirs = _unique_existing_dirs(
+            tuple(path for path in (existing_read_dir, existing_write_dir) if path is not None)
+        )
+        primary_dir = existing_write_dir or existing_read_dir or write_dir
+        return _ResolvedFactorValuePaths(read_dirs=read_dirs, write_dir=write_dir, primary_dir=primary_dir)
 
-    def _load_cached_scores(self, factor_dir: Path, *, factor_id: str, formula_signature: str) -> pd.DataFrame:
-        if not factor_dir.exists():
+    def read_factor_values(
+        self,
+        factor_dirs: tuple[Path, ...],
+        *,
+        factor_id: str,
+        formula_signature: str,
+    ) -> pd.DataFrame:
+        """Read cached factor values from canonical and overlay directories."""
+
+        if not factor_dirs:
             return _empty_scores()
         frames: list[pd.DataFrame] = []
-        for path in _factor_value_files(factor_dir):
-            frame = _read_score_file(
-                path,
-                factor_id=factor_id,
-                formula_signature=formula_signature,
-            )
-            if not frame.empty:
-                frames.append(frame)
+        for factor_dir in factor_dirs:
+            for path in _factor_value_files(factor_dir):
+                frame = _read_score_file(
+                    path,
+                    factor_id=factor_id,
+                    formula_signature=formula_signature,
+                )
+                if not frame.empty:
+                    frames.append(frame)
         if not frames:
             return _empty_scores()
         return _dedupe_scores(pd.concat(frames, ignore_index=True))
 
-    def _write_incremental_scores(
+    def write_incremental_values(
         self,
         factor_dir: Path,
         *,
@@ -321,24 +350,50 @@ def _find_existing_factor_dir(root: Path, candidates: list[str]) -> Path | None:
     return None
 
 
+def _unique_existing_dirs(paths: tuple[Path, ...]) -> tuple[Path, ...]:
+    result: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        try:
+            key = path.resolve()
+        except OSError:
+            key = path
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return tuple(result)
+
+
 def _is_child_name(value: str) -> bool:
     path = Path(value)
     return not path.is_absolute() and len(path.parts) == 1
 
 
 def _factor_dir_candidates(*, factor_id: str, factor_name: str) -> list[str]:
-    raw_candidates = [factor_name, factor_id, _safe_dir_name(factor_name), _safe_dir_name(factor_id)]
-    aliases: list[str] = []
-    for value in raw_candidates:
-        aliases.extend(_worldquant_aliases(value))
-    candidates = aliases + raw_candidates
-    partition_candidates = [f"factor_id={candidate}" for candidate in candidates if candidate]
-    return list(dict.fromkeys(candidate for candidate in [*candidates, *partition_candidates] if candidate))
+    canonical_candidates = [_canonical_factor_dir_name(factor_id)]
+    id_candidates = [factor_id, _safe_dir_name(factor_id)]
+    name_candidates = [factor_name, _safe_dir_name(factor_name)]
+    aliases = _worldquant_aliases(factor_id)
+    if aliases:
+        canonical_candidates.append(_canonical_factor_dir_name(aliases[0]))
+    legacy_candidates = [*aliases, *id_candidates, *name_candidates] if aliases else [*id_candidates, *name_candidates]
+    return list(dict.fromkeys(candidate for candidate in [*canonical_candidates, *legacy_candidates] if candidate))
+
+
+def _canonical_factor_dir_name(value: str) -> str:
+    normalized = value.strip().upper().replace("-", "_")
+    match = re.fullmatch(r"(?:(?:WORLDQUANT|WQ)_)?ALPHA_?0*(\d+)", normalized)
+    if match is not None:
+        factor_id = f"WQ_ALPHA_{int(match.group(1)):03d}"
+    else:
+        factor_id = _safe_dir_name(normalized)
+    return f"factor_id={factor_id}"
 
 
 def _worldquant_aliases(value: str) -> list[str]:
     normalized = value.strip().lower().replace("-", "_")
-    match = re.search(r"(?:worldquant_)?(?:wq_)?alpha_?0*(\d+)", normalized)
+    match = re.fullmatch(r"(?:(?:worldquant|wq)_)?alpha_?0*(\d+)", normalized)
     if match is None:
         return []
     number = int(match.group(1))

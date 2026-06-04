@@ -27,6 +27,8 @@ class WorkbenchService:
         data_root: Path,
         artifact_root: Path,
         factor_values_root: Path | None = None,
+        factor_values_overlay_root: Path | None = None,
+        factor_values_manifest_root: Path | None = None,
         simulation_profile: SimulationProfile | None = None,
         transaction_costs: TransactionCostModel | None = None,
         sample_splits: tuple[SampleSplitSpec, ...] | None = None,
@@ -35,12 +37,18 @@ class WorkbenchService:
         self.data_root = data_root
         self.artifact_root = artifact_root
         self.factor_values_root = factor_values_root
+        self.factor_values_overlay_root = factor_values_overlay_root
+        self.factor_values_manifest_root = factor_values_manifest_root
         self.simulation_profile = simulation_profile or SimulationProfile()
         self.transaction_costs = transaction_costs or TransactionCostModel()
         self.sample_splits = sample_splits
 
     def list_factors(self) -> list[FactorDefinition]:
-        return FactorCatalog(self.factor_root, factor_values_root=self.factor_values_root).list()
+        return FactorCatalog(
+            self.factor_root,
+            factor_values_root=self.factor_values_root,
+            factor_values_manifest_root=self.factor_values_manifest_root,
+        ).list()
 
     def idea_to_factor(self, text: str) -> FactorDefinition:
         factor = parse_idea_to_definition(text)
@@ -58,6 +66,8 @@ class WorkbenchService:
             horizon_days=horizon_days,
             simulation_profile=simulation_profile or self.simulation_profile,
             factor_values_root=self.factor_values_root,
+            factor_values_overlay_root=self.factor_values_overlay_root,
+            factor_values_manifest_root=self.factor_values_manifest_root,
         )
 
     def run_backtest(
@@ -76,4 +86,6 @@ class WorkbenchService:
             transaction_costs=self.transaction_costs,
             sample_splits=self.sample_splits,
             factor_values_root=self.factor_values_root,
+            factor_values_overlay_root=self.factor_values_overlay_root,
+            factor_values_manifest_root=self.factor_values_manifest_root,
         )

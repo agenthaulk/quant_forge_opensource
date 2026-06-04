@@ -19,6 +19,7 @@ class PathSettings:
     data_root: Path = Path("data")
     factor_root: Path = Path("factor_root")
     factor_values_root: Path | None = None
+    factor_values_overlay_root: Path | None = None
     factor_values_manifest_root: Path | None = None
     artifact_root: Path = Path("artifacts")
     output_root: Path = Path("outputs")
@@ -133,6 +134,7 @@ class QuantForgeConfig:
                 data_root=_under(root, self.paths.data_root),
                 factor_root=_under(root, self.paths.factor_root),
                 factor_values_root=_optional_under(root, self.paths.factor_values_root),
+                factor_values_overlay_root=_optional_under(root, self.paths.factor_values_overlay_root),
                 factor_values_manifest_root=_optional_under(root, self.paths.factor_values_manifest_root),
                 artifact_root=_under(root, self.paths.artifact_root),
                 output_root=_under(root, self.paths.output_root),
@@ -167,6 +169,7 @@ def load_config(config_path: Path | None = None, workspace: Path | None = None) 
             data_root=_path_setting(raw, "data_root", default="data"),
             factor_root=_path_setting(raw, "factor_root", default="factor_root"),
             factor_values_root=_optional_path_setting(raw, "factor_values_root"),
+            factor_values_overlay_root=_optional_path_setting(raw, "factor_values_overlay_root"),
             factor_values_manifest_root=_optional_path_setting(raw, "factor_values_manifest_root"),
             artifact_root=_path_setting(raw, "artifact_root", default="artifacts"),
             output_root=_path_setting(raw, "output_root", default="outputs"),

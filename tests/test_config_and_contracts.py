@@ -44,6 +44,7 @@ def test_config_workspace_resolves_paths(tmp_path: Path) -> None:
     assert config.paths.data_root == tmp_path / "data"
     assert config.paths.factor_root == tmp_path / "factor_root"
     assert config.paths.factor_values_root is None
+    assert config.paths.factor_values_overlay_root is None
 
 
 def test_config_resolves_optional_factor_value_paths(tmp_path: Path) -> None:
@@ -52,6 +53,7 @@ def test_config_resolves_optional_factor_value_paths(tmp_path: Path) -> None:
         """
 paths:
   factor_values_root: factor_values
+  factor_values_overlay_root: factor_values_overlay
   factor_values_manifest_root: manifests/factor_values
 """,
         encoding="utf-8",
@@ -60,6 +62,7 @@ paths:
     config = load_config(config_path, workspace=tmp_path)
 
     assert config.paths.factor_values_root == tmp_path / "factor_values"
+    assert config.paths.factor_values_overlay_root == tmp_path / "factor_values_overlay"
     assert config.paths.factor_values_manifest_root == tmp_path / "manifests" / "factor_values"
 
 

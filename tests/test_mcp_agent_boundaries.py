@@ -44,4 +44,25 @@ def test_agent_tools_can_use_factor_value_cache_root(tmp_path: Path) -> None:
     result = tools.evaluate_factor("FTR_DEMO_SMALL_CAP")
 
     assert result["observations"] > 0
-    assert (factor_values_root / "demo_small_cap" / "incremental" / "2024.parquet").exists()
+    assert (factor_values_root / "factor_id=FTR_DEMO_SMALL_CAP" / "incremental" / "2024.parquet").exists()
+
+
+def test_agent_tools_can_write_factor_value_increments_to_overlay(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    factor_values_root = tmp_path / "factor_values_read"
+    factor_values_overlay_root = tmp_path / "factor_values_overlay"
+    tools = AgentWorkspaceTools(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        factor_values_root=factor_values_root,
+        factor_values_overlay_root=factor_values_overlay_root,
+    )
+
+    result = tools.evaluate_factor("FTR_DEMO_SMALL_CAP")
+
+    overlay_factor_dir = factor_values_overlay_root / "factor_id=FTR_DEMO_SMALL_CAP"
+    assert result["observations"] > 0
+    assert result["factor_values_write_path"] == str(overlay_factor_dir)
+    assert (overlay_factor_dir / "incremental" / "2024.parquet").exists()
+    assert not (factor_values_root / "factor_id=FTR_DEMO_SMALL_CAP" / "incremental").exists()

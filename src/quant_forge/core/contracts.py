@@ -147,6 +147,7 @@ class EvaluationResult:
     score_cached_rows: int = 0
     score_computed_rows: int = 0
     factor_values_path: Path | None = None
+    factor_values_write_path: Path | None = None
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
 
@@ -222,6 +223,7 @@ class BacktestResult:
     score_cached_rows: int = 0
     score_computed_rows: int = 0
     factor_values_path: Path | None = None
+    factor_values_write_path: Path | None = None
 
 
 def _optional_iso_date(value: str | None, label: str) -> date | None:

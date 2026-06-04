@@ -1,6 +1,8 @@
 # Configuration
 
-Default public configuration lives in `configs/default.yaml`.
+Default public configuration lives in `configs/default.yaml`. Use
+`configs/mounted.draft.yaml` as the copyable template when the runtime database
+lives on a mounted disk.
 
 ## Runtime Env Files
 
@@ -40,7 +42,7 @@ docs.
 Explicit root flags remain available for advanced workflows:
 
 ```bash
-qf eval-factor FTR_DEMO_SMALL_CAP --data-root ./demo/data --factor-root ./demo/factor_root --artifact-root ./demo/artifacts --factor-values-root ./demo/factor_values
+qf eval-factor FTR_DEMO_SMALL_CAP --data-root ./demo/data --factor-root ./demo/factor_root --artifact-root ./demo/artifacts --factor-values-root ./demo/factor_values --factor-values-manifest-root ./demo/manifests/factor_values
 ```
 
 ## Mounted Database Discovery
@@ -63,12 +65,30 @@ loading merge both sources at read time without copying mounted factors into
 `factor_root`.
 
 `paths.factor_values_root` may point directly at a canonical factor-value root,
-or at a mounted data root containing `canonical/factor=cn_a`. Both canonical
-directories such as `worldquant_alpha_003/2025.parquet` and Hive-style
-directories such as `factor_id=WQ_ALPHA_003/2025Q1.parquet` are recognized.
+or at a mounted data root containing `canonical/factor=cn_a`. Treat this root as
+the read base for existing daily factor values. `paths.factor_values_overlay_root`
+is an optional writable overlay for newly computed increments. The preferred
+factor-value layout is one directory per registered factor:
+
+```text
+factor_values_root/
+  factor_id=<FACTOR_ID>/
+    2025.parquet
+    <FACTOR_ID>.metadata.json
+    incremental/
+      2026.parquet
+```
+
+Legacy directories such as `worldquant_alpha_003/2025.parquet`,
+`alpha_003/2025.parquet`, or a factor-name directory remain readable for
+mounted historical stores, but Quant Forge no longer treats provider or formula
+family names as canonical storage paths. New incremental factor values are
+written under `factor_values_overlay_root/factor_id=<FACTOR_ID>/incremental/YYYY.parquet`
+when an overlay is configured, otherwise they fall back to
+`factor_values_root/factor_id=<FACTOR_ID>/incremental/YYYY.parquet`.
 
 Discovered precomputed factors use a lightweight formula marker such as
-`precomputed:worldquant_alpha_003`. They are cache-only: Quant Forge reads the
+`precomputed:factor_id=WQ_ALPHA_003`. They are cache-only: Quant Forge reads the
 available values, leaves uncovered instruments as missing values, and does not
 attempt to recompute external or complex DSL formulas in the public kernel.
 
@@ -84,27 +104,61 @@ The import writes `factor.yaml` files under `factor_root` with
 `source: precomputed` and `formula: precomputed:<store_key>`. It does not store
 mounted absolute paths in those factor definitions.
 
+To normalize an existing mounted factor-value store without deleting legacy
+directories, run:
+
+```bash
+qf factor normalize-store --config configs/default.local.yaml --dry-run
+qf factor normalize-store --config configs/default.local.yaml --link-files
+```
+
+When a mounted disk contains previous factor-value roots outside the configured
+canonical root, merge them by passing explicit sources or scanning the mounted
+data tree:
+
+```bash
+qf factor normalize-store --config configs/default.local.yaml \
+  --source-factor-values-root <MOUNT_ROOT>/QuantForgeData/facotrs/wq77_hs300_csi500_20250101_20251231/factor_values \
+  --link-files
+
+qf factor normalize-store --config configs/default.local.yaml \
+  --scan-root <MOUNT_ROOT>/QuantForgeData \
+  --link-files
+```
+
+The command creates or updates `factor_id=<FACTOR_ID>` directories and writes a
+portable metadata manifest when `paths.factor_values_manifest_root` is
+configured. `--link-files` uses hardlinks when the mounted filesystem supports
+them, falling back to normal copies if needed.
+
 ## Factor Value Cache
 
 `paths.factor_values_root` is optional. When it is set, evaluation, backtest,
 Workbench, Web, and RD first look for existing factor scores under that root.
-If a factor has complete cached values for a trade date, Quant Forge reuses
-those values and does not execute the formula for that date.
+If `paths.factor_values_overlay_root` is also set, Quant Forge reads the
+canonical root first and the overlay second; overlay values win for duplicate
+`trade_date/instrument` keys. If a factor has complete cached values for a trade
+date, Quant Forge reuses those values and does not execute the formula for that
+date.
 
 If only part of the requested panel is cached, Quant Forge computes the missing
 dates only and writes them to `incremental/YYYY.parquet` sidecars inside the
-matched factor directory. Existing canonical yearly files are not overwritten.
+writable overlay when configured. Existing canonical yearly files are not
+overwritten.
 Quant Forge-owned incremental sidecars include a formula/filter signature, so
 changing a local factor formula recomputes that sidecar instead of reusing stale
 incremental values.
 
 WorldQuant-style names are matched by aliases such as `WQ_ALPHA_003`,
 `alpha_003`, and `worldquant_alpha_003`, so a configured WQ Alpha daily factor
-library can be reused without recomputing those factors.
+library can be reused without recomputing those factors. Alias matching is a
+legacy read-compatibility feature only; it does not change the canonical store
+key exposed to the project.
 
 ```yaml
 paths:
   factor_values_root: factor_values
+  factor_values_overlay_root: factor_values_overlay
   factor_values_manifest_root: manifests/factor_values
 ```
 

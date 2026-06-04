@@ -58,6 +58,8 @@ def run_idea_workflow(
         sample_splits=research_config.sample_splits,
         simulation_profile=research_config.simulation_profile,
         factor_values_root=config.paths.factor_values_root,
+        factor_values_overlay_root=config.paths.factor_values_overlay_root,
+        factor_values_manifest_root=config.paths.factor_values_manifest_root,
     )
     backtest = run_factor_backtest(
         parsed.factor.factor_id,
@@ -69,6 +71,8 @@ def run_idea_workflow(
         transaction_costs=research_config.transaction_costs,
         sample_splits=research_config.sample_splits,
         factor_values_root=config.paths.factor_values_root,
+        factor_values_overlay_root=config.paths.factor_values_overlay_root,
+        factor_values_manifest_root=config.paths.factor_values_manifest_root,
     )
     return _workflow_payload(parsed, evaluation, backtest)
 
@@ -248,6 +252,9 @@ def _run_research_once(
         factor_root=config.paths.factor_root,
         data_root=config.paths.data_root,
         artifact_root=config.paths.artifact_root,
+        factor_values_root=config.paths.factor_values_root,
+        factor_values_overlay_root=config.paths.factor_values_overlay_root,
+        factor_values_manifest_root=config.paths.factor_values_manifest_root,
         simulation_profile=rd_config.simulation_profile,
         simulation_profiles=rd_config.simulation_profiles,
         parameter_search_enabled=rd_config.parameter_search.enabled,
@@ -259,7 +266,6 @@ def _run_research_once(
         horizon_days_matrix=rd_config.horizon_days_matrix,
         sample_splits=rd_config.sample_splits,
         transaction_costs=rd_config.transaction_costs,
-        factor_values_root=config.paths.factor_values_root,
     )
     weights = weights_for_objective(rd_config, objective)
     return service.run_once(
@@ -302,6 +308,8 @@ def _paths_payload(config: QuantForgeConfig) -> dict[str, str]:
         "data_root": str(config.paths.data_root),
         "factor_root": str(config.paths.factor_root),
         "factor_values_root": str(config.paths.factor_values_root or ""),
+        "factor_values_overlay_root": str(config.paths.factor_values_overlay_root or ""),
+        "factor_values_manifest_root": str(config.paths.factor_values_manifest_root or ""),
         "artifact_root": str(config.paths.artifact_root),
     }
 
@@ -329,7 +337,11 @@ def _default_runtime_ready_llm(config: QuantForgeConfig) -> Any:
 
 def _default_seed_factor_id(config: QuantForgeConfig) -> str:
     try:
-        factors = FactorCatalog(config.paths.factor_root, factor_values_root=config.paths.factor_values_root).list()
+        factors = FactorCatalog(
+            config.paths.factor_root,
+            factor_values_root=config.paths.factor_values_root,
+            factor_values_manifest_root=config.paths.factor_values_manifest_root,
+        ).list()
     except Exception:
         return ""
     factor_ids = [factor.factor_id for factor in factors]
@@ -355,6 +367,7 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
     data_root = escape(paths["data_root"])
     factor_root = escape(paths["factor_root"])
     factor_values_root = escape(paths["factor_values_root"])
+    factor_values_overlay_root = escape(paths["factor_values_overlay_root"])
     artifact_root = escape(paths["artifact_root"])
     interval_options = "\n".join(
         f'      <option value="{day}"{_selected_attr(day == research_config.default_interval_days)}>{day}天</option>'
@@ -530,6 +543,7 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
     <p class="meta">data_root: {data_root}</p>
     <p class="meta">factor_root: {factor_root}</p>
     <p class="meta">factor_values_root: {factor_values_root or '未配置'}</p>
+    <p class="meta">factor_values_overlay_root: {factor_values_overlay_root or '未配置'}</p>
     <p class="meta">artifact_root: {artifact_root}</p>
     <label for="idea">因子观点</label>
     <textarea id="idea">非ST的小市值股票未来表现更好</textarea>

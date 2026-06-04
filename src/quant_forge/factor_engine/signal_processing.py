@@ -24,6 +24,7 @@ def prepare_factor_scores(
     factor_id: str | None = None,
     factor_name: str | None = None,
     factor_values_root: Path | None = None,
+    factor_values_overlay_root: Path | None = None,
 ) -> pd.DataFrame:
     return prepare_factor_scores_result(
         panel,
@@ -33,6 +34,7 @@ def prepare_factor_scores(
         factor_id=factor_id,
         factor_name=factor_name,
         factor_values_root=factor_values_root,
+        factor_values_overlay_root=factor_values_overlay_root,
     ).scores
 
 
@@ -45,13 +47,16 @@ def prepare_factor_scores_result(
     factor_id: str | None = None,
     factor_name: str | None = None,
     factor_values_root: Path | None = None,
+    factor_values_overlay_root: Path | None = None,
 ) -> FactorScoreResult:
     simulation_profile = profile or SimulationProfile()
     _validate_profile(simulation_profile)
     working_panel = apply_test_period(panel, simulation_profile)
     cache_only = is_precomputed_formula(formula)
-    if factor_values_root is not None and factor_id is not None:
-        score_result = FactorValueStore(factor_values_root).prepare_scores(
+    read_root = factor_values_root or factor_values_overlay_root
+    factor_values_write_path = None
+    if read_root is not None and factor_id is not None:
+        score_result = FactorValueStore(read_root, write_root=factor_values_overlay_root).prepare_scores(
             working_panel,
             factor_id=factor_id,
             factor_name=factor_name or factor_id,
@@ -64,8 +69,9 @@ def prepare_factor_scores_result(
         cached_rows = score_result.cached_rows
         computed_rows = score_result.computed_rows
         factor_values_path = score_result.factor_values_path
+        factor_values_write_path = score_result.factor_values_write_path
     elif cache_only:
-        raise ValueError("precomputed factors require factor_values_root")
+        raise ValueError("precomputed factors require factor_values_root or factor_values_overlay_root")
     else:
         scores = execute_factor_formula(working_panel, formula, universe_filters)
         source = "computed_formula"
@@ -85,6 +91,7 @@ def prepare_factor_scores_result(
         cached_rows=cached_rows,
         computed_rows=computed_rows,
         factor_values_path=factor_values_path,
+        factor_values_write_path=factor_values_write_path,
     )
 
 

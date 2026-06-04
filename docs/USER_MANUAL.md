@@ -198,6 +198,7 @@ Use these templates when creating your own config files:
 创建自己的配置文件时，可复制这些模板：
 
 - `configs/default.draft.yaml`
+- `configs/mounted.draft.yaml`
 - `configs/rd.draft.yaml`
 
 Recommended pattern:
@@ -208,6 +209,27 @@ Recommended pattern:
 cp configs/default.draft.yaml configs/my_default.yaml
 cp configs/rd.draft.yaml configs/my_rd.yaml
 ```
+
+For a portable mounted-disk setup, start from the mounted template instead:
+
+如果希望数据、因子定义和日频因子值随移动硬盘走，请从 mounted 模板开始：
+
+```bash
+cp configs/mounted.draft.yaml configs/default.local.yaml
+# edit <MOUNT_ROOT>, then scan and normalize existing factor-value roots
+qf factor normalize-store --config configs/default.local.yaml --scan-root <MOUNT_ROOT>/QuantForgeData --link-files
+qf doctor --config configs/default.local.yaml --rd-config configs/rd.yaml
+```
+
+The mounted layout should keep `factor_root`, `data/panel.parquet`, artifacts,
+and the writable `factor_values_overlay` under a stable workbench directory on
+the drive, while read-base daily factor values live under
+`canonical/factor=cn_a/factor_id=<FACTOR_ID>`.
+
+移动硬盘布局建议把 `factor_root`、`data/panel.parquet`、artifacts 和可写的
+`factor_values_overlay` 放在盘上的稳定 workbench 目录，已有日频因子值统一放在
+`canonical/factor=cn_a/factor_id=<FACTOR_ID>`。这样 canonical 可以作为只读基底，
+新增缺失日期只写入 overlay。
 
 Do not commit machine-local config files if they contain local paths or private
 runtime choices.

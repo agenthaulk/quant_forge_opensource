@@ -196,8 +196,12 @@ def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
         sample_splits,
         simulation_profile,
         factor_values_root,
+        factor_values_overlay_root,
+        factor_values_manifest_root,
     ):
         assert factor_values_root == config.paths.factor_values_root
+        assert factor_values_overlay_root == config.paths.factor_values_overlay_root
+        assert factor_values_manifest_root == config.paths.factor_values_manifest_root
         captured["horizon_days"] = horizon_days
         captured["horizon_count"] = len(horizon_days_matrix)
         captured["split_count"] = len(sample_splits)
@@ -245,11 +249,15 @@ def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
         transaction_costs,
         sample_splits,
         factor_values_root,
+        factor_values_overlay_root,
+        factor_values_manifest_root,
     ):
         assert holding_days == 11
         assert transaction_costs.commission_bps == 0.0
         assert len(sample_splits) == 3
         assert factor_values_root == config.paths.factor_values_root
+        assert factor_values_overlay_root == config.paths.factor_values_overlay_root
+        assert factor_values_manifest_root == config.paths.factor_values_manifest_root
         captured["top_quantile_basis_points"] = int(simulation_profile.top_quantile * 10000)
         return fake_run_factor_backtest(
             factor_id,

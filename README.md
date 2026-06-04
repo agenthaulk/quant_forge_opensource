@@ -21,6 +21,8 @@ source-available 许可证，之后自动转为 Apache-2.0。
 - Lightweight next-trading-day factor backtest / 次交易日执行语义的轻量回测
 - RD loop with smoke gates, objective weights, and optional successive halving /
   带门槛、权重和可选 successive halving 参数搜索的 RD 循环
+- Mounted-disk factor database for portable daily factor values /
+  可随移动硬盘迁移的日频因子值数据库
 - Local Web UI and CLI / 本地 Web 与命令行
 - Markdown research report output / 本地 Markdown 研究报告
 
@@ -123,6 +125,7 @@ Missing API key for active LLM provider deepseek. Expected environment variable:
 | `configs/default.yaml` | Runtime paths, local web settings, simulation defaults, LLM provider registry. |
 | `configs/rd.yaml` | RD objective, gates, sample splits, horizon matrix, parameter search settings. |
 | `configs/default.draft.yaml` | Copyable runtime config template with explanatory comments. |
+| `configs/mounted.draft.yaml` | Copyable mounted-disk config template for portable factor/data roots. |
 | `configs/rd.draft.yaml` | Copyable RD config template with explanatory comments. |
 | `.env.example` | Environment variable names only; copy to an ignored local env file if desired. |
 
@@ -131,6 +134,7 @@ Missing API key for active LLM provider deepseek. Expected environment variable:
 | `configs/default.yaml` | 运行路径、本地 Web、模拟参数、大模型供应商注册表。 |
 | `configs/rd.yaml` | RD 目标、门槛、样本切分、周期矩阵、参数搜索配置。 |
 | `configs/default.draft.yaml` | 可复制的运行配置模板，带注释说明。 |
+| `configs/mounted.draft.yaml` | 可复制的移动硬盘配置模板，用于随盘因子和数据根目录。 |
 | `configs/rd.draft.yaml` | 可复制的 RD 配置模板，带注释说明。 |
 | `.env.example` | 只放环境变量名；如需本地使用可复制为被忽略的环境文件。 |
 
@@ -142,6 +146,43 @@ Read the full bilingual guide:
 - [Architecture / 架构说明](docs/architecture.md)
 - [Configuration Reference / 配置参考](docs/configuration.md)
 - [Integration Workflow / 联调流程](docs/integration_workflow.md)
+
+## Mounted Factor Database / 移动硬盘因子库
+
+For a fresh checkout on another computer, keep runtime state on the mounted
+drive and point an ignored local config at it:
+
+```bash
+cp configs/mounted.draft.yaml configs/default.local.yaml
+# edit <MOUNT_ROOT> and optional LLM env file settings
+qf factor normalize-store --config configs/default.local.yaml --scan-root <MOUNT_ROOT>/QuantForgeData --link-files
+qf doctor --config configs/default.local.yaml --rd-config configs/rd.yaml
+qf factor list --config configs/default.local.yaml
+```
+
+Recommended mounted layout:
+
+```text
+QuantForgeData/
+  workbenches/quant_forge_opensource/
+    data/panel.parquet
+    factor_root/
+    artifacts/
+    outputs/
+    factor_values_overlay/
+  canonical/factor=cn_a/factor_id=<FACTOR_ID>/
+  catalog/manifests/market=cn_a/dataset=factor_values/
+```
+
+`factor_root` stores factor definitions and formulas. `canonical/factor=cn_a`
+stores read-base daily factor values. `factor_values_overlay` stores new local
+incremental values when the canonical store should remain read-only. The
+manifest directory stores portable metadata and must not contain machine-local
+paths.
+
+如果换一台电脑，只需要拉取代码、插入移动硬盘、复制并编辑
+`configs/mounted.draft.yaml`。`factor normalize-store --scan-root` 会扫描盘上
+已有的前序因子值目录，并非破坏性地合并到 `factor_id=<FACTOR_ID>` 规范目录。
 
 ## Data Contract / 数据契约
 
