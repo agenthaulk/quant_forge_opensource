@@ -123,16 +123,16 @@ def create_local_web_server(
             elif self.path == "/catalog":
                 self._json({"fields": list_available_fields(), "operators": list_available_operators()})
             elif self.path == "/api/status":
-                default_llm = _default_runtime_ready_llm(config)
+                active_llm = _active_llm(config)
                 self._json(
                     {
                         "name": "Quant Forge",
                         "paths": _paths_payload(config),
                         "llm": {
-                            "provider": default_llm.provider,
-                            "model": default_llm.model,
-                            "api_key_env": default_llm.api_key_env,
-                            "providers": _runtime_ready_provider_options(config),
+                            "provider": active_llm.provider,
+                            "model": active_llm.model,
+                            "api_key_env": active_llm.api_key_env,
+                            "providers": _llm_provider_options(config),
                         },
                     }
                 )
@@ -314,25 +314,27 @@ def _paths_payload(config: QuantForgeConfig) -> dict[str, str]:
     }
 
 
-def _runtime_ready_provider_options(config: QuantForgeConfig) -> tuple[dict[str, str], ...]:
+def _llm_provider_options(config: QuantForgeConfig) -> tuple[dict[str, str], ...]:
     options: list[dict[str, str]] = []
     for option in config.llm.public_provider_options():
-        try:
-            validate_llm_runtime(config.llm, option["provider"])
-        except RuntimeError:
-            continue
-        options.append(option)
+        runtime_ready, runtime_error = _llm_runtime_status(config, option["provider"])
+        enriched = dict(option)
+        enriched["runtime_ready"] = "true" if runtime_ready else "false"
+        enriched["runtime_error"] = runtime_error
+        options.append(enriched)
     return tuple(options)
 
 
-def _default_runtime_ready_llm(config: QuantForgeConfig) -> Any:
-    provider_options = _runtime_ready_provider_options(config)
-    available_provider_names = {option["provider"] for option in provider_options}
-    if config.llm.provider not in {"rule", "deterministic"} and config.llm.provider in available_provider_names:
-        return config.llm.select_provider(config.llm.provider)
-    if provider_options:
-        return config.llm.select_provider(provider_options[0]["provider"])
-    return config.llm.select_provider("rule")
+def _llm_runtime_status(config: QuantForgeConfig, provider: str) -> tuple[bool, str]:
+    try:
+        validate_llm_runtime(config.llm, provider)
+    except RuntimeError as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def _active_llm(config: QuantForgeConfig) -> Any:
+    return config.llm.select_provider()
 
 
 def _default_seed_factor_id(config: QuantForgeConfig) -> str:
@@ -354,15 +356,24 @@ def _selected_attr(selected: bool) -> str:
     return " selected" if selected else ""
 
 
+def _provider_readiness_label(option: dict[str, str]) -> str:
+    if option.get("runtime_ready") == "true":
+        return " · env " + option["api_key_env"] if option["api_key_env"] else " · no auth"
+    api_key_env = option.get("api_key_env", "")
+    if api_key_env:
+        return " · missing env " + api_key_env
+    return " · not ready"
+
+
 def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None = None) -> str:
     research_config = rd_config or load_research_loop_config(DEFAULT_RD_CONFIG_PATH, config.research, config.simulation)
     paths = _paths_payload(config)
-    provider_options = _runtime_ready_provider_options(config)
-    default_llm = _default_runtime_ready_llm(config)
-    default_provider = default_llm.provider if default_llm.provider not in {"rule", "deterministic"} else ""
-    provider = escape(default_llm.provider)
-    model = escape(default_llm.model)
-    parser_label = escape(default_provider or "未配置可用 LLM")
+    provider_options = _llm_provider_options(config)
+    active_llm = _active_llm(config)
+    active_provider = active_llm.provider if active_llm.provider not in {"rule", "deterministic"} else ""
+    provider = escape(active_llm.provider)
+    model = escape(active_llm.model)
+    parser_label = escape(active_provider or "未配置 LLM provider")
     seed_factor_id = escape(_default_seed_factor_id(config))
     data_root = escape(paths["data_root"])
     factor_root = escape(paths["factor_root"])
@@ -385,9 +396,9 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
     llm_provider_options = "\n".join(
         (
             f'      <option value="{escape(option["provider"])}"'
-            f'{_selected_attr(option["provider"] == default_provider)}>'
+            f'{_selected_attr(option["provider"] == active_provider)}>'
             f'{escape(option["provider"])} / {escape(option["model"])}'
-            f'{escape(" · env " + option["api_key_env"] if option["api_key_env"] else " · no auth")}</option>'
+            f'{escape(_provider_readiness_label(option))}</option>'
         )
         for option in provider_options
     )

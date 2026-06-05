@@ -13,7 +13,6 @@ from quant_forge.config import (
     PathSettings,
     QuantForgeConfig,
     load_config,
-    validate_any_llm_runtime,
     validate_llm_runtime,
 )
 from quant_forge.data.local import create_demo_workspace, validate_data_root
@@ -412,7 +411,6 @@ def _cmd_web(args: argparse.Namespace) -> int:
 
     config = load_config(args.config, args.workspace)
     rd_config = load_research_loop_config(args.rd_config, config.research, config.simulation)
-    validate_any_llm_runtime(config.llm)
     host = args.host or config.web.host
     port = args.port or config.web.port
     run_local_web(host=host, port=port, config=config, rd_config=rd_config)

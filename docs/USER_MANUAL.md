@@ -250,6 +250,15 @@ llm:
       api_key_env: DEEPSEEK_API_KEY
 ```
 
+The active `llm.provider` is the shared LLM setting for natural-language factor
+parsing and any LLM-backed RD adapter. The default public RD loop is still
+deterministic, but when RD LLM optimization is enabled it should reuse this
+same provider/key instead of asking for a second key.
+
+当前 `llm.provider` 是自然语言因子解析和 RD LLM adapter 共用的大模型配置。公开默认
+RD 循环仍是本地规则/确定性实现；如果启用 RD LLM 优化，也应复用同一个
+provider/key，而不是再配置第二套 key。
+
 Local ignored env file:
 
 本地忽略 env 文件：
@@ -262,6 +271,13 @@ chmod 600 configs/default.local.env
 qf doctor --config configs/default.local.yaml --rd-config configs/rd.yaml
 qf web --config configs/default.local.yaml --rd-config configs/rd.yaml
 ```
+
+`qf web` can start before the key is available. The key is checked only when you
+choose LLM parsing or an LLM-backed RD action; local rule parsing remains an
+explicit separate mode.
+
+即使 key 尚未加载，`qf web` 也可以先启动。只有选择 LLM 解析或 LLM-backed RD
+动作时才会检查 key；本地规则解析始终是明确标注的独立模式。
 
 If parsing fails with a missing key error, check:
 

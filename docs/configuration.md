@@ -164,9 +164,15 @@ paths:
 
 ## Local LLM Parsing
 
-The local web adapter switches LLM access by the provider selected in the
-front-end. `llm.provider` is the default selection, while `llm.providers`
-declares every provider that may appear in the Web UI.
+The local web adapter uses one active LLM provider by default. `llm.provider`
+selects the shared provider for LLM natural-language parsing and any RD LLM
+features that are enabled by an adapter. The current public RD loop remains
+deterministic unless such an adapter is supplied, but it should reuse this same
+LLM configuration rather than requiring a second key.
+
+`llm.providers` declares provider entries that may appear in the Web UI. Keep
+the default config to one provider/key unless you intentionally want users to
+choose among multiple providers.
 
 Store only environment variable names in configuration. For the local Web
 workbench, the actual key should stay in a declared ignored local env file.
@@ -185,22 +191,6 @@ llm:
       model: deepseek-chat
       base_url: https://api.deepseek.com
       api_key_env: DEEPSEEK_API_KEY
-    glm:
-      model: glm-5.1
-      base_url: https://open.bigmodel.cn/api/paas/v4
-      api_key_env: GLM_API_KEY
-    openai:
-      model: gpt-4o-mini
-      base_url: https://api.openai.com/v1
-      api_key_env: OPENAI_API_KEY
-    minimax:
-      model: MiniMax-M2
-      base_url: https://api.minimax.io/v1
-      api_key_env: MINIMAX_API_KEY
-    claude:
-      model: claude-sonnet-4-5
-      base_url: https://api.anthropic.com
-      api_key_env: ANTHROPIC_API_KEY
 ```
 
 Supported provider entries:
@@ -280,6 +270,10 @@ variable is not set when parsing starts, the parser fails with a message like
 variable: DEEPSEEK_API_KEY.` For local providers with `require_api_key` set to `false`,
 `api_key_env` is optional and no Authorization header is sent.
 
+`qf web` starts even when the active cloud provider's key is not loaded yet, so
+the user can inspect local status or choose rule parsing. The key is validated
+when an LLM parse or LLM-backed RD action is actually requested.
+
 Example local setup:
 
 ```bash
@@ -292,6 +286,10 @@ qf web --config configs/default.local.yaml --rd-config configs/rd.yaml
 
 Default RD settings live in `configs/rd.yaml`. They are public, local, and
 explicit:
+
+RD uses the main `llm` config when an LLM-backed research adapter is supplied.
+Do not create a separate RD API key for the same provider; keep one active
+`llm.provider` and one matching `api_key_env`.
 
 ```yaml
 objective: balanced

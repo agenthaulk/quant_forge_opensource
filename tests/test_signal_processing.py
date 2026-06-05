@@ -4,6 +4,7 @@ import pandas as pd
 
 from quant_forge.core.contracts import SimulationProfile
 from quant_forge.factor_engine.signal_processing import prepare_factor_scores, prepare_factor_scores_result
+from quant_forge.factor_engine.value_store import _formula_signature
 
 
 def test_prepare_factor_scores_applies_test_period_and_ewma_decay() -> None:
@@ -56,7 +57,7 @@ def test_prepare_factor_scores_reuses_existing_worldquant_daily_values(tmp_path)
 
     result = prepare_factor_scores_result(
         panel,
-        "missing_field",
+        "precomputed:worldquant_alpha_003",
         factor_id="WQ_ALPHA_003",
         factor_name="alpha_003",
         factor_values_root=tmp_path,
@@ -117,7 +118,7 @@ def test_prepare_factor_scores_ignores_root_period_parquet_files(tmp_path) -> No
 
     result = prepare_factor_scores_result(
         panel,
-        "missing_field",
+        "precomputed:factor_id=WQ_ALPHA_003",
         factor_id="WQ_ALPHA_003",
         factor_name="alpha_003",
         factor_values_root=tmp_path,
@@ -131,10 +132,12 @@ def test_prepare_factor_scores_computes_and_persists_only_missing_dates(tmp_path
     panel = _two_day_panel()
     factor_dir = tmp_path / "factor_id=FTR_PARTIAL"
     factor_dir.mkdir()
+    signature = _formula_signature("FTR_PARTIAL", "rank(market_cap)", ())
     pd.DataFrame(
         {
             "trade_date": ["2025-01-02", "2025-01-02"],
             "instrument": ["AAA", "BBB"],
+            "formula_signature": [signature, signature],
             "factor_value": [10.0, 20.0],
         }
     ).to_parquet(factor_dir / "2025.parquet", index=False)
@@ -159,16 +162,48 @@ def test_prepare_factor_scores_computes_and_persists_only_missing_dates(tmp_path
     assert incremental["formula_signature"].nunique() == 1
 
 
+def test_prepare_factor_scores_ignores_unsigned_root_cache_for_formula_factor(tmp_path) -> None:
+    panel = _two_day_panel()
+    factor_dir = tmp_path / "factor_id=FTR_UNSIGNED_ROOT"
+    factor_dir.mkdir()
+    pd.DataFrame(
+        {
+            "trade_date": ["2025-01-02", "2025-01-02", "2025-01-03", "2025-01-03"],
+            "instrument": ["AAA", "BBB", "AAA", "BBB"],
+            "factor_value": [9.0, 9.0, 9.0, 9.0],
+        }
+    ).to_parquet(factor_dir / "2025.parquet", index=False)
+
+    result = prepare_factor_scores_result(
+        panel,
+        "rank(market_cap)",
+        factor_id="FTR_UNSIGNED_ROOT",
+        factor_name="FTR_UNSIGNED_ROOT",
+        factor_values_root=tmp_path,
+    )
+
+    assert result.source == "factor_values_incremental"
+    assert result.cached_rows == 0
+    assert result.computed_rows == 4
+    assert list(result.scores["score"]) == [0.5, 1.0, 0.5, 1.0]
+
+    incremental = pd.read_parquet(factor_dir / "incremental" / "2025.parquet")
+    assert incremental["formula_signature"].nunique() == 1
+    assert set(incremental["factor_value"]) == {0.5, 1.0}
+
+
 def test_prepare_factor_scores_writes_missing_dates_to_overlay(tmp_path) -> None:
     panel = _two_day_panel()
     read_root = tmp_path / "canonical"
     overlay_root = tmp_path / "overlay"
     read_factor_dir = read_root / "factor_id=FTR_PARTIAL"
     read_factor_dir.mkdir(parents=True)
+    signature = _formula_signature("FTR_PARTIAL", "rank(market_cap)", ())
     pd.DataFrame(
         {
             "trade_date": ["2025-01-02", "2025-01-02"],
             "instrument": ["AAA", "BBB"],
+            "formula_signature": [signature, signature],
             "factor_value": [10.0, 20.0],
         }
     ).to_parquet(read_factor_dir / "2025.parquet", index=False)
@@ -200,10 +235,12 @@ def test_prepare_factor_scores_prefers_overlay_values_over_canonical(tmp_path) -
     overlay_factor_dir = overlay_root / "factor_id=FTR_OVERLAY"
     read_factor_dir.mkdir(parents=True)
     overlay_factor_dir.mkdir(parents=True)
+    signature = _formula_signature("FTR_OVERLAY", "rank(market_cap)", ())
     pd.DataFrame(
         {
             "trade_date": ["2025-01-02", "2025-01-02"],
             "instrument": ["AAA", "BBB"],
+            "formula_signature": [signature, signature],
             "factor_value": [1.0, 1.0],
         }
     ).to_parquet(read_factor_dir / "2025.parquet", index=False)
@@ -211,6 +248,7 @@ def test_prepare_factor_scores_prefers_overlay_values_over_canonical(tmp_path) -
         {
             "trade_date": ["2025-01-02", "2025-01-02"],
             "instrument": ["AAA", "BBB"],
+            "formula_signature": [signature, signature],
             "factor_value": [2.0, 3.0],
         }
     ).to_parquet(overlay_factor_dir / "2025.parquet", index=False)
@@ -254,7 +292,7 @@ def test_prepare_factor_scores_prefers_canonical_worldquant_alias(tmp_path) -> N
 
     result = prepare_factor_scores_result(
         panel,
-        "missing_field",
+        "precomputed:factor_id=WQ_ALPHA_003",
         factor_id="WQ_ALPHA_003",
         factor_name="alpha_003",
         factor_values_root=tmp_path,
@@ -280,7 +318,7 @@ def test_prepare_factor_scores_keeps_legacy_worldquant_readable_without_canonica
 
     result = prepare_factor_scores_result(
         panel,
-        "missing_field",
+        "precomputed:worldquant_alpha_003",
         factor_id="WQ_ALPHA_003",
         factor_name="alpha_003",
         factor_values_root=tmp_path,
@@ -295,10 +333,12 @@ def test_prepare_factor_scores_recomputes_dates_with_bad_cached_values(tmp_path)
     panel = _two_day_panel()
     factor_dir = tmp_path / "factor_id=FTR_BAD_CACHE"
     factor_dir.mkdir()
+    signature = _formula_signature("FTR_BAD_CACHE", "rank(market_cap)", ())
     pd.DataFrame(
         {
             "trade_date": ["2025-01-02", "2025-01-02", "2025-01-03", "2025-01-03"],
             "instrument": ["AAA", "BBB", "AAA", "BBB"],
+            "formula_signature": [signature, signature, signature, signature],
             "factor_value": [None, 20.0, 30.0, 40.0],
         }
     ).to_parquet(factor_dir / "2025.parquet", index=False)
@@ -329,10 +369,12 @@ def test_prepare_factor_scores_recomputes_when_filtered_instruments_are_missing(
     )
     factor_dir = tmp_path / "factor_id=FTR_FILTERED_CACHE"
     factor_dir.mkdir()
+    signature = _formula_signature("FTR_FILTERED_CACHE", "rank(market_cap)", ("is_st == false",))
     pd.DataFrame(
         {
             "trade_date": ["2025-01-02", "2025-01-02"],
             "instrument": ["CCC", "DDD"],
+            "formula_signature": [signature, signature],
             "factor_value": [30.0, 40.0],
         }
     ).to_parquet(factor_dir / "2025.parquet", index=False)

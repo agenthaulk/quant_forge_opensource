@@ -30,13 +30,7 @@ def test_default_config_uses_relative_paths() -> None:
     assert config.simulation.top_quantile == 0.3
     assert config.llm.provider == "deepseek"
     assert config.llm.select_provider("deepseek").api_key_env == "DEEPSEEK_API_KEY"
-    assert {option["provider"] for option in config.llm.public_provider_options()} >= {
-        "openai",
-        "glm",
-        "deepseek",
-        "minimax",
-        "claude",
-    }
+    assert {option["provider"] for option in config.llm.public_provider_options()} == {"deepseek"}
 
 
 def test_config_workspace_resolves_paths(tmp_path: Path) -> None:

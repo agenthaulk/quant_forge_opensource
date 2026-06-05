@@ -8,6 +8,7 @@ import urllib.request
 
 import pytest
 
+import quant_forge.apps.cli.main as cli_main
 import quant_forge.apps.web.server as web_server
 from quant_forge.apps.web.server import create_local_web_server, run_idea_workflow, run_research_once_workflow
 from quant_forge.config import LLMProviderSettings, LLMSettings, PathSettings, QuantForgeConfig
@@ -172,6 +173,47 @@ def test_web_research_scheduler_http_start_stop_and_validation(tmp_path) -> None
         thread.join(timeout=2.0)
 
 
+def test_web_status_keeps_active_llm_provider_when_key_is_missing(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("QF_TEST_DEEPSEEK_KEY", raising=False)
+    monkeypatch.setenv("QF_TEST_GLM_KEY", "set")
+    config = QuantForgeConfig(
+        llm=LLMSettings(
+            provider="deepseek",
+            providers={
+                "deepseek": LLMProviderSettings(
+                    provider="deepseek",
+                    model="fake-deepseek",
+                    base_url="http://localhost/deepseek",
+                    api_key_env="QF_TEST_DEEPSEEK_KEY",
+                ),
+                "glm": LLMProviderSettings(
+                    provider="glm",
+                    model="fake-glm",
+                    base_url="http://localhost/glm",
+                    api_key_env="QF_TEST_GLM_KEY",
+                ),
+            },
+        )
+    ).resolve(tmp_path / "demo")
+    server = create_local_web_server(host="127.0.0.1", port=0, config=config)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        status = _get_json(f"{base_url}/api/status")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+    assert status["llm"]["provider"] == "deepseek"
+    providers = {provider["provider"]: provider for provider in status["llm"]["providers"]}
+    assert providers["deepseek"]["runtime_ready"] == "false"
+    assert "QF_TEST_DEEPSEEK_KEY" in providers["deepseek"]["runtime_error"]
+    assert providers["glm"]["runtime_ready"] == "true"
+
+
 def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
     paths = create_demo_workspace(tmp_path / "demo")
     config = QuantForgeConfig().resolve(tmp_path / "demo")
@@ -292,6 +334,40 @@ def test_web_llm_mode_does_not_silently_fallback_to_rule_parser(tmp_path) -> Non
         run_idea_workflow(config, "小市值", parser_mode="llm")
 
 
+def test_cli_web_startup_does_not_validate_active_llm_key(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("QF_MISSING_WEB_START_KEY", raising=False)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+llm:
+  provider: deepseek
+  providers:
+    deepseek:
+      model: deepseek-chat
+      base_url: https://api.deepseek.com
+      api_key_env: QF_MISSING_WEB_START_KEY
+""",
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run_local_web(*, host, port, config, rd_config):
+        captured["host"] = host
+        captured["port"] = port
+        captured["provider"] = config.llm.provider
+        captured["rd_objective"] = rd_config.objective
+
+    monkeypatch.setattr(web_server, "run_local_web", fake_run_local_web)
+
+    assert cli_main.main(["web", "--config", str(config_path), "--port", "8766"]) == 0
+    assert captured == {
+        "host": "127.0.0.1",
+        "port": 8766,
+        "provider": "deepseek",
+        "rd_objective": "balanced",
+    }
+
+
 def test_web_workbench_uses_selected_llm_provider(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("QF_TEST_GLM_KEY", "set")
     create_demo_workspace(tmp_path / "demo")
@@ -336,7 +412,7 @@ def test_web_workbench_uses_selected_llm_provider(monkeypatch, tmp_path) -> None
     assert result["parser"]["provider"] == "glm"
 
 
-def test_web_html_only_exposes_runtime_ready_llm_providers(monkeypatch, tmp_path) -> None:
+def test_web_html_keeps_active_llm_provider_visible_when_key_is_missing(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("QF_TEST_DEEPSEEK_KEY", raising=False)
     monkeypatch.setenv("QF_TEST_GLM_KEY", "set")
     config = QuantForgeConfig(
@@ -361,9 +437,12 @@ def test_web_html_only_exposes_runtime_ready_llm_providers(monkeypatch, tmp_path
 
     html = web_server._index_html(config)
 
-    assert "LLM: glm / fake-glm" in html
-    assert '<option value="deepseek"' not in html
-    assert '<option value="glm" selected>glm / fake-glm · env QF_TEST_GLM_KEY</option>' in html
+    assert "LLM: deepseek / fake-deepseek" in html
+    assert (
+        '<option value="deepseek" selected>deepseek / fake-deepseek · missing env QF_TEST_DEEPSEEK_KEY</option>'
+        in html
+    )
+    assert '<option value="glm">glm / fake-glm · env QF_TEST_GLM_KEY</option>' in html
 
 
 def test_web_html_uses_existing_factor_as_default_rd_seed(tmp_path) -> None:
@@ -421,4 +500,9 @@ def _post_json(url: str, payload: dict) -> dict:
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=10) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _get_json(url: str) -> dict:
+    with urllib.request.urlopen(url, timeout=10) as response:
         return json.loads(response.read().decode("utf-8"))

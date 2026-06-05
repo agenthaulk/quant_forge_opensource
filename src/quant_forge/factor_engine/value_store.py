@@ -55,6 +55,7 @@ class FactorValueStore:
             factor_paths.read_dirs,
             factor_id=factor_id,
             formula_signature=formula_signature,
+            allow_unsigned_root_values=cache_only,
         )
         panel_keys = _score_keys(panel)
         required_keys = _required_score_keys(panel, universe_filters)
@@ -132,6 +133,7 @@ class FactorValueStore:
         *,
         factor_id: str,
         formula_signature: str,
+        allow_unsigned_root_values: bool = False,
     ) -> pd.DataFrame:
         """Read cached factor values from canonical and overlay directories."""
 
@@ -144,6 +146,7 @@ class FactorValueStore:
                     path,
                     factor_id=factor_id,
                     formula_signature=formula_signature,
+                    allow_unsigned_root_values=allow_unsigned_root_values,
                 )
                 if not frame.empty:
                     frames.append(frame)
@@ -238,7 +241,13 @@ def _is_yearly_factor_value_file(path: Path) -> bool:
     return not path.name.startswith("._") and re.fullmatch(r"\d{4}\.parquet", path.name) is not None
 
 
-def _read_score_file(path: Path, *, factor_id: str | None = None, formula_signature: str | None = None) -> pd.DataFrame:
+def _read_score_file(
+    path: Path,
+    *,
+    factor_id: str | None = None,
+    formula_signature: str | None = None,
+    allow_unsigned_root_values: bool = False,
+) -> pd.DataFrame:
     if not path.exists() or path.name.startswith("._"):
         return _empty_scores()
     raw = pd.read_parquet(path)
@@ -249,7 +258,7 @@ def _read_score_file(path: Path, *, factor_id: str | None = None, formula_signat
     if formula_signature is not None:
         if "formula_signature" in raw.columns:
             raw = raw[raw["formula_signature"].astype(str) == formula_signature]
-        elif path.parent.name == "incremental":
+        elif path.parent.name == "incremental" or not allow_unsigned_root_values:
             return _empty_scores()
     if raw.empty:
         return _empty_scores()

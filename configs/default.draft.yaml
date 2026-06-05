@@ -63,6 +63,8 @@ simulation:
 llm:
   # Use "rule" for deterministic local parsing with no external API call.
   # Other supported names: openai, openai_compatible, glm, deepseek, minimax, claude.
+  # When you enable LLM mode, use one active provider/key for both LLM parsing
+  # and RD LLM features. Add extra providers only if you want Web choices.
   provider: rule
   timeout_seconds: 30
   providers:
@@ -70,24 +72,3 @@ llm:
       model: deepseek-chat
       base_url: https://api.deepseek.com
       api_key_env: DEEPSEEK_API_KEY
-    glm:
-      model: glm-5.1
-      base_url: https://open.bigmodel.cn/api/paas/v4
-      api_key_env: GLM_API_KEY
-    openai:
-      model: gpt-4o-mini
-      base_url: https://api.openai.com/v1
-      api_key_env: OPENAI_API_KEY
-    minimax:
-      model: MiniMax-M2
-      base_url: https://api.minimax.io/v1
-      api_key_env: MINIMAX_API_KEY
-    claude:
-      model: claude-sonnet-4-5
-      base_url: https://api.anthropic.com
-      api_key_env: ANTHROPIC_API_KEY
-    openai_compatible:
-      provider: openai_compatible
-      model: <model-name>
-      base_url: <https://host.example/v1>
-      api_key_env: OPENAI_COMPATIBLE_API_KEY
