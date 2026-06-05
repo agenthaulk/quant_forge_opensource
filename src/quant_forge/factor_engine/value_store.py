@@ -49,7 +49,7 @@ class FactorValueStore:
         universe_filters: tuple[str, ...],
         cache_only: bool = False,
     ) -> FactorScoreResult:
-        factor_paths = self._resolve_factor_paths(factor_id=factor_id, factor_name=factor_name)
+        factor_paths = self._resolve_factor_paths(factor_id=factor_id, factor_name=factor_name, formula=formula)
         formula_signature = _formula_signature(factor_id, formula, universe_filters)
         cached = self.read_factor_values(
             factor_paths.read_dirs,
@@ -109,8 +109,14 @@ class FactorValueStore:
             factor_values_write_path=factor_paths.write_dir,
         )
 
-    def _resolve_factor_paths(self, *, factor_id: str, factor_name: str) -> _ResolvedFactorValuePaths:
-        candidates = _factor_dir_candidates(factor_id=factor_id, factor_name=factor_name)
+    def _resolve_factor_paths(
+        self,
+        *,
+        factor_id: str,
+        factor_name: str,
+        formula: str,
+    ) -> _ResolvedFactorValuePaths:
+        candidates = _factor_dir_candidates(factor_id=factor_id, factor_name=factor_name, formula=formula)
         existing_read_dir = _find_existing_factor_dir(self.root, candidates)
         existing_write_dir = _find_existing_factor_dir(self.write_root, candidates)
         write_dir = existing_write_dir or self.write_root / _canonical_factor_dir_name(factor_id or factor_name)
@@ -213,11 +219,23 @@ def _empty_scores() -> pd.DataFrame:
 
 
 def _factor_value_files(factor_dir: Path) -> list[Path]:
-    files = [path for path in sorted(factor_dir.glob("*.parquet")) if not path.name.startswith("._")]
+    files = [
+        path
+        for path in sorted(factor_dir.glob("*.parquet"))
+        if _is_yearly_factor_value_file(path)
+    ]
     incremental_dir = factor_dir / "incremental"
     if incremental_dir.exists():
-        files.extend(path for path in sorted(incremental_dir.glob("*.parquet")) if not path.name.startswith("._"))
+        files.extend(
+            path
+            for path in sorted(incremental_dir.glob("*.parquet"))
+            if _is_yearly_factor_value_file(path)
+        )
     return files
+
+
+def _is_yearly_factor_value_file(path: Path) -> bool:
+    return not path.name.startswith("._") and re.fullmatch(r"\d{4}\.parquet", path.name) is not None
 
 
 def _read_score_file(path: Path, *, factor_id: str | None = None, formula_signature: str | None = None) -> pd.DataFrame:
@@ -370,15 +388,28 @@ def _is_child_name(value: str) -> bool:
     return not path.is_absolute() and len(path.parts) == 1
 
 
-def _factor_dir_candidates(*, factor_id: str, factor_name: str) -> list[str]:
+def _factor_dir_candidates(*, factor_id: str, factor_name: str, formula: str) -> list[str]:
     canonical_candidates = [_canonical_factor_dir_name(factor_id)]
     id_candidates = [factor_id, _safe_dir_name(factor_id)]
     name_candidates = [factor_name, _safe_dir_name(factor_name)]
+    store_key = _precomputed_store_key(formula)
+    store_key_candidates = [store_key, _safe_dir_name(store_key)] if store_key else []
     aliases = _worldquant_aliases(factor_id)
     if aliases:
         canonical_candidates.append(_canonical_factor_dir_name(aliases[0]))
-    legacy_candidates = [*aliases, *id_candidates, *name_candidates] if aliases else [*id_candidates, *name_candidates]
+    legacy_candidates = (
+        [*store_key_candidates, *aliases, *id_candidates, *name_candidates]
+        if aliases
+        else [*store_key_candidates, *id_candidates, *name_candidates]
+    )
     return list(dict.fromkeys(candidate for candidate in [*canonical_candidates, *legacy_candidates] if candidate))
+
+
+def _precomputed_store_key(formula: str) -> str:
+    stripped = formula.strip()
+    if not stripped.lower().startswith("precomputed:"):
+        return ""
+    return stripped.split(":", 1)[1].strip()
 
 
 def _canonical_factor_dir_name(value: str) -> str:

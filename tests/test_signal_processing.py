@@ -70,6 +70,63 @@ def test_prepare_factor_scores_reuses_existing_worldquant_daily_values(tmp_path)
     assert not (factor_dir / "incremental").exists()
 
 
+def test_precomputed_scores_use_formula_store_key_directory(tmp_path) -> None:
+    panel = _two_day_panel().iloc[:2]
+    factor_dir = tmp_path / "vendor_alpha_777"
+    factor_dir.mkdir()
+    pd.DataFrame(
+        {
+            "trade_date": ["2025-01-02", "2025-01-02"],
+            "instrument": ["AAA", "BBB"],
+            "factor_id": ["FTR_VENDOR_ALPHA"] * 2,
+            "factor_value": [0.7, 0.2],
+        }
+    ).to_parquet(factor_dir / "2025.parquet", index=False)
+
+    result = prepare_factor_scores_result(
+        panel,
+        "precomputed:vendor_alpha_777",
+        factor_id="FTR_VENDOR_ALPHA",
+        factor_name="friendly_factor_name",
+        factor_values_root=tmp_path,
+    )
+
+    assert result.source == "factor_values_cached"
+    assert result.factor_values_path == factor_dir
+    assert list(result.scores["score"]) == [0.7, 0.2]
+
+
+def test_prepare_factor_scores_ignores_root_period_parquet_files(tmp_path) -> None:
+    panel = _two_day_panel().iloc[:2]
+    factor_dir = tmp_path / "factor_id=WQ_ALPHA_003"
+    factor_dir.mkdir()
+    pd.DataFrame(
+        {
+            "trade_date": ["2025-01-02", "2025-01-02"],
+            "instrument": ["AAA", "BBB"],
+            "factor_value": [0.3, 0.1],
+        }
+    ).to_parquet(factor_dir / "2025.parquet", index=False)
+    pd.DataFrame(
+        {
+            "trade_date": ["2025-01-02", "2025-01-02"],
+            "instrument": ["AAA", "BBB"],
+            "factor_value": [9.0, 9.0],
+        }
+    ).to_parquet(factor_dir / "2025Q1.parquet", index=False)
+
+    result = prepare_factor_scores_result(
+        panel,
+        "missing_field",
+        factor_id="WQ_ALPHA_003",
+        factor_name="alpha_003",
+        factor_values_root=tmp_path,
+    )
+
+    assert result.source == "factor_values_cached"
+    assert list(result.scores["score"]) == [0.3, 0.1]
+
+
 def test_prepare_factor_scores_computes_and_persists_only_missing_dates(tmp_path) -> None:
     panel = _two_day_panel()
     factor_dir = tmp_path / "factor_id=FTR_PARTIAL"
