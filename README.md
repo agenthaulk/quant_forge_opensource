@@ -76,16 +76,16 @@ qf web --workspace ./qf-demo --rd-config configs/rd.yaml
 ```
 
 Open the printed local URL in your browser. The web adapter is local-only.
-This starts with the deterministic rule parser. For LLM parsing, configure a
-local ignored config and env file first, then run `qf doctor --config ...`.
-If `llm.provider` remains `rule`, missing external LLM keys are reported only
-as optional readiness warnings.
+It exposes two explicit parser modes: local rule parsing for the built-in
+small-cap/momentum/low-volatility/volume patterns, and LLM semantic parsing for
+configured providers. When LLM parsing is selected, missing keys or failed LLM
+requests are returned to the user first; the browser asks before falling back
+to local rule parsing.
 
 在浏览器打开命令行打印的本地地址。本项目 Web 适配器只面向本地运行。
-上述命令使用确定性规则解析器。若要使用 LLM 解析，请先配置本地忽略的 config
-和 env 文件，再运行 `qf doctor --config ...`。
-如果 `llm.provider` 仍为 `rule`，缺少外部 LLM key 只会作为可选 readiness
-提示展示。
+界面会明确区分两种解析方式：本地规则解析只覆盖内置的小市值、动量、低波动、
+成交量等有限模式；LLM 语义解析会调用已配置 provider。选择 LLM 解析时，
+如果缺少 key 或 LLM 请求失败，系统先展示失败原因，并询问是否改用本地规则解析。
 
 ## LLM Provider Setup / 大模型配置
 
@@ -107,16 +107,24 @@ qf doctor --config configs/default.local.yaml --rd-config configs/rd.yaml
 qf web --config configs/default.local.yaml --rd-config configs/rd.yaml
 ```
 
-If a selected provider is missing `model`, `base_url`, `api_key_env`, or the
-named environment variable, Quant Forge raises a precise error such as:
+For cloud providers, if a selected provider is missing `model`, `base_url`,
+`api_key_env`, or the named environment variable, Quant Forge raises a precise
+error such as:
 
-如果所选供应商缺少 `model`、`base_url`、`api_key_env`，或对应环境变量没有设置，
-系统会给出精确错误，例如：
+对于云端 provider，如果所选供应商缺少 `model`、`base_url`、`api_key_env`，
+或对应环境变量没有设置，系统会给出精确错误，例如：
 
 ```text
 llm.providers.deepseek.base_url is required
 Missing API key for active LLM provider deepseek. Expected environment variable: DEEPSEEK_API_KEY.
 ```
+
+For a local OpenAI-compatible endpoint that does not require auth, set
+`require_api_key` to `false`; then `api_key_env` may be omitted and Quant Forge
+does not send an Authorization header.
+
+对于不需要鉴权的本地 OpenAI-compatible endpoint，可将 `require_api_key` 设为 `false`；
+此时可省略 `api_key_env`，请求中也不会发送 Authorization header。
 
 ## Configuration Files / 配置文件
 

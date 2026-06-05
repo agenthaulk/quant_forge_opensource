@@ -358,7 +358,7 @@ def _validate_llm_provider_settings(settings: LLMProviderSettings) -> None:
         missing.append("model")
     if not settings.base_url.strip():
         missing.append("base_url")
-    if not settings.api_key_env.strip():
+    if settings.api_key_required and not settings.api_key_env.strip():
         missing.append("api_key_env")
     if missing:
         joined = ", ".join(f"llm.providers.{provider}.{name}" for name in missing)

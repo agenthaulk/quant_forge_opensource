@@ -267,6 +267,29 @@ def test_validate_llm_runtime_reports_missing_active_key(monkeypatch: pytest.Mon
         validate_llm_runtime(config.llm)
 
 
+def test_config_allows_no_auth_openai_compatible_provider_without_env_name(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "llm:\n"
+        "  provider: openai_compatible\n"
+        "  providers:\n"
+        "    openai_compatible:\n"
+        "      provider: openai_compatible\n"
+        "      model: local-model\n"
+        "      base_url: http://127.0.0.1:11434/v1\n"
+        "      require_api_" "key: false\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    selected = config.llm.select_provider()
+
+    assert selected.provider == "openai_compatible"
+    assert selected.api_key_required is False
+    assert selected.api_key_env == ""
+    validate_llm_runtime(config.llm)
+
+
 def test_validate_any_llm_runtime_allows_active_rule_with_optional_registry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

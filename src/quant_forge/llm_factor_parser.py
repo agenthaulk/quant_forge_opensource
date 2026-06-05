@@ -91,8 +91,7 @@ def parse_factor_idea(text: str, llm: LLMSettings, *, mode: str = "llm") -> Pars
         raise ValueError(f"unsupported parser mode: {mode}")
     selected_llm = llm.select_provider()
     if selected_llm.provider.lower() in {"rule", "deterministic"}:
-        factor = parse_idea_to_definition(text)
-        return ParsedFactor(factor=factor, source="rule", provider="rule", model="deterministic")
+        raise RuntimeError("LLM parser was requested, but the selected provider is the local rule parser.")
     return _parse_with_configured_llm(text, selected_llm)
 
 
@@ -106,6 +105,9 @@ def _parse_with_configured_llm(text: str, llm: LLMSettings) -> ParsedFactor:
 
 
 def _parse_with_openai_compatible_llm(text: str, settings: LLMSettings, credential: str) -> ParsedFactor:
+    headers = {"Content-Type": "application/json"}
+    if credential:
+        headers["Authorization"] = f"Bearer {credential}"
     request = urllib.request.Request(
         _chat_completions_url(settings.base_url),
         data=json.dumps(
@@ -117,10 +119,7 @@ def _parse_with_openai_compatible_llm(text: str, settings: LLMSettings, credenti
             },
             ensure_ascii=False,
         ).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {credential}",
-            "Content-Type": "application/json",
-        },
+        headers=headers,
         method="POST",
     )
     try:
@@ -145,6 +144,12 @@ def _parse_with_openai_compatible_llm(text: str, settings: LLMSettings, credenti
 
 def _parse_with_anthropic_messages_llm(text: str, settings: LLMSettings, credential: str) -> ParsedFactor:
     system, user = _prompt_parts(text)
+    headers = {
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+    if credential:
+        headers["x-api-key"] = credential
     request = urllib.request.Request(
         _anthropic_messages_url(settings.base_url),
         data=json.dumps(
@@ -158,11 +163,7 @@ def _parse_with_anthropic_messages_llm(text: str, settings: LLMSettings, credent
             },
             ensure_ascii=False,
         ).encode("utf-8"),
-        headers={
-            "x-api-key": credential,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        },
+        headers=headers,
         method="POST",
     )
     try:
@@ -200,7 +201,11 @@ def _resolved_llm_settings(llm: LLMSettings) -> tuple[LLMSettings, str, str]:
         base_url_envs = ", ".join(defaults["base_url_envs"])
         raise ValueError(f"LLM base_url is required for provider {provider}. Set llm.base_url or one of: {base_url_envs}.")
 
-    credential, api_key_env = _read_api_key(provider, llm.api_key_env, tuple(defaults["api_key_envs"]))
+    credential, api_key_env = (
+        _read_api_key(provider, llm.api_key_env, tuple(defaults["api_key_envs"]))
+        if llm.api_key_required
+        else ("", llm.api_key_env.strip())
+    )
     return (
         LLMSettings(
             provider=provider,

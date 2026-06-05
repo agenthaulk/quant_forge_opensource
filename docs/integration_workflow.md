@@ -64,8 +64,10 @@ qf doctor --config configs/default.local.yaml --rd-config configs/rd.yaml
 
 正常情况下 `checks` 中不应有 `status: error`。`factor_values_root` 未配置或尚未
 创建可以是 warning，因为程序会在需要时执行本地计算或写入增量结果。
-当 active provider 是 `rule` 或 `deterministic` 时，未配置外部 LLM key 也不应成为
-error；程序应继续使用本地规则解析，并把外部 LLM readiness 作为可选提示展示。
+本地规则解析和 LLM 语义解析必须在 UI 与返回结果中明确区分。选择 LLM 解析时，
+如果缺少 API key 或 LLM 请求失败，程序应先返回具体原因，并在用户确认后才改用
+本地规则解析；用户拒绝时本次解析/运行应终止。配置 `require_api_key=false`
+的本地 OpenAI-compatible endpoint 可不设置 `api_key_env`。
 
 如果配置了挂载盘因子值库，`doctor` 还应展示：
 
@@ -226,6 +228,7 @@ artifact_root: ...
 | 数据目录不存在 | 指出 `data_root`，提示运行 init 或检查挂载盘 |
 | 面板字段缺失 | 列出缺失字段和最小数据契约 |
 | LLM key 未设置 | 指出 provider 和环境变量名，不打印 key |
+| LLM 调用失败 | 返回 HTTP/网络错误摘要，询问是否改用本地规则解析 |
 | 算子不存在 | 指出公式中的未知算子 |
 | 字段不存在 | 指出公式中的未知字段 |
 | 因子值已有 | 提示复用缓存和缓存路径 |

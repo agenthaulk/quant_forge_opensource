@@ -362,7 +362,7 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
     default_provider = default_llm.provider if default_llm.provider not in {"rule", "deterministic"} else ""
     provider = escape(default_llm.provider)
     model = escape(default_llm.model)
-    parser_label = escape(f"{default_provider or config.llm.provider}")
+    parser_label = escape(default_provider or "未配置可用 LLM")
     seed_factor_id = escape(_default_seed_factor_id(config))
     data_root = escape(paths["data_root"])
     factor_root = escape(paths["factor_root"])
@@ -387,7 +387,7 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
             f'      <option value="{escape(option["provider"])}"'
             f'{_selected_attr(option["provider"] == default_provider)}>'
             f'{escape(option["provider"])} / {escape(option["model"])}'
-            f' · env {escape(option["api_key_env"] or "未配置")}</option>'
+            f'{escape(" · env " + option["api_key_env"] if option["api_key_env"] else " · no auth")}</option>'
         )
         for option in provider_options
     )
@@ -549,8 +549,8 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
     <textarea id="idea">非ST的小市值股票未来表现更好</textarea>
     <label for="parser">解析方式</label>
     <select id="parser">
-      <option value="llm">配置 LLM: {parser_label}</option>
-      <option value="rule">规则解析</option>
+      <option value="llm">LLM 语义解析: {parser_label}</option>
+      <option value="rule">本地规则解析</option>
     </select>
     <label for="llm-provider">LLM Provider</label>
     <select id="llm-provider">
@@ -745,25 +745,45 @@ function rdPayload() {{
     max_candidates: Number(document.getElementById('rd-max').value)
   }};
 }}
+async function submitIdea(parserMode) {{
+  const response = await fetch('/api/run-idea', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{
+      text: document.getElementById('idea').value,
+      parser_mode: parserMode,
+      llm_provider: document.getElementById('llm-provider').value
+    }})
+  }});
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || 'request failed');
+  return payload;
+}}
 button.addEventListener('click', async () => {{
   button.disabled = true;
   errorEl.textContent = '';
   statusEl.textContent = '运行中...';
+  const parserMode = document.getElementById('parser').value;
   try {{
-    const response = await fetch('/api/run-idea', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{
-        text: document.getElementById('idea').value,
-        parser_mode: document.getElementById('parser').value,
-        llm_provider: document.getElementById('llm-provider').value
-      }})
-    }});
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || 'request failed');
+    const payload = await submitIdea(parserMode);
     render(payload);
     statusEl.innerHTML = '<span class="ok">验证完成</span>';
   }} catch (error) {{
+    if (parserMode === 'llm') {{
+      const fallback = window.confirm(`LLM 无法使用：${{error.message}}\n\n是否改用本地规则解析？`);
+      if (fallback) {{
+        try {{
+          const payload = await submitIdea('rule');
+          render(payload);
+          statusEl.innerHTML = '<span class="ok">已使用本地规则解析完成</span>';
+          return;
+        }} catch (fallbackError) {{
+          errorEl.textContent = fallbackError.message;
+          statusEl.textContent = '运行失败';
+          return;
+        }}
+      }}
+    }}
     errorEl.textContent = error.message;
     statusEl.textContent = '运行失败';
   }} finally {{

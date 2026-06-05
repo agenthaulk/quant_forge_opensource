@@ -127,15 +127,14 @@ qf web --workspace ./qf-demo --rd-config configs/rd.yaml
 ```
 
 The web adapter is local-only. Use it for idea parsing, evaluation, backtest,
-and RD triggering from a browser. This minimal command uses the deterministic
-rule parser. Use a local config plus `runtime.env_files` when enabling an LLM
-provider. If `llm.provider` is `rule`, missing external LLM keys are optional
-readiness warnings.
+and RD triggering from a browser. The parser selector clearly separates local
+rule parsing from LLM semantic parsing. If LLM parsing cannot read a key or the
+LLM request fails, the browser shows the reason and asks before retrying with
+local rule parsing.
 
 Web 适配器仅面向本地。可在浏览器里完成观点解析、评价、回测和 RD 触发。
-这个最小命令使用确定性规则解析器。启用 LLM provider 时，请使用本地 config 和
-`runtime.env_files`。如果 `llm.provider` 是 `rule`，缺少外部 LLM key 只会作为
-可选 readiness 提示。
+解析方式会明确区分本地规则解析与 LLM 语义解析。选择 LLM 时，如果读取不到
+key 或 LLM 请求失败，浏览器会先展示原因，并询问是否改用本地规则解析。
 
 ## 5. Configuration Files / 配置文件
 
@@ -279,6 +278,12 @@ If parsing fails with a missing key error, check:
 3. `api_key_env` 拼写是否正确。
 4. 被忽略的 env 文件是否列在 `runtime.env_files` 中。
 5. `qf doctor --config <local-config>` 是否报告 LLM 错误。
+
+For a local OpenAI-compatible endpoint that does not require authentication,
+set `require_api_key` to `false` and omit `api_key_env`.
+
+对于不需要鉴权的本地 OpenAI-compatible endpoint，将 `require_api_key` 设为 `false`
+即可省略 `api_key_env`。
 
 ## 7. Data Configuration / 数据配置
 

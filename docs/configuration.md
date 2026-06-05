@@ -171,6 +171,10 @@ declares every provider that may appear in the Web UI.
 Store only environment variable names in configuration. For the local Web
 workbench, the actual key should stay in a declared ignored local env file.
 `api_key_env` is the name of the variable, not the API key value.
+Local rule parsing remains available as a separate, explicitly labeled mode;
+LLM mode never silently falls back to rules. If a key is missing or a request
+fails, the Web UI shows the LLM failure reason and asks before retrying with
+local rule parsing.
 
 ```yaml
 llm:
@@ -256,14 +260,25 @@ llm:
       model: <model-name>
       base_url: <https://host.example/v1>
       api_key_env: OPENAI_COMPATIBLE_API_KEY
+
+# Local OpenAI-compatible endpoint without authentication
+llm:
+  provider: openai_compatible
+  providers:
+    openai_compatible:
+      provider: openai_compatible
+      model: <local-model-name>
+      base_url: http://127.0.0.1:11434/v1
+      # set require_api_key to false
 ```
 
-For configured providers, `model`, `base_url`, and `api_key_env` are required.
-If one is missing, config loading fails with a provider-specific message such
-as `llm.providers.deepseek.base_url`. If the selected provider's environment
+For cloud providers, `model`, `base_url`, and `api_key_env` are required. If
+one is missing, config loading fails with a provider-specific message such as
+`llm.providers.deepseek.base_url`. If the selected provider's environment
 variable is not set when parsing starts, the parser fails with a message like
 `Missing API key for active LLM provider deepseek. Expected environment
-variable: DEEPSEEK_API_KEY.`
+variable: DEEPSEEK_API_KEY.` For local providers with `require_api_key` set to `false`,
+`api_key_env` is optional and no Authorization header is sent.
 
 Example local setup:
 

@@ -101,6 +101,9 @@ allowed_interval_days: [5]
 
     assert "/api/research/run-once" in html
     assert "/api/research/schedule" in html
+    assert "LLM 语义解析" in html
+    assert "本地规则解析" in html
+    assert "是否改用本地规则解析" in html
     assert "rd-objective" in html
     assert 'value="2"' in html
     assert '<option value="rank_icir" selected>ICIR</option>' in html
@@ -279,6 +282,14 @@ def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
     assert result["factor"]["horizon_days"] == 11
     assert result["backtest"]["holding_days"] == 11
     assert paths["factor_root"].exists()
+
+
+def test_web_llm_mode_does_not_silently_fallback_to_rule_parser(tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig(llm=LLMSettings(provider="rule")).resolve(tmp_path / "demo")
+
+    with pytest.raises(RuntimeError, match="local rule parser"):
+        run_idea_workflow(config, "小市值", parser_mode="llm")
 
 
 def test_web_workbench_uses_selected_llm_provider(monkeypatch, tmp_path) -> None:
