@@ -9,7 +9,9 @@ from quant_forge.core.contracts import FactorDefinition
 from quant_forge.factor_engine.signal_processing import prepare_factor_scores_result
 from quant_forge.factor_library.catalog import (
     FactorCatalog,
+    _manifest_candidates,
     discover_factor_value_roots,
+    discover_precomputed_factors,
     import_precomputed_factors,
     normalize_precomputed_factor_store,
 )
@@ -192,6 +194,166 @@ def test_normalize_precomputed_store_creates_canonical_factor_id_partition(tmp_p
     )
     assert score_result.factor_values_path == canonical_dir
     assert list(score_result.scores["score"]) == [0.3]
+
+
+def test_manifest_supplements_sidecar_metadata_without_factor_id(tmp_path: Path) -> None:
+    factor_values_root = tmp_path / "factor_values"
+    factor_dir = factor_values_root / "opaque_vendor_store"
+    factor_dir.mkdir(parents=True)
+    (factor_dir / "2025.metadata.json").write_text(
+        json.dumps({"schema_version": "qf.vendor_sidecar.v1", "universe": "cn_a"}),
+        encoding="utf-8",
+    )
+    pd.DataFrame(
+        {
+            "trade_date": ["2025-01-02"],
+            "instrument": ["AAA"],
+            "factor_value": [0.8],
+        }
+    ).to_parquet(factor_dir / "2025.parquet", index=False)
+    manifest_root = tmp_path / "manifests"
+    manifest_root.mkdir()
+    (manifest_root / "opaque_vendor_store.json").write_text(
+        json.dumps(
+            {
+                "factor_id": "FTR_OPAQUE_VENDOR",
+                "factor_name": "opaque_vendor",
+                "factor_store_key": "opaque_vendor_store",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    discovered = discover_precomputed_factors(factor_values_root, manifest_root=manifest_root)
+    listed = FactorCatalog(
+        Path("unused"),
+        factor_values_root=factor_values_root,
+        factor_values_manifest_root=manifest_root,
+    ).get("FTR_OPAQUE_VENDOR")
+
+    assert [factor.factor_id for factor in discovered] == ["FTR_OPAQUE_VENDOR"]
+    assert listed.name == "opaque_vendor"
+    assert listed.description == (
+        "Precomputed factor values loaded from factor_values_root. "
+        "schema=qf.vendor_sidecar.v1. universe=cn_a."
+    )
+
+
+def test_manifest_candidates_prefer_canonical_factor_id_over_alias_manifest(tmp_path: Path) -> None:
+    factor_values_root = tmp_path / "factor_values"
+    factor_dir = factor_values_root / "worldquant_alpha_003"
+    factor_dir.mkdir(parents=True)
+    (factor_dir / "2025.metadata.json").write_text(
+        json.dumps(
+            {
+                "factor_id": "WQ_ALPHA_003",
+                "schema_version": "qf.canonical_factor_values.v1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    pd.DataFrame(
+        {
+            "trade_date": ["2025-01-02"],
+            "instrument": ["AAA"],
+            "factor_id": ["WQ_ALPHA_003"],
+            "factor_value": [0.3],
+        }
+    ).to_parquet(factor_dir / "2025.parquet", index=False)
+    manifest_root = tmp_path / "manifests"
+    manifest_root.mkdir()
+    (manifest_root / "WQ_ALPHA_003.json").write_text(
+        json.dumps(
+            {
+                "factor_name": "canonical_manifest_name",
+                "universe": "canonical_universe",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (manifest_root / "worldquant_alpha_003.json").write_text(
+        json.dumps(
+            {
+                "factor_name": "alias_manifest_name",
+                "universe": "alias_universe",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    discovered = discover_precomputed_factors(factor_values_root, manifest_root=manifest_root)
+    listed = FactorCatalog(
+        Path("unused"),
+        factor_values_root=factor_values_root,
+        factor_values_manifest_root=manifest_root,
+    ).get("alpha_003")
+
+    assert [factor.factor_id for factor in discovered] == ["WQ_ALPHA_003"]
+    assert discovered[0].name == "canonical_manifest_name"
+    assert discovered[0].description == (
+        "Precomputed factor values loaded from factor_values_root. "
+        "schema=qf.canonical_factor_values.v1. universe=canonical_universe."
+    )
+    assert listed.name == "canonical_manifest_name"
+    assert listed.description == (
+        "Precomputed factor values loaded from factor_values_root. "
+        "schema=qf.canonical_factor_values.v1. universe=canonical_universe."
+    )
+
+
+def test_manifest_candidates_fill_missing_fields_by_priority(tmp_path: Path) -> None:
+    factor_values_root = tmp_path / "factor_values"
+    factor_dir = factor_values_root / "factor_id=wq-alpha-008"
+    factor_dir.mkdir(parents=True)
+    (factor_dir / "2025.metadata.json").write_text(
+        json.dumps({"schema_version": "qf.canonical_factor_values.v1"}),
+        encoding="utf-8",
+    )
+    pd.DataFrame(
+        {
+            "trade_date": ["2025-01-02"],
+            "instrument": ["AAA"],
+            "factor_id": ["WQ_ALPHA_008"],
+            "factor_value": [0.8],
+        }
+    ).to_parquet(factor_dir / "2025.parquet", index=False)
+    manifest_root = tmp_path / "manifests"
+    manifest_root.mkdir()
+    (manifest_root / "WQ_ALPHA_008.json").write_text(
+        json.dumps({"factor_id": "WQ_ALPHA_008", "universe": "canonical_universe"}),
+        encoding="utf-8",
+    )
+    (manifest_root / "factor_id=WQ_ALPHA_008.json").write_text(
+        json.dumps({"factor_name": "store_manifest_name", "universe": "store_universe"}),
+        encoding="utf-8",
+    )
+    (manifest_root / "factor_id=wq-alpha-008.json").write_text(
+        json.dumps({"factor_name": "directory_manifest_name", "universe": "directory_universe"}),
+        encoding="utf-8",
+    )
+
+    discovered = discover_precomputed_factors(factor_values_root, manifest_root=manifest_root)
+
+    assert [factor.factor_id for factor in discovered] == ["WQ_ALPHA_008"]
+    assert discovered[0].name == "store_manifest_name"
+    assert discovered[0].description == (
+        "Precomputed factor values loaded from factor_values_root. "
+        "schema=qf.canonical_factor_values.v1. universe=canonical_universe."
+    )
+
+
+def test_manifest_candidates_are_ordered_and_deduped(tmp_path: Path) -> None:
+    manifest_root = tmp_path / "manifests"
+
+    assert _manifest_candidates(tmp_path / "factor_id=WQ_ALPHA_007", manifest_root) == (
+        manifest_root / "WQ_ALPHA_007.json",
+        manifest_root / "factor_id=WQ_ALPHA_007.json",
+    )
+    assert _manifest_candidates(tmp_path / "factor_id=wq-alpha-007", manifest_root) == (
+        manifest_root / "WQ_ALPHA_007.json",
+        manifest_root / "factor_id=WQ_ALPHA_007.json",
+        manifest_root / "factor_id=wq-alpha-007.json",
+    )
 
 
 def test_normalize_precomputed_store_merges_extra_source_roots(tmp_path: Path) -> None:

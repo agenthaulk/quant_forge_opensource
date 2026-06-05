@@ -13,6 +13,8 @@ from quant_forge.factor_library.repository import FactorRepository
 PANEL_FILE = "panel.parquet"
 REQUIRED_COLUMNS = ("trade_date", "instrument", "close", "market_cap", "is_st")
 OPTIONAL_COLUMNS = ("volume", "return_1d", "return_5d", "volatility_5d")
+SOURCE_PRICE_COLUMNS = ("ts_code", "trade_date", "close", "vol")
+SOURCE_DAILY_BASIC_COLUMNS = ("ts_code", "trade_date", "total_mv", "circ_mv")
 
 
 class LocalPanelDataProvider:
@@ -114,7 +116,7 @@ def _is_source_snapshot_root(path: Path) -> bool:
 
 def _validate_source_snapshot(data_root: Path, source_root: Path) -> DataValidationResult:
     try:
-        price = _read_snapshot_files(source_root / "price", columns=("ts_code", "trade_date"))
+        price = _read_snapshot_files(source_root / "price", columns=SOURCE_PRICE_COLUMNS)
     except Exception as exc:
         return DataValidationResult(
             data_root=data_root,
@@ -123,6 +125,19 @@ def _validate_source_snapshot(data_root: Path, source_root: Path) -> DataValidat
             instruments=0,
             date_count=0,
             missing_columns=("price",),
+            panel_path=source_root,
+            optional_columns=(f"source_snapshot_error={exc}",),
+        )
+    try:
+        _read_snapshot_files(source_root / "daily_basic", columns=SOURCE_DAILY_BASIC_COLUMNS)
+    except Exception as exc:
+        return DataValidationResult(
+            data_root=data_root,
+            ok=False,
+            rows=0,
+            instruments=0,
+            date_count=0,
+            missing_columns=("daily_basic",),
             panel_path=source_root,
             optional_columns=(f"source_snapshot_error={exc}",),
         )
@@ -152,10 +167,10 @@ def _validate_source_snapshot(data_root: Path, source_root: Path) -> DataValidat
 
 
 def _load_source_snapshot_panel(source_root: Path) -> pd.DataFrame:
-    price = _read_snapshot_files(source_root / "price", columns=("ts_code", "trade_date", "close", "vol"))
+    price = _read_snapshot_files(source_root / "price", columns=SOURCE_PRICE_COLUMNS)
     daily_basic = _read_snapshot_files(
         source_root / "daily_basic",
-        columns=("ts_code", "trade_date", "total_mv", "circ_mv"),
+        columns=SOURCE_DAILY_BASIC_COLUMNS,
     )
     if price.empty:
         raise ValueError(f"source snapshot has no price rows: {source_root}")

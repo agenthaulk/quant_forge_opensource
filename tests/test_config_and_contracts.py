@@ -494,6 +494,42 @@ def test_data_root_can_point_to_source_snapshot(tmp_path: Path) -> None:
     assert panel["market_cap"].tolist() == [1000.0, 2000.0, 1100.0, 1900.0, 1200.0, 2100.0]
 
 
+@pytest.mark.parametrize(
+    ("price_columns", "basic_columns", "missing_columns"),
+    (
+        (
+            {"ts_code": ["AAA"], "trade_date": ["20250102"], "vol": [100.0]},
+            {"ts_code": ["AAA"], "trade_date": ["20250102"], "total_mv": [1000.0], "circ_mv": [900.0]},
+            ("price",),
+        ),
+        (
+            {"ts_code": ["AAA"], "trade_date": ["20250102"], "close": [10.0], "vol": [100.0]},
+            {"ts_code": ["AAA"], "trade_date": ["20250102"], "circ_mv": [900.0]},
+            ("daily_basic",),
+        ),
+    ),
+)
+def test_source_snapshot_validation_requires_load_time_columns(
+    tmp_path: Path,
+    price_columns: dict[str, list[object]],
+    basic_columns: dict[str, list[object]],
+    missing_columns: tuple[str, ...],
+) -> None:
+    snapshot = tmp_path / "lakehouse" / "source_snapshot" / "provider=test" / "market=cn_a"
+    price_dir = snapshot / "price"
+    basic_dir = snapshot / "daily_basic"
+    price_dir.mkdir(parents=True)
+    basic_dir.mkdir(parents=True)
+    pd.DataFrame(price_columns).to_parquet(price_dir / "2025.parquet", index=False)
+    pd.DataFrame(basic_columns).to_parquet(basic_dir / "2025.parquet", index=False)
+
+    validation = LocalPanelDataProvider(tmp_path / "lakehouse").validate()
+
+    assert validation.ok is False
+    assert validation.missing_columns == missing_columns
+    assert validation.optional_columns[0].startswith("source_snapshot_error=")
+
+
 def test_simulation_profile_validation() -> None:
     assert simulation_profile_from_mapping({"decay_days": 2}, SimulationProfile()).decay_days == 2
     with pytest.raises(ValueError, match="only neutralization='none'"):

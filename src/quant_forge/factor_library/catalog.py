@@ -382,7 +382,7 @@ def _read_factor_metadata(directory: Path, *, manifest_root: Path | None) -> dic
             continue
         if isinstance(loaded, dict):
             metadata.update(_portable_metadata(loaded))
-    if metadata or manifest_root is None or not manifest_root.exists():
+    if manifest_root is None or not manifest_root.exists():
         return metadata
     for path in _manifest_candidates(directory, manifest_root):
         try:
@@ -390,13 +390,39 @@ def _read_factor_metadata(directory: Path, *, manifest_root: Path | None) -> dic
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
         if isinstance(loaded, dict):
-            metadata.update(_portable_metadata(loaded))
+            _fill_missing_metadata(metadata, _portable_metadata(loaded))
     return metadata
 
 
+def _fill_missing_metadata(metadata: dict[str, Any], supplemental: dict[str, Any]) -> None:
+    for key, value in supplemental.items():
+        if _metadata_value_missing(metadata.get(key)):
+            metadata[key] = value
+
+
+def _metadata_value_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    return False
+
+
 def _manifest_candidates(directory: Path, manifest_root: Path) -> tuple[Path, ...]:
-    names = {directory.name, _factor_id_from_name(directory.name), _store_key_from_name(directory.name)}
-    return tuple(manifest_root / f"{name}.json" for name in names if name)
+    factor_id = _factor_id_from_name(directory.name)
+    names = (
+        _canonical_factor_id(factor_id) or factor_id,
+        _store_key_from_name(directory.name),
+        directory.name,
+    )
+    ordered_names: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        ordered_names.append(name)
+    return tuple(manifest_root / f"{name}.json" for name in ordered_names)
 
 
 def _factor_from_store(directory: Path, metadata: dict[str, Any]) -> FactorDefinition | None:
