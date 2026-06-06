@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import time
 
-from quant_forge.data.local import create_demo_workspace
+import pandas as pd
+
+from quant_forge.data.local import LocalPanelDataProvider, PANEL_FILE, create_demo_workspace
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.core.contracts import (
     BacktestResult,
@@ -12,6 +15,7 @@ from quant_forge.core.contracts import (
     SimulationProfile,
     TransactionCostModel,
 )
+from quant_forge.research_loop.campaign import ResearchCampaignService
 from quant_forge.research_loop.scheduler import ResearchLoopScheduler, ResearchScheduleRequest
 from quant_forge.research_loop.service import ResearchGate, ResearchLoopService, apply_gate
 from quant_forge.workbench.service import WorkbenchService
@@ -258,3 +262,220 @@ def test_research_loop_successive_halving_keeps_only_survivors_for_full_stage(tm
     assert {candidate.backtest.simulation_profile for candidate in result.candidates} == survivor_profiles
     assert result.report_path is not None
     assert "Successive Halving Trace" in result.report_path.read_text(encoding="utf-8")
+
+
+def test_research_campaign_runs_multi_round_variants_and_returns_final_backtest(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    campaign = ResearchCampaignService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+    )
+
+    result = campaign.run(
+        ["FTR_DEMO_SMALL_CAP", "FTR_DEMO_MOMENTUM"],
+        objective="balanced",
+        rounds=2,
+    )
+
+    assert result.rounds_requested == 2
+    assert result.rounds_completed >= 1
+    assert result.round_results
+    assert result.final_factor_id is not None
+    assert result.final_factor is not None
+    assert result.final_factor.factor_id == result.final_factor_id
+    assert result.final_factor.source == "research_campaign"
+    assert result.final_factor.factor_id not in {"FTR_DEMO_SMALL_CAP", "FTR_DEMO_MOMENTUM"}
+    assert result.final_evaluation is not None
+    assert result.final_backtest is not None
+    assert result.final_score is not None
+    assert result.final_evaluation.artifact_path.exists()
+    assert result.final_backtest.artifact_path.exists()
+    assert result.artifacts
+    assert all(path.exists() for path in result.artifacts)
+    assert result.round_results[0].candidates
+    assert result.round_results[0].selected_factor_ids
+
+
+def test_research_campaign_can_combine_precomputed_seed_frontier(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    panel = LocalPanelDataProvider(paths["data_root"]).load_panel()
+    factor_values_root = tmp_path / "factor_values"
+    factor_values_overlay_root = tmp_path / "factor_values_overlay"
+    seed_factor_ids = (
+        "WQ_ALPHA_001",
+        "WQ_ALPHA_002",
+        "WQ_ALPHA_003",
+        "WQ_ALPHA_004",
+        "WQ_ALPHA_005",
+        "WQ_ALPHA_006",
+    )
+    _write_precomputed_seed(
+        factor_values_root,
+        panel,
+        factor_id="WQ_ALPHA_001",
+        factor_name="wq_alpha_001",
+        scores=1.0 - panel.groupby("trade_date")["market_cap"].rank(pct=True),
+    )
+    _write_precomputed_seed(
+        factor_values_root,
+        panel,
+        factor_id="WQ_ALPHA_002",
+        factor_name="wq_alpha_002",
+        scores=panel.groupby("trade_date")["return_5d"].rank(pct=True),
+    )
+    _write_precomputed_seed(
+        factor_values_root,
+        panel,
+        factor_id="WQ_ALPHA_003",
+        factor_name="wq_alpha_003",
+        scores=1.0 - panel.groupby("trade_date")["volatility_5d"].rank(pct=True),
+    )
+    _write_precomputed_seed(
+        factor_values_root,
+        panel,
+        factor_id="WQ_ALPHA_004",
+        factor_name="wq_alpha_004",
+        scores=panel.groupby("trade_date")["volume"].rank(pct=True),
+    )
+    _write_precomputed_seed(
+        factor_values_root,
+        panel,
+        factor_id="WQ_ALPHA_005",
+        factor_name="wq_alpha_005",
+        scores=panel.groupby("trade_date")["close"].rank(pct=True),
+    )
+    _write_precomputed_seed(
+        factor_values_root,
+        panel,
+        factor_id="WQ_ALPHA_006",
+        factor_name="wq_alpha_006",
+        scores=panel.groupby("trade_date")["return_1d"].rank(pct=True),
+    )
+    campaign = ResearchCampaignService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        factor_values_root=factor_values_root,
+        factor_values_overlay_root=factor_values_overlay_root,
+        simulation_profile=SimulationProfile(
+            test_period_start="2024-01-15",
+            test_period_end="2024-02-09",
+        ),
+    )
+
+    result = campaign.run(seed_factor_ids, objective="balanced", rounds=5)
+
+    assert result.rounds_requested == 5
+    assert result.rounds_completed == 5
+    assert result.final_factor_id is not None
+    assert result.final_factor is not None
+    assert result.final_factor.factor_id == result.final_factor_id
+    assert result.final_factor.source == "research_campaign"
+    assert result.final_factor.formula == f"precomputed:factor_id={result.final_factor_id}"
+    assert result.final_evaluation is not None
+    assert result.final_backtest is not None
+    assert result.final_evaluation.artifact_path.exists()
+    assert result.final_backtest.artifact_path.exists()
+    assert result.artifacts
+    stored = FactorRepository(paths["factor_root"]).get(result.final_factor_id)
+    assert stored.formula == result.final_factor.formula
+    overlay_files = tuple((factor_values_overlay_root / f"factor_id={result.final_factor_id}" / "incremental").glob("*.parquet"))
+    assert overlay_files
+    assert result.round_results[0].input_seed_factor_ids == seed_factor_ids
+    assert result.round_results[-1].selected_factor_ids
+
+
+def test_research_campaign_preserves_partial_round_errors(tmp_path: Path, monkeypatch) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    campaign = ResearchCampaignService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+    )
+    original_candidate_variants = campaign._candidate_variants
+
+    def fake_candidate_variants(seed, seen_formulas):
+        if seed.factor_id == "FTR_DEMO_MOMENTUM":
+            return ()
+        return original_candidate_variants(seed, seen_formulas)
+
+    monkeypatch.setattr(campaign, "_candidate_variants", fake_candidate_variants)
+
+    result = campaign.run(
+        ["FTR_DEMO_SMALL_CAP", "FTR_DEMO_MOMENTUM"],
+        objective="balanced",
+        rounds=1,
+    )
+
+    assert result.final_factor_id is not None
+    assert result.errors
+    assert any("FTR_DEMO_MOMENTUM" in error and "no unseen variants" in error for error in result.errors)
+    assert result.round_results[0].errors == result.errors
+
+
+def test_research_campaign_respects_2025_only_simulation_profile(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    _rewrite_demo_panel_to_2025(paths["data_root"])
+    campaign = ResearchCampaignService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        simulation_profile=SimulationProfile(
+            test_period_start="2025-01-01",
+            test_period_end="2025-12-31",
+        ),
+    )
+
+    result = campaign.run(
+        ["FTR_DEMO_SMALL_CAP", "FTR_DEMO_MOMENTUM"],
+        objective="balanced",
+        rounds=1,
+    )
+
+    assert result.final_backtest is not None
+    assert result.final_backtest.simulation_profile.test_period_start == "2025-01-01"
+    assert result.final_backtest.simulation_profile.test_period_end == "2025-12-31"
+    assert result.final_evaluation is not None
+    assert result.final_evaluation.simulation_profile.test_period_start == "2025-01-01"
+    assert result.final_evaluation.simulation_profile.test_period_end == "2025-12-31"
+    assert all(metric.start_date.startswith("2025-") for metric in result.final_backtest.segment_metrics)
+
+
+def _write_precomputed_seed(
+    factor_values_root: Path,
+    panel: pd.DataFrame,
+    *,
+    factor_id: str,
+    factor_name: str,
+    scores: pd.Series,
+) -> None:
+    factor_dir = factor_values_root / f"factor_id={factor_id}"
+    factor_dir.mkdir(parents=True, exist_ok=True)
+    (factor_dir / "2024.metadata.json").write_text(
+        json.dumps(
+            {
+                "factor_id": factor_id,
+                "factor_name": factor_name,
+                "factor_store_key": f"factor_id={factor_id}",
+                "schema_version": "qf.canonical_factor_values.v1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = panel[["trade_date", "instrument"]].copy()
+    payload["factor_id"] = factor_id
+    payload["factor_value"] = pd.to_numeric(scores, errors="coerce")
+    payload["trade_date"] = pd.to_datetime(payload["trade_date"]).dt.strftime("%Y-%m-%d")
+    payload[["trade_date", "instrument", "factor_id", "factor_value"]].to_parquet(
+        factor_dir / "2024.parquet",
+        index=False,
+    )
+
+
+def _rewrite_demo_panel_to_2025(data_root: Path) -> None:
+    panel_path = data_root / PANEL_FILE
+    panel = pd.read_parquet(panel_path)
+    trade_dates = pd.to_datetime(panel["trade_date"])
+    panel["trade_date"] = trade_dates + pd.offsets.DateOffset(years=1)
+    panel.to_parquet(panel_path, index=False)
