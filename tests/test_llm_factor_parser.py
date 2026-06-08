@@ -60,6 +60,29 @@ class FakeOpenAICompatibleHandler(BaseHTTPRequestHandler):
         return
 
 
+class FakeNoAuthOpenAICompatibleHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:
+        length = int(self.headers["Content-Length"])
+        request = json.loads(self.rfile.read(length).decode("utf-8"))
+        assert self.path == "/v1/chat/completions"
+        assert self.headers.get("Authorization") is None
+        assert request["model"] == "fake-local"
+        content = {
+            "name": "local_close_strength",
+            "formula": "rank(close)",
+            "description": "Close-price strength from a local no-auth endpoint.",
+            "horizon_days": 5,
+            "universe_filters": [],
+        }
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"choices": [{"message": {"content": json.dumps(content)}}]}).encode("utf-8"))
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
 class FakeClaudeHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         length = int(self.headers["Content-Length"])
@@ -131,6 +154,29 @@ def test_openai_parser_reads_provider_default_env(monkeypatch: pytest.MonkeyPatc
 
     assert parsed.provider == "openai"
     assert parsed.model == "fake-openai"
+    assert parsed.factor.formula == "rank(close)"
+
+
+def test_openai_compatible_parser_allows_no_auth_local_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeNoAuthOpenAICompatibleHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.delenv("OPENAI_COMPATIBLE_API_KEY", raising=False)
+    try:
+        parsed = parse_factor_idea(
+            "收盘价强势",
+            LLMSettings(
+                provider="openai_compatible",
+                model="fake-local",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key_required=False,
+            ),
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+    assert parsed.provider == "openai_compatible"
     assert parsed.factor.formula == "rank(close)"
 
 
@@ -235,6 +281,11 @@ def test_deepseek_parser_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> No
                 api_key_env="QF_TEST_DEEPSEEK_KEY",
             ),
         )
+
+
+def test_llm_mode_rejects_rule_provider_without_silent_fallback() -> None:
+    with pytest.raises(RuntimeError, match="local rule parser"):
+        parse_factor_idea("小市值股票", LLMSettings(provider="rule"), mode="llm")
 
 
 def test_llm_factor_identity_includes_horizon() -> None:

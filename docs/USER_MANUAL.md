@@ -52,6 +52,7 @@ PYTHONPATH=src python3 -m quant_forge.apps.cli.main --help
 
 ```bash
 qf init --workspace ./qf-demo
+qf doctor --workspace ./qf-demo
 qf data validate --workspace ./qf-demo
 qf factor list --workspace ./qf-demo
 ```
@@ -60,9 +61,12 @@ Expected result:
 
 预期结果：
 
-- `data validate` reports the required local panel fields.
+- `doctor` reports config, data, factor roots, factor-value cache readiness,
+  RD settings, LLM readiness, and next commands.
+- `data validate` reports the required local panel fields and date range.
 - `factor list` shows demo factors under the demo `factor_root`.
-- `data validate` 会报告本地面板字段。
+- `doctor` 会报告配置、数据、因子目录、因子值缓存、RD 设置、LLM readiness 和下一步命令。
+- `data validate` 会报告本地面板字段和日期范围。
 - `factor list` 会显示 demo 工作区中的示例因子。
 
 ## 4. Main Workflows / 主要流程
@@ -112,20 +116,32 @@ qf research run-once FTR_DEMO_SMALL_CAP --workspace ./qf-demo --rd-config config
 
 The RD loop generates bounded hypotheses, evaluates candidates, applies smoke
 gates, and writes a Markdown report under `artifact_root/research_reports`.
+Ordinary RD focuses on research ideas and optional hyper-parameter/profile
+search. Enable `llm.hypothesis_mode` and `llm.review_mode` only in an ignored
+local RD config when you want LLM-backed idea generation and review. Campaign
+mode is reserved for the later factor-synthesis workflow.
 
 RD 循环会生成有限候选假设，评价候选因子，应用 smoke gate，并在
-`artifact_root/research_reports` 写入 Markdown 报告。
+`artifact_root/research_reports` 写入 Markdown 报告。普通 RD 只聚焦研究 idea
+和可选的超参数/profile 搜索；如果要使用大模型生成 idea 或复盘，请只在被忽略的
+本地 RD 配置中打开 `llm.hypothesis_mode` 和 `llm.review_mode`。Campaign 模式只用于
+后续因子合成阶段。
 
 ### 4.5 Local Web / 本地 Web
 
 ```bash
-qf web --workspace ./qf-demo --config configs/default.yaml --rd-config configs/rd.yaml
+qf web --workspace ./qf-demo --rd-config configs/rd.yaml
 ```
 
 The web adapter is local-only. Use it for idea parsing, evaluation, backtest,
-and RD triggering from a browser.
+and RD triggering from a browser. The parser selector clearly separates local
+rule parsing from LLM semantic parsing. If LLM parsing cannot read a key or the
+LLM request fails, the browser shows the reason and asks before retrying with
+local rule parsing.
 
 Web 适配器仅面向本地。可在浏览器里完成观点解析、评价、回测和 RD 触发。
+解析方式会明确区分本地规则解析与 LLM 语义解析。选择 LLM 时，如果读取不到
+key 或 LLM 请求失败，浏览器会先展示原因，并询问是否改用本地规则解析。
 
 ## 5. Configuration Files / 配置文件
 
@@ -188,6 +204,7 @@ Use these templates when creating your own config files:
 创建自己的配置文件时，可复制这些模板：
 
 - `configs/default.draft.yaml`
+- `configs/mounted.draft.yaml`
 - `configs/rd.draft.yaml`
 
 Recommended pattern:
@@ -198,6 +215,29 @@ Recommended pattern:
 cp configs/default.draft.yaml configs/my_default.yaml
 cp configs/rd.draft.yaml configs/my_rd.yaml
 ```
+
+For a portable mounted-disk setup, start from the mounted template instead:
+
+如果希望数据、因子定义和日频因子值随移动硬盘走，请从 mounted 模板开始：
+
+```bash
+cp configs/mounted.draft.yaml configs/default.local.yaml
+# edit <MOUNT_ROOT>, then normalize factor definitions and values
+qf factor normalize-root --config configs/default.local.yaml
+qf factor normalize-store --config configs/default.local.yaml --scan-root <MOUNT_ROOT>/QuantForgeData --link-files
+qf doctor --config configs/default.local.yaml --rd-config configs/rd.yaml
+```
+
+The mounted layout should keep `factor_root`, `data/panel.parquet`, artifacts,
+and the writable `factor_values_overlay` under a stable workbench directory on
+the drive, while read-base daily factor values live under
+`canonical/factor=cn_a/{原始因子,合成因子}/factor_id=<FACTOR_ID>`.
+
+移动硬盘布局建议把 `factor_root`、`data/panel.parquet`、artifacts 和可写的
+`factor_values_overlay` 放在盘上的稳定 workbench 目录，已有日频因子值统一放在
+`canonical/factor=cn_a/{原始因子,合成因子}/factor_id=<FACTOR_ID>`。`factor_root`
+中的定义也按 `原始因子` 和 `合成因子` 两类保存。这样 canonical 可以作为只读基底，
+新增缺失日期只写入 overlay 中对应分类目录。
 
 Do not commit machine-local config files if they contain local paths or private
 runtime choices.
@@ -219,14 +259,37 @@ llm:
       api_key_env: DEEPSEEK_API_KEY
 ```
 
-Runtime shell:
+The active `llm.provider` is the shared LLM setting for natural-language factor
+parsing and optional RD LLM features. The default public RD config is
+local-first. Set `llm.hypothesis_mode` and `llm.review_mode` to `llm` in an
+ignored local RD config when you want ordinary RD hypothesis generation and
+self-review to reuse the same provider/key. Set `llm.campaign_mode` only when
+explicitly running factor-synthesis Campaign workflows.
 
-运行时 shell：
+当前 `llm.provider` 是自然语言因子解析和可选 RD LLM 功能共用的大模型配置。默认公开
+RD 配置是 local-first；如果希望普通 RD 研究假设和研究复盘复用同一个
+provider/key，请在被忽略的本地 RD 配置中打开 `llm.hypothesis_mode` 和
+`llm.review_mode`。只有明确运行因子合成 Campaign 时才打开 `llm.campaign_mode`。
+
+Local ignored env file:
+
+本地忽略 env 文件：
 
 ```bash
-export DEEPSEEK_API_KEY="<your-api-key>"
-qf web --workspace ./qf-demo --config configs/default.yaml --rd-config configs/rd.yaml
+cp configs/default.draft.yaml configs/default.local.yaml
+printf 'DEEPSEEK_API_KEY=<your-api-key>\n' > configs/default.local.env
+chmod 600 configs/default.local.env
+# edit configs/default.local.yaml paths.* and runtime.env_files as needed
+qf doctor --config configs/default.local.yaml --rd-config configs/rd.yaml
+qf web --config configs/default.local.yaml --rd-config configs/rd.yaml
 ```
+
+`qf web` can start before the key is available. The key is checked only when you
+choose LLM parsing or an LLM-backed RD action; local rule parsing remains an
+explicit separate mode.
+
+即使 key 尚未加载，`qf web` 也可以先启动。只有选择 LLM 解析或 LLM-backed RD
+动作时才会检查 key；本地规则解析始终是明确标注的独立模式。
 
 If parsing fails with a missing key error, check:
 
@@ -235,12 +298,20 @@ If parsing fails with a missing key error, check:
 1. The selected provider name in `llm.provider`.
 2. The provider entry under `llm.providers.<provider>`.
 3. The spelling of `api_key_env`.
-4. Whether the environment variable is set in the same shell that starts `qf`.
+4. Whether the ignored env file is listed in `runtime.env_files`.
+5. Whether `qf doctor --config <local-config>` reports an LLM error.
 
 1. `llm.provider` 选择的供应商名。
 2. `llm.providers.<provider>` 中是否有对应配置。
 3. `api_key_env` 拼写是否正确。
-4. 启动 `qf` 的同一个 shell 是否设置了该环境变量。
+4. 被忽略的 env 文件是否列在 `runtime.env_files` 中。
+5. `qf doctor --config <local-config>` 是否报告 LLM 错误。
+
+For a local OpenAI-compatible endpoint that does not require authentication,
+set `require_api_key` to `false` and omit `api_key_env`.
+
+对于不需要鉴权的本地 OpenAI-compatible endpoint，将 `require_api_key` 设为 `false`
+即可省略 `api_key_env`。
 
 ## 7. Data Configuration / 数据配置
 
@@ -298,7 +369,7 @@ Fix the named field in the config file.
 ### Missing API key environment variable
 
 ```text
-Missing API key for LLM provider deepseek
+Missing API key for active LLM provider deepseek. Expected environment variable: DEEPSEEK_API_KEY.
 ```
 
 Fix:
@@ -306,7 +377,8 @@ Fix:
 修复：
 
 ```bash
-export DEEPSEEK_API_KEY="<your-api-key>"
+printf 'DEEPSEEK_API_KEY=<your-api-key>\n' > configs/default.local.env
+qf doctor --config configs/default.local.yaml --rd-config configs/rd.yaml
 ```
 
 ### Unsupported simulation option

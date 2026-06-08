@@ -1,6 +1,7 @@
 # Quant Forge runtime config draft.
 # Copy this file and edit the copy:
 #   cp configs/default.draft.yaml configs/my_default.yaml
+# For a mounted-disk database, start from configs/mounted.draft.yaml instead.
 #
 # Do not commit machine-local copies if they contain private paths or runtime
 # choices. Put real API keys in environment variables, never in YAML.
@@ -10,10 +11,26 @@ paths:
   data_root: data
   # Factor definitions. This is the factor source of truth.
   factor_root: factor_root
+  # Optional factor value cache. Existing complete daily values are reused;
+  # missing dates are computed into incremental/*.parquet sidecars.
+  factor_values_root: null
+  # Optional writable overlay for new incremental factor values. When set,
+  # factor_values_root is treated as the read base and new increments are
+  # written under this overlay instead of the read base.
+  factor_values_overlay_root: null
+  # Optional external manifest/catalog pointer for local operators.
+  factor_values_manifest_root: null
   # Evaluation, backtest, and RD reports.
   artifact_root: artifacts
   # Optional command outputs.
   output_root: outputs
+
+runtime:
+  # Optional local secret env files. Paths are relative to this config file,
+  # must stay under this directory, must be ignored by git, and must use
+  # plain KEY=value lines.
+  env_files:
+    # - default.local.env
 
 web:
   # The public web adapter is local-only.
@@ -46,6 +63,8 @@ simulation:
 llm:
   # Use "rule" for deterministic local parsing with no external API call.
   # Other supported names: openai, openai_compatible, glm, deepseek, minimax, claude.
+  # When you enable LLM mode, use one active provider/key for both LLM parsing
+  # and RD LLM features. Add extra providers only if you want Web choices.
   provider: rule
   timeout_seconds: 30
   providers:
@@ -53,24 +72,3 @@ llm:
       model: deepseek-chat
       base_url: https://api.deepseek.com
       api_key_env: DEEPSEEK_API_KEY
-    glm:
-      model: glm-5.1
-      base_url: https://open.bigmodel.cn/api/paas/v4
-      api_key_env: GLM_API_KEY
-    openai:
-      model: gpt-4o-mini
-      base_url: https://api.openai.com/v1
-      api_key_env: OPENAI_API_KEY
-    minimax:
-      model: MiniMax-M2
-      base_url: https://api.minimax.io/v1
-      api_key_env: MINIMAX_API_KEY
-    claude:
-      model: claude-sonnet-4-5
-      base_url: https://api.anthropic.com
-      api_key_env: ANTHROPIC_API_KEY
-    openai_compatible:
-      provider: openai_compatible
-      model: <model-name>
-      base_url: <https://host.example/v1>
-      api_key_env: OPENAI_COMPATIBLE_API_KEY

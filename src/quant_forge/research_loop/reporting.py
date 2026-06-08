@@ -46,9 +46,11 @@ def render_research_report(result: ResearchLoopResult, *, generated_at: datetime
         f"| Annualized Return | {_fmt(result.objective_weights.annualized_return)} |",
         f"| Max Drawdown | {_fmt(result.objective_weights.max_drawdown)} |",
         "",
-        "## Successive Halving Trace",
+        "## Deduplication",
         "",
     ]
+    lines.extend(_deduplication_lines(result))
+    lines.extend(["## Successive Halving Trace", ""])
     lines.extend(_search_trace_lines(result))
     lines.extend(["## SOTA / Best Candidate", ""])
     if best is None:
@@ -72,6 +74,8 @@ def render_research_report(result: ResearchLoopResult, *, generated_at: datetime
             "| none | - | - | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.00% "
             "| 0.00% | 0.0000 | 0.00% | 0.00% | - |"
         )
+    lines.extend(["", "## Blocked / Skipped Plans", ""])
+    lines.extend(_blocked_plan_lines(result))
     lines.extend(["", "## Iteration Trace", ""])
     if result.candidates:
         for index, candidate in enumerate(result.candidates, start=1):
@@ -85,6 +89,7 @@ def render_research_report(result: ResearchLoopResult, *, generated_at: datetime
                     f"- Gate: {'passed' if candidate.gate_passed else 'failed'}",
                     f"- Gate Reasons: {'; '.join(candidate.gate_reasons)}",
                     f"- Self Review: {candidate.self_review.summary}",
+                    f"- Review Normalization: {_sentence_list(candidate.self_review.normalization_warnings)}",
                     "",
                 ]
             )
@@ -131,6 +136,20 @@ def _candidate_summary(candidate: ResearchCandidateResult) -> list[str]:
     ]
 
 
+def _deduplication_lines(result: ResearchLoopResult) -> list[str]:
+    summary = result.deduplication or {}
+    if not summary:
+        return ["No duplicate-control summary was recorded.", ""]
+    enabled = "yes" if summary.get("enabled") else "no"
+    return [
+        f"- Enabled: {enabled}",
+        f"- Formula Fingerprint Skips: {int(summary.get('formula_skipped') or 0)}",
+        f"- Candidate Diversity Skips: {int(summary.get('diversity_skipped') or 0)}",
+        f"- Result Signature Duplicates: {int(summary.get('result_duplicates') or 0)}",
+        "",
+    ]
+
+
 def _search_trace_lines(result: ResearchLoopResult) -> list[str]:
     if not result.search_trace:
         return ["Parameter search was not enabled for this run.", ""]
@@ -143,6 +162,22 @@ def _search_trace_lines(result: ResearchLoopResult) -> list[str]:
         lines.append(
             f"| {item.rank} | {survived} | `{item.factor_id}` | {_profile_label_from_profile(item.simulation_profile)} "
             f"| {_fmt(item.score)} | {_fmt(item.split_weighted_icir)} |"
+        )
+    lines.append("")
+    return lines
+
+
+def _blocked_plan_lines(result: ResearchLoopResult) -> list[str]:
+    if not result.blocked_plans:
+        return ["No plans were blocked or skipped.", ""]
+    lines = [
+        "| Plan | Status | Formula | Reason |",
+        "| --- | --- | --- | --- |",
+    ]
+    for item in result.blocked_plans:
+        reason = "; ".join(item.plan.blocking_reasons) or item.error or "-"
+        lines.append(
+            f"| `{item.plan.plan_id}` | {item.plan.status} | `{item.plan.formula_dsl or '-'}` | {reason} |"
         )
     lines.append("")
     return lines
@@ -169,8 +204,8 @@ def _candidate_detail(candidate: ResearchCandidateResult) -> list[str]:
         f"- Horizon Days: {candidate.factor.horizon_days}",
         f"- Filters: {_inline_code_list(candidate.factor.universe_filters)}",
         f"- Simulation Profile: {_profile_label(candidate)}",
-        f"- Evaluation Artifact: `{candidate.evaluation.artifact_path}`",
-        f"- Backtest Artifact: `{candidate.backtest.artifact_path}`",
+        f"- Evaluation Artifact: `{_artifact_label(candidate.evaluation.artifact_path)}`",
+        f"- Backtest Artifact: `{_artifact_label(candidate.backtest.artifact_path)}`",
         f"- Backtest Warnings: {_sentence_list(candidate.backtest.warnings)}",
         f"- Research Assumptions: {_sentence_list(candidate.backtest.assumptions)}",
         "",
@@ -180,6 +215,7 @@ def _candidate_detail(candidate: ResearchCandidateResult) -> list[str]:
         f"- Strengths: {_sentence_list(candidate.self_review.strengths)}",
         f"- Risks: {_sentence_list(candidate.self_review.risks)}",
         f"- Next Hypotheses: {_sentence_list(candidate.self_review.next_hypotheses)}",
+        f"- Normalization Warnings: {_sentence_list(candidate.self_review.normalization_warnings)}",
         "",
         "#### Split Metrics",
         "",
@@ -284,6 +320,11 @@ def _sentence_list(values: tuple[str, ...]) -> str:
 
 def _profile_label(candidate: ResearchCandidateResult) -> str:
     return _profile_label_from_profile(candidate.backtest.simulation_profile)
+
+
+def _artifact_label(path: Path | str) -> str:
+    name = Path(path).name
+    return name or "<artifact>"
 
 
 def _profile_label_from_profile(profile) -> str:

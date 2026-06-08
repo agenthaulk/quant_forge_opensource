@@ -1,6 +1,32 @@
 # Configuration
 
-Default public configuration lives in `configs/default.yaml`.
+Default public configuration lives in `configs/default.yaml`. Use
+`configs/mounted.draft.yaml` as the copyable template when the runtime database
+lives on a mounted disk.
+
+## Runtime Env Files
+
+Quant Forge does not rely on macOS shell inheritance for local LLM keys. A
+config may explicitly declare local env files:
+
+```yaml
+runtime:
+  env_files:
+    - default.local.env
+```
+
+Paths must be relative to the YAML config file and stay under that config
+directory. These files must be ignored by git and must contain only plain
+`KEY=value` lines with no whitespace or shell metacharacters in the value. The
+loader does not execute shell syntax, does not scan parent directories, and does
+not print loaded values.
+For example, the local ignored file can define the variable name used below:
+
+```env
+DEEPSEEK_API_KEY=
+```
+
+Fill the value only in the ignored local file. Do not commit that file.
 
 All runtime paths may be overridden through CLI flags:
 
@@ -16,18 +42,177 @@ docs.
 Explicit root flags remain available for advanced workflows:
 
 ```bash
-qf eval-factor FTR_DEMO_SMALL_CAP --data-root ./demo/data --factor-root ./demo/factor_root --artifact-root ./demo/artifacts
+qf eval-factor FTR_DEMO_SMALL_CAP --data-root ./demo/data --factor-root ./demo/factor_root --artifact-root ./demo/artifacts --factor-values-root ./demo/factor_values --factor-values-manifest-root ./demo/manifests/factor_values
+```
+
+## Mounted Database Discovery
+
+Quant Forge treats the configured roots as a portable local database. When the
+same mounted drive is attached on another machine, point the local config at the
+mounted roots and run `qf doctor` before starting Web or RD.
+
+`paths.data_root` may point to a directory containing `panel.parquet`, to a
+workspace directory containing `data/panel.parquet`, directly to a parquet panel
+file, or to a mounted source snapshot root containing `price/` and
+`daily_basic/`. The source snapshot adapter builds the lightweight public panel
+from close, volume, and market-value fields; deeper PIT and provider-specific
+ETL remain outside the lightweight core.
+
+`paths.factor_root` remains the writable source of truth for user-created factor
+definitions. `paths.factor_values_root` is read as an additional mounted factor
+database. `qf factor list`, evaluation, backtest, Web, MCP catalog, and RD seed
+loading merge both sources at read time without copying mounted factors into
+`factor_root`.
+
+Factor definitions are stored under category directories:
+
+```text
+factor_root/
+  原始因子/{active_factors,inactive_factors}/<FACTOR_ID>/factor.yaml
+  合成因子/{active_factors,inactive_factors}/<FACTOR_ID>/factor.yaml
+```
+
+`原始因子` contains imported/public formulas and external precomputed factors.
+`合成因子` contains RD, campaign, parameter-search, or composite candidates.
+Legacy flat paths such as `factor_root/inactive_factors/<FACTOR_ID>/factor.yaml`
+remain readable. Run `qf factor normalize-root` to copy those legacy definitions
+into the categorized layout without deleting the originals.
+
+`paths.factor_values_root` may point directly at a canonical factor-value root,
+or at a mounted data root containing `canonical/factor=cn_a`. Treat this root as
+the read base for existing daily factor values. `paths.factor_values_overlay_root`
+is an optional writable overlay for newly computed increments. The preferred
+factor-value layout is one category directory plus one directory per registered
+factor:
+
+```text
+factor_values_root/
+  原始因子/factor_id=<FACTOR_ID>/
+    2025.parquet
+    <FACTOR_ID>.metadata.json
+    incremental/
+      2026.parquet
+  合成因子/factor_id=<FACTOR_ID>/
+    2025.parquet
+    <FACTOR_ID>.metadata.json
+    incremental/
+      2026.parquet
+```
+
+Legacy directories such as `worldquant_alpha_003/2025.parquet`,
+`alpha_003/2025.parquet`, or a factor-name directory remain readable for
+mounted historical stores, but Quant Forge no longer treats provider or formula
+family names as canonical storage paths. New incremental factor values are
+written under
+`factor_values_overlay_root/{原始因子,合成因子}/factor_id=<FACTOR_ID>/incremental/YYYY.parquet`
+when an overlay is configured, otherwise they fall back to
+`factor_values_root/{原始因子,合成因子}/factor_id=<FACTOR_ID>/incremental/YYYY.parquet`.
+
+Discovered precomputed factors use a lightweight formula marker such as
+`precomputed:factor_id=WQ_ALPHA_003`. They are cache-only: Quant Forge reads the
+available values, leaves uncovered instruments as missing values, and does not
+attempt to recompute external or complex DSL formulas in the public kernel.
+
+To make mounted precomputed factors part of the local project registry, import
+them explicitly:
+
+```bash
+qf factor import-precomputed --config configs/default.local.yaml --all
+qf factor import-precomputed WQ_ALPHA_003 --config configs/default.local.yaml
+```
+
+The import writes `factor.yaml` files under `factor_root` with
+`source: precomputed` and `formula: precomputed:<store_key>`. It does not store
+mounted absolute paths in those factor definitions.
+
+To normalize existing factor definitions without deleting legacy flat paths,
+run:
+
+```bash
+qf factor normalize-root --config configs/default.local.yaml --dry-run
+qf factor normalize-root --config configs/default.local.yaml
+```
+
+To normalize an existing mounted factor-value store without deleting legacy
+directories, run:
+
+```bash
+qf factor normalize-store --config configs/default.local.yaml --dry-run
+qf factor normalize-store --config configs/default.local.yaml --link-files
+```
+
+When a mounted disk contains previous factor-value roots outside the configured
+canonical root, merge them by passing explicit sources or scanning the mounted
+data tree:
+
+```bash
+qf factor normalize-store --config configs/default.local.yaml \
+  --source-factor-values-root <MOUNT_ROOT>/QuantForgeData/facotrs/wq77_hs300_csi500_20250101_20251231/factor_values \
+  --link-files
+
+qf factor normalize-store --config configs/default.local.yaml \
+  --scan-root <MOUNT_ROOT>/QuantForgeData \
+  --link-files
+```
+
+The command creates or updates
+`原始因子/factor_id=<FACTOR_ID>` or `合成因子/factor_id=<FACTOR_ID>` directories
+and writes a portable metadata manifest when `paths.factor_values_manifest_root`
+is configured. `--link-files` uses hardlinks when the mounted filesystem
+supports them, falling back to normal copies if needed.
+
+## Factor Value Cache
+
+`paths.factor_values_root` is optional. When it is set, evaluation, backtest,
+Workbench, Web, and RD first look for existing factor scores under that root.
+If `paths.factor_values_overlay_root` is also set, Quant Forge reads the
+canonical root first and the overlay second; overlay values win for duplicate
+`trade_date/instrument` keys. If a factor has complete cached values for a trade
+date, Quant Forge reuses those values and does not execute the formula for that
+date.
+
+If only part of the requested panel is cached, Quant Forge computes the missing
+dates only and writes them to `incremental/YYYY.parquet` sidecars inside the
+writable overlay when configured. Existing canonical yearly files are not
+overwritten.
+Quant Forge-owned incremental sidecars include a formula/filter signature, so
+changing a local factor formula recomputes that sidecar instead of reusing stale
+incremental values.
+
+WorldQuant-style names are matched by aliases such as `WQ_ALPHA_003`,
+`alpha_003`, and `worldquant_alpha_003`, so a configured WQ Alpha daily factor
+library can be reused without recomputing those factors. Alias matching is a
+legacy read-compatibility feature only; it does not change the canonical store
+key exposed to the project.
+
+```yaml
+paths:
+  factor_values_root: factor_values
+  factor_values_overlay_root: factor_values_overlay
+  factor_values_manifest_root: manifests/factor_values
 ```
 
 ## Local LLM Parsing
 
-The local web adapter switches LLM access by the provider selected in the
-front-end. `llm.provider` is the default selection, while `llm.providers`
-declares every provider that may appear in the Web UI.
+The local web adapter can use one active LLM provider for natural-language
+factor parsing and optional RD LLM features. The public RD config is
+local-first by default. Ordinary RD focuses on research ideas and bounded
+hyper-parameter/profile search; set `llm.hypothesis_mode` and
+`llm.review_mode` to `llm` in an ignored local RD config when you want RD idea
+generation and self-review to reuse the same provider/key. Set
+`llm.campaign_mode` only for the later factor-synthesis Campaign workflow.
 
-Store only environment variable names in configuration. The actual key must
-stay in the user shell, a local secret manager, or an ignored local env file.
+`llm.providers` declares provider entries that may appear in the Web UI. Keep
+the default config to one provider/key unless you intentionally want users to
+choose among multiple providers.
+
+Store only environment variable names in configuration. For the local Web
+workbench, the actual key should stay in a declared ignored local env file.
 `api_key_env` is the name of the variable, not the API key value.
+Local rule parsing remains available as a separate, explicitly labeled mode;
+LLM mode never silently falls back to rules. If a key is missing or a request
+fails, the Web UI shows the LLM failure reason and asks before retrying with
+local rule parsing.
 
 ```yaml
 llm:
@@ -38,22 +223,6 @@ llm:
       model: deepseek-chat
       base_url: https://api.deepseek.com
       api_key_env: DEEPSEEK_API_KEY
-    glm:
-      model: glm-5.1
-      base_url: https://open.bigmodel.cn/api/paas/v4
-      api_key_env: GLM_API_KEY
-    openai:
-      model: gpt-4o-mini
-      base_url: https://api.openai.com/v1
-      api_key_env: OPENAI_API_KEY
-    minimax:
-      model: MiniMax-M2
-      base_url: https://api.minimax.io/v1
-      api_key_env: MINIMAX_API_KEY
-    claude:
-      model: claude-sonnet-4-5
-      base_url: https://api.anthropic.com
-      api_key_env: ANTHROPIC_API_KEY
 ```
 
 Supported provider entries:
@@ -113,20 +282,40 @@ llm:
       model: <model-name>
       base_url: <https://host.example/v1>
       api_key_env: OPENAI_COMPATIBLE_API_KEY
+
+# Local OpenAI-compatible endpoint without authentication
+llm:
+  provider: openai_compatible
+  providers:
+    openai_compatible:
+      provider: openai_compatible
+      model: <local-model-name>
+      base_url: http://127.0.0.1:11434/v1
+      # set require_api_key to false
 ```
 
-For configured providers, `model`, `base_url`, and `api_key_env` are required.
-If one is missing, config loading fails with a provider-specific message such
-as `llm.providers.deepseek.base_url`. If the selected provider's environment
+For cloud providers, `model`, `base_url`, and `api_key_env` are required. If
+one is missing, config loading fails with a provider-specific message such as
+`llm.providers.deepseek.base_url`. If the selected provider's environment
 variable is not set when parsing starts, the parser fails with a message like
-`Missing API key for LLM provider deepseek. Set one of these environment
-variables: DEEPSEEK_API_KEY.`
+`Missing API key for active LLM provider deepseek. Expected environment
+variable: DEEPSEEK_API_KEY.` For local providers with `require_api_key` set to `false`,
+`api_key_env` is optional and no Authorization header is sent.
 
-Example shell setup:
+`qf web` starts even when the active cloud provider's key is not loaded yet, so
+the user can inspect local status or choose rule parsing. The key is validated
+when an LLM parse or LLM-backed RD action is actually requested. The public RD
+config is local-first, so default RD smoke runs do not require a provider key.
+If an ignored local RD config explicitly enables an LLM-backed RD mode and the
+active provider cannot be used, that RD action fails with the LLM readiness
+reason instead of silently switching to local rules.
+
+Example local setup:
 
 ```bash
-export DEEPSEEK_API_KEY="<your-deepseek-api-key>"
-qf web --workspace ./demo --config configs/default.yaml --rd-config configs/rd.yaml
+printf 'DEEPSEEK_API_KEY=<your-deepseek-api-key>\n' > configs/default.local.env
+chmod 600 configs/default.local.env
+qf web --config configs/default.local.yaml --rd-config configs/rd.yaml
 ```
 
 ## Research Loop
@@ -134,12 +323,24 @@ qf web --workspace ./demo --config configs/default.yaml --rd-config configs/rd.y
 Default RD settings live in `configs/rd.yaml`. They are public, local, and
 explicit:
 
+RD hypothesis and review modes are `local` by default. For optional LLM-backed
+ordinary RD work, copy `configs/rd.draft.yaml` to an ignored local RD config and
+set `llm.hypothesis_mode` and `llm.review_mode` to `llm`. RD uses the main
+`llm` config in that mode; do not create a separate RD API key for the same
+provider. Keep one active `llm.provider` and one matching `api_key_env`.
+`llm.campaign_mode` is reserved for factor-synthesis Campaign runs.
+
 ```yaml
 objective: balanced
 default_max_candidates: 3
 default_interval_days: 1
 allowed_interval_days: [1, 5, 15, 30]
 top_quantile: 0.3
+llm:
+  hypothesis_mode: local
+  review_mode: local
+  # Use only when running factor-synthesis Campaign workflows.
+  campaign_mode: local
 simulation:
   execution_delay_days: 1
   top_quantile: 0.3
@@ -225,10 +426,12 @@ it does not move factors to `active`.
 
 Every RD run writes one Markdown research report under
 `artifact_root/research_reports` and returns its `report_path` from CLI and web
-JSON payloads. The report is deterministic local output: overview, SOTA/best
+JSON payloads. The report contains local evidence: overview, SOTA/best
 candidate, candidate comparison, iteration trace, split and horizon evidence,
-group returns, conclusion notes, and risk notes. It is not LLM-authored by
-default and is not an investment recommendation.
+group returns, conclusion notes, and risk notes. When `llm.review_mode: llm`,
+the bounded self-review text is LLM-generated from local evidence; evaluation,
+backtest metrics, gates, and promotion decisions remain local and reproducible.
+The report is not an investment recommendation.
 
 `weights` applies to the configured default `objective`. `weight_profiles`
 applies when a user temporarily selects another objective from CLI or web, so
@@ -264,6 +467,14 @@ value.
 simulation profile variants. The public default is disabled and keeps a single
 pure daily profile. The first version supports only `top_quantile` and
 `decay_days` variants.
+
+When LLM-backed hypothesis generation is enabled, RD gives the model local
+operator context, field constraints, effective prior ideas, and recent failure
+feedback. The model should first propose executable operator-aware or financial
+analysis hypotheses, including variations inspired by effective ideas. Only
+when no better executable formula idea is available should it mark a parameter
+search fallback; deterministic gating and local formula validation still decide
+what can run.
 
 When enabled with `method: successive_halving`, RD runs a quick stage over all
 formula/profile trials using `quick_horizon_days_matrix` and

@@ -5,8 +5,18 @@
 # One of: balanced, rank_ic, rank_icir, annualized_return.
 objective: balanced
 
-# Public local RD keeps candidate generation bounded and readable.
+# Public RD keeps candidate generation bounded and readable.
 default_max_candidates: 3
+
+# Public RD is local-first by default. Ordinary RD focuses on research ideas
+# and parameter-search/profile tuning only. Set hypothesis/review to llm in an
+# ignored local RD config when you want DeepSeek/OpenAI-compatible idea
+# generation and review through the active top-level llm.provider.
+llm:
+  hypothesis_mode: local
+  review_mode: local
+  # Campaign is reserved for the later factor-synthesis stage only.
+  # campaign_mode: llm
 
 # Web scheduler options. The scheduler is an in-process local convenience tool.
 default_interval_days: 1
@@ -37,6 +47,17 @@ parameter_search:
       score_weight: 1.0
   top_quantile: [0.2, 0.3]
   decay_days: [0, 5]
+
+# Duplicate-control gates prevent RD from spending compute on candidates that
+# already have the same formula, same result profile, or low in-batch diversity.
+deduplication:
+  enabled: true
+  formula_fingerprint: true
+  result_signature: true
+  candidate_diversity: true
+  result_precision: 6
+  recent_trace_limit: 500
+  max_same_shape_per_run: 2
 
 # Evidence matrix for full evaluation.
 horizon_days_matrix: [5, 10, 21, 63]
