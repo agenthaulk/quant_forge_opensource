@@ -2,34 +2,18 @@
 
 from __future__ import annotations
 
+import ast
 import math
-import re
 
 import numpy as np
 import pandas as pd
 
-SUPPORTED_OPERATORS = {
-    "abs",
-    "correlation",
-    "covariance",
-    "decay_linear",
-    "delay",
-    "delta",
-    "log",
-    "rank",
-    "scale",
-    "sign",
-    "signedpower",
-    "stddev",
-    "ts_max",
-    "ts_mean",
-    "ts_min",
-    "ts_rank",
-    "ts_sum",
-    "wq_max",
-    "wq_min",
-    "zscore",
-}
+from quant_forge.factor_engine.formula_parser import (
+    SUPPORTED_OPERATORS,
+    field_name,
+    numeric_constant,
+    parse_formula_node,
+)
 
 
 def execute_factor_formula(panel: pd.DataFrame, formula: str, universe_filters: tuple[str, ...] = ()) -> pd.DataFrame:
@@ -46,31 +30,37 @@ def execute_factor_formula(panel: pd.DataFrame, formula: str, universe_filters: 
 
 
 def _eval_expression(panel: pd.DataFrame, expression: str) -> pd.Series:
-    expression = expression.strip()
-    if expression.startswith("-"):
-        return -_eval_expression(panel, expression[1:].strip())
-    if _is_number(expression):
-        return pd.Series(float(expression), index=panel.index, dtype="float64")
-    if expression.lower().startswith("precomputed:"):
-        raise ValueError("precomputed factors are only supported as whole factor formulas")
+    return _eval_node(panel, parse_formula_node(expression))
 
-    binary = _split_top_level_binary(expression)
-    if binary is not None:
-        left_expression, operator, right_expression = binary
-        left = _eval_expression(panel, left_expression)
-        right = _eval_expression(panel, right_expression)
-        if operator == "+":
+
+def _eval_node(panel: pd.DataFrame, node: ast.AST) -> pd.Series:
+    if isinstance(node, ast.Constant):
+        value = numeric_constant(node)
+        if value is None:
+            raise ValueError("formula validation failed")
+        return pd.Series(value, index=panel.index, dtype="float64")
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        return _field(panel, field_name(node))
+    if isinstance(node, ast.UnaryOp):
+        values = _eval_node(panel, node.operand)
+        if isinstance(node.op, ast.USub):
+            return -values
+        if isinstance(node.op, ast.UAdd):
+            return values
+    if isinstance(node, ast.BinOp):
+        left = _eval_node(panel, node.left)
+        right = _eval_node(panel, node.right)
+        if isinstance(node.op, ast.Add):
             return left + right
-        if operator == "-":
+        if isinstance(node.op, ast.Sub):
             return left - right
-        if operator == "*":
+        if isinstance(node.op, ast.Mult):
             return left * right
-        if operator == "/":
+        if isinstance(node.op, ast.Div):
             return left / right.replace(0, pd.NA)
-
-    call = _parse_call(expression)
-    if call:
-        operator, args = call
+    if isinstance(node, ast.Call):
+        operator = node.func.id
+        args = list(node.args)
         if operator not in SUPPORTED_OPERATORS:
             raise ValueError(f"unsupported factor operator: {operator}")
         if operator in {"rank", "zscore"}:
@@ -89,7 +79,8 @@ def _eval_expression(panel: pd.DataFrame, expression: str) -> pd.Series:
         if operator == "sign":
             return pd.Series(np.sign(_one_series_arg(panel, operator, args)), index=panel.index)
         if operator == "delay":
-            return _by_instrument(panel, _one_series_arg(panel, operator, args[:1]), lambda values: values.shift(_window(args, 1)))
+            values = _one_series_arg(panel, operator, args[:1])
+            return _by_instrument(panel, values, lambda series: series.shift(_window(args, 1)))
         if operator == "delta":
             values = _one_series_arg(panel, operator, args[:1])
             return values - _by_instrument(panel, values, lambda series: series.shift(_window(args, 1)))
@@ -98,111 +89,46 @@ def _eval_expression(panel: pd.DataFrame, expression: str) -> pd.Series:
         if operator in {"correlation", "covariance"}:
             if len(args) != 3:
                 raise ValueError(f"{operator} expects 3 arguments")
-            left = _eval_expression(panel, args[0])
-            right = _eval_expression(panel, args[1])
+            left = _eval_node(panel, args[0])
+            right = _eval_node(panel, args[1])
             window = _window(args, 2)
             return _rolling_pairwise(panel, left, right, window=window, operator=operator)
         if operator == "scale":
             if len(args) not in {1, 2}:
                 raise ValueError("scale expects 1 or 2 arguments")
-            values = _eval_expression(panel, args[0])
-            target = float(args[1]) if len(args) == 2 else 1.0
+            values = _eval_node(panel, args[0])
+            target = _number_arg(args[1], "scale target") if len(args) == 2 else 1.0
             denom = values.abs().groupby(panel["trade_date"]).transform("sum").replace(0, pd.NA)
             return values / denom * target
         if operator == "signedpower":
             if len(args) != 2:
                 raise ValueError("signedpower expects 2 arguments")
-            values = _eval_expression(panel, args[0])
-            exponent = _eval_expression(panel, args[1])
+            values = _eval_node(panel, args[0])
+            exponent = _eval_node(panel, args[1])
             return pd.Series(np.sign(values) * (values.abs() ** exponent), index=panel.index)
         if operator in {"wq_min", "wq_max"}:
             if len(args) != 2:
                 raise ValueError(f"{operator} expects 2 arguments")
-            left = _eval_expression(panel, args[0])
-            if _is_number(args[1]):
+            left = _eval_node(panel, args[0])
+            if numeric_constant(args[1]) is not None:
                 rolling_name = "ts_min" if operator == "wq_min" else "ts_max"
                 return _rolling_operator(panel, rolling_name, [args[0], args[1]])
-            right = _eval_expression(panel, args[1])
+            right = _eval_node(panel, args[1])
             func = np.minimum if operator == "wq_min" else np.maximum
             return pd.Series(func(left, right), index=panel.index)
-
-    return _field(panel, expression)
-
-
-def _split_top_level_binary(expression: str) -> tuple[str, str, str] | None:
-    for operators in ("+-", "*/"):
-        depth = 0
-        for index in range(len(expression) - 1, -1, -1):
-            char = expression[index]
-            if char == ")":
-                depth += 1
-            elif char == "(":
-                depth -= 1
-            elif depth == 0 and char in operators and not _is_unary_operator(expression, index):
-                left = expression[:index].strip()
-                right = expression[index + 1 :].strip()
-                if not left or not right:
-                    raise ValueError("binary operator requires two operands")
-                return left, char, right
-    return None
+    raise ValueError("formula validation failed")
 
 
-def _is_unary_operator(expression: str, index: int) -> bool:
-    if expression[index] not in "+-":
-        return False
-    previous = expression[:index].rstrip()
-    return not previous or previous[-1] in "(,+-*/"
-
-
-def _parse_call(expression: str) -> tuple[str, list[str]] | None:
-    match = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*)\(", expression)
-    if not match or not expression.endswith(")"):
-        return None
-    operator = match.group(1)
-    start = len(operator) + 1
-    depth = 0
-    for index, char in enumerate(expression[start:-1], start=start):
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth < 0:
-                return None
-    if depth != 0:
-        return None
-    return operator, _split_args(expression[start:-1])
-
-
-def _split_args(text: str) -> list[str]:
-    args: list[str] = []
-    depth = 0
-    start = 0
-    for index, char in enumerate(text):
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth < 0:
-                raise ValueError("unbalanced formula parentheses")
-        elif char == "," and depth == 0:
-            args.append(text[start:index].strip())
-            start = index + 1
-    tail = text[start:].strip()
-    if tail:
-        args.append(tail)
-    return args
-
-
-def _one_series_arg(panel: pd.DataFrame, operator: str, args: list[str]) -> pd.Series:
+def _one_series_arg(panel: pd.DataFrame, operator: str, args: list[ast.AST]) -> pd.Series:
     if len(args) != 1:
         raise ValueError(f"{operator} expects 1 argument")
-    return _eval_expression(panel, args[0])
+    return _eval_node(panel, args[0])
 
 
-def _rolling_operator(panel: pd.DataFrame, operator: str, args: list[str]) -> pd.Series:
+def _rolling_operator(panel: pd.DataFrame, operator: str, args: list[ast.AST]) -> pd.Series:
     if len(args) != 2:
         raise ValueError(f"{operator} expects 2 arguments")
-    values = _eval_expression(panel, args[0])
+    values = _eval_node(panel, args[0])
     window = _window(args, 1)
     grouped = values.groupby(panel["instrument"], sort=False)
     if operator == "ts_sum":
@@ -216,7 +142,11 @@ def _rolling_operator(panel: pd.DataFrame, operator: str, args: list[str]) -> pd
     if operator == "stddev":
         return grouped.rolling(window, min_periods=window).std().reset_index(level=0, drop=True)
     if operator == "ts_rank":
-        return grouped.rolling(window, min_periods=window).apply(_last_rank_pct, raw=False).reset_index(level=0, drop=True)
+        return (
+            grouped.rolling(window, min_periods=window)
+            .apply(_last_rank_pct, raw=False)
+            .reset_index(level=0, drop=True)
+        )
     if operator == "decay_linear":
         weights = np.arange(1, window + 1, dtype=float)
         weights = weights / weights.sum()
@@ -253,22 +183,21 @@ def _by_instrument(panel: pd.DataFrame, values: pd.Series, transform) -> pd.Seri
     return values.groupby(panel["instrument"], sort=False).transform(transform)
 
 
-def _window(args: list[str], index: int) -> int:
-    if index >= len(args) or not _is_number(args[index]):
+def _window(args: list[ast.AST], index: int) -> int:
+    if index >= len(args):
         raise ValueError("window argument must be a number")
-    return max(int(math.floor(float(args[index]))), 1)
+    return max(int(math.floor(_number_arg(args[index], "window argument"))), 1)
 
 
 def _last_rank_pct(values: pd.Series) -> float:
     return float(values.rank(pct=True).iloc[-1])
 
 
-def _is_number(value: str) -> bool:
-    try:
-        float(value)
-    except ValueError:
-        return False
-    return True
+def _number_arg(node: ast.AST, label: str) -> float:
+    value = numeric_constant(node)
+    if value is None:
+        raise ValueError(f"{label} must be a number")
+    return value
 
 
 def _field(panel: pd.DataFrame, name: str) -> pd.Series:

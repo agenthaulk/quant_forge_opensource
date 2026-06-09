@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
 
+from quant_forge.factor_engine.formula_parser import inspect_formula
 from quant_forge.factor_library.catalog import is_precomputed_formula
 from quant_forge.mcp.read_models import list_available_fields, list_available_operators
 from quant_forge.research_loop.contracts import (
@@ -40,7 +40,12 @@ class ExperimentPlanner:
 
         allow_whole_precomputed = hypothesis.parameter_search_fallback
         parsed = (
-            _parse_formula(formula, known_operators=operators, allow_whole_precomputed=allow_whole_precomputed)
+            inspect_formula(
+                formula,
+                known_operators=operators,
+                allow_whole_precomputed=allow_whole_precomputed,
+                is_whole_precomputed=is_precomputed_formula,
+            )
             if formula and formula != "未指定"
             else None
         )
@@ -143,206 +148,6 @@ def _available_operators(context: ResearchContext) -> set[str]:
     if context.available_operators:
         return set(context.available_operators)
     return {operator["name"] for operator in list_available_operators()}
-
-
-@dataclass(frozen=True)
-class _FormulaParts:
-    operators: tuple[str, ...]
-    fields: tuple[str, ...]
-    errors: tuple[str, ...]
-    is_valid: bool
-
-
-def _parse_formula(
-    formula: str,
-    *,
-    known_operators: set[str] | None = None,
-    allow_whole_precomputed: bool = False,
-) -> _FormulaParts | None:
-    operators: list[str] = []
-    fields: list[str] = []
-    errors: list[str] = []
-    is_valid = _collect_formula_parts(
-        formula,
-        operators=operators,
-        fields=fields,
-        errors=errors,
-        known_operators=known_operators or set(),
-        allow_precomputed=allow_whole_precomputed,
-    )
-    return _FormulaParts(
-        operators=tuple(dict.fromkeys(operators)),
-        fields=tuple(dict.fromkeys(fields)),
-        errors=tuple(dict.fromkeys(errors)),
-        is_valid=is_valid,
-    )
-
-
-def _collect_formula_parts(
-    text: str,
-    *,
-    operators: list[str],
-    fields: list[str],
-    errors: list[str],
-    known_operators: set[str],
-    allow_precomputed: bool,
-) -> bool:
-    expression = text.strip()
-    while expression.startswith("-"):
-        expression = expression[1:].strip()
-    if not expression:
-        errors.append("empty expression")
-        return False
-    if expression.lower().startswith("precomputed:"):
-        if allow_precomputed and is_precomputed_formula(expression):
-            return True
-        errors.append("precomputed formulas can only be used as whole seed factors")
-        return False
-    if _is_number(expression):
-        return True
-    binary = _split_top_level_binary(expression)
-    if binary is not None:
-        left, _, right = binary
-        return all(
-            _collect_formula_parts(
-                item,
-                operators=operators,
-                fields=fields,
-                errors=errors,
-                known_operators=known_operators,
-                allow_precomputed=False,
-            )
-            for item in (left, right)
-        )
-    if re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_.]*", expression):
-        fields.append(expression.split(".")[-1])
-        return True
-    call = _parse_call(expression)
-    if call is None:
-        errors.append("formula validation failed")
-        return False
-    operator, args = call
-    operators.append(operator)
-    signature_ok = _validate_operator_signature(operator, args, known_operators=known_operators, errors=errors)
-    child_ok = bool(args) and all(
-        _collect_formula_parts(
-            arg,
-            operators=operators,
-            fields=fields,
-            errors=errors,
-            known_operators=known_operators,
-            allow_precomputed=False,
-        )
-        for arg in args
-    )
-    return signature_ok and child_ok
-
-
-def _split_top_level_binary(expression: str) -> tuple[str, str, str] | None:
-    for operators in ("+-", "*/"):
-        depth = 0
-        for index in range(len(expression) - 1, -1, -1):
-            char = expression[index]
-            if char == ")":
-                depth += 1
-            elif char == "(":
-                depth -= 1
-            elif depth == 0 and char in operators and not _is_unary_operator(expression, index):
-                left = expression[:index].strip()
-                right = expression[index + 1 :].strip()
-                if not left or not right:
-                    return None
-                return left, char, right
-    return None
-
-
-def _is_unary_operator(expression: str, index: int) -> bool:
-    if expression[index] not in "+-":
-        return False
-    previous = expression[:index].rstrip()
-    return not previous or previous[-1] in "(,+-*/"
-
-
-def _parse_call(expression: str) -> tuple[str, list[str]] | None:
-    match = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*)\(", expression)
-    if not match or not expression.endswith(")"):
-        return None
-    operator = match.group(1)
-    body = expression[len(operator) + 1 : -1]
-    try:
-        args = _split_args(body)
-    except ValueError:
-        return None
-    return operator, args
-
-
-def _split_args(text: str) -> list[str]:
-    args: list[str] = []
-    depth = 0
-    start = 0
-    for index, char in enumerate(text):
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth < 0:
-                raise ValueError("unbalanced formula parentheses")
-        elif char == "," and depth == 0:
-            args.append(text[start:index].strip())
-            start = index + 1
-    if depth != 0:
-        raise ValueError("unbalanced formula parentheses")
-    tail = text[start:].strip()
-    if tail:
-        args.append(tail)
-    return args
-
-
-def _is_number(value: str) -> bool:
-    try:
-        float(value)
-    except ValueError:
-        return False
-    return True
-
-
-def _validate_operator_signature(
-    operator: str,
-    args: list[str],
-    *,
-    known_operators: set[str],
-    errors: list[str],
-) -> bool:
-    if operator not in known_operators:
-        return True
-    if operator in {"rank", "zscore", "abs", "log", "sign"}:
-        return _expect_arity(operator, args, 1, errors)
-    if operator in {"delay", "delta", "ts_sum", "ts_mean", "ts_min", "ts_max", "stddev", "ts_rank", "decay_linear"}:
-        return _expect_arity(operator, args, 2, errors) and _expect_number_arg(operator, args, 1, errors)
-    if operator in {"correlation", "covariance"}:
-        return _expect_arity(operator, args, 3, errors) and _expect_number_arg(operator, args, 2, errors)
-    if operator == "scale":
-        if len(args) not in {1, 2}:
-            errors.append("scale expects 1 or 2 arguments")
-            return False
-        return len(args) == 1 or _expect_number_arg(operator, args, 1, errors)
-    if operator in {"signedpower", "wq_min", "wq_max"}:
-        return _expect_arity(operator, args, 2, errors)
-    return True
-
-
-def _expect_arity(operator: str, args: list[str], expected: int, errors: list[str]) -> bool:
-    if len(args) == expected:
-        return True
-    errors.append(f"{operator} expects {expected} argument{'s' if expected != 1 else ''}")
-    return False
-
-
-def _expect_number_arg(operator: str, args: list[str], index: int, errors: list[str]) -> bool:
-    if index < len(args) and _is_number(args[index]):
-        return True
-    errors.append(f"{operator} argument {index + 1} must be a number")
-    return False
 
 
 def _contains_st_numeric_feature(formula: str) -> bool:

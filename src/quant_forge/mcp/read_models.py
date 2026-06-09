@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from quant_forge.factor_engine.executor import SUPPORTED_OPERATORS
+from quant_forge.factor_engine.formula_parser import SUPPORTED_OPERATORS
 from quant_forge.factor_library.catalog import FactorCatalog
 
 AVAILABLE_FIELDS = {

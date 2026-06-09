@@ -187,6 +187,67 @@ def test_experiment_planner_accepts_safe_binary_formula() -> None:
     assert plan.operator_validation["used_operators"] == ["zscore", "rank"]
 
 
+def test_experiment_planner_accepts_grouped_arithmetic_formula() -> None:
+    hypothesis = StructuredResearchHypothesis(
+        hypothesis_id="grouped_formula",
+        text="average close and volume ranks",
+        formula_dsl="zscore((rank(close) + rank(volume)) / 2)",
+        expected_direction="positive",
+        source="financial_analyst",
+    )
+
+    plan = ExperimentPlanner().plan(hypothesis, default_context())
+
+    assert plan.status == "ready"
+    assert plan.inputs == ("close", "volume")
+    assert plan.operator_validation["used_operators"] == ["zscore", "rank"]
+
+
+def test_experiment_planner_preserves_dotted_field_leaf_compatibility() -> None:
+    hypothesis = StructuredResearchHypothesis(
+        hypothesis_id="dotted_field",
+        text="rank local close",
+        formula_dsl="rank(local.close)",
+        expected_direction="positive",
+        source="financial_analyst",
+    )
+
+    plan = ExperimentPlanner().plan(hypothesis, default_context())
+
+    assert plan.status == "ready"
+    assert plan.inputs == ("close",)
+    assert plan.operator_validation["used_operators"] == ["rank"]
+
+
+@pytest.mark.parametrize(
+    "formula",
+    [
+        "rank(close).__class__",
+        "close > volume",
+        "[close]",
+        "rank(close, window=2)",
+        "rank(close ** 2)",
+        "rank(close // 2)",
+        "close if volume else market_cap",
+        "np.log(close)",
+        "+rank(close)",
+    ],
+)
+def test_experiment_planner_blocks_unsafe_ast_formula_syntax(formula: str) -> None:
+    hypothesis = StructuredResearchHypothesis(
+        hypothesis_id="unsafe_formula",
+        text="unsafe formula",
+        formula_dsl=formula,
+        expected_direction="positive",
+        source="financial_analyst",
+    )
+
+    plan = ExperimentPlanner().plan(hypothesis, default_context())
+
+    assert plan.status == "blocked_formula_invalid"
+    assert "formula validation failed" in plan.blocking_reasons
+
+
 def test_experiment_planner_allows_whole_precomputed_parameter_search_seed() -> None:
     hypothesis = StructuredResearchHypothesis(
         hypothesis_id="precomputed_seed",

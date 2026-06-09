@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from quant_forge.core.contracts import SimulationProfile
 from quant_forge.factor_engine.executor import execute_factor_formula
@@ -105,6 +106,58 @@ def test_execute_factor_formula_supports_safe_binary_arithmetic() -> None:
 
     assert result["score"].notna().all()
     assert list(result.groupby("trade_date")["score"].mean().round(12)) == [0.0, 0.0]
+
+
+def test_execute_factor_formula_supports_grouped_arithmetic() -> None:
+    panel = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(["2025-01-01", "2025-01-01", "2025-01-01"]),
+            "instrument": ["AAA", "BBB", "CCC"],
+            "close": [10.0, 20.0, 30.0],
+            "volume": [300.0, 100.0, 200.0],
+            "market_cap": [30.0, 20.0, 10.0],
+            "return_5d": [0.1, -0.2, 0.3],
+        }
+    )
+
+    grouped = execute_factor_formula(panel, "(rank(close) + rank(volume)) / 2")
+    nested = execute_factor_formula(panel, "((rank(close) + rank(volume)) / 2)")
+    wrapped = execute_factor_formula(panel, "zscore((rank(market_cap) * -rank(return_5d)))")
+    dotted = execute_factor_formula(panel, "rank(local.close)")
+
+    assert list(grouped["score"].round(6)) == [0.666667, 0.5, 0.833333]
+    assert list(nested["score"].round(6)) == list(grouped["score"].round(6))
+    assert wrapped["score"].notna().all()
+    assert list(dotted["score"].round(6)) == [0.333333, 0.666667, 1.0]
+
+
+@pytest.mark.parametrize(
+    "formula",
+    [
+        "rank(close).__class__",
+        "close > volume",
+        "[close]",
+        "rank(close, window=2)",
+        "rank(close ** 2)",
+        "rank(close // 2)",
+        "close if volume else market_cap",
+        "np.log(close)",
+        "+rank(close)",
+        "precomputed:factor_id=FTR_PRE + rank(close)",
+    ],
+)
+def test_execute_factor_formula_rejects_unsafe_ast_syntax(formula: str) -> None:
+    panel = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(["2025-01-01"]),
+            "instrument": ["AAA"],
+            "close": [10.0],
+            "volume": [100.0],
+        }
+    )
+
+    with pytest.raises(ValueError):
+        execute_factor_formula(panel, formula)
 
 
 def test_prepare_factor_scores_reuses_existing_worldquant_daily_values(tmp_path) -> None:

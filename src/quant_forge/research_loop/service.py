@@ -23,6 +23,7 @@ from quant_forge.core.contracts import (
     TransactionCostModel,
 )
 from quant_forge.evaluation.service import evaluate_factor
+from quant_forge.factor_engine.formula_parser import SUPPORTED_OPERATORS, inspect_formula
 from quant_forge.factor_library.catalog import FactorCatalog, is_precomputed_formula
 from quant_forge.factor_library.repository import FactorRepository, parse_idea_to_definition
 from quant_forge.research_loop.candidate_gate import evaluate_candidate as evaluate_structured_candidate
@@ -1364,35 +1365,8 @@ def _structured_source(hypothesis: ResearchHypothesis, generation: ResearchGener
 def _formula_input_fields(formula: str) -> tuple[str, ...]:
     if is_precomputed_formula(formula):
         return ()
-    fields = re.findall(r"[a-zA-Z_][a-zA-Z0-9_.]*", formula)
-    operators = {
-        "abs",
-        "correlation",
-        "covariance",
-        "decay_linear",
-        "delay",
-        "delta",
-        "log",
-        "rank",
-        "scale",
-        "sign",
-        "signedpower",
-        "stddev",
-        "ts_max",
-        "ts_mean",
-        "ts_min",
-        "ts_rank",
-        "ts_sum",
-        "wq_max",
-        "wq_min",
-        "zscore",
-    }
-    result: list[str] = []
-    for field in fields:
-        leaf = field.split(".")[-1]
-        if leaf not in operators and not leaf.replace("_", "").isdigit():
-            result.append(leaf)
-    return tuple(dict.fromkeys(result))
+    inspection = inspect_formula(formula, known_operators=set(SUPPORTED_OPERATORS))
+    return inspection.fields
 
 
 def _safe_factor_name(text: str) -> str:
