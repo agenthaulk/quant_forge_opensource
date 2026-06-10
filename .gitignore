@@ -4,6 +4,8 @@
 !.env.example
 configs/local*.yaml
 configs/*.local.yaml
+configs/*.local.env
+configs/*.secrets.env
 .venv/
 __pycache__/
 *.py[cod]

@@ -11,7 +11,12 @@ import yaml
 from quant_forge.config import ResearchSettings, simulation_profile_from_mapping
 from quant_forge.core.contracts import SampleSplitSpec, SimulationProfile, TransactionCostModel
 from quant_forge.evaluation.service import DEFAULT_HORIZON_DAYS, DEFAULT_SAMPLE_SPLITS
-from quant_forge.research_loop.service import ResearchGate, ResearchObjectiveWeights, objective_weights_for
+from quant_forge.research_loop.service import (
+    ResearchDeduplicationConfig,
+    ResearchGate,
+    ResearchObjectiveWeights,
+    objective_weights_for,
+)
 
 DEFAULT_RD_CONFIG_PATH = Path("configs/rd.yaml")
 
@@ -90,6 +95,31 @@ class ResearchParameterSearchConfig:
 
 
 @dataclass(frozen=True)
+class ResearchLLMConfig:
+    hypothesis_mode: str = "local"
+    review_mode: str = "local"
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("hypothesis_mode", self.hypothesis_mode),
+            ("review_mode", self.review_mode),
+        ):
+            if _canonical_generation_mode(value) not in {"llm", "local"}:
+                raise ValueError(f"RD llm.{name} must be llm or local")
+
+    @property
+    def uses_llm(self) -> bool:
+        return self.research_uses_llm
+
+    @property
+    def research_uses_llm(self) -> bool:
+        return any(
+            _canonical_generation_mode(value) == "llm"
+            for value in (self.hypothesis_mode, self.review_mode)
+        )
+
+
+@dataclass(frozen=True)
 class ResearchLoopConfig:
     objective: str = "balanced"
     default_max_candidates: int = 3
@@ -103,6 +133,8 @@ class ResearchLoopConfig:
     weight_profiles: tuple[ResearchWeightProfile, ...] = field(default_factory=default_research_weight_profiles)
     parameter_search: ResearchParameterSearchConfig = field(default_factory=ResearchParameterSearchConfig)
     transaction_costs: TransactionCostModel = field(default_factory=TransactionCostModel)
+    llm: ResearchLLMConfig = field(default_factory=ResearchLLMConfig)
+    deduplication: ResearchDeduplicationConfig = field(default_factory=ResearchDeduplicationConfig)
 
     def __post_init__(self) -> None:
         if self.default_max_candidates < 1 or self.default_max_candidates > 10:
@@ -214,6 +246,8 @@ def load_research_loop_config(
         weight_profiles=_load_weight_profiles(loaded.get("weight_profiles"), base.weight_profiles),
         parameter_search=_load_parameter_search(loaded.get("parameter_search"), base.parameter_search),
         transaction_costs=_load_transaction_costs(loaded.get("transaction_costs"), base.transaction_costs),
+        llm=_load_rd_llm_config(loaded.get("llm"), base.llm),
+        deduplication=_load_deduplication(loaded.get("deduplication"), base.deduplication),
     )
 
 
@@ -291,6 +325,42 @@ def _load_transaction_costs(raw: Any, default: TransactionCostModel) -> Transact
         slippage_bps=float(raw.get("slippage_bps", default.slippage_bps)),
         short_borrow_bps_annual=float(raw.get("short_borrow_bps_annual", default.short_borrow_bps_annual)),
     )
+
+
+def _load_rd_llm_config(raw: Any, default: ResearchLLMConfig) -> ResearchLLMConfig:
+    if raw is None:
+        return default
+    if not isinstance(raw, dict):
+        raise ValueError("RD config llm section must be a mapping")
+    if "campaign_mode" in raw:
+        raise ValueError("RD config llm.campaign_mode is not supported in the public research workbench")
+    return ResearchLLMConfig(
+        hypothesis_mode=_canonical_generation_mode(raw.get("hypothesis_mode", default.hypothesis_mode)),
+        review_mode=_canonical_generation_mode(raw.get("review_mode", default.review_mode)),
+    )
+
+
+def _load_deduplication(raw: Any, default: ResearchDeduplicationConfig) -> ResearchDeduplicationConfig:
+    if raw is None:
+        return default
+    if not isinstance(raw, dict):
+        raise ValueError("RD config deduplication must be a mapping")
+    return ResearchDeduplicationConfig(
+        enabled=bool(raw.get("enabled", default.enabled)),
+        formula_fingerprint=bool(raw.get("formula_fingerprint", default.formula_fingerprint)),
+        result_signature=bool(raw.get("result_signature", default.result_signature)),
+        candidate_diversity=bool(raw.get("candidate_diversity", default.candidate_diversity)),
+        result_precision=int(raw.get("result_precision", default.result_precision)),
+        recent_trace_limit=int(raw.get("recent_trace_limit", default.recent_trace_limit)),
+        max_same_shape_per_run=int(raw.get("max_same_shape_per_run", default.max_same_shape_per_run)),
+    )
+
+
+def _canonical_generation_mode(value: Any) -> str:
+    normalized = str(value).strip().lower()
+    if normalized in {"deterministic", "rule", "local_rule", "local"}:
+        return "local"
+    return normalized
 
 
 def _validate_sample_splits(split_specs: tuple[SampleSplitSpec, ...]) -> None:

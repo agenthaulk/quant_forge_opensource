@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from quant_forge.backtesting.service import _max_drawdown, _return_summary, run_factor_backtest
 from quant_forge.core.contracts import SampleSplitSpec, SimulationProfile, TransactionCostModel
@@ -42,6 +43,7 @@ def test_backtest_uses_next_day_execution(tmp_path: Path) -> None:
     assert payload["assumptions"]
     assert "rebalance_rate tracks component replacement per rebalance" in payload["assumptions"]
     assert "turnover_rate estimates true portfolio weight turnover" in payload["assumptions"]
+    assert "short annualization window" not in "; ".join(payload["warnings"])
     assert {metric["name"] for metric in payload["segment_metrics"]} == {"IS", "OOS1", "OOS2"}
     assert sum(metric["periods"] for metric in payload["segment_metrics"]) == payload["periods"]
     segments = payload["segment_metrics"]
@@ -119,6 +121,32 @@ def test_backtest_reports_cost_aware_net_metrics_and_turnover(tmp_path: Path) ->
     assert result.transaction_costs.slippage_bps == 5.0
     assert result.net_annualized_return < result.annualized_return
     assert result.turnover_rate > 0
+
+
+def test_backtest_rejects_display_window_shorter_than_six_months(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+
+    with pytest.raises(ValueError, match="at least 126 daily trading dates"):
+        run_factor_backtest(
+            "FTR_DEMO_SMALL_CAP",
+            factor_root=paths["factor_root"],
+            data_root=paths["data_root"],
+            artifact_root=paths["artifact_root"],
+            simulation_profile=SimulationProfile(test_period_end="2024-02-14"),
+        )
+
+
+def test_backtest_warns_when_annualized_holding_exposure_is_short(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    result = run_factor_backtest(
+        "FTR_DEMO_SMALL_CAP",
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        holding_days=80,
+    )
+
+    assert "short annualization window" in "; ".join(result.warnings)
 
 
 def test_backtest_does_not_emit_fake_empty_group_returns(tmp_path: Path) -> None:

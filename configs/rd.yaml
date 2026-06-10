@@ -3,6 +3,9 @@ default_max_candidates: 3
 default_interval_days: 1
 allowed_interval_days: [1, 5, 15, 30]
 top_quantile: 0.3
+llm:
+  hypothesis_mode: local
+  review_mode: local
 simulation:
   execution_delay_days: 1
   top_quantile: 0.3
@@ -26,6 +29,14 @@ parameter_search:
       score_weight: 1.0
   top_quantile: [0.3]
   decay_days: [0]
+deduplication:
+  enabled: true
+  formula_fingerprint: true
+  result_signature: true
+  candidate_diversity: true
+  result_precision: 6
+  recent_trace_limit: 500
+  max_same_shape_per_run: 2
 horizon_days_matrix: [5, 10, 21, 63]
 sample_splits:
   - name: IS

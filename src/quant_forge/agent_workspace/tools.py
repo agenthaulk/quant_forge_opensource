@@ -11,16 +11,38 @@ from quant_forge.workbench.service import WorkbenchService
 
 
 class AgentWorkspaceTools:
-    def __init__(self, *, factor_root: Path, data_root: Path, artifact_root: Path) -> None:
-        self.workbench = WorkbenchService(factor_root=factor_root, data_root=data_root, artifact_root=artifact_root)
+    def __init__(
+        self,
+        *,
+        factor_root: Path,
+        data_root: Path,
+        artifact_root: Path,
+        factor_values_root: Path | None = None,
+        factor_values_overlay_root: Path | None = None,
+        factor_values_manifest_root: Path | None = None,
+    ) -> None:
+        self.workbench = WorkbenchService(
+            factor_root=factor_root,
+            data_root=data_root,
+            artifact_root=artifact_root,
+            factor_values_root=factor_values_root,
+            factor_values_overlay_root=factor_values_overlay_root,
+            factor_values_manifest_root=factor_values_manifest_root,
+        )
         self.factor_root = factor_root
+        self.factor_values_root = factor_values_root
+        self.factor_values_manifest_root = factor_values_manifest_root
         self.artifact_root = artifact_root
 
     def read_catalog(self) -> dict[str, object]:
         return {
             "fields": read_models.list_available_fields(),
             "operators": read_models.list_available_operators(),
-            "factors": read_models.list_factors(self.factor_root),
+            "factors": read_models.list_factors(
+                self.factor_root,
+                self.factor_values_root,
+                self.factor_values_manifest_root,
+            ),
             "artifacts": read_models.list_artifacts(self.artifact_root),
         }
 
@@ -32,6 +54,10 @@ class AgentWorkspaceTools:
         result = self.workbench.evaluate(factor_id)
         payload = asdict(result)
         payload["artifact_path"] = str(result.artifact_path)
+        payload["factor_values_path"] = str(result.factor_values_path) if result.factor_values_path else None
+        payload["factor_values_write_path"] = (
+            str(result.factor_values_write_path) if result.factor_values_write_path else None
+        )
         return payload
 
     def request_promotion(self, factor_id: str, target_status: str) -> dict[str, str]:

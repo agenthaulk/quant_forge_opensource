@@ -13,7 +13,12 @@ from quant_forge.core.contracts import (
     TransactionCostModel,
 )
 from quant_forge.research_loop.scheduler import ResearchLoopScheduler, ResearchScheduleRequest
-from quant_forge.research_loop.service import ResearchGate, ResearchLoopService, apply_gate
+from quant_forge.research_loop.service import (
+    ResearchDeduplicationConfig,
+    ResearchGate,
+    ResearchLoopService,
+    apply_gate,
+)
 from quant_forge.workbench.service import WorkbenchService
 
 
@@ -48,7 +53,8 @@ def test_workbench_and_research_loop(tmp_path: Path) -> None:
     assert result.candidates
     assert result.accepted_candidate_ids
     first = result.candidates[0]
-    assert first.factor.formula == "-rank(market_cap)"
+    assert first.factor.formula != "-rank(market_cap)"
+    assert first.factor.formula in {"rank(return_5d)", "-rank(volatility_5d)"}
     assert first.factor.status == "candidate"
     assert first.evaluation.observations > 0
     assert first.backtest.periods > 0
@@ -80,6 +86,11 @@ def test_workbench_and_research_loop(tmp_path: Path) -> None:
     assert "Backtest Segments" in report
     assert "Net Annualized Return" in report
     assert "research artifact" in report
+    assert first.evaluation.artifact_path.name in report
+    assert first.backtest.artifact_path.name in report
+    assert str(paths["workspace"]) not in report
+    assert str(first.evaluation.artifact_path) not in report
+    assert str(first.backtest.artifact_path) not in report
 
 
 def test_research_loop_scheduler_runs_immediately(tmp_path: Path) -> None:
@@ -121,6 +132,7 @@ def test_research_loop_preserves_existing_candidate_status_on_later_gate_failure
         factor_root=paths["factor_root"],
         data_root=paths["data_root"],
         artifact_root=paths["artifact_root"],
+        deduplication=ResearchDeduplicationConfig(enabled=False),
     )
 
     passing = loop.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)

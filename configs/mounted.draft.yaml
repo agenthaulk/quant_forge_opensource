@@ -1,0 +1,61 @@
+# Quant Forge mounted-disk runtime config draft.
+# Copy this file to an ignored local config and replace <MOUNT_ROOT> with the
+# mounted QuantForgeData parent path on the current machine:
+#   cp configs/mounted.draft.yaml configs/default.local.yaml
+#
+# The repository should not commit machine-local absolute paths. This draft is
+# intentionally a template; edit the copy before running qf doctor.
+
+paths:
+  # Stable mounted workbench roots. Keep factor definitions and artifacts here
+  # when you want a fresh Git checkout on another machine to continue research
+  # without copying repo-local state.
+  data_root: <MOUNT_ROOT>/QuantForgeData/workbenches/quant_forge_opensource/data
+  factor_root: <MOUNT_ROOT>/QuantForgeData/workbenches/quant_forge_opensource/factor_root
+  artifact_root: <MOUNT_ROOT>/QuantForgeData/workbenches/quant_forge_opensource/artifacts
+  output_root: <MOUNT_ROOT>/QuantForgeData/workbenches/quant_forge_opensource/outputs
+
+  # Shared factor-value database. Existing daily factor values are read from
+  # 原始因子/factor_id=<FACTOR_ID> and 合成因子/factor_id=<FACTOR_ID> directories.
+  factor_values_root: <MOUNT_ROOT>/QuantForgeData/canonical/factor=cn_a
+  # Writable overlay for new local incremental values. Use this when the
+  # canonical store should remain read-only while research continues.
+  factor_values_overlay_root: <MOUNT_ROOT>/QuantForgeData/workbenches/quant_forge_opensource/factor_values_overlay
+  factor_values_manifest_root: <MOUNT_ROOT>/QuantForgeData/catalog/manifests/market=cn_a/dataset=factor_values
+
+runtime:
+  env_files:
+    # - default.local.env
+
+web:
+  host: 127.0.0.1
+  port: 8765
+
+research:
+  default_horizon_days: 5
+  default_top_quantile: 0.3
+
+simulation:
+  market: cn_a
+  instrument_type: equity
+  universe: local_panel
+  execution_delay_days: 1
+  top_quantile: 0.3
+  nan_policy: drop
+  neutralization: none
+  truncation: null
+  decay_days: 0
+  test_period:
+    start: null
+    end: null
+
+llm:
+  # Use one active provider/key for both LLM parsing and RD LLM features.
+  # Keep real keys in an ignored runtime.env_files entry.
+  provider: rule
+  timeout_seconds: 30
+  providers:
+    deepseek:
+      model: deepseek-chat
+      base_url: https://api.deepseek.com
+      api_key_env: DEEPSEEK_API_KEY

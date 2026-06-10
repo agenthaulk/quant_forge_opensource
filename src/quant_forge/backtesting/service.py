@@ -20,11 +20,15 @@ from quant_forge.data.local import LocalPanelDataProvider
 from quant_forge.evaluation.service import DEFAULT_SAMPLE_SPLITS
 from quant_forge.factor_engine.signal_processing import (
     apply_test_period,
-    prepare_factor_scores,
+    prepare_factor_scores_result,
+    require_minimum_display_trading_days,
     simulation_profile_suffix,
 )
-from quant_forge.factor_library.repository import FactorRepository
+from quant_forge.factor_library.catalog import FactorCatalog
 from quant_forge.utils import write_json
+
+
+MIN_ANNUALIZATION_EXPOSURE_DAYS = 126
 
 
 def run_factor_backtest(
@@ -39,6 +43,9 @@ def run_factor_backtest(
     simulation_profile: SimulationProfile | None = None,
     transaction_costs: TransactionCostModel | None = None,
     sample_splits: tuple[SampleSplitSpec, ...] | None = None,
+    factor_values_root: Path | None = None,
+    factor_values_overlay_root: Path | None = None,
+    factor_values_manifest_root: Path | None = None,
 ) -> BacktestResult:
     profile = simulation_profile or SimulationProfile()
     costs = transaction_costs or TransactionCostModel()
@@ -59,13 +66,28 @@ def run_factor_backtest(
     top_quantile = profile.top_quantile
     if group_count < 2:
         raise ValueError("group_count must be at least 2")
-    factor = FactorRepository(factor_root).get(factor_id)
+    factor = FactorCatalog(
+        factor_root,
+        factor_values_root=factor_values_root,
+        factor_values_manifest_root=factor_values_manifest_root,
+    ).get(factor_id)
     holding = holding_days or factor.horizon_days
     if holding < 1:
         raise ValueError("holding_days must be positive")
     panel = LocalPanelDataProvider(data_root).load_panel()
     working_panel = apply_test_period(panel, profile)
-    scores = prepare_factor_scores(working_panel, factor.formula, factor.universe_filters, profile=profile)
+    require_minimum_display_trading_days(working_panel)
+    score_result = prepare_factor_scores_result(
+        working_panel,
+        factor.formula,
+        factor.universe_filters,
+        profile=profile,
+        factor_id=factor.factor_id,
+        factor_name=factor.name,
+        factor_values_root=factor_values_root,
+        factor_values_overlay_root=factor_values_overlay_root,
+    )
+    scores = score_result.scores
     close = working_panel[["trade_date", "instrument", "close"]].copy()
     dates = sorted(working_panel["trade_date"].drop_duplicates())
     rows: list[dict[str, object]] = []
@@ -147,6 +169,7 @@ def run_factor_backtest(
     segment_metrics = _segment_metrics(rows, holding, sample_splits or DEFAULT_SAMPLE_SPLITS)
     warnings = _backtest_warnings(
         periods=len(rows),
+        holding_days=holding,
         rebalance_rate=rebalance_rate,
         turnover_rate=turnover_rate,
         gross_annualized_return=gross_summary["annualized_return"],
@@ -180,6 +203,13 @@ def run_factor_backtest(
             "holding_days": holding,
             "top_quantile": top_quantile,
             "simulation_profile": asdict(profile),
+            "score_source": score_result.source,
+            "score_cached_rows": score_result.cached_rows,
+            "score_computed_rows": score_result.computed_rows,
+            "factor_values_path": str(score_result.factor_values_path) if score_result.factor_values_path else None,
+            "factor_values_write_path": (
+                str(score_result.factor_values_write_path) if score_result.factor_values_write_path else None
+            ),
             "transaction_costs": asdict(costs),
             "periods": len(rows),
             "cumulative_return": gross_summary["cumulative_return"],
@@ -234,6 +264,11 @@ def run_factor_backtest(
         segment_metrics=segment_metrics,
         warnings=warnings,
         assumptions=assumptions,
+        score_source=score_result.source,
+        score_cached_rows=score_result.cached_rows,
+        score_computed_rows=score_result.computed_rows,
+        factor_values_path=score_result.factor_values_path,
+        factor_values_write_path=score_result.factor_values_write_path,
     )
 
 
@@ -404,6 +439,7 @@ def _split_dates(
 def _backtest_warnings(
     *,
     periods: int,
+    holding_days: int,
     rebalance_rate: float,
     turnover_rate: float,
     gross_annualized_return: float,
@@ -413,6 +449,10 @@ def _backtest_warnings(
     warnings: list[str] = []
     if periods < 2:
         warnings.append("too few backtest periods for stable Sharpe or drawdown estimates")
+    if 0 < periods * holding_days < MIN_ANNUALIZATION_EXPOSURE_DAYS:
+        warnings.append(
+            "short annualization window: annualized return and volatility are highly extrapolated"
+        )
     if rebalance_rate > 0.8:
         warnings.append("high rebalance rate")
     if turnover_rate > 1.5:

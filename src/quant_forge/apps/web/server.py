@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import Any
 
 from quant_forge.backtesting.service import run_factor_backtest
-from quant_forge.config import QuantForgeConfig
+from quant_forge.config import QuantForgeConfig, validate_llm_runtime
 from quant_forge.core.contracts import BacktestResult, EvaluationResult
 from quant_forge.evaluation.service import evaluate_factor
+from quant_forge.factor_library.catalog import FactorCatalog
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.llm_factor_parser import ParsedFactor, parse_factor_idea
 from quant_forge.mcp.read_models import list_available_fields, list_available_operators
@@ -26,6 +27,7 @@ from quant_forge.research_loop.config import (
     load_research_loop_config,
     weights_for_objective,
 )
+from quant_forge.research_loop.llm import LLMHypothesisGenerator, LLMResearchReviewGenerator
 from quant_forge.research_loop.service import ResearchLoopResult, ResearchLoopService
 
 
@@ -43,6 +45,8 @@ def run_idea_workflow(
         raise ValueError("idea text is required")
     research_config = rd_config or load_research_loop_config(DEFAULT_RD_CONFIG_PATH, config.research, config.simulation)
     llm_settings = config.llm.select_provider(llm_provider) if parser_mode == "llm" else config.llm
+    if parser_mode == "llm":
+        validate_llm_runtime(llm_settings)
     parsed = parse_factor_idea(text, llm_settings, mode=parser_mode)
     FactorRepository(config.paths.factor_root).save(parsed.factor)
     evaluation = evaluate_factor(
@@ -54,6 +58,9 @@ def run_idea_workflow(
         horizon_days_matrix=research_config.horizon_days_matrix,
         sample_splits=research_config.sample_splits,
         simulation_profile=research_config.simulation_profile,
+        factor_values_root=config.paths.factor_values_root,
+        factor_values_overlay_root=config.paths.factor_values_overlay_root,
+        factor_values_manifest_root=config.paths.factor_values_manifest_root,
     )
     backtest = run_factor_backtest(
         parsed.factor.factor_id,
@@ -64,6 +71,9 @@ def run_idea_workflow(
         holding_days=parsed.factor.horizon_days,
         transaction_costs=research_config.transaction_costs,
         sample_splits=research_config.sample_splits,
+        factor_values_root=config.paths.factor_values_root,
+        factor_values_overlay_root=config.paths.factor_values_overlay_root,
+        factor_values_manifest_root=config.paths.factor_values_manifest_root,
     )
     return _workflow_payload(parsed, evaluation, backtest)
 
@@ -114,16 +124,18 @@ def create_local_web_server(
             elif self.path == "/catalog":
                 self._json({"fields": list_available_fields(), "operators": list_available_operators()})
             elif self.path == "/api/status":
+                active_llm = _active_llm(config)
                 self._json(
                     {
                         "name": "Quant Forge",
                         "paths": _paths_payload(config),
                         "llm": {
-                            "provider": config.llm.provider,
-                            "model": config.llm.model,
-                            "api_key_env": config.llm.api_key_env,
-                            "providers": config.llm.public_provider_options(),
+                            "provider": active_llm.provider,
+                            "model": active_llm.model,
+                            "api_key_env": active_llm.api_key_env,
+                            "providers": _llm_provider_options(config),
                         },
+                        "rd": _rd_status_payload(config, research_config),
                     }
                 )
             elif self.path == "/api/research/status":
@@ -238,10 +250,19 @@ def _run_research_once(
 ) -> ResearchLoopResult:
     if not seed_factor_id.strip():
         raise ValueError("seed_factor_id is required")
+    hypothesis_generator = None
+    review_generator = None
+    if _rd_generation_mode(rd_config.llm.hypothesis_mode) == "llm":
+        hypothesis_generator = LLMHypothesisGenerator(_rd_llm_settings(config, feature="RD hypothesis generation"))
+    if _rd_generation_mode(rd_config.llm.review_mode) == "llm":
+        review_generator = LLMResearchReviewGenerator(_rd_llm_settings(config, feature="RD self-review"))
     service = ResearchLoopService(
         factor_root=config.paths.factor_root,
         data_root=config.paths.data_root,
         artifact_root=config.paths.artifact_root,
+        factor_values_root=config.paths.factor_values_root,
+        factor_values_overlay_root=config.paths.factor_values_overlay_root,
+        factor_values_manifest_root=config.paths.factor_values_manifest_root,
         simulation_profile=rd_config.simulation_profile,
         simulation_profiles=rd_config.simulation_profiles,
         parameter_search_enabled=rd_config.parameter_search.enabled,
@@ -253,6 +274,9 @@ def _run_research_once(
         horizon_days_matrix=rd_config.horizon_days_matrix,
         sample_splits=rd_config.sample_splits,
         transaction_costs=rd_config.transaction_costs,
+        deduplication=rd_config.deduplication,
+        hypothesis_generator=hypothesis_generator,
+        review_generator=review_generator,
     )
     weights = weights_for_objective(rd_config, objective)
     return service.run_once(
@@ -262,6 +286,21 @@ def _run_research_once(
         weights=weights,
         gate=rd_config.gate,
     )
+
+
+def _rd_llm_settings(config: QuantForgeConfig, *, feature: str) -> Any:
+    selected = config.llm.select_provider()
+    if selected.provider.lower() in {"rule", "deterministic"}:
+        raise RuntimeError(f"{feature} requires a configured LLM provider; selected provider is local rule.")
+    validate_llm_runtime(selected)
+    return selected
+
+
+def _rd_generation_mode(mode: str) -> str:
+    normalized = mode.strip().lower()
+    if normalized in {"deterministic", "rule", "local_rule"}:
+        return "local"
+    return normalized
 
 
 def _json_safe(value: Any) -> Any:
@@ -274,7 +313,7 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, list):
         return [_json_safe(item) for item in value]
     if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
+        return {str(key): _json_safe(item) for key, item in value.items() if str(key) != "raw_response"}
     return value
 
 
@@ -294,27 +333,113 @@ def _paths_payload(config: QuantForgeConfig) -> dict[str, str]:
     return {
         "data_root": str(config.paths.data_root),
         "factor_root": str(config.paths.factor_root),
+        "factor_values_root": str(config.paths.factor_values_root or ""),
+        "factor_values_overlay_root": str(config.paths.factor_values_overlay_root or ""),
+        "factor_values_manifest_root": str(config.paths.factor_values_manifest_root or ""),
         "artifact_root": str(config.paths.artifact_root),
     }
+
+
+def _llm_provider_options(config: QuantForgeConfig) -> tuple[dict[str, str], ...]:
+    options: list[dict[str, str]] = []
+    for option in config.llm.public_provider_options():
+        runtime_ready, runtime_error = _llm_runtime_status(config, option["provider"])
+        enriched = dict(option)
+        enriched["runtime_ready"] = "true" if runtime_ready else "false"
+        enriched["runtime_error"] = runtime_error
+        options.append(enriched)
+    return tuple(options)
+
+
+def _llm_runtime_status(config: QuantForgeConfig, provider: str) -> tuple[bool, str]:
+    try:
+        validate_llm_runtime(config.llm, provider)
+    except RuntimeError as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def _active_llm(config: QuantForgeConfig) -> Any:
+    return config.llm.select_provider()
+
+
+def _rd_status_payload(config: QuantForgeConfig, rd_config: ResearchLoopConfig) -> dict[str, str]:
+    active_llm = _active_llm(config)
+    return {
+        "research_stage": "research",
+        "hypothesis_mode": _rd_generation_mode(rd_config.llm.hypothesis_mode),
+        "review_mode": _rd_generation_mode(rd_config.llm.review_mode),
+        "provider": active_llm.provider,
+        "model": active_llm.model,
+    }
+
+
+def _rd_optimizer_label(config: QuantForgeConfig, rd_config: ResearchLoopConfig) -> str:
+    active_llm = _active_llm(config)
+    modes = (
+        _rd_generation_mode(rd_config.llm.hypothesis_mode),
+        _rd_generation_mode(rd_config.llm.review_mode),
+    )
+    if "llm" not in modes:
+        return "research local deterministic"
+    if active_llm.provider in {"rule", "deterministic"}:
+        return "research LLM required / provider not configured"
+    return f"research LLM / {active_llm.provider} / {active_llm.model}"
+
+
+def _default_seed_factor_id(config: QuantForgeConfig) -> str:
+    factor_ids = _catalog_factor_ids(config)
+    if "FTR_DEMO_SMALL_CAP" in factor_ids:
+        return "FTR_DEMO_SMALL_CAP"
+    return factor_ids[0] if factor_ids else ""
+
+
+def _simulation_profile_period_text(profile: Any) -> str:
+    start = getattr(profile, "test_period_start", None) or "full available data"
+    end = getattr(profile, "test_period_end", None) or "latest available data"
+    return f"{start} -> {end}"
+
+
+def _catalog_factor_ids(config: QuantForgeConfig) -> list[str]:
+    try:
+        factors = FactorCatalog(
+            config.paths.factor_root,
+            factor_values_root=config.paths.factor_values_root,
+            factor_values_manifest_root=config.paths.factor_values_manifest_root,
+        ).list()
+    except Exception:
+        return []
+    return [factor.factor_id for factor in factors]
 
 
 def _selected_attr(selected: bool) -> str:
     return " selected" if selected else ""
 
 
+def _provider_readiness_label(option: dict[str, str]) -> str:
+    if option.get("runtime_ready") == "true":
+        return " · env " + option["api_key_env"] if option["api_key_env"] else " · no auth"
+    api_key_env = option.get("api_key_env", "")
+    if api_key_env:
+        return " · missing env " + api_key_env
+    return " · not ready"
+
+
 def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None = None) -> str:
     research_config = rd_config or load_research_loop_config(DEFAULT_RD_CONFIG_PATH, config.research, config.simulation)
     paths = _paths_payload(config)
-    provider_options = config.llm.public_provider_options()
-    default_provider = config.llm.provider if config.llm.provider not in {"rule", "deterministic"} else ""
-    if not default_provider and provider_options:
-        default_provider = provider_options[0]["provider"]
-    default_llm = config.llm.select_provider(default_provider) if default_provider else config.llm.select_provider()
-    provider = escape(default_llm.provider)
-    model = escape(default_llm.model)
-    parser_label = escape(f"{default_provider or config.llm.provider}")
+    provider_options = _llm_provider_options(config)
+    active_llm = _active_llm(config)
+    active_provider = active_llm.provider if active_llm.provider not in {"rule", "deterministic"} else ""
+    provider = escape(active_llm.provider)
+    model = escape(active_llm.model)
+    parser_label = escape(active_provider or "未配置 LLM provider")
+    rd_optimizer_label = escape(_rd_optimizer_label(config, research_config))
+    seed_factor_id = escape(_default_seed_factor_id(config))
     data_root = escape(paths["data_root"])
     factor_root = escape(paths["factor_root"])
+    factor_values_root = escape(paths["factor_values_root"])
+    factor_values_overlay_root = escape(paths["factor_values_overlay_root"])
     artifact_root = escape(paths["artifact_root"])
     interval_options = "\n".join(
         f'      <option value="{day}"{_selected_attr(day == research_config.default_interval_days)}>{day}天</option>'
@@ -332,14 +457,19 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
     llm_provider_options = "\n".join(
         (
             f'      <option value="{escape(option["provider"])}"'
-            f'{_selected_attr(option["provider"] == default_provider)}>'
+            f'{_selected_attr(option["provider"] == active_provider)}>'
             f'{escape(option["provider"])} / {escape(option["model"])}'
-            f' · env {escape(option["api_key_env"] or "未配置")}</option>'
+            f'{escape(_provider_readiness_label(option))}</option>'
         )
         for option in provider_options
     )
     if not llm_provider_options:
         llm_provider_options = '      <option value="">未配置 LLM provider</option>'
+    rd_seed_html = (
+        f'<input id="rd-seed" value="{seed_factor_id}">'
+        if seed_factor_id
+        else '<input id="rd-seed" value="" placeholder="先创建或配置一个因子">'
+    )
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -464,6 +594,7 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
       font-size: 12px;
     }}
     .ok {{ color: var(--accent-2); font-weight: 800; }}
+    .warn {{ color: #9a5a12; font-weight: 800; }}
     .err {{ color: var(--bad); font-weight: 800; white-space: pre-wrap; }}
     .formula {{
       font-size: 22px;
@@ -481,16 +612,19 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
 <main>
   <aside>
     <h1>Quant Forge</h1>
-    <p class="meta">LLM: {provider} / {model}</p>
+    <p class="meta">LLM parser: {provider} / {model}</p>
+    <p class="meta">RD optimizer: {rd_optimizer_label}</p>
     <p class="meta">data_root: {data_root}</p>
     <p class="meta">factor_root: {factor_root}</p>
+    <p class="meta">factor_values_root: {factor_values_root or '未配置'}</p>
+    <p class="meta">factor_values_overlay_root: {factor_values_overlay_root or '未配置'}</p>
     <p class="meta">artifact_root: {artifact_root}</p>
     <label for="idea">因子观点</label>
     <textarea id="idea">非ST的小市值股票未来表现更好</textarea>
     <label for="parser">解析方式</label>
     <select id="parser">
-      <option value="llm">配置 LLM: {parser_label}</option>
-      <option value="rule">规则解析</option>
+      <option value="llm">LLM 语义解析: {parser_label}</option>
+      <option value="rule">本地规则解析</option>
     </select>
     <label for="llm-provider">LLM Provider</label>
     <select id="llm-provider">
@@ -501,7 +635,7 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
     <hr>
     <h2>RD</h2>
     <label for="rd-seed">Seed Factor</label>
-    <input id="rd-seed" value="FTR_DEMO_SMALL_CAP">
+    {rd_seed_html}
     <label for="rd-objective">目标优先级</label>
     <select id="rd-objective">
 {objective_options}
@@ -557,11 +691,16 @@ function num(value, digits = 4) {{
 function esc(value) {{
   return String(value).replace(/[&<>"']/g, ch => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[ch]));
 }}
+function profilePeriodText(profile) {{
+  const start = profile.test_period_start || 'full available data';
+  const end = profile.test_period_end || 'latest available data';
+  return `${{start}} -> ${{end}}`;
+}}
 function render(payload) {{
-	  const factor = payload.factor;
-	  const evaluation = payload.evaluation;
-	  const backtest = payload.backtest;
-	  const profile = backtest.simulation_profile || evaluation.simulation_profile || {{}};
+  const factor = payload.factor;
+  const evaluation = payload.evaluation;
+  const backtest = payload.backtest;
+  const profile = backtest.simulation_profile || evaluation.simulation_profile || {{}};
   const splitRows = (evaluation.split_metrics || []).map(metric =>
     `<span class="pill">${{esc(metric.name)}} ICIR ${{num(metric.rank_icir, 2)}} · days ${{metric.ic_days}}</span>`
   ).join('');
@@ -574,15 +713,22 @@ function render(payload) {{
   const segmentRows = (backtest.segment_metrics || []).map(metric =>
     `<span class="pill">${{esc(metric.name)}} net ${{pct(metric.net_annualized_return)}} · sharpe ${{num(metric.net_long_short_sharpe || 0, 2)}}</span>`
   ).join('');
-  const warningRows = (backtest.warnings || []).map(item =>
+  const warningRows = [...(evaluation.warnings || []), ...(backtest.warnings || [])].map(item =>
     `<span class="pill">${{esc(item)}}</span>`
   ).join('');
+  const cacheRows = [
+    `eval ${{evaluation.score_source || 'computed'}} · cached ${{evaluation.score_cached_rows || 0}} · computed ${{evaluation.score_computed_rows || 0}}`,
+    evaluation.factor_values_path ? `eval path ${{evaluation.factor_values_path}}` : '',
+    `backtest ${{backtest.score_source || 'computed'}} · cached ${{backtest.score_cached_rows || 0}} · computed ${{backtest.score_computed_rows || 0}}`,
+    backtest.factor_values_path ? `backtest path ${{backtest.factor_values_path}}` : ''
+  ].filter(Boolean).map(item => `<span class="pill">${{esc(item)}}</span>`).join('');
   resultEl.innerHTML = `
     <div class="panel">
       <h3>${{esc(factor.factor_id)}} · ${{esc(payload.parser.source)}} / ${{esc(payload.parser.provider)}} / ${{esc(payload.parser.model)}}</h3>
       <div class="formula">${{esc(factor.formula)}}</div>
       <p>${{esc(factor.description || '')}}</p>
       <p class="meta">horizon_days: ${{factor.horizon_days}} · filters: ${{esc((factor.universe_filters || []).join(', ') || 'none')}}</p>
+      <p class="meta">test period: ${{esc(profilePeriodText(profile))}}</p>
       <p class="meta">研究口径，不是生产交易口径。</p>
     </div>
     <div class="grid">
@@ -596,11 +742,11 @@ function render(payload) {{
       <div class="tile">净年化收益<b>${{pct(backtest.net_annualized_return || 0)}}</b></div>
       <div class="tile">年化波动<b>${{pct(backtest.annualized_volatility)}}</b></div>
       <div class="tile">最大回撤<b>${{pct(backtest.max_drawdown)}}</b></div>
-	      <div class="tile">持有期<b>${{backtest.holding_days}}日</b></div>
-	      <div class="tile">Decay<b>${{profile.decay_days || 0}}</b></div>
-	      <div class="tile">Top Quantile<b>${{num(profile.top_quantile || backtest.top_quantile || 0, 2)}}</b></div>
-	      <div class="tile">Delay<b>${{profile.execution_delay_days || 1}}日</b></div>
-	      <div class="tile">净多空Sharpe<b>${{num(backtest.net_long_short_sharpe || backtest.long_short_sharpe || 0, 2)}}</b></div>
+      <div class="tile">持有期<b>${{backtest.holding_days}}日</b></div>
+      <div class="tile">Decay<b>${{profile.decay_days || 0}}</b></div>
+      <div class="tile">Top Quantile<b>${{num(profile.top_quantile || backtest.top_quantile || 0, 2)}}</b></div>
+      <div class="tile">Delay<b>${{profile.execution_delay_days || 1}}日</b></div>
+      <div class="tile">净多空Sharpe<b>${{num(backtest.net_long_short_sharpe || backtest.long_short_sharpe || 0, 2)}}</b></div>
       <div class="tile">调仓率<b>${{pct(backtest.rebalance_rate || 0)}}</b></div>
       <div class="tile">换手率<b>${{pct(backtest.turnover_rate || 0)}}</b></div>
     </div>
@@ -615,6 +761,8 @@ function render(payload) {{
       <p>${{groupRows || '<span class="pill">暂无</span>'}}</p>
       <h3>风险提示</h3>
       <p>${{warningRows || '<span class="pill">研究口径，不是生产交易口径</span>'}}</p>
+      <h3>因子值缓存</h3>
+      <p>${{cacheRows || '<span class="pill">computed</span>'}}</p>
     </div>
     <div class="panel">
       <h3>Artifacts</h3>
@@ -626,32 +774,41 @@ function renderResearch(payload) {{
   const candidates = payload.candidates || [];
   const accepted = payload.accepted_candidate_ids || [];
   const cards = candidates.map(candidate => {{
-	    const factor = candidate.factor;
-	    const evaluation = candidate.evaluation;
-	    const backtest = candidate.backtest;
-	    const profile = backtest.simulation_profile || {{}};
-	    const gate = candidate.gate_passed ? '<span class="ok">candidate</span>' : '<span class="err">draft</span>';
+    const factor = candidate.factor;
+    const evaluation = candidate.evaluation;
+    const backtest = candidate.backtest;
+    const profile = backtest.simulation_profile || {{}};
+    const gate = candidate.gate_passed ? '<span class="ok">candidate</span>' : '<span class="err">draft</span>';
+    const cacheText = `${{evaluation.score_source || 'computed'}} / ${{backtest.score_source || 'computed'}} · cached ${{evaluation.score_cached_rows || 0}}/${{backtest.score_cached_rows || 0}} · computed ${{evaluation.score_computed_rows || 0}}/${{backtest.score_computed_rows || 0}}`;
+    const cachePaths = [evaluation.factor_values_path, backtest.factor_values_path].filter(Boolean).join(' / ');
+    const artifacts = [evaluation.artifact_path, backtest.artifact_path].filter(Boolean).join(' / ');
+    const reviewWarnings = ((candidate.self_review && candidate.self_review.normalization_warnings) || []).join('; ');
     return `
       <div class="panel">
         <h3>${{esc(factor.factor_id)}} · ${{gate}}</h3>
         <div class="formula">${{esc(factor.formula)}}</div>
         <p>${{esc(candidate.hypothesis.text)}}</p>
         <p class="meta">${{esc(candidate.hypothesis.rationale)}}</p>
+        <p class="meta">test period: ${{esc(profilePeriodText(profile))}}</p>
         <p class="meta">研究口径，不是生产交易口径。</p>
-	        <p>
-	          <span class="pill">score ${{num(candidate.score, 4)}}</span>
-	          <span class="pill">split ICIR ${{num(candidate.split_weighted_icir || 0, 2)}}</span>
-	          <span class="pill">IC ${{num(evaluation.rank_ic_mean)}}</span>
-	          <span class="pill">ICIR ${{num(evaluation.rank_icir, 2)}}</span>
-	          <span class="pill">decay ${{profile.decay_days || 0}}</span>
-	          <span class="pill">top ${{num(profile.top_quantile || backtest.top_quantile || 0, 2)}}</span>
-	          <span class="pill">net LS Sharpe ${{num(backtest.net_long_short_sharpe || backtest.long_short_sharpe || 0, 2)}}</span>
-	          <span class="pill">gross ${{pct(backtest.gross_annualized_return ?? backtest.annualized_return)}}</span>
-	          <span class="pill">net ${{pct(backtest.net_annualized_return || 0)}}</span>
-	          <span class="pill">rebalance rate ${{pct(backtest.rebalance_rate || 0)}}</span>
-	          <span class="pill">turnover rate ${{pct(backtest.turnover_rate || 0)}}</span>
-	        </p>
+        <p>
+          <span class="pill">score ${{num(candidate.score, 4)}}</span>
+          <span class="pill">split ICIR ${{num(candidate.split_weighted_icir || 0, 2)}}</span>
+          <span class="pill">IC ${{num(evaluation.rank_ic_mean)}}</span>
+          <span class="pill">ICIR ${{num(evaluation.rank_icir, 2)}}</span>
+          <span class="pill">decay ${{profile.decay_days || 0}}</span>
+          <span class="pill">top ${{num(profile.top_quantile || backtest.top_quantile || 0, 2)}}</span>
+          <span class="pill">net LS Sharpe ${{num(backtest.net_long_short_sharpe || backtest.long_short_sharpe || 0, 2)}}</span>
+          <span class="pill">gross ${{pct(backtest.gross_annualized_return ?? backtest.annualized_return)}}</span>
+          <span class="pill">net ${{pct(backtest.net_annualized_return || 0)}}</span>
+          <span class="pill">rebalance rate ${{pct(backtest.rebalance_rate || 0)}}</span>
+          <span class="pill">turnover rate ${{pct(backtest.turnover_rate || 0)}}</span>
+          <span class="pill">factor cache ${{esc(cacheText)}}</span>
+        </p>
         <p class="meta">${{esc((candidate.self_review && candidate.self_review.summary) || '')}}</p>
+        <p class="meta">review normalization: ${{esc(reviewWarnings || 'none')}}</p>
+        <p class="meta">factor_values: ${{esc(cachePaths || 'none')}}</p>
+        <p class="meta">artifacts: ${{esc(artifacts || 'not generated')}}</p>
         <p class="meta">${{esc((backtest.warnings || []).join('; ') || 'research semantics, not production trading semantics')}}</p>
         <p class="meta">${{esc((candidate.gate_reasons || []).join('; '))}}</p>
       </div>`;
@@ -659,6 +816,7 @@ function renderResearch(payload) {{
   rdResultEl.innerHTML = `
     <div class="panel">
       <h3>${{esc(payload.seed_factor_id)}} · ${{esc(payload.objective)}}</h3>
+      <p class="meta">workflow: ${{esc(payload.workflow_type || payload.rd_stage || 'research')}}</p>
       <p class="meta">accepted: ${{esc(accepted.join(', ') || 'none')}}</p>
       <p class="meta">report: ${{esc(payload.report_path || 'not generated')}}</p>
     </div>
@@ -671,25 +829,45 @@ function rdPayload() {{
     max_candidates: Number(document.getElementById('rd-max').value)
   }};
 }}
+async function submitIdea(parserMode) {{
+  const response = await fetch('/api/run-idea', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{
+      text: document.getElementById('idea').value,
+      parser_mode: parserMode,
+      llm_provider: document.getElementById('llm-provider').value
+    }})
+  }});
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || 'request failed');
+  return payload;
+}}
 button.addEventListener('click', async () => {{
   button.disabled = true;
   errorEl.textContent = '';
   statusEl.textContent = '运行中...';
+  const parserMode = document.getElementById('parser').value;
   try {{
-    const response = await fetch('/api/run-idea', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{
-        text: document.getElementById('idea').value,
-        parser_mode: document.getElementById('parser').value,
-        llm_provider: document.getElementById('llm-provider').value
-      }})
-    }});
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || 'request failed');
+    const payload = await submitIdea(parserMode);
     render(payload);
     statusEl.innerHTML = '<span class="ok">验证完成</span>';
   }} catch (error) {{
+    if (parserMode === 'llm') {{
+      const fallback = window.confirm(`LLM 无法使用：${{error.message}}\n\n是否改用本地规则解析？`);
+      if (fallback) {{
+        try {{
+          const payload = await submitIdea('rule');
+          render(payload);
+          statusEl.innerHTML = '<span class="ok">已使用本地规则解析完成</span>';
+          return;
+        }} catch (fallbackError) {{
+          errorEl.textContent = fallbackError.message;
+          statusEl.textContent = '运行失败';
+          return;
+        }}
+      }}
+    }}
     errorEl.textContent = error.message;
     statusEl.textContent = '运行失败';
   }} finally {{

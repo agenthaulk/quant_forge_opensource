@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+import re
 from typing import Literal
 
 
@@ -28,8 +29,8 @@ class FactorDefinition:
         allowed: set[str] = {"draft", "candidate", "active", "inactive", "archived"}
         if self.status not in allowed:
             raise ValueError(f"invalid factor status: {self.status}")
-        if not self.factor_id.startswith("FTR_"):
-            raise ValueError("factor_id must start with FTR_")
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_=-]*", self.factor_id):
+            raise ValueError("factor_id must start with a letter and contain only letters, digits, underscores, =, or -")
         if self.horizon_days < 1:
             raise ValueError("horizon_days must be positive")
 
@@ -42,6 +43,10 @@ class DataValidationResult:
     instruments: int
     date_count: int
     missing_columns: tuple[str, ...] = field(default_factory=tuple)
+    panel_path: Path | None = None
+    start_date: str = ""
+    end_date: str = ""
+    optional_columns: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -138,6 +143,12 @@ class EvaluationResult:
     split_metrics: tuple[EvaluationSplitMetric, ...] = field(default_factory=tuple)
     horizon_metrics: tuple[HorizonEvaluationMetric, ...] = field(default_factory=tuple)
     simulation_profile: SimulationProfile = field(default_factory=SimulationProfile)
+    score_source: str = "computed"
+    score_cached_rows: int = 0
+    score_computed_rows: int = 0
+    factor_values_path: Path | None = None
+    factor_values_write_path: Path | None = None
+    warnings: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -208,6 +219,11 @@ class BacktestResult:
     segment_metrics: tuple[BacktestSegmentMetric, ...] = field(default_factory=tuple)
     warnings: tuple[str, ...] = field(default_factory=tuple)
     assumptions: tuple[str, ...] = field(default_factory=tuple)
+    score_source: str = "computed"
+    score_cached_rows: int = 0
+    score_computed_rows: int = 0
+    factor_values_path: Path | None = None
+    factor_values_write_path: Path | None = None
 
 
 def _optional_iso_date(value: str | None, label: str) -> date | None:
