@@ -19,6 +19,7 @@ from quant_forge.data.local import LocalPanelDataProvider
 from quant_forge.factor_engine.signal_processing import (
     apply_test_period,
     prepare_factor_scores_result,
+    require_minimum_display_trading_days,
     simulation_profile_suffix,
 )
 from quant_forge.factor_library.catalog import FactorCatalog
@@ -57,6 +58,7 @@ def evaluate_factor(
         raise ValueError("horizon_days must be positive")
     panel = LocalPanelDataProvider(data_root).load_panel()
     working_panel = apply_test_period(panel, profile)
+    require_minimum_display_trading_days(working_panel)
     score_result = prepare_factor_scores_result(
         working_panel,
         factor.formula,

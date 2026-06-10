@@ -74,6 +74,19 @@ def test_evaluation_records_non_default_simulation_profile(tmp_path: Path) -> No
     assert payload["simulation_profile"]["decay_days"] == 2
 
 
+def test_evaluation_rejects_display_window_shorter_than_six_months(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+
+    with pytest.raises(ValueError, match="at least 126 daily trading dates"):
+        evaluate_factor(
+            "FTR_DEMO_SMALL_CAP",
+            factor_root=paths["factor_root"],
+            data_root=paths["data_root"],
+            artifact_root=paths["artifact_root"],
+            simulation_profile=SimulationProfile(test_period_end="2024-02-14"),
+        )
+
+
 def test_evaluation_loads_precomputed_factor_without_local_definition(tmp_path: Path) -> None:
     paths = create_demo_workspace(tmp_path / "demo")
     panel = LocalPanelDataProvider(paths["data_root"]).load_panel()

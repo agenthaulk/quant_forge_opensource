@@ -28,17 +28,14 @@ class FactorScoreResult:
 @dataclass(frozen=True)
 class _ResolvedFactorValuePaths:
     read_dirs: tuple[Path, ...]
-    write_dir: Path
+    write_dir: Path | None
     primary_dir: Path
 
 
 class FactorValueStore:
     def __init__(self, root: Path, *, write_root: Path | None = None) -> None:
         self.root = (resolve_factor_values_root(root) or root).expanduser()
-        if write_root is None:
-            self.write_root = self.root
-        else:
-            self.write_root = (resolve_factor_values_root(write_root) or write_root).expanduser()
+        self.write_root = (resolve_factor_values_root(write_root) or write_root).expanduser() if write_root else None
 
     def prepare_scores(
         self,
@@ -82,7 +79,7 @@ class FactorValueStore:
             if not missing_panel.empty
             else _empty_scores()
         )
-        if not computed.empty:
+        if not computed.empty and factor_paths.write_dir is not None:
             self.write_incremental_values(
                 factor_paths.write_dir,
                 factor_id=factor_id,
@@ -120,13 +117,21 @@ class FactorValueStore:
     ) -> _ResolvedFactorValuePaths:
         candidates = _factor_dir_candidates(factor_id=factor_id, factor_name=factor_name, formula=formula)
         existing_read_dirs = _find_existing_factor_dirs(self.root, candidates)
-        existing_write_dirs = _find_existing_factor_dirs(self.write_root, candidates)
+        existing_write_dirs = _find_existing_factor_dirs(self.write_root, candidates) if self.write_root else ()
         category = factor_category_from_parts(factor_id=factor_id, factor_name=factor_name, formula=formula)
-        write_dir = self.write_root / FACTOR_CATEGORY_DIRS[category] / _canonical_factor_dir_name(factor_id or factor_name)
+        write_dir = (
+            self.write_root / FACTOR_CATEGORY_DIRS[category] / _canonical_factor_dir_name(factor_id or factor_name)
+            if self.write_root
+            else None
+        )
         read_dirs = _unique_existing_dirs(
             (*existing_read_dirs, *existing_write_dirs)
         )
-        primary_dir = existing_write_dirs[-1] if existing_write_dirs else (existing_read_dirs[-1] if existing_read_dirs else write_dir)
+        primary_dir = (
+            existing_write_dirs[-1]
+            if existing_write_dirs
+            else (existing_read_dirs[-1] if existing_read_dirs else (write_dir or self.root))
+        )
         return _ResolvedFactorValuePaths(read_dirs=read_dirs, write_dir=write_dir, primary_dir=primary_dir)
 
     def read_factor_values(

@@ -52,7 +52,8 @@ local machine paths.
    `factor_values_root/{原始因子,合成因子}/factor_id=<FACTOR_ID>`. If
    `factor_values_overlay_root` is configured, missing local formula dates are
    written to overlay incremental sidecars under the same category instead of
-   the read-base store.
+   the read-base store. Without an overlay, missing dates are computed for the
+   current run but are not written back to `factor_values_root`.
 5. The factor engine compiles formulas only when cached values are incomplete or
    unavailable; shared signal preparation applies the effective simulation
    profile.
@@ -96,6 +97,8 @@ small:
 
 - validate the effective `SimulationProfile`;
 - apply the configured `test_period` to local panel rows;
+- require at least 126 daily trading dates for displayable evaluation and
+  backtest metrics;
 - execute the factor formula and factor-owned universe filters;
 - apply EWMA score decay when `decay_days > 1`;
 - support only `nan_policy: drop`, `neutralization: none`, and `truncation:

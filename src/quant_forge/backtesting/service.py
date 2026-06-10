@@ -21,10 +21,14 @@ from quant_forge.evaluation.service import DEFAULT_SAMPLE_SPLITS
 from quant_forge.factor_engine.signal_processing import (
     apply_test_period,
     prepare_factor_scores_result,
+    require_minimum_display_trading_days,
     simulation_profile_suffix,
 )
 from quant_forge.factor_library.catalog import FactorCatalog
 from quant_forge.utils import write_json
+
+
+MIN_ANNUALIZATION_EXPOSURE_DAYS = 126
 
 
 def run_factor_backtest(
@@ -72,6 +76,7 @@ def run_factor_backtest(
         raise ValueError("holding_days must be positive")
     panel = LocalPanelDataProvider(data_root).load_panel()
     working_panel = apply_test_period(panel, profile)
+    require_minimum_display_trading_days(working_panel)
     score_result = prepare_factor_scores_result(
         working_panel,
         factor.formula,
@@ -164,6 +169,7 @@ def run_factor_backtest(
     segment_metrics = _segment_metrics(rows, holding, sample_splits or DEFAULT_SAMPLE_SPLITS)
     warnings = _backtest_warnings(
         periods=len(rows),
+        holding_days=holding,
         rebalance_rate=rebalance_rate,
         turnover_rate=turnover_rate,
         gross_annualized_return=gross_summary["annualized_return"],
@@ -433,6 +439,7 @@ def _split_dates(
 def _backtest_warnings(
     *,
     periods: int,
+    holding_days: int,
     rebalance_rate: float,
     turnover_rate: float,
     gross_annualized_return: float,
@@ -442,6 +449,10 @@ def _backtest_warnings(
     warnings: list[str] = []
     if periods < 2:
         warnings.append("too few backtest periods for stable Sharpe or drawdown estimates")
+    if 0 < periods * holding_days < MIN_ANNUALIZATION_EXPOSURE_DAYS:
+        warnings.append(
+            "short annualization window: annualized return and volatility are highly extrapolated"
+        )
     if rebalance_rate > 0.8:
         warnings.append("high rebalance rate")
     if turnover_rate > 1.5:

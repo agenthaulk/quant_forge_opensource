@@ -11,12 +11,12 @@ paths:
   data_root: data
   # Factor definitions. This is the factor source of truth.
   factor_root: factor_root
-  # Optional factor value cache. Existing complete daily values are reused;
-  # missing dates are computed into incremental/*.parquet sidecars.
+  # Optional read-base factor value cache. Existing complete daily values are
+  # reused; missing formula dates are computed in memory unless an overlay is set.
   factor_values_root: null
-  # Optional writable overlay for new incremental factor values. When set,
-  # factor_values_root is treated as the read base and new increments are
-  # written under this overlay instead of the read base.
+  # Optional writable overlay for new incremental factor values. Set this when
+  # you want newly computed formula values to persist without modifying the
+  # read-base factor_values_root.
   factor_values_overlay_root: null
   # Optional external manifest/catalog pointer for local operators.
   factor_values_manifest_root: null

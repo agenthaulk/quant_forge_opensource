@@ -269,7 +269,7 @@ def create_demo_workspace(
 
 def _build_demo_panel() -> pd.DataFrame:
     instruments = [f"STK{i:03d}" for i in range(1, 13)]
-    dates = pd.bdate_range("2024-01-02", periods=32)
+    dates = pd.bdate_range("2024-01-02", periods=160)
     rows: list[dict[str, object]] = []
     for instrument_index, instrument in enumerate(instruments):
         base_close = 10.0 + instrument_index

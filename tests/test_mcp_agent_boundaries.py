@@ -42,7 +42,7 @@ def test_agent_tools_do_not_mutate_factor_root_directly(tmp_path: Path) -> None:
         FactorRepository(paths["factor_root"]).get(proposed["factor_id"])
 
 
-def test_agent_tools_can_use_factor_value_cache_root(tmp_path: Path) -> None:
+def test_agent_tools_treat_factor_value_cache_root_as_read_only_without_overlay(tmp_path: Path) -> None:
     paths = create_demo_workspace(tmp_path / "demo")
     factor_values_root = tmp_path / "factor_values"
     tools = AgentWorkspaceTools(
@@ -55,7 +55,8 @@ def test_agent_tools_can_use_factor_value_cache_root(tmp_path: Path) -> None:
     result = tools.evaluate_factor("FTR_DEMO_SMALL_CAP")
 
     assert result["observations"] > 0
-    assert (
+    assert result["factor_values_write_path"] in (None, "")
+    assert not (
         factor_values_root
         / "原始因子"
         / "factor_id=FTR_DEMO_SMALL_CAP"

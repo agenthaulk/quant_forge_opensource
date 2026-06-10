@@ -184,6 +184,11 @@ Purpose:
 - `weight_profiles`: named scoring presets.
 - `parameter_search`: optional profile search settings.
 
+Evaluation, backtest, Web, and RD displays require at least 126 daily trading
+dates after `simulation.test_period` is applied. If the command reports that
+the display window is too short, widen the configured test period or load a
+longer daily panel before comparing factor metrics.
+
 用途：
 
 - `objective`：RD 目标。
@@ -194,6 +199,10 @@ Purpose:
 - `weights`：默认目标的评分权重。
 - `weight_profiles`：命名评分预设。
 - `parameter_search`：可选参数搜索配置。
+
+评价、回测、Web 和 RD 展示至少需要 `simulation.test_period` 过滤后仍有
+126 个日频交易日。如果系统提示展示窗口过短，请放宽测试区间或加载更长的
+日频面板后再比较因子指标。
 
 ### 5.3 Draft Templates / 配置模板
 

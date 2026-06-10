@@ -15,6 +15,9 @@ from quant_forge.factor_engine.value_store import FactorScoreResult, FactorValue
 from quant_forge.factor_library.catalog import is_precomputed_formula
 
 
+MIN_DISPLAY_TRADING_DAYS = 126
+
+
 def prepare_factor_scores(
     panel: pd.DataFrame,
     formula: str,
@@ -102,6 +105,26 @@ def apply_test_period(panel: pd.DataFrame, profile: SimulationProfile) -> pd.Dat
     if profile.test_period_end:
         result = result[result["trade_date"] <= pd.Timestamp(profile.test_period_end)]
     return result
+
+
+def require_minimum_display_trading_days(
+    panel: pd.DataFrame,
+    *,
+    min_trading_days: int = MIN_DISPLAY_TRADING_DAYS,
+) -> None:
+    dates = pd.to_datetime(panel.get("trade_date", pd.Series(dtype="datetime64[ns]")), errors="coerce")
+    unique_dates = dates.dropna().drop_duplicates().sort_values()
+    date_count = int(len(unique_dates))
+    if date_count >= min_trading_days:
+        return
+    start = unique_dates.iloc[0].date().isoformat() if date_count else "none"
+    end = unique_dates.iloc[-1].date().isoformat() if date_count else "none"
+    raise ValueError(
+        "factor display requires at least "
+        f"{min_trading_days} daily trading dates, approximately six months, after test_period; "
+        f"found {date_count} from {start} to {end}. "
+        "Expand simulation.test_period or load a longer daily panel."
+    )
 
 
 def _validate_profile(profile: SimulationProfile) -> None:

@@ -99,7 +99,8 @@ qf factor import-precomputed --config configs/default.local.yaml --all
 `factor_values_root/{原始因子,合成因子}/factor_id=<FACTOR_ID>` 目录；旧的
 `worldquant_alpha_*`、中文名、风格名等目录只作为可读兼容资产保留。跨来源合并
 只向 configured `factor_values_root` 写入规范目录，不删除源目录。运行时补算缺失日期时，
-如果配置了 `factor_values_overlay_root`，新增增量只写 overlay 的对应分类目录，不写回 canonical 根。
+新增增量只在配置了 `factor_values_overlay_root` 时写入 overlay 的对应分类目录；未配置
+overlay 时只在本次运行内计算，不写回 canonical 根。
 
 ### 3.2 数据校验反馈
 

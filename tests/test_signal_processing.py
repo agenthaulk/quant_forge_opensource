@@ -163,7 +163,7 @@ def test_execute_factor_formula_rejects_unsafe_ast_syntax(formula: str) -> None:
 def test_prepare_factor_scores_reuses_existing_worldquant_daily_values(tmp_path) -> None:
     panel = _two_day_panel()
     factor_dir = tmp_path / "worldquant_alpha_003"
-    factor_dir.mkdir()
+    factor_dir.mkdir(parents=True)
     pd.DataFrame(
         {
             "instrument_id": ["AAA", "BBB", "AAA", "BBB"],
@@ -192,7 +192,7 @@ def test_prepare_factor_scores_reuses_existing_worldquant_daily_values(tmp_path)
 def test_precomputed_scores_use_formula_store_key_directory(tmp_path) -> None:
     panel = _two_day_panel().iloc[:2]
     factor_dir = tmp_path / "vendor_alpha_777"
-    factor_dir.mkdir()
+    factor_dir.mkdir(parents=True)
     pd.DataFrame(
         {
             "trade_date": ["2025-01-02", "2025-01-02"],
@@ -218,7 +218,7 @@ def test_precomputed_scores_use_formula_store_key_directory(tmp_path) -> None:
 def test_prepare_factor_scores_ignores_root_period_parquet_files(tmp_path) -> None:
     panel = _two_day_panel().iloc[:2]
     factor_dir = tmp_path / "factor_id=WQ_ALPHA_003"
-    factor_dir.mkdir()
+    factor_dir.mkdir(parents=True)
     pd.DataFrame(
         {
             "trade_date": ["2025-01-02", "2025-01-02"],
@@ -248,8 +248,10 @@ def test_prepare_factor_scores_ignores_root_period_parquet_files(tmp_path) -> No
 
 def test_prepare_factor_scores_computes_and_persists_only_missing_dates(tmp_path) -> None:
     panel = _two_day_panel()
-    factor_dir = tmp_path / "factor_id=FTR_PARTIAL"
-    factor_dir.mkdir()
+    read_root = tmp_path / "canonical"
+    overlay_root = tmp_path / "overlay"
+    factor_dir = read_root / "factor_id=FTR_PARTIAL"
+    factor_dir.mkdir(parents=True)
     signature = _formula_signature("FTR_PARTIAL", "rank(market_cap)", ())
     pd.DataFrame(
         {
@@ -265,7 +267,8 @@ def test_prepare_factor_scores_computes_and_persists_only_missing_dates(tmp_path
         "rank(market_cap)",
         factor_id="FTR_PARTIAL",
         factor_name="FTR_PARTIAL",
-        factor_values_root=tmp_path,
+        factor_values_root=read_root,
+        factor_values_overlay_root=overlay_root,
     )
 
     assert result.source == "factor_values_incremental"
@@ -273,7 +276,7 @@ def test_prepare_factor_scores_computes_and_persists_only_missing_dates(tmp_path
     assert result.computed_rows == 2
     assert list(result.scores["score"]) == [10.0, 20.0, 0.5, 1.0]
 
-    categorized_dir = tmp_path / "原始因子" / "factor_id=FTR_PARTIAL"
+    categorized_dir = overlay_root / "原始因子" / "factor_id=FTR_PARTIAL"
     incremental = pd.read_parquet(categorized_dir / "incremental" / "2025.parquet")
     assert list(incremental["trade_date"]) == ["2025-01-03", "2025-01-03"]
     assert list(incremental["instrument"]) == ["AAA", "BBB"]
@@ -282,10 +285,30 @@ def test_prepare_factor_scores_computes_and_persists_only_missing_dates(tmp_path
     assert not (factor_dir / "incremental").exists()
 
 
+def test_prepare_factor_scores_does_not_write_to_root_without_overlay(tmp_path) -> None:
+    panel = _two_day_panel()
+
+    result = prepare_factor_scores_result(
+        panel,
+        "rank(market_cap)",
+        factor_id="FTR_READ_ONLY",
+        factor_name="FTR_READ_ONLY",
+        factor_values_root=tmp_path,
+    )
+
+    assert result.source == "factor_values_incremental"
+    assert result.cached_rows == 0
+    assert result.computed_rows == 4
+    assert result.factor_values_write_path is None
+    assert not (tmp_path / "原始因子" / "factor_id=FTR_READ_ONLY" / "incremental").exists()
+
+
 def test_prepare_factor_scores_ignores_unsigned_root_cache_for_formula_factor(tmp_path) -> None:
     panel = _two_day_panel()
-    factor_dir = tmp_path / "factor_id=FTR_UNSIGNED_ROOT"
-    factor_dir.mkdir()
+    read_root = tmp_path / "canonical"
+    overlay_root = tmp_path / "overlay"
+    factor_dir = read_root / "factor_id=FTR_UNSIGNED_ROOT"
+    factor_dir.mkdir(parents=True)
     pd.DataFrame(
         {
             "trade_date": ["2025-01-02", "2025-01-02", "2025-01-03", "2025-01-03"],
@@ -299,7 +322,8 @@ def test_prepare_factor_scores_ignores_unsigned_root_cache_for_formula_factor(tm
         "rank(market_cap)",
         factor_id="FTR_UNSIGNED_ROOT",
         factor_name="FTR_UNSIGNED_ROOT",
-        factor_values_root=tmp_path,
+        factor_values_root=read_root,
+        factor_values_overlay_root=overlay_root,
     )
 
     assert result.source == "factor_values_incremental"
@@ -307,7 +331,7 @@ def test_prepare_factor_scores_ignores_unsigned_root_cache_for_formula_factor(tm
     assert result.computed_rows == 4
     assert list(result.scores["score"]) == [0.5, 1.0, 0.5, 1.0]
 
-    categorized_dir = tmp_path / "原始因子" / "factor_id=FTR_UNSIGNED_ROOT"
+    categorized_dir = overlay_root / "原始因子" / "factor_id=FTR_UNSIGNED_ROOT"
     incremental = pd.read_parquet(categorized_dir / "incremental" / "2025.parquet")
     assert incremental["formula_signature"].nunique() == 1
     assert set(incremental["factor_value"]) == {0.5, 1.0}
@@ -351,16 +375,17 @@ def test_prepare_factor_scores_writes_missing_dates_to_overlay(tmp_path) -> None
 
 def test_prepare_factor_scores_writes_rd_synthetic_values_to_synthetic_category(tmp_path) -> None:
     panel = _two_day_panel()
+    overlay_root = tmp_path / "overlay"
 
     result = prepare_factor_scores_result(
         panel,
         "rank(market_cap)",
         factor_id="RD_SYN_TEST",
         factor_name="synthetic_test",
-        factor_values_root=tmp_path,
+        factor_values_overlay_root=overlay_root,
     )
 
-    factor_dir = tmp_path / "合成因子" / "factor_id=RD_SYN_TEST"
+    factor_dir = overlay_root / "合成因子" / "factor_id=RD_SYN_TEST"
     assert result.source == "factor_values_incremental"
     assert result.factor_values_write_path == factor_dir
     assert (factor_dir / "incremental" / "2025.parquet").exists()
@@ -538,7 +563,9 @@ def test_prepare_factor_scores_recomputes_when_filtered_instruments_are_missing(
 
 def test_prepare_factor_scores_ignores_incremental_cache_with_different_formula(tmp_path) -> None:
     panel = _two_day_panel()
-    factor_dir = tmp_path / "factor_id=FTR_SIGNATURE"
+    read_root = tmp_path / "canonical"
+    overlay_root = tmp_path / "overlay"
+    factor_dir = read_root / "factor_id=FTR_SIGNATURE"
     incremental_dir = factor_dir / "incremental"
     incremental_dir.mkdir(parents=True)
     pd.DataFrame(
@@ -557,7 +584,8 @@ def test_prepare_factor_scores_ignores_incremental_cache_with_different_formula(
         "rank(market_cap)",
         factor_id="FTR_SIGNATURE",
         factor_name="FTR_SIGNATURE",
-        factor_values_root=tmp_path,
+        factor_values_root=read_root,
+        factor_values_overlay_root=overlay_root,
     )
 
     assert result.source == "factor_values_incremental"
@@ -566,7 +594,7 @@ def test_prepare_factor_scores_ignores_incremental_cache_with_different_formula(
     assert list(result.scores["score"]) == [0.5, 1.0, 0.5, 1.0]
 
     legacy_incremental = pd.read_parquet(incremental_dir / "2025.parquet")
-    categorized_incremental_dir = tmp_path / "原始因子" / "factor_id=FTR_SIGNATURE" / "incremental"
+    categorized_incremental_dir = overlay_root / "原始因子" / "factor_id=FTR_SIGNATURE" / "incremental"
     incremental = pd.read_parquet(categorized_incremental_dir / "2025.parquet")
     assert set(legacy_incremental["factor_value"]) == {9.0}
     assert set(legacy_incremental["formula_signature"]) == {"old-signature"}
@@ -576,7 +604,9 @@ def test_prepare_factor_scores_ignores_incremental_cache_with_different_formula(
 
 def test_prepare_factor_scores_ignores_legacy_incremental_cache_without_signature(tmp_path) -> None:
     panel = _two_day_panel()
-    factor_dir = tmp_path / "factor_id=FTR_LEGACY_INCREMENTAL"
+    read_root = tmp_path / "canonical"
+    overlay_root = tmp_path / "overlay"
+    factor_dir = read_root / "factor_id=FTR_LEGACY_INCREMENTAL"
     incremental_dir = factor_dir / "incremental"
     incremental_dir.mkdir(parents=True)
     pd.DataFrame(
@@ -594,7 +624,8 @@ def test_prepare_factor_scores_ignores_legacy_incremental_cache_without_signatur
         "rank(market_cap)",
         factor_id="FTR_LEGACY_INCREMENTAL",
         factor_name="FTR_LEGACY_INCREMENTAL",
-        factor_values_root=tmp_path,
+        factor_values_root=read_root,
+        factor_values_overlay_root=overlay_root,
     )
 
     assert result.source == "factor_values_incremental"
@@ -603,7 +634,7 @@ def test_prepare_factor_scores_ignores_legacy_incremental_cache_without_signatur
     assert list(result.scores["score"]) == [0.5, 1.0, 0.5, 1.0]
 
     legacy_incremental = pd.read_parquet(incremental_dir / "2025.parquet")
-    categorized_incremental_dir = tmp_path / "原始因子" / "factor_id=FTR_LEGACY_INCREMENTAL" / "incremental"
+    categorized_incremental_dir = overlay_root / "原始因子" / "factor_id=FTR_LEGACY_INCREMENTAL" / "incremental"
     incremental = pd.read_parquet(categorized_incremental_dir / "2025.parquet")
     assert set(legacy_incremental["factor_value"]) == {9.0}
     assert set(incremental["factor_value"]) == {0.5, 1.0}

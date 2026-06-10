@@ -139,6 +139,7 @@ def test_cli_smoke_path(tmp_path: Path) -> None:
     assert parsed["universe_filters"] == ["is_st == false"]
 
     factor_values_root = workspace / "factor_values"
+    factor_values_overlay_root = workspace / "factor_values_overlay"
     evaluation = run_cli(
         "eval-factor",
         "FTR_DEMO_SMALL_CAP",
@@ -150,13 +151,18 @@ def test_cli_smoke_path(tmp_path: Path) -> None:
         str(workspace / "artifacts"),
         "--factor-values-root",
         str(factor_values_root),
+        "--factor-values-overlay-root",
+        str(factor_values_overlay_root),
     )
     assert evaluation["observations"] > 0
     assert Path(evaluation["artifact_path"]).exists()
     assert evaluation["score_source"] == "factor_values_incremental"
     assert evaluation["score_computed_rows"] > 0
-    assert evaluation["factor_values_path"]
-    assert (factor_values_root / "原始因子" / "factor_id=FTR_DEMO_SMALL_CAP" / "incremental" / "2024.parquet").exists()
+    overlay_factor_dir = factor_values_overlay_root / "原始因子" / "factor_id=FTR_DEMO_SMALL_CAP"
+    assert evaluation["factor_values_path"] == str(overlay_factor_dir)
+    assert evaluation["factor_values_write_path"] == str(overlay_factor_dir)
+    assert (overlay_factor_dir / "incremental" / "2024.parquet").exists()
+    assert not (factor_values_root / "原始因子" / "factor_id=FTR_DEMO_SMALL_CAP" / "incremental").exists()
 
     backtest = run_cli(
         "run-backtest",
@@ -169,6 +175,8 @@ def test_cli_smoke_path(tmp_path: Path) -> None:
         str(workspace / "artifacts"),
         "--factor-values-root",
         str(factor_values_root),
+        "--factor-values-overlay-root",
+        str(factor_values_overlay_root),
     )
     assert backtest["periods"] > 0
     assert Path(backtest["artifact_path"]).exists()

@@ -105,8 +105,8 @@ mounted historical stores, but Quant Forge no longer treats provider or formula
 family names as canonical storage paths. New incremental factor values are
 written under
 `factor_values_overlay_root/{原始因子,合成因子}/factor_id=<FACTOR_ID>/incremental/YYYY.parquet`
-when an overlay is configured, otherwise they fall back to
-`factor_values_root/{原始因子,合成因子}/factor_id=<FACTOR_ID>/incremental/YYYY.parquet`.
+when an overlay is configured. Without an overlay, missing formula values are
+computed for the current run only and are not written back to `factor_values_root`.
 
 Discovered precomputed factors use a lightweight formula marker such as
 `precomputed:factor_id=WQ_ALPHA_003`. They are cache-only: Quant Forge reads the
@@ -174,7 +174,8 @@ date.
 If only part of the requested panel is cached, Quant Forge computes the missing
 dates only and writes them to `incremental/YYYY.parquet` sidecars inside the
 writable overlay when configured. Existing canonical yearly files are not
-overwritten.
+overwritten. If no overlay is configured, missing dates are computed in memory
+for the current command and `factor_values_root` remains unchanged.
 Quant Forge-owned incremental sidecars include a formula/filter signature, so
 changing a local factor formula recomputes that sidecar instead of reusing stale
 incremental values.
@@ -453,6 +454,11 @@ idea workflows, and RD. First-version score preparation applies `test_period`,
 factor formula execution, universe filters, and EWMA `decay_days`; it supports
 only `nan_policy: drop`, `neutralization: none`, and `truncation: null`.
 Unsupported values fail fast.
+
+Displayable evaluation and backtest metrics require at least 126 daily trading
+dates after `simulation.test_period` is applied. This is the public workbench's
+six-month daily-data floor; if a configured period is shorter, expand the
+period or load a longer panel before showing factor metrics.
 
 `top_quantile` controls the long and short tail size. The legacy top-level key
 is still accepted, but the canonical value is `simulation.top_quantile`. Pass

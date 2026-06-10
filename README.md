@@ -209,7 +209,7 @@ QuantForgeData/
 
 `factor_root` stores factor definitions and formulas. `canonical/factor=cn_a`
 stores read-base daily factor values. `factor_values_overlay` stores new local
-incremental values when the canonical store should remain read-only. Factor
+incremental values while the canonical store remains read-only. Factor
 definitions and values are split into `原始因子` and `合成因子`: original factors
 come from imported/public formulas or precomputed external values, while
 synthetic factors come from RD outputs or other explicitly generated research
