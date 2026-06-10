@@ -7,7 +7,6 @@ from html import escape
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-import re
 from typing import Any
 
 from quant_forge.backtesting.service import run_factor_backtest
@@ -28,34 +27,8 @@ from quant_forge.research_loop.config import (
     load_research_loop_config,
     weights_for_objective,
 )
-from quant_forge.research_loop.llm import LLMCampaignPlanner, LLMHypothesisGenerator, LLMResearchReviewGenerator
-from quant_forge.research_loop.campaign import (
-    DEFAULT_CAMPAIGN_ROUNDS,
-    MAX_CAMPAIGN_SEEDS,
-    ResearchCampaignOptimizerMetadata,
-    ResearchCampaignResult,
-    ResearchCampaignService,
-)
+from quant_forge.research_loop.llm import LLMHypothesisGenerator, LLMResearchReviewGenerator
 from quant_forge.research_loop.service import ResearchLoopResult, ResearchLoopService
-
-DEFAULT_CAMPAIGN_SEED_AUDIT_DIR = "ralph_2025_factor_audit_20260605T035747Z"
-DEFAULT_CAMPAIGN_SEED_AUDIT_FILE = "top20_stable_decorrelated.json"
-
-
-class _CampaignSeedSelection(tuple):
-    __slots__ = ()
-
-    @property
-    def seed_factor_ids(self) -> tuple[str, ...]:
-        return self[0]
-
-    @property
-    def source_path(self) -> str | None:
-        return self[1]
-
-    @property
-    def source_label(self) -> str:
-        return self[2]
 
 
 def run_idea_workflow(
@@ -126,39 +99,6 @@ def run_research_once_workflow(
     return _json_safe(result)
 
 
-def run_research_campaign_workflow(
-    config: QuantForgeConfig,
-    seed_factor_ids: list[str] | tuple[str, ...],
-    *,
-    seed_source_path: str | None = None,
-    objective: str | None = None,
-    rounds: int = DEFAULT_CAMPAIGN_ROUNDS,
-    rd_config: ResearchLoopConfig | None = None,
-) -> dict[str, Any]:
-    """Run a bounded multi-round RD campaign and return JSON-safe data."""
-
-    research_config = rd_config or load_research_loop_config(DEFAULT_RD_CONFIG_PATH, config.research, config.simulation)
-    seed_selection = _campaign_seed_selection(
-        config,
-        seed_factor_ids=tuple(seed_factor_ids),
-        seed_source_path=seed_source_path,
-    )
-    result = _run_research_campaign(
-        config,
-        research_config,
-        seed_selection.seed_factor_ids,
-        objective=objective or research_config.objective,
-        rounds=rounds,
-    )
-    payload = _json_safe(result)
-    payload["seed_source_path"] = seed_selection.source_path
-    payload["seed_source_label"] = seed_selection.source_label
-    payload["simulation_profile"] = _json_safe(research_config.simulation_profile)
-    payload["status"] = _campaign_status(result)
-    payload["status_label"] = _campaign_status_label(result)
-    return payload
-
-
 def create_local_web_server(
     *, host: str, port: int, config: QuantForgeConfig, rd_config: ResearchLoopConfig | None = None
 ) -> ThreadingHTTPServer:
@@ -222,17 +162,6 @@ def create_local_web_server(
                         str(payload.get("seed_factor_id", "")),
                         objective=str(payload.get("objective", research_config.objective)),
                         max_candidates=_optional_int(payload.get("max_candidates")),
-                        rd_config=research_config,
-                    )
-                    self._json(result)
-                    return
-                if self.path == "/api/research/campaign":
-                    result = run_research_campaign_workflow(
-                        config,
-                        _seed_factor_ids(payload.get("seed_factor_ids")),
-                        seed_source_path=_optional_str(payload.get("seed_source_path")),
-                        objective=str(payload.get("objective", research_config.objective)),
-                        rounds=int(payload.get("rounds", DEFAULT_CAMPAIGN_ROUNDS)),
                         rd_config=research_config,
                     )
                     self._json(result)
@@ -359,44 +288,6 @@ def _run_research_once(
     )
 
 
-def _run_research_campaign(
-    config: QuantForgeConfig,
-    rd_config: ResearchLoopConfig,
-    seed_factor_ids: list[str] | tuple[str, ...],
-    *,
-    objective: str,
-    rounds: int,
-) -> ResearchCampaignResult:
-    optimizer = ResearchCampaignOptimizerMetadata()
-    strategy_order: tuple[str, ...] = ()
-    if _rd_generation_mode(rd_config.llm.campaign_mode) == "llm":
-        planner = LLMCampaignPlanner(_rd_llm_settings(config, feature="RD campaign optimization"))
-        optimizer = planner.plan(seed_factor_ids=tuple(seed_factor_ids), objective=objective, rounds=rounds)
-        strategy_order = optimizer.strategy_names
-    service = ResearchCampaignService(
-        factor_root=config.paths.factor_root,
-        data_root=config.paths.data_root,
-        artifact_root=config.paths.artifact_root,
-        factor_values_root=config.paths.factor_values_root,
-        factor_values_overlay_root=config.paths.factor_values_overlay_root,
-        factor_values_manifest_root=config.paths.factor_values_manifest_root,
-        simulation_profile=rd_config.simulation_profile,
-        horizon_days_matrix=rd_config.horizon_days_matrix,
-        sample_splits=rd_config.sample_splits,
-        transaction_costs=rd_config.transaction_costs,
-        precomputed_strategy_order=strategy_order,
-        optimizer=optimizer,
-    )
-    weights = weights_for_objective(rd_config, objective)
-    return service.run(
-        tuple(seed_factor_ids),
-        objective=objective,
-        rounds=rounds,
-        weights=weights,
-        gate=rd_config.gate,
-    )
-
-
 def _rd_llm_settings(config: QuantForgeConfig, *, feature: str) -> Any:
     selected = config.llm.select_provider()
     if selected.provider.lower() in {"rule", "deterministic"}:
@@ -438,23 +329,6 @@ def _optional_str(value: Any) -> str | None:
     return str(value)
 
 
-def _seed_factor_ids(value: Any) -> tuple[str, ...]:
-    if value is None:
-        return ()
-    if isinstance(value, str):
-        raw_items = re.split(r"[\s,]+", value)
-    elif isinstance(value, (list, tuple)):
-        raw_items = [str(item) for item in value]
-    else:
-        raise ValueError("seed_factor_ids must be a list or string")
-    normalized: list[str] = []
-    for item in raw_items:
-        factor_id = str(item).strip()
-        if factor_id and factor_id not in normalized:
-            normalized.append(factor_id)
-    return tuple(normalized[:MAX_CAMPAIGN_SEEDS])
-
-
 def _paths_payload(config: QuantForgeConfig) -> dict[str, str]:
     return {
         "data_root": str(config.paths.data_root),
@@ -493,11 +367,8 @@ def _rd_status_payload(config: QuantForgeConfig, rd_config: ResearchLoopConfig) 
     active_llm = _active_llm(config)
     return {
         "research_stage": "research",
-        "synthesis_stage": "factor_synthesis",
         "hypothesis_mode": _rd_generation_mode(rd_config.llm.hypothesis_mode),
         "review_mode": _rd_generation_mode(rd_config.llm.review_mode),
-        "campaign_mode": _rd_generation_mode(rd_config.llm.campaign_mode),
-        "synthesis_campaign_mode": _rd_generation_mode(rd_config.llm.campaign_mode),
         "provider": active_llm.provider,
         "model": active_llm.model,
     }
@@ -521,135 +392,6 @@ def _default_seed_factor_id(config: QuantForgeConfig) -> str:
     if "FTR_DEMO_SMALL_CAP" in factor_ids:
         return "FTR_DEMO_SMALL_CAP"
     return factor_ids[0] if factor_ids else ""
-
-
-def _default_campaign_seed_factor_ids(config: QuantForgeConfig) -> tuple[str, ...]:
-    return _default_campaign_seed_selection(config).seed_factor_ids
-
-
-def _default_campaign_seed_selection(config: QuantForgeConfig) -> _CampaignSeedSelection:
-    default_audit_path = _default_campaign_seed_source_path(config)
-    if default_audit_path.exists():
-        try:
-            seed_factor_ids = _load_campaign_seed_factor_ids(default_audit_path)
-        except Exception:
-            pass
-        else:
-            return _CampaignSeedSelection(
-                (
-                    seed_factor_ids,
-                    str(default_audit_path),
-                    "Top20 audit JSON (rank order)",
-                )
-            )
-    factor_ids = _catalog_factor_ids(config)
-    prioritized = [factor_id for factor_id in factor_ids if factor_id != "FTR_DEMO_SMALL_CAP"]
-    if "FTR_DEMO_SMALL_CAP" in factor_ids:
-        prioritized.insert(0, "FTR_DEMO_SMALL_CAP")
-    return _CampaignSeedSelection((tuple(prioritized[:MAX_CAMPAIGN_SEEDS]), None, "Catalog fallback"))
-
-
-def _campaign_seed_selection(
-    config: QuantForgeConfig,
-    *,
-    seed_factor_ids: tuple[str, ...],
-    seed_source_path: str | None,
-) -> _CampaignSeedSelection:
-    if seed_source_path:
-        path = _normalize_allowed_campaign_seed_source_path(config, seed_source_path)
-        return _CampaignSeedSelection(
-            (
-                _load_campaign_seed_factor_ids(path),
-                str(path),
-                "Audit JSON seed source",
-            )
-        )
-    return _CampaignSeedSelection((tuple(seed_factor_ids), None, "Manual seed list"))
-
-
-def _default_campaign_seed_source_path(config: QuantForgeConfig) -> Path:
-    repo_level_path, *fallback_paths = _allowed_campaign_seed_source_paths(config)
-    if repo_level_path.exists():
-        return repo_level_path
-    return fallback_paths[0] if fallback_paths else repo_level_path
-
-
-def _normalize_allowed_campaign_seed_source_path(config: QuantForgeConfig, path: str | Path) -> Path:
-    normalized_path = _normalize_campaign_seed_source_path(path)
-    if normalized_path not in _allowed_campaign_seed_source_paths(config):
-        raise ValueError(f"campaign seed source path is not allowed: {normalized_path}")
-    return normalized_path
-
-
-def _allowed_campaign_seed_source_paths(config: QuantForgeConfig) -> tuple[Path, ...]:
-    repo_level_path = _normalize_campaign_seed_source_path(
-        Path.cwd() / "artifacts" / DEFAULT_CAMPAIGN_SEED_AUDIT_DIR / DEFAULT_CAMPAIGN_SEED_AUDIT_FILE
-    )
-    artifact_root_path = _normalize_campaign_seed_source_path(
-        config.paths.artifact_root / DEFAULT_CAMPAIGN_SEED_AUDIT_DIR / DEFAULT_CAMPAIGN_SEED_AUDIT_FILE
-    )
-    if artifact_root_path == repo_level_path:
-        return (repo_level_path,)
-    return (repo_level_path, artifact_root_path)
-
-
-def _normalize_campaign_seed_source_path(path: str | Path) -> Path:
-    normalized_path = Path(path).expanduser()
-    if not normalized_path.is_absolute():
-        normalized_path = Path.cwd() / normalized_path
-    return normalized_path.resolve(strict=False)
-
-
-def _load_campaign_seed_factor_ids(path: Path) -> tuple[str, ...]:
-    if not path.exists():
-        raise FileNotFoundError(f"campaign seed source does not exist: {path}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, list):
-        raise ValueError("campaign seed source must be a JSON array")
-
-    ranked_seed_ids: list[tuple[int, int, str]] = []
-    for index, item in enumerate(payload):
-        factor_id = ""
-        rank = index + 1
-        if isinstance(item, str):
-            factor_id = item.strip()
-        elif isinstance(item, dict):
-            factor_id = str(item.get("factor_id", "")).strip()
-            raw_rank = item.get("rank", rank)
-            try:
-                rank = int(raw_rank)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("campaign seed source rank must be an integer") from exc
-        else:
-            raise ValueError("campaign seed source items must be strings or objects")
-        if not factor_id:
-            raise ValueError("campaign seed source items must include factor_id")
-        ranked_seed_ids.append((rank, index, factor_id))
-
-    ranked_seed_ids.sort(key=lambda item: (item[0], item[1]))
-    normalized: list[str] = []
-    for _, _, factor_id in ranked_seed_ids:
-        if factor_id not in normalized:
-            normalized.append(factor_id)
-    return tuple(normalized[:MAX_CAMPAIGN_SEEDS])
-
-
-def _campaign_status(result: ResearchCampaignResult) -> str:
-    has_errors = bool(result.errors or any(round_result.errors for round_result in result.round_results))
-    if result.final_factor_id is None:
-        return "fail"
-    if has_errors:
-        return "warning"
-    return "ok"
-
-
-def _campaign_status_label(result: ResearchCampaignResult) -> str:
-    status = _campaign_status(result)
-    if status == "warning":
-        return "Campaign 完成，但存在 partial errors"
-    if status == "fail":
-        return "Campaign 失败"
-    return "Campaign 完成"
 
 
 def _simulation_profile_period_text(profile: Any) -> str:
@@ -694,12 +436,6 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
     parser_label = escape(active_provider or "未配置 LLM provider")
     rd_optimizer_label = escape(_rd_optimizer_label(config, research_config))
     seed_factor_id = escape(_default_seed_factor_id(config))
-    campaign_seed_selection = _default_campaign_seed_selection(config)
-    campaign_seed_ids = campaign_seed_selection.seed_factor_ids
-    campaign_seed_text = escape("\n".join(campaign_seed_ids))
-    campaign_seed_source_path = escape(campaign_seed_selection.source_path or "")
-    campaign_seed_source_label = escape(campaign_seed_selection.source_label)
-    campaign_test_period = escape(_simulation_profile_period_text(research_config.simulation_profile))
     data_root = escape(paths["data_root"])
     factor_root = escape(paths["factor_root"])
     factor_values_root = escape(paths["factor_values_root"])
@@ -733,11 +469,6 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
         f'<input id="rd-seed" value="{seed_factor_id}">'
         if seed_factor_id
         else '<input id="rd-seed" value="" placeholder="先创建或配置一个因子">'
-    )
-    rd_campaign_seed_html = (
-        f'<textarea id="rd-campaign-seeds">{campaign_seed_text}</textarea>'
-        if campaign_seed_ids
-        else '<textarea id="rd-campaign-seeds" placeholder="每行或逗号分隔一个因子 ID"></textarea>'
     )
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -921,15 +652,6 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
       <button id="rd-stop">停止</button>
     </div>
     <p id="rd-status" class="meta"></p>
-    <label for="rd-campaign-seeds">Campaign Seeds</label>
-    {rd_campaign_seed_html}
-    <input id="rd-campaign-seed-source-path" type="hidden" value="{campaign_seed_source_path}">
-    <p id="rd-campaign-seed-source-label" class="meta">seed source: {campaign_seed_source_label}</p>
-    <p class="meta">test period: {campaign_test_period}</p>
-    <label for="rd-rounds">Campaign 轮数</label>
-    <input id="rd-rounds" type="number" min="1" max="10" value="{DEFAULT_CAMPAIGN_ROUNDS}">
-    <button id="rd-campaign">运行 5 轮 Campaign</button>
-    <p id="rd-campaign-status" class="meta"></p>
   </aside>
   <section>
     <h2>最新结果</h2>
@@ -947,13 +669,6 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
         <p class="meta">RD 候选会展示在这里。</p>
       </div>
     </div>
-    <h2>RD Campaign</h2>
-    <div id="rd-campaign-result">
-      <div class="panel">
-        <h3>等待运行</h3>
-        <p class="meta">Campaign 的轮次筛选和最终因子会展示在这里。</p>
-      </div>
-    </div>
   </section>
 </main>
 <script>
@@ -966,9 +681,6 @@ const rdStart = document.getElementById('rd-start');
 const rdStop = document.getElementById('rd-stop');
 const rdStatusEl = document.getElementById('rd-status');
 const rdResultEl = document.getElementById('rd-result');
-const rdCampaign = document.getElementById('rd-campaign');
-const rdCampaignStatusEl = document.getElementById('rd-campaign-status');
-const rdCampaignResultEl = document.getElementById('rd-campaign-result');
 
 function pct(value) {{
   return (Number(value) * 100).toFixed(2) + '%';
@@ -983,12 +695,6 @@ function profilePeriodText(profile) {{
   const start = profile.test_period_start || 'full available data';
   const end = profile.test_period_end || 'latest available data';
   return `${{start}} -> ${{end}}`;
-}}
-function campaignStatusHtml(payload) {{
-  const status = payload.status || 'ok';
-  const label = payload.status_label || 'Campaign 完成';
-  const cssClass = status === 'warning' ? 'warn' : (status === 'fail' ? 'err' : 'ok');
-  return `<span class="${{cssClass}}">${{esc(label)}}</span>`;
 }}
 function render(payload) {{
   const factor = payload.factor;
@@ -1116,78 +822,11 @@ function renderResearch(payload) {{
     </div>
     ${{cards || '<div class="panel"><h3>无候选</h3></div>'}}`;
 }}
-function renderCampaign(payload) {{
-  const rounds = payload.round_results || [];
-  const finalFactor = payload.final_factor || null;
-  const finalEvaluation = payload.final_evaluation || null;
-  const finalBacktest = payload.final_backtest || null;
-  const profile = payload.simulation_profile || (finalBacktest && finalBacktest.simulation_profile) || {{}};
-  const roundCards = rounds.map(round => {{
-    const attempts = (round.candidates || []).map(candidate => {{
-      const factor = candidate.factor || {{}};
-      return `
-        <p>
-          <span class="pill">seed ${{esc(candidate.seed_factor_id)}}</span>
-          <span class="pill">factor ${{esc(factor.factor_id || '')}}</span>
-          <span class="pill">score ${{num(candidate.score || 0, 4)}}</span>
-          <span class="pill">net ${{pct((candidate.backtest || {{}}).net_annualized_return || 0)}}</span>
-          <span class="pill">${{candidate.gate_passed ? 'gate passed' : 'gate failed'}}</span>
-        </p>
-        <p class="meta">${{esc(factor.formula || '')}}</p>
-        <p class="meta">${{esc((candidate.gate_reasons || []).join('; '))}}</p>`;
-    }}).join('');
-    return `
-      <div class="panel">
-        <h3>Round ${{round.round_index}}</h3>
-        <p class="meta">input: ${{esc((round.input_seed_factor_ids || []).join(', ') || 'none')}}</p>
-        <p class="meta">selected: ${{esc((round.selected_factor_ids || []).join(', ') || 'none')}}</p>
-        ${{attempts || '<p class="meta">无候选</p>'}}
-        <p class="${{(round.errors || []).length ? 'warn' : 'meta'}}">${{esc((round.errors || []).join(' | ') || '')}}</p>
-      </div>`;
-  }}).join('');
-  const finalPanel = finalFactor && finalEvaluation && finalBacktest ? `
-    <div class="panel">
-      <h3>最终因子 · ${{esc(finalFactor.factor_id)}}</h3>
-      <div class="formula">${{esc(finalFactor.formula)}}</div>
-      <p class="meta">score ${{num(payload.final_score || 0, 4)}} · source ${{esc(finalFactor.source || '')}}</p>
-      <p class="meta">seed source: ${{esc(payload.seed_source_label || 'manual')}}${{payload.seed_source_path ? ` · ${{esc(payload.seed_source_path)}}` : ''}}</p>
-      <p class="meta">test period: ${{esc(profilePeriodText(profile))}}</p>
-      <p>
-        <span class="pill">IC ${{num(finalEvaluation.rank_ic_mean)}}</span>
-        <span class="pill">ICIR ${{num(finalEvaluation.rank_icir, 2)}}</span>
-        <span class="pill">net ${{pct(finalBacktest.net_annualized_return || 0)}}</span>
-        <span class="pill">turnover ${{pct(finalBacktest.turnover_rate || 0)}}</span>
-        <span class="pill">rebalance ${{pct(finalBacktest.rebalance_rate || 0)}}</span>
-      </p>
-      <p class="${{(payload.errors || []).length ? 'warn' : 'meta'}}">${{esc((payload.errors || []).join(' | ') || '')}}</p>
-      <p class="meta">artifacts: ${{esc((payload.artifacts || []).join(' / ') || 'none')}}</p>
-    </div>` : `
-    <div class="panel">
-      <h3>最终因子</h3>
-      <p class="meta">seed source: ${{esc(payload.seed_source_label || 'manual')}}${{payload.seed_source_path ? ` · ${{esc(payload.seed_source_path)}}` : ''}}</p>
-      <p class="meta">test period: ${{esc(profilePeriodText(profile))}}</p>
-      <p class="${{(payload.errors || []).length ? 'err' : 'meta'}}">${{esc((payload.errors || []).join(' | ') || '')}}</p>
-      <p class="meta">Campaign 未生成可用结果。</p>
-    </div>`;
-  rdCampaignResultEl.innerHTML = finalPanel + roundCards;
-}}
 function rdPayload() {{
   return {{
     seed_factor_id: document.getElementById('rd-seed').value,
     objective: document.getElementById('rd-objective').value,
     max_candidates: Number(document.getElementById('rd-max').value)
-  }};
-}}
-function campaignPayload() {{
-  const seedSourcePath = document.getElementById('rd-campaign-seed-source-path').value.trim();
-  return {{
-    seed_factor_ids: document.getElementById('rd-campaign-seeds').value
-      .split(/[\\s,]+/)
-      .map(item => item.trim())
-      .filter(Boolean),
-    seed_source_path: seedSourcePath || null,
-    objective: document.getElementById('rd-objective').value,
-    rounds: Number(document.getElementById('rd-rounds').value || {DEFAULT_CAMPAIGN_ROUNDS})
   }};
 }}
 async function submitIdea(parserMode) {{
@@ -1291,31 +930,6 @@ rdStop.addEventListener('click', async () => {{
     rdStatusEl.textContent = error.message;
   }} finally {{
     rdStop.disabled = false;
-  }}
-}});
-document.getElementById('rd-campaign-seeds').addEventListener('input', () => {{
-  const seedSourcePathEl = document.getElementById('rd-campaign-seed-source-path');
-  if (!seedSourcePathEl.value) return;
-  seedSourcePathEl.value = '';
-  document.getElementById('rd-campaign-seed-source-label').textContent = 'seed source: Manual seed list';
-}});
-rdCampaign.addEventListener('click', async () => {{
-  rdCampaign.disabled = true;
-  rdCampaignStatusEl.textContent = 'Campaign 运行中...';
-  try {{
-    const response = await fetch('/api/research/campaign', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify(campaignPayload())
-    }});
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || 'request failed');
-    renderCampaign(payload);
-    rdCampaignStatusEl.innerHTML = campaignStatusHtml(payload);
-  }} catch (error) {{
-    rdCampaignStatusEl.textContent = error.message;
-  }} finally {{
-    rdCampaign.disabled = false;
   }}
 }});
 </script>

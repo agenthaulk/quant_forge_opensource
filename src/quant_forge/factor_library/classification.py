@@ -19,16 +19,13 @@ FACTOR_CATEGORY_DIRS: dict[FactorCategory, str] = {
 _DIR_TO_CATEGORY = {value: key for key, value in FACTOR_CATEGORY_DIRS.items()}
 
 _SYNTHETIC_SOURCE_MARKERS = {
-    "research_campaign",
-    "campaign",
     "synthetic",
     "composite",
     "rd",
 }
 _SYNTHETIC_ID_PATTERNS = (
-    re.compile(r"^FTR_CAMP(?:_|$)", re.IGNORECASE),
     re.compile(r"^GTJA_RD(?:_|$)", re.IGNORECASE),
-    re.compile(r"^RD_(?:CAMP|SYN|TOP)(?:_|$)", re.IGNORECASE),
+    re.compile(r"^RD_(?:SYN|TOP)(?:_|$)", re.IGNORECASE),
 )
 
 

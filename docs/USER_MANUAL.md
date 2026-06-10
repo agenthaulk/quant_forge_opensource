@@ -118,14 +118,12 @@ The RD loop generates bounded hypotheses, evaluates candidates, applies smoke
 gates, and writes a Markdown report under `artifact_root/research_reports`.
 Ordinary RD focuses on research ideas and optional hyper-parameter/profile
 search. Enable `llm.hypothesis_mode` and `llm.review_mode` only in an ignored
-local RD config when you want LLM-backed idea generation and review. Campaign
-mode is reserved for the later factor-synthesis workflow.
+local RD config when you want LLM-backed idea generation and review.
 
 RD 循环会生成有限候选假设，评价候选因子，应用 smoke gate，并在
 `artifact_root/research_reports` 写入 Markdown 报告。普通 RD 只聚焦研究 idea
 和可选的超参数/profile 搜索；如果要使用大模型生成 idea 或复盘，请只在被忽略的
-本地 RD 配置中打开 `llm.hypothesis_mode` 和 `llm.review_mode`。Campaign 模式只用于
-后续因子合成阶段。
+本地 RD 配置中打开 `llm.hypothesis_mode` 和 `llm.review_mode`。
 
 ### 4.5 Local Web / 本地 Web
 
@@ -263,13 +261,12 @@ The active `llm.provider` is the shared LLM setting for natural-language factor
 parsing and optional RD LLM features. The default public RD config is
 local-first. Set `llm.hypothesis_mode` and `llm.review_mode` to `llm` in an
 ignored local RD config when you want ordinary RD hypothesis generation and
-self-review to reuse the same provider/key. Set `llm.campaign_mode` only when
-explicitly running factor-synthesis Campaign workflows.
+self-review to reuse the same provider/key.
 
 当前 `llm.provider` 是自然语言因子解析和可选 RD LLM 功能共用的大模型配置。默认公开
 RD 配置是 local-first；如果希望普通 RD 研究假设和研究复盘复用同一个
 provider/key，请在被忽略的本地 RD 配置中打开 `llm.hypothesis_mode` 和
-`llm.review_mode`。只有明确运行因子合成 Campaign 时才打开 `llm.campaign_mode`。
+`llm.review_mode`。
 
 Local ignored env file:
 

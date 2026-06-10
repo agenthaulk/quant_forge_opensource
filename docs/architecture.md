@@ -123,17 +123,14 @@ configured horizon matrix and split definitions when an RD config is supplied.
 The public RD loop is a local research triage tool. It is not a production
 worker, not a trading scheduler, and not an automatic `active` promotion system.
 
-RD has two separate local workflows:
+RD currently exposes the research workflow in the public workbench:
 
 - `research`: optimize or propose factors through bounded research ideas plus
   optional hyper-parameter/profile search.
-- `factor_synthesis`: combine multiple existing factors through the Campaign
-  workflow. Campaign is not part of ordinary idea optimization.
 
-The two workflows intentionally share scoring, gates, trace writing, and report
-formatting, but they do not share generation semantics. Research accepts one
-seed factor and produces idea/profile variants. Campaign accepts multiple seed
-factors and produces composite/synthetic candidates.
+Factor synthesis is not part of the current public workbench. If it is added
+later, it should be designed as a separate workflow rather than mixed into
+ordinary idea optimization.
 
 One `research run-once` cycle:
 

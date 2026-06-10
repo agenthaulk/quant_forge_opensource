@@ -349,18 +349,18 @@ def test_prepare_factor_scores_writes_missing_dates_to_overlay(tmp_path) -> None
     assert (overlay_factor_dir / "incremental" / "2025.parquet").exists()
 
 
-def test_prepare_factor_scores_writes_synthetic_campaign_values_to_synthetic_category(tmp_path) -> None:
+def test_prepare_factor_scores_writes_rd_synthetic_values_to_synthetic_category(tmp_path) -> None:
     panel = _two_day_panel()
 
     result = prepare_factor_scores_result(
         panel,
         "rank(market_cap)",
-        factor_id="FTR_CAMP_TEST",
-        factor_name="campaign_test",
+        factor_id="RD_SYN_TEST",
+        factor_name="synthetic_test",
         factor_values_root=tmp_path,
     )
 
-    factor_dir = tmp_path / "合成因子" / "factor_id=FTR_CAMP_TEST"
+    factor_dir = tmp_path / "合成因子" / "factor_id=RD_SYN_TEST"
     assert result.source == "factor_values_incremental"
     assert result.factor_values_write_path == factor_dir
     assert (factor_dir / "incremental" / "2025.parquet").exists()

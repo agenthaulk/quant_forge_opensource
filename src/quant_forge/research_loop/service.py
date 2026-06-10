@@ -44,7 +44,6 @@ from quant_forge.research_loop.trace_store import ResearchTraceStore, utc_timest
 DEFAULT_QUICK_HORIZON_DAYS = (5, 21)
 DEFAULT_QUICK_SAMPLE_SPLITS = (SampleSplitSpec(name="IS", fraction=1.0, score_weight=1.0),)
 RD_RESEARCH_STAGE = "research"
-RD_FACTOR_SYNTHESIS_STAGE = "factor_synthesis"
 
 
 @dataclass(frozen=True)

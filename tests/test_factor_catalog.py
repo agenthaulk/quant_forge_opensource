@@ -146,18 +146,18 @@ def test_catalog_canonicalizes_legacy_local_precomputed_registration(tmp_path: P
 def test_factor_repository_writes_synthetic_factors_under_synthetic_category(tmp_path: Path) -> None:
     factor_root = tmp_path / "factor_root"
     factor = FactorDefinition(
-        factor_id="FTR_CAMP_TEST",
-        name="campaign_test",
-        formula="precomputed:factor_id=FTR_CAMP_TEST",
+        factor_id="RD_SYN_TEST",
+        name="synthetic_test",
+        formula="precomputed:factor_id=RD_SYN_TEST",
         status="candidate",
-        source="research_campaign",
+        source="rd",
     )
 
     path = FactorRepository(factor_root).save(factor)
-    loaded = FactorRepository(factor_root).get("FTR_CAMP_TEST")
+    loaded = FactorRepository(factor_root).get("RD_SYN_TEST")
 
-    assert path == factor_root / "合成因子" / "inactive_factors" / "FTR_CAMP_TEST" / "factor.yaml"
-    assert loaded.factor_id == "FTR_CAMP_TEST"
+    assert path == factor_root / "合成因子" / "inactive_factors" / "RD_SYN_TEST" / "factor.yaml"
+    assert loaded.factor_id == "RD_SYN_TEST"
 
 
 def test_normalize_factor_root_layout_copies_legacy_definitions_and_dedupes_list(tmp_path: Path) -> None:

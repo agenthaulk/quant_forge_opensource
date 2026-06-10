@@ -10,14 +10,9 @@ from quant_forge.core.contracts import BacktestResult, EvaluationResult, FactorD
 from quant_forge.factor_library.catalog import is_precomputed_formula
 from quant_forge.llm_client import extract_json_object, generate_chat_text
 from quant_forge.mcp.read_models import list_available_fields, list_available_operators
-from quant_forge.research_loop.campaign import (
-    PRECOMPUTED_CAMPAIGN_STRATEGIES,
-    ResearchCampaignOptimizerMetadata,
-)
 from quant_forge.research_loop.contracts import ResearchContext
 from quant_forge.research_loop.llm_contracts import (
     RD_LLM_SCHEMA_VERSION,
-    normalize_campaign_payload,
     normalize_review_payload,
 )
 from quant_forge.research_loop.service import (
@@ -124,41 +119,6 @@ class LLMResearchReviewGenerator:
             risks=_string_tuple(payload.get("risks")),
             next_hypotheses=_string_tuple(payload.get("next_hypotheses")),
             normalization_warnings=normalized.normalization_warnings,
-        )
-
-
-class LLMCampaignPlanner:
-    """Ask the shared LLM to order bounded precomputed campaign strategies."""
-
-    def __init__(self, llm: LLMSettings) -> None:
-        self.llm = _require_non_rule_llm(llm, feature="RD campaign LLM optimization")
-
-    def plan(
-        self,
-        *,
-        seed_factor_ids: tuple[str, ...],
-        objective: str,
-        rounds: int,
-    ) -> ResearchCampaignOptimizerMetadata:
-        result = generate_chat_text(
-            self.llm,
-            _campaign_messages(seed_factor_ids=seed_factor_ids, objective=objective, rounds=rounds),
-            temperature=0.1,
-            max_tokens=1000,
-        )
-        payload = extract_json_object(result.content)
-        payload = normalize_campaign_payload(
-            payload,
-            fallback_summary=f"Plan up to {rounds} bounded campaign strategies for {objective}.",
-        ).payload
-        strategy_names = _campaign_strategy_names(payload, rounds=rounds)
-        return ResearchCampaignOptimizerMetadata(
-            source="llm_campaign_planner",
-            provider=result.provider,
-            model=result.model,
-            summary=str(payload.get("summary", "")).strip(),
-            strategy_names=strategy_names,
-            raw_response=result.content,
         )
 
 
@@ -284,44 +244,6 @@ def _review_messages(
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def _campaign_messages(
-    *,
-    seed_factor_ids: tuple[str, ...],
-    objective: str,
-    rounds: int,
-) -> list[dict[str, str]]:
-    allowed = [strategy.suffix for strategy in PRECOMPUTED_CAMPAIGN_STRATEGIES]
-    system = (
-        "You are Quant Forge's RD campaign planner. Return one JSON object only. "
-        "Choose an ordered list of allowed strategy names for a bounded factor-combination campaign. "
-        "The local system will still compute factor values, evaluation, backtest, score, and gate."
-    )
-    user = json.dumps(
-        {
-            "seed_factor_ids": seed_factor_ids,
-            "objective": objective,
-            "rounds": rounds,
-            "allowed_strategy_names": allowed,
-            "strategy_meaning": {
-                "top20_equal": "combine top 20 seeds equally",
-                "top10_equal": "combine top 10 seeds equally",
-                "top5_equal": "combine top 5 seeds equally",
-                "top10_weighted": "combine top 10 seeds with higher weight for better rank",
-                "top10_weighted_ewm": "rank-weighted top 10 with EWM smoothing span 3",
-            },
-            "return_shape": {
-                "schema_version": RD_LLM_SCHEMA_VERSION,
-                "task_type": "rd_campaign_plan",
-                "summary": "why this strategy order is suitable",
-                "strategy_names": ["one or more allowed names, in execution order"],
-                "normalization_warnings": [],
-            },
-        },
-        ensure_ascii=False,
-    )
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
-
-
 def _factor_summary(factor: FactorDefinition) -> dict[str, Any]:
     return {
         "factor_id": factor.factor_id,
@@ -385,25 +307,6 @@ def _drop_provider_fallbacks_when_regular_ideas_exist(
     if any(not is_fallback for is_fallback in provider_fallback_seen):
         return [item for item, is_fallback in zip(hypotheses, provider_fallback_seen, strict=True) if not is_fallback]
     return hypotheses
-
-
-def _campaign_strategy_names(payload: dict[str, Any], *, rounds: int) -> tuple[str, ...]:
-    allowed = {strategy.suffix for strategy in PRECOMPUTED_CAMPAIGN_STRATEGIES}
-    raw = payload.get("strategy_names")
-    if not isinstance(raw, list):
-        raise RuntimeError("RD campaign LLM response must include strategy_names list")
-    names: list[str] = []
-    for item in raw:
-        name = str(item).strip()
-        if name not in allowed:
-            raise RuntimeError(f"RD campaign LLM returned unsupported strategy: {name}")
-        if name not in names:
-            names.append(name)
-        if len(names) >= rounds:
-            break
-    if not names:
-        raise RuntimeError("RD campaign LLM response did not produce any usable strategies")
-    return tuple(names)
 
 
 def _required_str(payload: dict[str, Any], key: str) -> str:

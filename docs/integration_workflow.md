@@ -27,7 +27,6 @@
 | 因子评价 | `eval-factor` 或 Web 评价 | 返回 Rank IC、ICIR、coverage、IC days、horizon matrix、IS/OOS split | OOS 是否衰减应显式展示 |
 | 回测 | `run-backtest` 或 Web 回测 | 返回持有期、调仓间隔、执行延迟、毛/净收益、回撤、Sharpe、换手口径、artifact path | 换手率必须说明口径 |
 | RD 单次运行 | `research run-once` 或 Web RD | 返回 seed factor、objective、候选列表、score、gate 结果、accepted candidates、report path | 不应只看全样本收益 |
-| Campaign 合成 | Web Campaign 或后续 synthesis 工作流 | 返回 seed list、strategy、composite factor、score、report path | 只用于多因子组合/合成，不用于普通 idea 优化 |
 | 报告生成 | RD report 或最终报告 | 输出 Markdown/HTML/PDF 路径，报告内含配置、数据源、关键指标、风险说明 | 报告能复现本次联调路径 |
 | 结束复核 | 测试和安全扫描 | pytest/help/git diff check 通过，或明确说明未运行原因 | 无秘密、无绝对私有路径被提交 |
 
@@ -212,9 +211,8 @@ RD 运行反馈应包含：
 - `workflow_type=research`；普通 research 只做 idea research 和参数/profile search。
 - 如果 LLM review 返回不完整 JSON，应展示 `normalization_warnings`，但不泄露 raw key。
 
-Campaign 反馈应包含 `workflow_type=campaign` 或 `factor_synthesis`，并展示 seed 列表、
-组合策略、最终合成因子和报告路径。Campaign 不应混入普通 research 的单因子 idea
-生成逻辑。
+如果未来增加因子合成，应作为独立 workflow 重新设计，不应混入普通 research 的
+单因子 idea 生成逻辑。
 
 如果候选只在 IS 好、OOS 弱，应反馈：
 

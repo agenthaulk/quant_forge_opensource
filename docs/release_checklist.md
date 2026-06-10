@@ -5,7 +5,6 @@
 - [ ] CLI smoke path from `qf init` through backtest
 - [ ] RD local smoke path through `qf research run-once FTR_DEMO_SMALL_CAP --workspace <demo> --rd-config configs/rd.yaml`
 - [ ] RD LLM smoke path through an ignored RD config that sets `llm.hypothesis_mode` and `llm.review_mode` to `llm` with an ignored env file supplying the active provider key
-- [ ] Factor-synthesis Campaign smoke path only when explicitly testing multi-factor composition; set `llm.campaign_mode` separately if LLM campaign planning is required
 - [ ] RD smoke output includes `report_path`, and the Markdown report exists under `artifact_root/research_reports`
 - [ ] RD parameter-search reports include a quick-stage trace when successive halving is enabled
 - [ ] Evaluation artifacts include IS/OOS1/OOS2 splits and the configured horizon matrix

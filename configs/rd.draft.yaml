@@ -15,8 +15,6 @@ default_max_candidates: 3
 llm:
   hypothesis_mode: local
   review_mode: local
-  # Campaign is reserved for the later factor-synthesis stage only.
-  # campaign_mode: llm
 
 # Web scheduler options. The scheduler is an in-process local convenience tool.
 default_interval_days: 1

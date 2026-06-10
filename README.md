@@ -65,12 +65,12 @@ qf research run-once FTR_DEMO_SMALL_CAP --workspace ./qf-demo --rd-config config
 `configs/rd.yaml` is local-first. Ordinary RD focuses on research ideas plus
 optional hyper-parameter/profile search; enable `llm.hypothesis_mode` and
 `llm.review_mode` only in an ignored local RD config when you want LLM-backed
-idea generation or review. Campaign mode is reserved for factor synthesis.
+idea generation or review.
 
 `configs/rd.yaml` 默认 local-first。普通 RD 只聚焦研究 idea 和可选的超参数/profile
 搜索；如需大模型生成 idea 或复盘，只在被忽略的本地 RD 配置中打开
-`llm.hypothesis_mode` 和 `llm.review_mode`。Campaign 模式只用于因子合成。
-运行 RD 前请先配置当前 `llm.provider` 的 key；如果只是离线 smoke，可复制
+`llm.hypothesis_mode` 和 `llm.review_mode`。运行 RD 前请先配置当前
+`llm.provider` 的 key；如果只是离线 smoke，可复制
 `configs/rd.draft.yaml` 为被忽略的本地 RD 配置，并保持 `llm.hypothesis_mode`
 和 `llm.review_mode` 为 `local`。
 
@@ -212,8 +212,9 @@ stores read-base daily factor values. `factor_values_overlay` stores new local
 incremental values when the canonical store should remain read-only. Factor
 definitions and values are split into `原始因子` and `合成因子`: original factors
 come from imported/public formulas or precomputed external values, while
-synthetic factors come from RD/campaign/composite generation. The manifest
-directory stores portable metadata and must not contain machine-local paths.
+synthetic factors come from RD outputs or other explicitly generated research
+candidates. The manifest directory stores portable metadata and must not
+contain machine-local paths.
 
 如果换一台电脑，只需要拉取代码、插入移动硬盘、复制并编辑
 `configs/mounted.draft.yaml`。`factor normalize-root` 会把旧版 `factor_root`

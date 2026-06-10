@@ -191,7 +191,6 @@ allowed_interval_days: [1, 5, 15, 30]
 llm:
   hypothesis_mode: local
   review_mode: local
-  campaign_mode: local
 weights:
   rank_ic_mean: 0.45
   rank_icir: 0.35
@@ -444,7 +443,6 @@ def test_cli_uses_workspace_config_roots(tmp_path: Path) -> None:
 llm:
   hypothesis_mode: local
   review_mode: local
-  campaign_mode: local
 """,
         encoding="utf-8",
     )

@@ -98,20 +98,18 @@ class ResearchParameterSearchConfig:
 class ResearchLLMConfig:
     hypothesis_mode: str = "local"
     review_mode: str = "local"
-    campaign_mode: str = "local"
 
     def __post_init__(self) -> None:
         for name, value in (
             ("hypothesis_mode", self.hypothesis_mode),
             ("review_mode", self.review_mode),
-            ("campaign_mode", self.campaign_mode),
         ):
             if _canonical_generation_mode(value) not in {"llm", "local"}:
                 raise ValueError(f"RD llm.{name} must be llm or local")
 
     @property
     def uses_llm(self) -> bool:
-        return self.research_uses_llm or self.synthesis_uses_llm
+        return self.research_uses_llm
 
     @property
     def research_uses_llm(self) -> bool:
@@ -119,10 +117,6 @@ class ResearchLLMConfig:
             _canonical_generation_mode(value) == "llm"
             for value in (self.hypothesis_mode, self.review_mode)
         )
-
-    @property
-    def synthesis_uses_llm(self) -> bool:
-        return _canonical_generation_mode(self.campaign_mode) == "llm"
 
 
 @dataclass(frozen=True)
@@ -338,10 +332,11 @@ def _load_rd_llm_config(raw: Any, default: ResearchLLMConfig) -> ResearchLLMConf
         return default
     if not isinstance(raw, dict):
         raise ValueError("RD config llm section must be a mapping")
+    if "campaign_mode" in raw:
+        raise ValueError("RD config llm.campaign_mode is not supported in the public research workbench")
     return ResearchLLMConfig(
         hypothesis_mode=_canonical_generation_mode(raw.get("hypothesis_mode", default.hypothesis_mode)),
         review_mode=_canonical_generation_mode(raw.get("review_mode", default.review_mode)),
-        campaign_mode=_canonical_generation_mode(raw.get("campaign_mode", default.campaign_mode)),
     )
 
 

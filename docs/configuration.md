@@ -73,7 +73,7 @@ factor_root/
 ```
 
 `原始因子` contains imported/public formulas and external precomputed factors.
-`合成因子` contains RD, campaign, parameter-search, or composite candidates.
+`合成因子` contains RD, parameter-search, or other explicitly generated research candidates.
 Legacy flat paths such as `factor_root/inactive_factors/<FACTOR_ID>/factor.yaml`
 remain readable. Run `qf factor normalize-root` to copy those legacy definitions
 into the categorized layout without deleting the originals.
@@ -199,8 +199,7 @@ factor parsing and optional RD LLM features. The public RD config is
 local-first by default. Ordinary RD focuses on research ideas and bounded
 hyper-parameter/profile search; set `llm.hypothesis_mode` and
 `llm.review_mode` to `llm` in an ignored local RD config when you want RD idea
-generation and self-review to reuse the same provider/key. Set
-`llm.campaign_mode` only for the later factor-synthesis Campaign workflow.
+generation and self-review to reuse the same provider/key.
 
 `llm.providers` declares provider entries that may appear in the Web UI. Keep
 the default config to one provider/key unless you intentionally want users to
@@ -328,7 +327,6 @@ ordinary RD work, copy `configs/rd.draft.yaml` to an ignored local RD config and
 set `llm.hypothesis_mode` and `llm.review_mode` to `llm`. RD uses the main
 `llm` config in that mode; do not create a separate RD API key for the same
 provider. Keep one active `llm.provider` and one matching `api_key_env`.
-`llm.campaign_mode` is reserved for factor-synthesis Campaign runs.
 
 ```yaml
 objective: balanced
@@ -339,8 +337,6 @@ top_quantile: 0.3
 llm:
   hypothesis_mode: local
   review_mode: local
-  # Use only when running factor-synthesis Campaign workflows.
-  campaign_mode: local
 simulation:
   execution_delay_days: 1
   top_quantile: 0.3

@@ -373,16 +373,14 @@ def test_rd_config_loads_defaults_and_overrides(tmp_path: Path) -> None:
     assert [split.name for split in default_config.sample_splits] == ["IS", "OOS1", "OOS2"]
     assert weights_for_objective(default_config, "rank_icir").weighted_split_icir == 0.5
     assert default_config.llm.research_uses_llm is False
-    assert default_config.llm.synthesis_uses_llm is False
     assert default_config.deduplication.enabled is True
     assert default_config.deduplication.formula_fingerprint is True
     assert default_config.deduplication.result_signature is True
     assert default_config.deduplication.candidate_diversity is True
 
-    synthesis_only_llm = ResearchLLMConfig(hypothesis_mode="local", review_mode="local", campaign_mode="llm")
-    assert synthesis_only_llm.research_uses_llm is False
-    assert synthesis_only_llm.synthesis_uses_llm is True
-    assert synthesis_only_llm.uses_llm is True
+    review_only_llm = ResearchLLMConfig(hypothesis_mode="local", review_mode="llm")
+    assert review_only_llm.research_uses_llm is True
+    assert review_only_llm.uses_llm is True
 
     rd_path = tmp_path / "rd.yaml"
     rd_path.write_text(
@@ -479,6 +477,18 @@ deduplication:
     legacy_config = load_research_loop_config(legacy_path)
     assert legacy_config.gate.max_rebalance_rate == 0.7
     assert legacy_config.gate.max_turnover_rate == 1.2
+
+    unsupported_llm_path = tmp_path / "rd-unsupported-llm.yaml"
+    unsupported_llm_path.write_text(
+        """llm:
+  hypothesis_mode: local
+  review_mode: local
+  campaign_mode: local
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="llm.campaign_mode is not supported"):
+        load_research_loop_config(unsupported_llm_path)
 
 
 def test_factor_status_validation() -> None:
