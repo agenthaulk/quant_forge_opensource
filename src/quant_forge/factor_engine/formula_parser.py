@@ -97,6 +97,12 @@ def inspect_formula(
     )
 
 
+def formula_lookback_rows(formula: str) -> int:
+    """Return the prior per-instrument rows needed to evaluate a formula."""
+
+    return _node_lookback_rows(parse_formula_node(formula))
+
+
 def field_name(node: ast.AST) -> str:
     if isinstance(node, ast.Name):
         return node.id
@@ -200,6 +206,37 @@ def _collect_formula_parts(
             errors=errors,
             known_operators=known_operators,
         )
+
+
+def _node_lookback_rows(node: ast.AST) -> int:
+    if isinstance(node, ast.Call):
+        operator = node.func.id
+        args = list(node.args)
+        child_lookbacks = [_node_lookback_rows(arg) for arg in args]
+        if operator in {"delay", "delta"} and len(args) >= 2:
+            return child_lookbacks[0] + _positive_int_arg(args[1])
+        if (
+            operator in {"ts_sum", "ts_mean", "ts_min", "ts_max", "stddev", "ts_rank", "decay_linear"}
+            and len(args) >= 2
+        ):
+            return child_lookbacks[0] + max(_positive_int_arg(args[1]) - 1, 0)
+        if operator in {"correlation", "covariance"} and len(args) >= 3:
+            return max(child_lookbacks[0], child_lookbacks[1]) + max(_positive_int_arg(args[2]) - 1, 0)
+        if operator in {"wq_min", "wq_max"} and len(args) >= 2 and numeric_constant(args[1]) is not None:
+            return child_lookbacks[0] + max(_positive_int_arg(args[1]) - 1, 0)
+        return max(child_lookbacks, default=0)
+    if isinstance(node, ast.BinOp):
+        return max(_node_lookback_rows(node.left), _node_lookback_rows(node.right))
+    if isinstance(node, ast.UnaryOp):
+        return _node_lookback_rows(node.operand)
+    return 0
+
+
+def _positive_int_arg(node: ast.AST) -> int:
+    value = numeric_constant(node)
+    if value is None:
+        return 1
+    return max(int(math.floor(value)), 1)
 
 
 def _validate_operator_signature(

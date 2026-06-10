@@ -5,6 +5,7 @@ import pytest
 
 from quant_forge.core.contracts import SimulationProfile
 from quant_forge.factor_engine.executor import execute_factor_formula
+from quant_forge.factor_engine.formula_parser import formula_lookback_rows
 from quant_forge.factor_engine.signal_processing import prepare_factor_scores, prepare_factor_scores_result
 from quant_forge.factor_engine.value_store import _formula_signature
 
@@ -73,6 +74,14 @@ def test_execute_factor_formula_supports_time_series_operator_subset() -> None:
     assert list(nested["score"].iloc[2:]) == [1.0, 0.5, 1.0, 0.5]
     assert list(corr["score"].iloc[:2].isna()) == [True, True]
     assert corr["score"].iloc[2:].notna().all()
+
+
+def test_formula_lookback_rows_tracks_nested_time_series_requirements() -> None:
+    assert formula_lookback_rows("rank(market_cap)") == 0
+    assert formula_lookback_rows("delta(close, 2)") == 2
+    assert formula_lookback_rows("ts_mean(close, 5)") == 4
+    assert formula_lookback_rows("correlation(close, volume, 10)") == 9
+    assert formula_lookback_rows("ts_mean(delta(close, 2), 3)") == 4
 
 
 def test_execute_factor_formula_supports_worldquant_style_transforms() -> None:
@@ -283,6 +292,168 @@ def test_prepare_factor_scores_computes_and_persists_only_missing_dates(tmp_path
     assert list(incremental["factor_value"]) == [0.5, 1.0]
     assert incremental["formula_signature"].nunique() == 1
     assert not (factor_dir / "incremental").exists()
+
+
+def test_prepare_factor_scores_preserves_lookback_when_filling_cache_gaps(tmp_path) -> None:
+    panel = _three_day_panel()
+    read_root = tmp_path / "canonical"
+    overlay_root = tmp_path / "overlay"
+    factor_dir = read_root / "factor_id=FTR_DELTA_CACHE"
+    factor_dir.mkdir(parents=True)
+    signature = _formula_signature("FTR_DELTA_CACHE", "delta(close, 1)", ())
+    pd.DataFrame(
+        {
+            "trade_date": ["2025-01-02", "2025-01-02", "2025-01-03", "2025-01-03"],
+            "instrument": ["AAA", "BBB", "AAA", "BBB"],
+            "formula_signature": [signature, signature, signature, signature],
+            "factor_value": [-99.0, -88.0, 2.0, 3.0],
+        }
+    ).to_parquet(factor_dir / "2025.parquet", index=False)
+
+    result = prepare_factor_scores_result(
+        panel,
+        "delta(close, 1)",
+        factor_id="FTR_DELTA_CACHE",
+        factor_name="FTR_DELTA_CACHE",
+        factor_values_root=read_root,
+        factor_values_overlay_root=overlay_root,
+    )
+
+    assert result.source == "factor_values_incremental"
+    assert result.cached_rows == 4
+    assert result.computed_rows == 2
+    assert list(result.scores["score"]) == [-99.0, -88.0, 2.0, 3.0, 3.0, 5.0]
+
+    incremental = pd.read_parquet(
+        overlay_root / "原始因子" / "factor_id=FTR_DELTA_CACHE" / "incremental" / "2025.parquet"
+    )
+    assert list(incremental["trade_date"]) == ["2025-01-06", "2025-01-06"]
+    assert list(incremental["instrument"]) == ["AAA", "BBB"]
+    assert list(incremental["factor_value"]) == [3.0, 5.0]
+    assert not (factor_dir / "incremental").exists()
+
+
+def test_prepare_factor_scores_preserves_rolling_lookback_when_filling_cache_gaps(tmp_path) -> None:
+    panel = _three_day_panel()
+    read_root = tmp_path / "canonical"
+    overlay_root = tmp_path / "overlay"
+    factor_dir = read_root / "factor_id=FTR_ROLLING_CACHE"
+    factor_dir.mkdir(parents=True)
+    signature = _formula_signature("FTR_ROLLING_CACHE", "ts_mean(close, 2)", ())
+    pd.DataFrame(
+        {
+            "trade_date": ["2025-01-02", "2025-01-02", "2025-01-03", "2025-01-03"],
+            "instrument": ["AAA", "BBB", "AAA", "BBB"],
+            "formula_signature": [signature, signature, signature, signature],
+            "factor_value": [-99.0, -88.0, 11.0, 21.5],
+        }
+    ).to_parquet(factor_dir / "2025.parquet", index=False)
+
+    result = prepare_factor_scores_result(
+        panel,
+        "ts_mean(close, 2)",
+        factor_id="FTR_ROLLING_CACHE",
+        factor_name="FTR_ROLLING_CACHE",
+        factor_values_root=read_root,
+        factor_values_overlay_root=overlay_root,
+    )
+
+    assert result.source == "factor_values_incremental"
+    assert result.cached_rows == 4
+    assert result.computed_rows == 2
+    assert list(result.scores["score"]) == [-99.0, -88.0, 11.0, 21.5, 13.5, 25.5]
+
+    incremental = pd.read_parquet(
+        overlay_root / "原始因子" / "factor_id=FTR_ROLLING_CACHE" / "incremental" / "2025.parquet"
+    )
+    assert list(incremental["trade_date"]) == ["2025-01-06", "2025-01-06"]
+    assert list(incremental["instrument"]) == ["AAA", "BBB"]
+    assert list(incremental["factor_value"]) == [13.5, 25.5]
+    assert not (factor_dir / "incremental").exists()
+
+
+def test_prepare_factor_scores_writes_only_missing_instrument_rows(tmp_path) -> None:
+    panel = _two_day_panel()
+    read_root = tmp_path / "canonical"
+    overlay_root = tmp_path / "overlay"
+    factor_dir = read_root / "factor_id=FTR_PARTIAL_ROW"
+    factor_dir.mkdir(parents=True)
+    signature = _formula_signature("FTR_PARTIAL_ROW", "rank(market_cap)", ())
+    pd.DataFrame(
+        {
+            "trade_date": ["2025-01-02", "2025-01-02", "2025-01-03"],
+            "instrument": ["AAA", "BBB", "AAA"],
+            "formula_signature": [signature, signature, signature],
+            "factor_value": [10.0, 20.0, 30.0],
+        }
+    ).to_parquet(factor_dir / "2025.parquet", index=False)
+
+    result = prepare_factor_scores_result(
+        panel,
+        "rank(market_cap)",
+        factor_id="FTR_PARTIAL_ROW",
+        factor_name="FTR_PARTIAL_ROW",
+        factor_values_root=read_root,
+        factor_values_overlay_root=overlay_root,
+    )
+
+    assert result.source == "factor_values_incremental"
+    assert result.cached_rows == 3
+    assert result.computed_rows == 1
+    assert list(result.scores["score"]) == [10.0, 20.0, 30.0, 1.0]
+
+    incremental = pd.read_parquet(
+        overlay_root / "原始因子" / "factor_id=FTR_PARTIAL_ROW" / "incremental" / "2025.parquet"
+    )
+    assert list(incremental["trade_date"]) == ["2025-01-03"]
+    assert list(incremental["instrument"]) == ["BBB"]
+    assert list(incremental["factor_value"]) == [1.0]
+
+
+def test_prepare_factor_scores_uses_per_instrument_lookback_for_sparse_history(tmp_path) -> None:
+    panel = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(["2025-01-02", "2025-01-03", "2025-01-06", "2025-01-06"]),
+            "instrument": ["AAA", "BBB", "AAA", "BBB"],
+            "close": [10.0, 20.0, 13.0, 25.0],
+            "market_cap": [100.0, 200.0, 300.0, 400.0],
+            "is_st": [False, False, False, False],
+        }
+    )
+    read_root = tmp_path / "canonical"
+    overlay_root = tmp_path / "overlay"
+    factor_dir = read_root / "factor_id=FTR_SPARSE_DELTA"
+    factor_dir.mkdir(parents=True)
+    signature = _formula_signature("FTR_SPARSE_DELTA", "delta(close, 1)", ())
+    pd.DataFrame(
+        {
+            "trade_date": ["2025-01-02", "2025-01-03"],
+            "instrument": ["AAA", "BBB"],
+            "formula_signature": [signature, signature],
+            "factor_value": [-99.0, -88.0],
+        }
+    ).to_parquet(factor_dir / "2025.parquet", index=False)
+
+    result = prepare_factor_scores_result(
+        panel,
+        "delta(close, 1)",
+        factor_id="FTR_SPARSE_DELTA",
+        factor_name="FTR_SPARSE_DELTA",
+        factor_values_root=read_root,
+        factor_values_overlay_root=overlay_root,
+    )
+
+    assert result.source == "factor_values_incremental"
+    assert result.cached_rows == 2
+    assert result.computed_rows == 2
+    assert list(result.scores["score"]) == [-99.0, -88.0, 3.0, 5.0]
+
+    incremental = pd.read_parquet(
+        overlay_root / "原始因子" / "factor_id=FTR_SPARSE_DELTA" / "incremental" / "2025.parquet"
+    )
+    assert list(incremental["trade_date"]) == ["2025-01-06", "2025-01-06"]
+    assert list(incremental["instrument"]) == ["AAA", "BBB"]
+    assert list(incremental["factor_value"]) == [3.0, 5.0]
 
 
 def test_prepare_factor_scores_does_not_write_to_root_without_overlay(tmp_path) -> None:
@@ -517,9 +688,9 @@ def test_prepare_factor_scores_recomputes_dates_with_bad_cached_values(tmp_path)
     )
 
     assert result.source == "factor_values_incremental"
-    assert result.cached_rows == 2
-    assert result.computed_rows == 2
-    assert list(result.scores["score"]) == [0.5, 1.0, 30.0, 40.0]
+    assert result.cached_rows == 3
+    assert result.computed_rows == 1
+    assert list(result.scores["score"]) == [0.5, 20.0, 30.0, 40.0]
 
 
 def test_prepare_factor_scores_recomputes_when_filtered_instruments_are_missing(tmp_path) -> None:
@@ -555,7 +726,7 @@ def test_prepare_factor_scores_recomputes_when_filtered_instruments_are_missing(
 
     assert result.source == "factor_values_incremental"
     assert result.cached_rows == 0
-    assert result.computed_rows == 4
+    assert result.computed_rows == 2
     assert list(result.scores["instrument"]) == ["AAA", "BBB", "CCC", "DDD"]
     assert list(result.scores["score"].iloc[:2]) == [0.25, 0.5]
     assert result.scores["score"].iloc[2:].isna().all()
@@ -649,5 +820,26 @@ def _two_day_panel() -> pd.DataFrame:
             "close": [10.0, 11.0, 12.0, 13.0],
             "market_cap": [100.0, 200.0, 300.0, 400.0],
             "is_st": [False, False, False, False],
+        }
+    )
+
+
+def _three_day_panel() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(
+                [
+                    "2025-01-02",
+                    "2025-01-02",
+                    "2025-01-03",
+                    "2025-01-03",
+                    "2025-01-06",
+                    "2025-01-06",
+                ]
+            ),
+            "instrument": ["AAA", "BBB", "AAA", "BBB", "AAA", "BBB"],
+            "close": [10.0, 20.0, 12.0, 23.0, 15.0, 28.0],
+            "market_cap": [100.0, 200.0, 300.0, 400.0, 500.0, 600.0],
+            "is_st": [False, False, False, False, False, False],
         }
     )

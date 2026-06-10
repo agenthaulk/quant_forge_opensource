@@ -13,6 +13,7 @@ import pandas as pd
 from quant_forge.factor_library.classification import FACTOR_CATEGORY_DIRS, factor_category_from_parts
 from quant_forge.factor_library.catalog import precomputed_formula_store_key, resolve_factor_values_root
 from quant_forge.factor_engine.executor import execute_factor_formula
+from quant_forge.factor_engine.formula_parser import formula_lookback_rows
 
 
 @dataclass(frozen=True)
@@ -70,15 +71,21 @@ class FactorValueStore:
                 factor_values_path=factor_paths.primary_dir,
                 factor_values_write_path=factor_paths.write_dir,
             )
-        complete_dates = _complete_cached_dates(required_keys, cached_for_panel)
-        cached_complete = cached_for_panel[cached_for_panel["trade_date"].isin(complete_dates)]
-        missing_panel = panel[~panel["trade_date"].isin(complete_dates)]
+        cached_available = _restrict_to_panel(
+            _dedupe_scores(cached_for_panel).dropna(subset=["score"]),
+            required_keys,
+        )
+        missing_keys = _missing_score_keys(required_keys, cached_available)
+        cached_complete = cached_available
+        result_missing_keys = _missing_score_keys(panel_keys, cached_complete)
 
-        computed = (
-            execute_factor_formula(missing_panel, formula, universe_filters)
-            if not missing_panel.empty
+        computed_context = (
+            execute_factor_formula(_panel_with_lookback(panel, missing_keys, formula), formula, universe_filters)
+            if not missing_keys.empty
             else _empty_scores()
         )
+        computed = _restrict_to_panel(computed_context, missing_keys)
+        computed_for_result = _restrict_to_panel(computed_context, result_missing_keys)
         if not computed.empty and factor_paths.write_dir is not None:
             self.write_incremental_values(
                 factor_paths.write_dir,
@@ -88,7 +95,7 @@ class FactorValueStore:
                 scores=computed,
             )
 
-        combined = pd.concat([cached_complete, computed], ignore_index=True)
+        combined = pd.concat([cached_complete, computed_for_result], ignore_index=True)
         if combined.empty:
             combined = _empty_scores()
         else:
@@ -211,6 +218,41 @@ def _score_keys(panel: pd.DataFrame) -> pd.DataFrame:
     return keys.drop_duplicates().reset_index(drop=True)
 
 
+def _missing_score_keys(target_keys: pd.DataFrame, cached: pd.DataFrame) -> pd.DataFrame:
+    if target_keys.empty:
+        return target_keys
+    cached_keys = _score_keys(cached)
+    marked = target_keys.merge(
+        cached_keys.assign(_cached=True),
+        on=["trade_date", "instrument"],
+        how="left",
+    )
+    missing = marked[marked["_cached"].isna()][["trade_date", "instrument"]]
+    return missing.reset_index(drop=True)
+
+
+def _panel_with_lookback(panel: pd.DataFrame, missing_keys: pd.DataFrame, formula: str) -> pd.DataFrame:
+    if missing_keys.empty:
+        return panel.iloc[0:0]
+    lookback = formula_lookback_rows(formula)
+    normalized_panel = panel.copy()
+    normalized_panel["trade_date"] = pd.to_datetime(normalized_panel["trade_date"])
+    normalized_panel["instrument"] = normalized_panel["instrument"].astype(str)
+    normalized_missing = _score_keys(missing_keys)
+    context_dates = set(normalized_missing["trade_date"])
+    if lookback > 0:
+        for _, missing_key in normalized_missing.iterrows():
+            instrument_rows = normalized_panel[normalized_panel["instrument"] == missing_key["instrument"]]
+            instrument_rows = instrument_rows.sort_values("trade_date").reset_index(drop=True)
+            positions = instrument_rows.index[instrument_rows["trade_date"] == missing_key["trade_date"]]
+            if len(positions) == 0:
+                continue
+            position = int(positions[0])
+            start = max(0, position - lookback)
+            context_dates.update(instrument_rows.loc[start:position, "trade_date"])
+    return panel[pd.to_datetime(panel["trade_date"]).isin(context_dates)]
+
+
 def _required_score_keys(panel: pd.DataFrame, universe_filters: tuple[str, ...]) -> pd.DataFrame:
     if not universe_filters:
         return _score_keys(panel)
@@ -305,26 +347,6 @@ def _restrict_to_panel(scores: pd.DataFrame, target_keys: pd.DataFrame) -> pd.Da
         return _empty_scores()
     normalized = _dedupe_scores(scores)
     return target_keys.merge(normalized, on=["trade_date", "instrument"], how="inner")
-
-
-def _complete_cached_dates(target_keys: pd.DataFrame, cached: pd.DataFrame) -> set[pd.Timestamp]:
-    if target_keys.empty or cached.empty:
-        return set()
-    required_by_date = _instrument_sets_by_date(target_keys)
-    cached_non_null = _dedupe_scores(cached).dropna(subset=["score"])
-    available_by_date = _instrument_sets_by_date(cached_non_null)
-    return {
-        date
-        for date, required in required_by_date.items()
-        if required.issubset(available_by_date.get(date, frozenset()))
-    }
-
-
-def _instrument_sets_by_date(keys: pd.DataFrame) -> pd.Series:
-    if keys.empty:
-        return pd.Series(dtype="object")
-    normalized = _score_keys(keys)
-    return normalized.groupby("trade_date")["instrument"].agg(frozenset)
 
 
 def _apply_universe_filters(
