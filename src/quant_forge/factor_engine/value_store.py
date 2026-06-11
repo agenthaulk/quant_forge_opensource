@@ -392,7 +392,7 @@ def _dedupe_scores(scores: pd.DataFrame) -> pd.DataFrame:
 
 
 def _find_existing_factor_dirs(root: Path, candidates: list[str]) -> tuple[Path, ...]:
-    if not root.exists():
+    if not _safe_is_dir(root):
         return ()
     matches: list[Path] = []
     for candidate in reversed(candidates):
@@ -400,14 +400,14 @@ def _find_existing_factor_dirs(root: Path, candidates: list[str]) -> tuple[Path,
             continue
         for category_dir in FACTOR_CATEGORY_DIRS.values():
             direct = root / category_dir / candidate
-            if direct.is_dir():
+            if _safe_is_dir(direct):
                 matches.append(direct)
         direct = root / candidate
-        if direct.is_dir():
+        if _safe_is_dir(direct):
             matches.append(direct)
     children: dict[str, Path] = {}
     for search_root in _factor_value_search_roots(root):
-        children.update({child.name.lower(): child for child in search_root.iterdir() if child.is_dir()})
+        children.update({child.name.lower(): child for child in _safe_child_dirs(search_root)})
     for candidate in reversed(candidates):
         match = children.get(candidate.lower())
         if match is not None:
@@ -419,9 +419,36 @@ def _factor_value_search_roots(root: Path) -> tuple[Path, ...]:
     roots = [root]
     for category_dir in FACTOR_CATEGORY_DIRS.values():
         category_root = root / category_dir
-        if category_root.is_dir():
+        if _safe_is_dir(category_root):
             roots.append(category_root)
     return tuple(roots)
+
+
+def _safe_child_dirs(root: Path) -> list[Path]:
+    directories: list[Path] = []
+    try:
+        children = sorted(root.iterdir())
+    except OSError:
+        return directories
+    for child in children:
+        if _is_ignored_mount_entry(child):
+            continue
+        if _safe_is_dir(child):
+            directories.append(child)
+    return directories
+
+
+def _safe_is_dir(path: Path) -> bool:
+    if _is_ignored_mount_entry(path):
+        return False
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+def _is_ignored_mount_entry(path: Path) -> bool:
+    return path.name.startswith("._") or path.name in {".DS_Store", ".Spotlight-V100", ".Trashes", ".fseventsd"}
 
 
 def _unique_existing_dirs(paths: tuple[Path, ...]) -> tuple[Path, ...]:
