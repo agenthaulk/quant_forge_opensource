@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
@@ -292,6 +294,36 @@ def test_prepare_factor_scores_computes_and_persists_only_missing_dates(tmp_path
     assert list(incremental["factor_value"]) == [0.5, 1.0]
     assert incremental["formula_signature"].nunique() == 1
     assert not (factor_dir / "incremental").exists()
+
+
+def test_prepare_factor_scores_skips_macos_appledouble_entries_before_stat(tmp_path, monkeypatch) -> None:
+    panel = _two_day_panel().iloc[:2]
+    read_root = tmp_path / "canonical"
+    overlay_root = tmp_path / "overlay"
+    read_root.mkdir()
+    (read_root / "._原始因子").write_bytes(b"appledouble")
+
+    original_is_dir = Path.is_dir
+
+    def guarded_is_dir(path: Path) -> bool:
+        if path.name.startswith("._"):
+            raise PermissionError(f"operation not permitted: {path}")
+        return original_is_dir(path)
+
+    monkeypatch.setattr(Path, "is_dir", guarded_is_dir)
+
+    result = prepare_factor_scores_result(
+        panel,
+        "rank(market_cap)",
+        factor_id="FTR_DOCKER_SMOKE",
+        factor_name="docker_smoke",
+        factor_values_root=read_root,
+        factor_values_overlay_root=overlay_root,
+    )
+
+    assert result.source == "factor_values_incremental"
+    assert result.computed_rows == 2
+    assert list(result.scores["score"]) == [0.5, 1.0]
 
 
 def test_prepare_factor_scores_preserves_lookback_when_filling_cache_gaps(tmp_path) -> None:

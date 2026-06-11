@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -296,6 +297,53 @@ llm:
     assert payload["ok"] is False
     assert payload["llm"]["missing_providers"][0]["api_key_env"] == "QF_DOCTOR_MISSING_KEY"
     assert "QF_DOCTOR_MISSING_KEY" in payload["llm"]["missing_providers"][0]["error"]
+
+
+def test_doctor_skips_macos_appledouble_entries_before_stat(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "doctor_mount_demo"
+    create_demo_workspace(workspace)
+    factor_values_root = workspace / "factor_values"
+    factor_dir = factor_values_root / "原始因子" / "factor_id=WQ_ALPHA_003"
+    factor_dir.mkdir(parents=True)
+    (factor_values_root / "._原始因子").write_bytes(b"appledouble")
+    (factor_dir / "2025.metadata.json").write_text(
+        json.dumps({"factor_id": "WQ_ALPHA_003", "factor_name": "worldquant_alpha_003"}),
+        encoding="utf-8",
+    )
+    pd.DataFrame(
+        {
+            "trade_date": ["2025-01-02"],
+            "instrument": ["AAA"],
+            "factor_id": ["WQ_ALPHA_003"],
+            "factor_value": [0.3],
+        }
+    ).to_parquet(factor_dir / "2025.parquet", index=False)
+
+    original_is_dir = Path.is_dir
+
+    def guarded_is_dir(path: Path) -> bool:
+        if path.name.startswith("._"):
+            raise PermissionError(f"operation not permitted: {path}")
+        return original_is_dir(path)
+
+    monkeypatch.setattr(Path, "is_dir", guarded_is_dir)
+    args = argparse.Namespace(
+        config=None,
+        workspace=None,
+        rd_config=Path("configs/rd.yaml"),
+        data_root=workspace / "data",
+        factor_root=workspace / "factor_root",
+        factor_values_root=factor_values_root,
+        factor_values_overlay_root=None,
+        factor_values_manifest_root=None,
+        artifact_root=workspace / "artifacts",
+    )
+
+    payload = cli_main._doctor_payload(args)
+
+    assert payload["ok"] is True
+    assert payload["factor_values"]["precomputed_factor_count"] == 1
+    assert not any("._原始因子" in str(check) for check in payload["checks"])
 
 
 def test_cli_default_rd_local_mode_does_not_require_provider_key(tmp_path: Path, monkeypatch) -> None:
