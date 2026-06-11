@@ -357,14 +357,14 @@ def _factor_value_dirs(root: Path) -> list[Path]:
         return []
     directories = [
         child
-        for child in sorted(root.iterdir())
-        if child.is_dir() and not child.name.startswith("._") and _looks_like_factor_dir(child)
+        for child in _safe_child_dirs(root)
+        if _looks_like_factor_dir(child)
     ]
     for category_root in _category_roots(root):
         directories.extend(
             child
-            for child in sorted(category_root.iterdir())
-            if child.is_dir() and not child.name.startswith("._") and _looks_like_factor_dir(child)
+            for child in _safe_child_dirs(category_root)
+            if _looks_like_factor_dir(child)
         )
     return list(dict.fromkeys(directories))
 
@@ -373,7 +373,7 @@ def _looks_like_factor_values_root(path: Path) -> bool:
     if not path.exists() or not path.is_dir():
         return False
     try:
-        if any(child.is_dir() and _looks_like_factor_dir(child) for child in path.iterdir()):
+        if any(_looks_like_factor_dir(child) for child in _safe_child_dirs(path)):
             return True
         return any(_looks_like_factor_values_root(child) for child in _category_roots(path))
     except OSError:
@@ -616,9 +616,30 @@ def _category_roots(root: Path) -> list[Path]:
         return []
     return [
         child
-        for child in sorted(root.iterdir())
-        if child.is_dir() and not child.name.startswith("._") and is_factor_category_dir(child)
+        for child in _safe_child_dirs(root)
+        if is_factor_category_dir(child)
     ]
+
+
+def _safe_child_dirs(root: Path) -> list[Path]:
+    directories: list[Path] = []
+    try:
+        children = sorted(root.iterdir())
+    except OSError:
+        return directories
+    for child in children:
+        if _is_ignored_mount_entry(child):
+            continue
+        try:
+            if child.is_dir():
+                directories.append(child)
+        except OSError:
+            continue
+    return directories
+
+
+def _is_ignored_mount_entry(path: Path) -> bool:
+    return path.name.startswith("._") or path.name in {".DS_Store", ".Spotlight-V100", ".Trashes", ".fseventsd"}
 
 
 def _store_files(directory: Path) -> list[Path]:

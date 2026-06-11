@@ -391,6 +391,31 @@ def test_manifest_candidates_fill_missing_fields_by_priority(tmp_path: Path) -> 
     )
 
 
+def test_catalog_skips_macos_appledouble_entries_before_stat(tmp_path: Path, monkeypatch) -> None:
+    factor_values_root = tmp_path / "factor_values"
+    _write_precomputed_factor(
+        factor_values_root / "原始因子" / "factor_id=WQ_ALPHA_003",
+        factor_id="WQ_ALPHA_003",
+        factor_name="worldquant_alpha_003",
+        factor_store_key="factor_id=WQ_ALPHA_003",
+        value=0.3,
+    )
+    (factor_values_root / "._原始因子").write_bytes(b"appledouble")
+
+    original_is_dir = Path.is_dir
+
+    def guarded_is_dir(path: Path) -> bool:
+        if path.name.startswith("._"):
+            raise PermissionError(f"operation not permitted: {path}")
+        return original_is_dir(path)
+
+    monkeypatch.setattr(Path, "is_dir", guarded_is_dir)
+
+    discovered = discover_precomputed_factors(factor_values_root)
+
+    assert [factor.factor_id for factor in discovered] == ["WQ_ALPHA_003"]
+
+
 def test_manifest_candidates_are_ordered_and_deduped(tmp_path: Path) -> None:
     manifest_root = tmp_path / "manifests"
 
