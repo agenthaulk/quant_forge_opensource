@@ -69,6 +69,41 @@ class LLMHypothesisGenerator:
         )
         return hypotheses
 
+    def repair_invalid_hypothesis(
+        self,
+        seed: FactorDefinition,
+        *,
+        hypothesis: ResearchHypothesis,
+        context: ResearchContext,
+        objective: str,
+        validation_error: str,
+        attempt: int,
+        max_attempts: int,
+    ) -> ResearchHypothesis | None:
+        result = generate_chat_text(
+            self.llm,
+            _repair_messages(
+                seed=seed,
+                hypothesis=hypothesis,
+                context=context,
+                objective=objective,
+                validation_error=validation_error,
+                attempt=attempt,
+                max_attempts=max_attempts,
+            ),
+            temperature=0.1,
+            max_tokens=900,
+        )
+        payload = extract_json_object(result.content)
+        repaired = _hypotheses_from_payload(payload, max_candidates=1)
+        self._metadata = ResearchGenerationMetadata(
+            source="llm_formula_repair",
+            provider=result.provider,
+            model=result.model,
+            raw_response=result.content,
+        )
+        return repaired[0] if repaired else None
+
 
 class LLMResearchReviewGenerator:
     """Review RD candidate evidence with the configured shared LLM."""
@@ -174,6 +209,67 @@ def _hypothesis_messages(
         "\"source\":\"financial_analyst|effective_idea|operator_mcp\","
         "\"source_detail\":\"...\",\"parameter_search_fallback\":false}]}. "
         "Always set parameter_search_fallback=false for LLM hypotheses."
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _repair_messages(
+    *,
+    seed: FactorDefinition,
+    hypothesis: ResearchHypothesis,
+    context: ResearchContext,
+    objective: str,
+    validation_error: str,
+    attempt: int,
+    max_attempts: int,
+) -> list[dict[str, str]]:
+    field_catalog = _catalog_for_prompt(context.field_catalog or tuple(list_available_fields()))
+    operator_catalog = _catalog_for_prompt(context.operator_catalog or tuple(list_available_operators()))
+    system = (
+        "You are Quant Forge's RD formula repair adapter. Return one JSON object only. "
+        "Repair the given hypothesis so formula_dsl passes local validation. "
+        "Use only listed fields, listed operators, numeric window arguments where required, and safe arithmetic. "
+        "Do not change the research intent unless needed to make the formula executable. "
+        "Do not request parameter-search fallback. If you cannot repair it, return an empty hypotheses list."
+    )
+    user = json.dumps(
+        {
+            "seed": _factor_summary(seed),
+            "objective": objective,
+            "repair_attempt": attempt,
+            "max_repair_attempts": max_attempts,
+            "validation_error": validation_error,
+            "invalid_hypothesis": {
+                "text": hypothesis.text,
+                "rationale": hypothesis.rationale,
+                "formula_dsl": hypothesis.formula_dsl,
+                "input_fields": hypothesis.input_fields,
+                "expected_direction": hypothesis.expected_direction,
+                "universe_constraints": hypothesis.universe_constraints,
+                "source": hypothesis.source,
+                "source_detail": hypothesis.source_detail,
+            },
+            "available_fields": field_catalog,
+            "available_operators": operator_catalog,
+            "return_shape": {
+                "schema_version": RD_LLM_SCHEMA_VERSION,
+                "task_type": "rd_research_hypotheses",
+                "hypotheses": [
+                    {
+                        "text": "same research idea, repaired",
+                        "rationale": "why this executable repair preserves the idea",
+                        "formula_dsl": "rank(delta(close, 5))",
+                        "input_fields": ["close"],
+                        "expected_direction": "positive",
+                        "universe_constraints": ["is_st == false"],
+                        "source": "llm",
+                        "source_detail": "formula_repair",
+                        "parameter_search_fallback": False,
+                    }
+                ],
+            },
+        },
+        ensure_ascii=False,
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 

@@ -17,7 +17,7 @@ from quant_forge.apps.web.server import (
     run_idea_workflow,
     run_research_once_workflow,
 )
-from quant_forge.config import LLMProviderSettings, LLMSettings, PathSettings, QuantForgeConfig
+from quant_forge.config import LLMProviderSettings, LLMSettings, PathSettings, QuantForgeConfig, WebSettings
 from quant_forge.core.contracts import BacktestResult, EvaluationResult, FactorDefinition
 from quant_forge.data.local import create_demo_workspace
 from quant_forge.llm_client import LLMChatResult
@@ -219,6 +219,33 @@ def test_web_research_unknown_endpoint_returns_404(tmp_path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2.0)
+
+
+def test_web_server_rejects_docker_bind_host_by_default(tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+
+    with pytest.raises(ValueError, match="allow_docker_bind"):
+        create_local_web_server(host="0.0.0.0", port=0, config=config)
+
+
+def test_web_server_allows_explicit_docker_bind_host(tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig(web=WebSettings(allow_docker_bind=True)).resolve(tmp_path / "demo")
+    server = create_local_web_server(host="0.0.0.0", port=0, config=config)
+
+    try:
+        assert server.server_address[1] > 0
+    finally:
+        server.server_close()
+
+
+def test_web_server_rejects_nonlocal_bind_host(tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+
+    with pytest.raises(ValueError, match="local-only"):
+        create_local_web_server(host="192.0.2.1", port=0, config=config)
 
 
 def test_web_status_keeps_active_llm_provider_when_key_is_missing(monkeypatch, tmp_path) -> None:
@@ -455,7 +482,7 @@ def test_web_research_once_uses_shared_llm_for_hypothesis_and_review(monkeypatch
     assert result["candidates"][0]["factor"]["formula"] == "rank(return_5d)"
 
 
-def test_web_research_llm_missing_formula_dsl_is_blocked(monkeypatch, tmp_path) -> None:
+def test_web_research_llm_missing_formula_dsl_repairs_then_falls_back(monkeypatch, tmp_path) -> None:
     create_demo_workspace(tmp_path / "demo")
     config = QuantForgeConfig(
         llm=LLMSettings(
@@ -471,7 +498,10 @@ def test_web_research_llm_missing_formula_dsl_is_blocked(monkeypatch, tmp_path) 
         )
     ).resolve(tmp_path / "demo")
 
+    prompts: list[str] = []
+
     def fake_generate_chat_text(llm, messages, *, temperature=0.0, max_tokens=1200):
+        prompts.append("\n".join(message["content"] for message in messages))
         return LLMChatResult(
             content=json.dumps(
                 {
@@ -492,7 +522,11 @@ def test_web_research_llm_missing_formula_dsl_is_blocked(monkeypatch, tmp_path) 
     monkeypatch.setattr(rd_llm, "generate_chat_text", fake_generate_chat_text)
 
     rd_config = _llm_rd_config(config)
-    rd_config = replace(rd_config, parameter_search=replace(rd_config.parameter_search, enabled=True))
+    rd_config = replace(
+        rd_config,
+        llm=ResearchLLMConfig(hypothesis_mode="llm", review_mode="local"),
+        parameter_search=replace(rd_config.parameter_search, enabled=True),
+    )
 
     result = run_research_once_workflow(
         config,
@@ -501,7 +535,14 @@ def test_web_research_llm_missing_formula_dsl_is_blocked(monkeypatch, tmp_path) 
         rd_config=rd_config,
     )
 
-    assert result["candidates"] == []
+    assert len(prompts) == 3
+    assert "formula_dsl is missing" in prompts[1]
+    assert result["candidates"]
+    assert result["candidates"][0]["factor"]["factor_id"] == "FTR_DEMO_SMALL_CAP"
+    assert result["candidates"][0]["hypothesis"]["parameter_search_fallback"] is True
+    assert result["accepted_candidate_ids"] == []
+    assert result["optimization_performed"] is False
+    assert result["no_optimization_performed"] is True
     assert result["blocked_plans"][0]["plan"]["status"] == "blocked_missing_formula"
     assert result["blocked_plans"][0]["error"] == "formula_dsl is missing"
 

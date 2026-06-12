@@ -29,7 +29,7 @@ PlanStatus = Literal[
     "blocked_formula_invalid",
 ]
 GateStatus = Literal["passed", "blocked"]
-ResearchRunStatus = Literal["queued", "running", "completed", "partial", "failed"]
+ResearchRunStatus = Literal["queued", "running", "completed", "partial", "failed", "no_optimization_performed"]
 
 
 @dataclass(frozen=True)

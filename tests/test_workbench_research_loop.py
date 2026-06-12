@@ -240,6 +240,10 @@ def test_research_loop_can_score_profile_variants(tmp_path: Path) -> None:
     assert {candidate.backtest.simulation_profile.decay_days for candidate in result.candidates} == {0, 2}
     assert len(result.accepted_candidate_ids) == 1
     assert len({candidate.backtest.artifact_path for candidate in result.candidates}) == 2
+    assert result.report_path is not None
+    report = result.report_path.read_text(encoding="utf-8")
+    assert "No successive-halving trace was recorded for this run." in report
+    assert "Parameter search was not enabled for this run." not in report
 
 
 def test_research_loop_successive_halving_keeps_only_survivors_for_full_stage(tmp_path: Path) -> None:

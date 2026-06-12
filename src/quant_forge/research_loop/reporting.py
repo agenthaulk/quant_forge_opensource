@@ -35,6 +35,8 @@ def render_research_report(result: ResearchLoopResult, *, generated_at: datetime
         f"- Objective: `{result.objective}`",
         f"- Accepted Candidates: {_inline_code_list(result.accepted_candidate_ids)}",
         f"- Candidate Count: {len(result.candidates)}",
+        f"- Optimization Performed: {'yes' if result.optimization_performed else 'no'}",
+        f"- No Optimization Performed: {'yes' if result.no_optimization_performed else 'no'}",
         "",
         "## Objective Weights",
         "",
@@ -99,6 +101,16 @@ def render_research_report(result: ResearchLoopResult, *, generated_at: datetime
     for candidate in result.candidates:
         lines.extend(_candidate_detail(candidate))
     lines.extend(_conclusion_lines(best))
+    if result.no_optimization_performed:
+        lines.extend(
+            [
+                "## No Optimization Performed",
+                "",
+                "The RD run did not produce a formula or profile variant that differs from the seed. "
+                "Treat this as a failed or smoke-only research attempt, not as an optimized factor.",
+                "",
+            ]
+        )
     lines.extend(
         [
             "## Risk Notes",
@@ -152,7 +164,7 @@ def _deduplication_lines(result: ResearchLoopResult) -> list[str]:
 
 def _search_trace_lines(result: ResearchLoopResult) -> list[str]:
     if not result.search_trace:
-        return ["Parameter search was not enabled for this run.", ""]
+        return ["No successive-halving trace was recorded for this run.", ""]
     lines = [
         "| Rank | Survived | Factor | Profile | Score | Split ICIR |",
         "| ---: | --- | --- | --- | ---: | ---: |",

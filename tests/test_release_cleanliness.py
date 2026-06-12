@@ -31,31 +31,38 @@ def iter_public_files() -> list[Path]:
     files: list[Path] = []
     for root in PUBLIC_ROOTS:
         if root.is_file():
-            files.append(root)
+            if not _is_gitless_local_file(root):
+                files.append(root)
         elif root.exists():
             files.extend(
                 path
                 for path in root.rglob("*")
-                if path.is_file() and "__pycache__" not in path.parts and path.suffix not in {".pyc", ".pyo"}
+                if path.is_file()
+                and "__pycache__" not in path.parts
+                and path.suffix not in {".pyc", ".pyo"}
+                and not _is_gitless_local_file(path)
             )
     return files
 
 
 def _git_public_files() -> list[Path] | None:
-    result = subprocess.run(
-        [
-            "git",
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "--",
-            *(str(root) for root in PUBLIC_ROOTS),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "--",
+                *(str(root) for root in PUBLIC_ROOTS),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
     if result.returncode != 0:
         return None
     return [
@@ -66,6 +73,14 @@ def _git_public_files() -> list[Path] | None:
         and "__pycache__" not in Path(line).parts
         and Path(line).suffix not in {".pyc", ".pyo"}
     ]
+
+
+def _is_gitless_local_file(path: Path) -> bool:
+    if not path.parts:
+        return False
+    if path.parts[0] == "configs":
+        return path.name.endswith((".local.yaml", ".local.env", ".secrets.env")) or path.name.startswith("local")
+    return path.name in {".env"} or path.name.startswith(".env.")
 
 
 def test_public_files_do_not_expose_local_paths_or_secret_markers() -> None:

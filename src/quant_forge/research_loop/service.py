@@ -43,6 +43,7 @@ from quant_forge.research_loop.trace_store import ResearchTraceStore, utc_timest
 
 DEFAULT_QUICK_HORIZON_DAYS = (5, 21)
 DEFAULT_QUICK_SAMPLE_SPLITS = (SampleSplitSpec(name="IS", fraction=1.0, score_weight=1.0),)
+DEFAULT_LLM_FORMULA_REPAIR_ATTEMPTS = 2
 RD_RESEARCH_STAGE = "research"
 
 
@@ -331,6 +332,8 @@ class ResearchLoopResult:
     report_path: Path | None = None
     workflow_type: str = "research"
     deduplication: dict[str, object] = field(default_factory=dict)
+    optimization_performed: bool = False
+    no_optimization_performed: bool = False
 
 
 @dataclass(frozen=True)
@@ -348,6 +351,14 @@ class _ScoredTrial:
     backtest: BacktestResult
     split_weighted_icir: float
     score: float
+
+
+@dataclass(frozen=True)
+class _RepairOutcome:
+    hypothesis: ResearchHypothesis | None
+    draft: FactorDefinition | None
+    plan: FactorExperimentPlan
+    exhausted: bool = False
 
 
 class ResearchLoopService:
@@ -377,6 +388,7 @@ class ResearchLoopService:
         trace_store: ResearchTraceStore | None = None,
         experiment_planner: ExperimentPlanner | None = None,
         deduplication: ResearchDeduplicationConfig | None = None,
+        llm_formula_repair_attempts: int = DEFAULT_LLM_FORMULA_REPAIR_ATTEMPTS,
     ) -> None:
         self.factor_root = factor_root
         self.data_root = data_root
@@ -413,6 +425,9 @@ class ResearchLoopService:
         self.trace_store = trace_store or ResearchTraceStore(self.artifact_root / "research_loop")
         self.experiment_planner = experiment_planner or ExperimentPlanner()
         self.deduplication = deduplication or ResearchDeduplicationConfig()
+        if not 0 <= llm_formula_repair_attempts <= 3:
+            raise ValueError("llm_formula_repair_attempts must be between 0 and 3")
+        self.llm_formula_repair_attempts = llm_formula_repair_attempts
 
     def run_once(
         self,
@@ -470,6 +485,7 @@ class ResearchLoopService:
                 "objective": objective,
                 "max_candidates": max_candidates,
                 "generation": _generation_snapshot(generation),
+                "llm_formula_repair_attempts": self.llm_formula_repair_attempts,
                 "parameter_search_enabled": self.parameter_search_enabled,
                 "parameter_search_method": self.parameter_search_method,
                 "deduplication": _deduplication_snapshot(self.deduplication),
@@ -478,7 +494,6 @@ class ResearchLoopService:
 
         trials: list[_ResearchTrial] = []
         blocked_plans: list[StructuredFactorExperimentResult] = []
-        blocked_due_to_missing_llm_formula = False
         formula_index = (
             _formula_fingerprint_index(catalog.list())
             if self.deduplication.enabled and self.deduplication.formula_fingerprint
@@ -504,22 +519,73 @@ class ResearchLoopService:
         for lane_index, raw_hypothesis in enumerate(planned[:max_candidates], start=1):
             hypothesis = _normalize_llm_research_hypothesis(raw_hypothesis, generation)
             if _llm_formula_required_but_missing(hypothesis, generation):
-                blocked_due_to_missing_llm_formula = True
                 structured = _structured_hypothesis_for_missing_formula(hypothesis, generation, lane_index=lane_index)
                 plan = self.experiment_planner.plan(structured, context)
                 self._trace_plan(run_id, structured, plan)
-                blocked_result = _blocked_structured_result(plan)
-                blocked_plans.append(blocked_result)
-                self._trace_structured_result(run_id, blocked_result, phase="plan_blocked")
-                continue
-            draft = (
-                seed
-                if hypothesis.parameter_search_fallback
-                else _candidate_from_hypothesis(hypothesis, seed.horizon_days)
-            )
-            structured = _structured_hypothesis_from_candidate(hypothesis, draft, generation, lane_index=lane_index)
-            plan = self.experiment_planner.plan(structured, context)
-            self._trace_plan(run_id, structured, plan)
+                repair = self._repair_invalid_llm_plan(
+                    run_id=run_id,
+                    seed=seed,
+                    context=context,
+                    objective=objective,
+                    generation=generation,
+                    hypothesis=hypothesis,
+                    plan=plan,
+                    lane_index=lane_index,
+                )
+                if repair is not None and repair.hypothesis is not None and repair.draft is not None:
+                    hypothesis = repair.hypothesis
+                    draft = repair.draft
+                    plan = repair.plan
+                else:
+                    self._record_blocked_plan_and_maybe_fallback(
+                        run_id=run_id,
+                        seed=seed,
+                        context=context,
+                        generation=generation,
+                        lane_index=lane_index,
+                        plan=plan,
+                        repair=repair,
+                        trials=trials,
+                        blocked_plans=blocked_plans,
+                    )
+                    continue
+            else:
+                draft = (
+                    seed
+                    if hypothesis.parameter_search_fallback
+                    else _candidate_from_hypothesis(hypothesis, seed.horizon_days)
+                )
+                structured = _structured_hypothesis_from_candidate(hypothesis, draft, generation, lane_index=lane_index)
+                plan = self.experiment_planner.plan(structured, context)
+                self._trace_plan(run_id, structured, plan)
+            if plan.status != "ready":
+                repair = self._repair_invalid_llm_plan(
+                    run_id=run_id,
+                    seed=seed,
+                    context=context,
+                    objective=objective,
+                    generation=generation,
+                    hypothesis=hypothesis,
+                    plan=plan,
+                    lane_index=lane_index,
+                )
+                if repair is not None and repair.hypothesis is not None and repair.draft is not None:
+                    hypothesis = repair.hypothesis
+                    draft = repair.draft
+                    plan = repair.plan
+                else:
+                    self._record_blocked_plan_and_maybe_fallback(
+                        run_id=run_id,
+                        seed=seed,
+                        context=context,
+                        generation=generation,
+                        lane_index=lane_index,
+                        plan=plan,
+                        repair=repair,
+                        trials=trials,
+                        blocked_plans=blocked_plans,
+                    )
+                    continue
             if plan.status != "ready":
                 blocked_result = _blocked_structured_result(
                     plan,
@@ -556,27 +622,6 @@ class ResearchLoopService:
             )
             for profile in self.simulation_profiles:
                 trials.append(_ResearchTrial(hypothesis, candidate, profile, plan))
-        if not trials and blocked_plans and self.parameter_search_enabled and not blocked_due_to_missing_llm_formula:
-            fallback = _parameter_search_fallback_hypothesis(seed)
-            structured = _structured_hypothesis_from_candidate(
-                fallback,
-                seed,
-                generation,
-                lane_index=len(planned[:max_candidates]) + 1,
-            )
-            plan = self.experiment_planner.plan(structured, context)
-            self._trace_plan(run_id, structured, plan)
-            if plan.status == "ready":
-                for profile in self.simulation_profiles:
-                    trials.append(_ResearchTrial(fallback, seed, profile, plan))
-            else:
-                blocked_result = _blocked_structured_result(
-                    plan,
-                    artifact_refs=_operator_draft_refs(self.artifact_root, plan),
-                )
-                blocked_plans.append(blocked_result)
-                self._trace_structured_result(run_id, blocked_result, phase="plan_blocked")
-
         search_trace, final_trials, failed_quick_results = self._select_final_trials(trials, objective_weights)
         blocked_plans.extend(failed_quick_results)
         for failed in failed_quick_results:
@@ -610,6 +655,7 @@ class ResearchLoopService:
                 and not (result.hypothesis.parameter_search_fallback and result.factor.factor_id == seed_factor_id)
             )
         )
+        optimization_performed = _optimization_performed(results, seed, self.simulation_profile)
         result = ResearchLoopResult(
             rd_stage=RD_RESEARCH_STAGE,
             seed_factor_id=seed_factor_id,
@@ -623,11 +669,17 @@ class ResearchLoopService:
             blocked_plans=tuple(blocked_plans),
             trace_root=self.trace_store.run_dir(run_id),
             deduplication=dedup_summary,
+            optimization_performed=optimization_performed,
+            no_optimization_performed=not optimization_performed,
         )
         from quant_forge.research_loop.reporting import write_research_report
 
         result = replace(result, report_path=write_research_report(result, self.artifact_root))
-        run_status = "completed" if results else ("partial" if blocked_plans else "failed")
+        run_status = (
+            "completed"
+            if results and optimization_performed
+            else ("no_optimization_performed" if results else ("partial" if blocked_plans else "failed"))
+        )
         self.trace_store.write_run(
             run_id,
             {
@@ -637,10 +689,121 @@ class ResearchLoopService:
                 "candidate_count": len(result.candidates),
                 "blocked_plan_count": len(result.blocked_plans),
                 "accepted_candidate_ids": list(result.accepted_candidate_ids),
+                "optimization_performed": result.optimization_performed,
+                "no_optimization_performed": result.no_optimization_performed,
                 "report_path": result.report_path,
             },
         )
         return result
+
+    def _record_blocked_plan_and_maybe_fallback(
+        self,
+        *,
+        run_id: str,
+        seed: FactorDefinition,
+        context: ResearchContext,
+        generation: ResearchGenerationMetadata,
+        lane_index: int,
+        plan: FactorExperimentPlan,
+        repair: _RepairOutcome | None,
+        trials: list[_ResearchTrial],
+        blocked_plans: list[StructuredFactorExperimentResult],
+    ) -> None:
+        blocked_plan = repair.plan if repair is not None else plan
+        blocked_result = _blocked_structured_result(
+            blocked_plan,
+            artifact_refs=_operator_draft_refs(self.artifact_root, blocked_plan),
+        )
+        blocked_plans.append(blocked_result)
+        self._trace_structured_result(run_id, blocked_result, phase="plan_blocked")
+        if repair is not None and repair.exhausted and self.parameter_search_enabled:
+            self._append_parameter_search_fallback_trials(
+                run_id=run_id,
+                seed=seed,
+                context=context,
+                generation=generation,
+                lane_index=lane_index,
+                trials=trials,
+                blocked_plans=blocked_plans,
+            )
+
+    def _append_parameter_search_fallback_trials(
+        self,
+        *,
+        run_id: str,
+        seed: FactorDefinition,
+        context: ResearchContext,
+        generation: ResearchGenerationMetadata,
+        lane_index: int,
+        trials: list[_ResearchTrial],
+        blocked_plans: list[StructuredFactorExperimentResult],
+    ) -> None:
+        fallback = _parameter_search_fallback_hypothesis(seed)
+        structured = _structured_hypothesis_from_candidate(
+            fallback,
+            seed,
+            generation,
+            lane_index=lane_index,
+        )
+        fallback_plan = self.experiment_planner.plan(structured, context)
+        self._trace_plan(run_id, structured, fallback_plan)
+        if fallback_plan.status == "ready":
+            for profile in self.simulation_profiles:
+                trials.append(_ResearchTrial(fallback, seed, profile, fallback_plan))
+            return
+        fallback_result = _blocked_structured_result(
+            fallback_plan,
+            artifact_refs=_operator_draft_refs(self.artifact_root, fallback_plan),
+        )
+        blocked_plans.append(fallback_result)
+        self._trace_structured_result(run_id, fallback_result, phase="plan_blocked")
+
+    def _repair_invalid_llm_plan(
+        self,
+        *,
+        run_id: str,
+        seed: FactorDefinition,
+        context: ResearchContext,
+        objective: str,
+        generation: ResearchGenerationMetadata,
+        hypothesis: ResearchHypothesis,
+        plan: FactorExperimentPlan,
+        lane_index: int,
+    ) -> _RepairOutcome | None:
+        if not _should_repair_llm_plan(hypothesis, generation, plan, self.llm_formula_repair_attempts):
+            return None
+        repair = getattr(self.hypothesis_generator, "repair_invalid_hypothesis", None)
+        if not callable(repair):
+            return None
+
+        current_hypothesis = hypothesis
+        current_plan = plan
+        for attempt in range(1, self.llm_formula_repair_attempts + 1):
+            repaired = repair(
+                seed,
+                hypothesis=current_hypothesis,
+                context=context,
+                objective=objective,
+                validation_error=_plan_validation_error(current_plan),
+                attempt=attempt,
+                max_attempts=self.llm_formula_repair_attempts,
+            )
+            if not isinstance(repaired, ResearchHypothesis):
+                continue
+            repaired = _normalize_llm_research_hypothesis(repaired, generation)
+            if _llm_formula_required_but_missing(repaired, generation):
+                structured = _structured_hypothesis_for_missing_formula(repaired, generation, lane_index=lane_index)
+                draft = None
+            else:
+                draft = _candidate_from_hypothesis(repaired, seed.horizon_days)
+                structured = _structured_hypothesis_from_candidate(repaired, draft, generation, lane_index=lane_index)
+            repaired_plan = self.experiment_planner.plan(structured, context)
+            self._trace_plan(run_id, structured, repaired_plan)
+            current_hypothesis = repaired
+            current_plan = repaired_plan
+            if repaired_plan.status == "ready" and draft is not None:
+                return _RepairOutcome(repaired, draft, repaired_plan)
+        return _RepairOutcome(None, None, current_plan, exhausted=True)
 
     def _trace_plan(self, run_id: str, hypothesis: StructuredResearchHypothesis, plan: FactorExperimentPlan) -> None:
         self.trace_store.append_trace(
@@ -1274,6 +1437,51 @@ def _parameter_search_fallback_hypothesis(seed: FactorDefinition) -> ResearchHyp
         source="parameter_search",
         source_detail="bounded_profile_search",
         parameter_search_fallback=True,
+    )
+
+
+def _should_repair_llm_plan(
+    hypothesis: ResearchHypothesis,
+    generation: ResearchGenerationMetadata,
+    plan: FactorExperimentPlan,
+    max_attempts: int,
+) -> bool:
+    if max_attempts <= 0 or hypothesis.parameter_search_fallback:
+        return False
+    if not _is_llm_research_hypothesis(hypothesis, generation):
+        return False
+    return plan.status in {
+        "blocked_formula_invalid",
+        "blocked_missing_field",
+        "blocked_missing_formula",
+        "blocked_direction_unknown",
+    }
+
+
+def _plan_validation_error(plan: FactorExperimentPlan) -> str:
+    reasons = "; ".join(plan.blocking_reasons)
+    if reasons:
+        return reasons
+    if not plan.operator_validation.get("is_valid", True):
+        return "formula validation failed"
+    return f"plan status is {plan.status}"
+
+
+def _optimization_performed(
+    results: list[ResearchCandidateResult],
+    seed: FactorDefinition,
+    seed_profile: SimulationProfile,
+) -> bool:
+    return any(
+        not (result.hypothesis.parameter_search_fallback and result.factor.factor_id == seed.factor_id)
+        and (
+            result.factor.factor_id != seed.factor_id
+            or result.factor.formula != seed.formula
+            or result.factor.universe_filters != seed.universe_filters
+            or result.factor.horizon_days != seed.horizon_days
+            or result.backtest.simulation_profile != seed_profile
+        )
+        for result in results
     )
 
 

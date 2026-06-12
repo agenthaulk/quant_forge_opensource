@@ -15,6 +15,10 @@ default_max_candidates: 3
 llm:
   hypothesis_mode: local
   review_mode: local
+  # When LLM hypothesis mode is enabled, invalid formulas are sent back with
+  # validation errors for bounded repair. Default 2 means initial formula + 2
+  # repairs = 3 failed LLM formula attempts before fallback. Use 0 to disable.
+  max_formula_repair_attempts: 2
 
 # Web scheduler options. The scheduler is an in-process local convenience tool.
 default_interval_days: 1

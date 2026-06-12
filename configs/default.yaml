@@ -11,6 +11,7 @@ runtime:
 web:
   host: 127.0.0.1
   port: 8765
+  allow_docker_bind: false
 research:
   default_horizon_days: 5
   default_top_quantile: 0.3

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 from typing import Any
 
@@ -29,6 +30,7 @@ class PathSettings:
 class WebSettings:
     host: str = "127.0.0.1"
     port: int = 8765
+    allow_docker_bind: bool = False
 
 
 @dataclass(frozen=True)
@@ -177,6 +179,7 @@ def load_config(config_path: Path | None = None, workspace: Path | None = None) 
         web=WebSettings(
             host=str(_nested(raw, "web", "host", default="127.0.0.1")),
             port=int(_nested(raw, "web", "port", default=8765)),
+            allow_docker_bind=bool(_nested(raw, "web", "allow_docker_bind", default=False)),
         ),
         research=ResearchSettings(
             default_horizon_days=int(_nested(raw, "research", "default_horizon_days", default=5)),
@@ -431,6 +434,9 @@ def _require_git_ignored_runtime_env_file(env_file: Path) -> None:
         relative = env_file.resolve().relative_to(git_root)
     except ValueError as exc:
         raise ValueError(f"runtime env file must stay inside the git worktree: {env_file}") from exc
+    if shutil.which("git") is None:
+        _require_gitless_runtime_env_file_pattern(relative, env_file)
+        return
     tracked = subprocess.run(
         ["git", "-C", str(git_root), "ls-files", "--error-unmatch", "--", str(relative)],
         check=False,
@@ -450,6 +456,8 @@ def _require_git_ignored_runtime_env_file(env_file: Path) -> None:
 
 
 def _git_worktree_root(path: Path) -> Path | None:
+    if shutil.which("git") is None:
+        return _find_git_metadata_root(path)
     result = subprocess.run(
         ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
         check=False,
@@ -459,6 +467,28 @@ def _git_worktree_root(path: Path) -> Path | None:
     if result.returncode != 0:
         return None
     return Path(result.stdout.strip()).resolve()
+
+
+def _find_git_metadata_root(path: Path) -> Path | None:
+    candidate = path.expanduser().resolve(strict=False)
+    for root in (candidate, *candidate.parents):
+        if (root / ".git").exists():
+            return root
+    return None
+
+
+def _require_gitless_runtime_env_file_pattern(relative: Path, env_file: Path) -> None:
+    if not relative.parts or relative.parts[0] != "configs":
+        raise ValueError(
+            "git executable is unavailable; runtime env files inside a worktree "
+            f"must live under configs/ and use a local secret filename: {env_file}"
+        )
+    name = relative.name
+    if not (name.endswith(".local.env") or name.endswith(".secrets.env")):
+        raise ValueError(
+            "git executable is unavailable; runtime env files inside a worktree "
+            f"must be named *.local.env or *.secrets.env: {env_file}"
+        )
 
 
 def _nested(raw: dict[str, Any], section: str, key: str, *, default: Any) -> Any:

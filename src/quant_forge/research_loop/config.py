@@ -98,6 +98,7 @@ class ResearchParameterSearchConfig:
 class ResearchLLMConfig:
     hypothesis_mode: str = "local"
     review_mode: str = "local"
+    max_formula_repair_attempts: int = 2
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -106,6 +107,8 @@ class ResearchLLMConfig:
         ):
             if _canonical_generation_mode(value) not in {"llm", "local"}:
                 raise ValueError(f"RD llm.{name} must be llm or local")
+        if not 0 <= self.max_formula_repair_attempts <= 3:
+            raise ValueError("RD llm.max_formula_repair_attempts must be between 0 and 3")
 
     @property
     def uses_llm(self) -> bool:
@@ -337,6 +340,9 @@ def _load_rd_llm_config(raw: Any, default: ResearchLLMConfig) -> ResearchLLMConf
     return ResearchLLMConfig(
         hypothesis_mode=_canonical_generation_mode(raw.get("hypothesis_mode", default.hypothesis_mode)),
         review_mode=_canonical_generation_mode(raw.get("review_mode", default.review_mode)),
+        max_formula_repair_attempts=int(
+            raw.get("max_formula_repair_attempts", default.max_formula_repair_attempts)
+        ),
     )
 
 
