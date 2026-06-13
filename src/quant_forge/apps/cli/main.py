@@ -382,6 +382,7 @@ def _cmd_research_run_once(args: argparse.Namespace) -> int:
         factor_values_root=paths.factor_values_root,
         factor_values_overlay_root=paths.factor_values_overlay_root,
         factor_values_manifest_root=paths.factor_values_manifest_root,
+        llm_formula_repair_attempts=rd_config.llm.max_formula_repair_attempts,
         hypothesis_generator=hypothesis_generator,
         review_generator=review_generator,
     )

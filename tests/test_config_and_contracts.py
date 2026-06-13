@@ -27,6 +27,7 @@ def test_default_config_uses_relative_paths() -> None:
     assert not config.paths.factor_root.is_absolute()
     assert not config.paths.artifact_root.is_absolute()
     assert config.web.host == "127.0.0.1"
+    assert config.web.allow_docker_bind is False
     assert config.simulation.decay_days == 0
     assert config.simulation.top_quantile == 0.3
     assert config.llm.provider == "deepseek"
@@ -171,6 +172,7 @@ def test_runtime_env_files_require_git_ignore_inside_worktree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("quant_forge.config.shutil.which", lambda command: "/usr/bin/git" if command == "git" else command)
     config_path = tmp_path / "config.yaml"
     env_path = tmp_path / "local.env"
     env_path.write_text("QF_TEST_API_KEY=test-value\n", encoding="utf-8")
@@ -195,6 +197,65 @@ runtime:
     monkeypatch.setattr("quant_forge.config.subprocess.run", fake_run)
 
     with pytest.raises(ValueError, match="must be ignored by git"):
+        load_config(config_path)
+
+
+def test_runtime_env_files_allow_standard_local_env_when_git_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("QF_TEST_API_KEY", raising=False)
+    monkeypatch.setattr("quant_forge.config.shutil.which", lambda command: None if command == "git" else command)
+    (tmp_path / ".git").mkdir()
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    config_path = config_dir / "default.local.yaml"
+    env_path = config_dir / "default.local.env"
+    env_path.write_text("QF_TEST_API_KEY=test-value\n", encoding="utf-8")
+    config_path.write_text(
+        """
+runtime:
+  env_files:
+    - default.local.env
+llm:
+  provider: deepseek
+  providers:
+    deepseek:
+      provider: deepseek
+      model: deepseek-chat
+      base_url: https://api.deepseek.com
+      api_key_env: QF_TEST_API_KEY
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.runtime.env_files == (env_path,)
+    validate_llm_runtime(config.llm)
+
+
+def test_runtime_env_files_reject_unconstrained_env_when_git_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("quant_forge.config.shutil.which", lambda command: None if command == "git" else command)
+    (tmp_path / ".git").mkdir()
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    config_path = config_dir / "default.local.yaml"
+    env_path = config_dir / "local.env"
+    env_path.write_text("QF_TEST_API_KEY=test-value\n", encoding="utf-8")
+    config_path.write_text(
+        """
+runtime:
+  env_files:
+    - local.env
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"\*\.local\.env or \*\.secrets\.env"):
         load_config(config_path)
 
 
@@ -373,6 +434,7 @@ def test_rd_config_loads_defaults_and_overrides(tmp_path: Path) -> None:
     assert [split.name for split in default_config.sample_splits] == ["IS", "OOS1", "OOS2"]
     assert weights_for_objective(default_config, "rank_icir").weighted_split_icir == 0.5
     assert default_config.llm.research_uses_llm is False
+    assert default_config.llm.max_formula_repair_attempts == 2
     assert default_config.deduplication.enabled is True
     assert default_config.deduplication.formula_fingerprint is True
     assert default_config.deduplication.result_signature is True
@@ -425,6 +487,10 @@ parameter_search:
   max_profile_variants: 4
   top_quantile: [0.2, 0.3]
   decay_days: [0, 3]
+llm:
+  hypothesis_mode: llm
+  review_mode: local
+  max_formula_repair_attempts: 3
 deduplication:
   enabled: true
   result_precision: 4
@@ -444,6 +510,8 @@ deduplication:
     assert custom_config.parameter_search.method == "successive_halving"
     assert custom_config.parameter_search.keep_ratio == 0.34
     assert custom_config.parameter_search.min_survivors == 2
+    assert custom_config.llm.hypothesis_mode == "llm"
+    assert custom_config.llm.max_formula_repair_attempts == 3
     assert len(custom_config.simulation_profiles) == 4
     assert {profile.decay_days for profile in custom_config.simulation_profiles} == {0, 3}
     assert {profile.top_quantile for profile in custom_config.simulation_profiles} == {0.2, 0.3}

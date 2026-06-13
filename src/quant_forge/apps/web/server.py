@@ -102,8 +102,14 @@ def run_research_once_workflow(
 def create_local_web_server(
     *, host: str, port: int, config: QuantForgeConfig, rd_config: ResearchLoopConfig | None = None
 ) -> ThreadingHTTPServer:
-    if host not in {"127.0.0.1", "localhost"}:
-        raise ValueError("OpenSource web adapter is local-only; use 127.0.0.1 or localhost")
+    allowed_hosts = {"127.0.0.1", "localhost"}
+    if config.web.allow_docker_bind:
+        allowed_hosts.add("0.0.0.0")
+    if host not in allowed_hosts:
+        raise ValueError(
+            "OpenSource web adapter is local-only; use 127.0.0.1 or localhost. "
+            "Set web.allow_docker_bind only for Docker containers published to host loopback."
+        )
 
     research_config = rd_config or load_research_loop_config(DEFAULT_RD_CONFIG_PATH, config.research, config.simulation)
     scheduler = ResearchLoopScheduler(
@@ -275,6 +281,7 @@ def _run_research_once(
         sample_splits=rd_config.sample_splits,
         transaction_costs=rd_config.transaction_costs,
         deduplication=rd_config.deduplication,
+        llm_formula_repair_attempts=rd_config.llm.max_formula_repair_attempts,
         hypothesis_generator=hypothesis_generator,
         review_generator=review_generator,
     )
@@ -817,6 +824,7 @@ function renderResearch(payload) {{
     <div class="panel">
       <h3>${{esc(payload.seed_factor_id)}} · ${{esc(payload.objective)}}</h3>
       <p class="meta">workflow: ${{esc(payload.workflow_type || payload.rd_stage || 'research')}}</p>
+      <p class="meta">optimization: ${{payload.optimization_performed ? 'performed' : 'no_optimization_performed'}}</p>
       <p class="meta">accepted: ${{esc(accepted.join(', ') || 'none')}}</p>
       <p class="meta">report: ${{esc(payload.report_path || 'not generated')}}</p>
     </div>

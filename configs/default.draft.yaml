@@ -36,6 +36,9 @@ web:
   # The public web adapter is local-only.
   host: 127.0.0.1
   port: 8765
+  # Set true only inside Docker when publishing the container port to host
+  # loopback, for example 127.0.0.1:8765:8765.
+  allow_docker_bind: false
 
 research:
   # Used by simple parser defaults and lightweight workflows.

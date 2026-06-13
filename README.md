@@ -41,6 +41,30 @@ source .venv/bin/activate
 python3 -m pip install -e ".[dev]"
 ```
 
+### Common Local/Docker Issues / 常见本地与 Docker 问题
+
+- Minimal Docker images such as `python:3.12-slim` may not include `git`.
+  Install it before running the full test suite or release checks:
+  `apt-get update && apt-get install -y --no-install-recommends git`.
+- Docker containers do not automatically inherit your macOS shell variables.
+  Put real LLM keys in an ignored file such as `configs/default.local.env`,
+  declare it through `runtime.env_files`, or pass it explicitly with
+  `docker --env-file`. Never commit the key file.
+- Docker Desktop must be allowed to share the mounted data drive. If the
+  mounted drive is not visible inside the container, add it in Docker Desktop
+  file-sharing settings and mount it with `-v`.
+- Use Python 3.11 or newer. If dependency installation fails, verify
+  `python --version`, recreate the virtual environment, and reinstall with
+  `python -m pip install -e ".[dev]"`.
+- LLM-backed RD plus parameter search on a full mounted dataset can take
+  several minutes. For first-time smoke testing, use an ignored local RD config
+  with `default_max_candidates: 1` and a small parameter/profile grid; expand
+  the grid after `qf doctor` and one `qf research run-once` succeed.
+
+最小 Docker 镜像、本机 shell 环境变量继承、挂载盘共享、Python 版本，是新人联调中
+最常见的环境类问题。这些问题不应通过提交本地路径或密钥解决；请通过 ignored local
+config、Docker 启动参数或镜像依赖安装来处理。
+
 If you do not install the package, run commands with `PYTHONPATH=src`:
 
 如果不安装包，可以用 `PYTHONPATH=src` 运行：
@@ -74,6 +98,18 @@ idea generation or review.
 `configs/rd.draft.yaml` 为被忽略的本地 RD 配置，并保持 `llm.hypothesis_mode`
 和 `llm.review_mode` 为 `local`。
 
+When LLM RD returns an invalid formula, Quant Forge sends the validation error
+back to the LLM for bounded repair. With the default RD config, fallback starts
+only after three failed LLM formula attempts: the original formula plus two
+repairs. A fallback that only reuses the seed is reported as
+`no_optimization_performed`; treat it as a failed or smoke-only research run,
+not as an optimized factor.
+
+当 LLM RD 返回非法公式时，系统会把公式校验错误回传给 LLM 进行有限次数修复。
+默认配置下，只有连续三次 LLM 公式失败后才进入 fallback：原始公式一次，加两次
+修复。若 fallback 只是复用 seed，没有产生新公式或新 profile，结果会标记为
+`no_optimization_performed`，这只能说明研究失败或 smoke 闭环完成，不能视为因子优化成功。
+
 The RD command prints a `report_path`. The Markdown report is written under
 the workspace artifact root, usually `./qf-demo/artifacts/research_reports/`.
 
@@ -99,6 +135,15 @@ to local rule parsing.
 界面会明确区分两种解析方式：本地规则解析只覆盖内置的小市值、动量、低波动、
 成交量等有限模式；LLM 语义解析会调用已配置 provider。选择 LLM 解析时，
 如果缺少 key 或 LLM 请求失败，系统先展示失败原因，并询问是否改用本地规则解析。
+
+When running inside Docker, bind the container service explicitly and publish
+the port only to the host loopback interface. In the ignored local config used
+inside Docker, set `web.allow_docker_bind: true`.
+
+```bash
+qf web --config configs/default.local.yaml --rd-config configs/rd.yaml --host 0.0.0.0 --port 8765
+# docker run example: publish as 127.0.0.1:8765:8765 on the host
+```
 
 ## LLM Provider Setup / 大模型配置
 

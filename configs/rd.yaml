@@ -6,6 +6,7 @@ top_quantile: 0.3
 llm:
   hypothesis_mode: local
   review_mode: local
+  max_formula_repair_attempts: 2
 simulation:
   execution_delay_days: 1
   top_quantile: 0.3

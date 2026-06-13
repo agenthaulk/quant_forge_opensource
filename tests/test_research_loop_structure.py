@@ -6,7 +6,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from quant_forge.core.contracts import BacktestResult, BacktestSegmentMetric, EvaluationResult, FactorDefinition
+from quant_forge.core.contracts import (
+    BacktestResult,
+    BacktestSegmentMetric,
+    EvaluationResult,
+    FactorDefinition,
+    SimulationProfile,
+)
 from quant_forge.data.local import create_demo_workspace
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.research_loop.candidate_gate import CandidateGateConfig, evaluate_candidate
@@ -574,6 +580,35 @@ def test_context_builder_includes_effective_ideas_and_operator_context(tmp_path:
     assert "Never include precomputed:" in prompt
 
 
+def test_llm_repair_prompt_includes_validation_error(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    repo = FactorRepository(paths["factor_root"])
+    context = ResearchContextBuilder(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+    ).build(seed_factor_ids=("FTR_DEMO_SMALL_CAP",))
+    messages = rd_llm._repair_messages(  # noqa: SLF001 - lock repair feedback contract.
+        seed=repo.get("FTR_DEMO_SMALL_CAP"),
+        hypothesis=ResearchHypothesis(
+            text="bad volume reversal",
+            rationale="invalid window argument",
+            source="llm",
+            formula_dsl="rank(delta(return_5d, volatility_5d))",
+            input_fields=("return_5d", "volatility_5d"),
+        ),
+        context=context,
+        objective="balanced",
+        validation_error="delta argument 2 must be a number",
+        attempt=1,
+        max_attempts=2,
+    )
+    prompt = "\n".join(message["content"] for message in messages)
+
+    assert "delta argument 2 must be a number" in prompt
+    assert "rank(delta(return_5d, volatility_5d))" in prompt
+    assert "Do not request parameter-search fallback" in prompt
+
+
 def test_llm_hypothesis_payload_drops_provider_fallback_when_regular_ideas_exist() -> None:
     hypotheses = rd_llm._hypotheses_from_payload(  # noqa: SLF001 - regression for LLM payload normalization.
         {
@@ -724,12 +759,135 @@ def test_research_loop_uses_parameter_search_fallback_when_no_ideas(tmp_path: Pa
     assert result.candidates[0].factor.factor_id == "FTR_DEMO_SMALL_CAP"
     assert result.candidates[0].hypothesis.parameter_search_fallback is True
     assert result.accepted_candidate_ids == ()
+    assert result.optimization_performed is False
+    assert result.no_optimization_performed is True
     assert result.trace_root is not None
+    run_payload = json.loads((result.trace_root / "run.json").read_text(encoding="utf-8"))
+    assert run_payload["status"] == "no_optimization_performed"
     trace_text = (result.trace_root / "trace.jsonl").read_text(encoding="utf-8")
     assert '"parameter_search_fallback": true' in trace_text
     trace_rows = [json.loads(line) for line in trace_text.splitlines() if line.strip()]
     experiment_rows = [row for row in trace_rows if row["phase"] == "experiment_result"]
     assert experiment_rows[0]["gate_decision"]["should_transition_to_candidate"] is False
+    report = result.report_path.read_text(encoding="utf-8") if result.report_path else ""
+    assert "No Optimization Performed: yes" in report
+    assert "failed or smoke-only research attempt" in report
+
+
+def test_research_loop_repairs_invalid_llm_formula_before_evaluation(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    generator = _InvalidThenRepairGenerator()
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        parameter_search_enabled=True,
+        hypothesis_generator=generator,
+        deduplication=ResearchDeduplicationConfig(enabled=False),
+    )
+
+    result = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert generator.repair_errors
+    assert "delta argument 2 must be a number" in generator.repair_errors[0]
+    assert result.blocked_plans == ()
+    assert result.candidates
+    assert result.candidates[0].factor.formula == "rank(return_5d)"
+    assert result.optimization_performed is True
+    assert result.no_optimization_performed is False
+    assert result.accepted_candidate_ids
+    assert result.trace_root is not None
+    trace_text = (result.trace_root / "trace.jsonl").read_text(encoding="utf-8")
+    assert "delta(return_5d, volatility_5d)" in trace_text
+    assert "rank(return_5d)" in trace_text
+
+
+def test_research_loop_repairs_missing_llm_formula_before_blocking(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    generator = _MissingFormulaThenRepairGenerator()
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        hypothesis_generator=generator,
+        deduplication=ResearchDeduplicationConfig(enabled=False),
+    )
+
+    result = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert generator.repair_errors == ["formula_dsl is missing"]
+    assert result.blocked_plans == ()
+    assert result.candidates
+    assert result.candidates[0].factor.formula == "rank(return_5d)"
+    assert result.optimization_performed is True
+
+
+def test_research_loop_does_not_parameter_fallback_after_invalid_llm_formula(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        parameter_search_enabled=True,
+        hypothesis_generator=_InvalidNoRepairGenerator(),
+    )
+
+    result = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert result.candidates == ()
+    assert len(result.blocked_plans) == 1
+    assert result.blocked_plans[0].plan.status == "blocked_formula_invalid"
+    assert "delta argument 2 must be a number" in result.blocked_plans[0].error
+    assert result.optimization_performed is False
+    assert result.no_optimization_performed is True
+    assert result.trace_root is not None
+    trace_text = (result.trace_root / "trace.jsonl").read_text(encoding="utf-8")
+    assert '"parameter_search_fallback": true' not in trace_text
+    run_payload = json.loads((result.trace_root / "run.json").read_text(encoding="utf-8"))
+    assert run_payload["candidate_count"] == 0
+    assert run_payload["optimization_performed"] is False
+
+
+def test_research_loop_falls_back_only_after_repeated_llm_formula_failures(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    FactorRepository(paths["factor_root"]).promote(
+        "FTR_DEMO_SMALL_CAP",
+        "candidate",
+        "test existing candidate fallback after failed repair",
+    )
+    generator = _InvalidRepairFailsThenFallbackGenerator()
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        simulation_profile=SimulationProfile(top_quantile=0.2),
+        simulation_profiles=(SimulationProfile(top_quantile=0.2), SimulationProfile(top_quantile=0.3)),
+        parameter_search_enabled=True,
+        hypothesis_generator=generator,
+        llm_formula_repair_attempts=2,
+    )
+
+    result = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert len(generator.repair_errors) == 2
+    assert all("delta argument 2 must be a number" in error for error in generator.repair_errors)
+    assert result.blocked_plans
+    assert result.blocked_plans[0].plan.status == "blocked_formula_invalid"
+    assert result.candidates
+    assert len(result.candidates) == 2
+    assert result.candidates[0].factor.factor_id == "FTR_DEMO_SMALL_CAP"
+    assert result.candidates[0].hypothesis.parameter_search_fallback is True
+    assert result.accepted_candidate_ids == ()
+    assert result.optimization_performed is False
+    assert result.no_optimization_performed is True
+    assert result.trace_root is not None
+    trace_text = (result.trace_root / "trace.jsonl").read_text(encoding="utf-8")
+    assert trace_text.count("delta(return_5d, volatility_5d)") >= 3
+    assert '"parameter_search_fallback": true' in trace_text
+    config_snapshot = json.loads((result.trace_root / "config_snapshot.json").read_text(encoding="utf-8"))
+    assert config_snapshot["llm_formula_repair_attempts"] == 2
+    run_payload = json.loads((result.trace_root / "run.json").read_text(encoding="utf-8"))
+    assert run_payload["status"] == "no_optimization_performed"
 
 
 def test_research_loop_refreshes_generation_metadata_after_generation(tmp_path: Path) -> None:
@@ -985,6 +1143,99 @@ class _EmptyGenerator:
 
     def generate_with_context(self, *args, **kwargs):
         return ()
+
+
+class _InvalidNoRepairGenerator:
+    def metadata(self) -> ResearchGenerationMetadata:
+        return ResearchGenerationMetadata(source="llm_hypothesis", provider="test", model="invalid-no-repair")
+
+    def generate_with_context(self, *args, **kwargs):
+        return (
+            ResearchHypothesis(
+                text="invalid llm formula",
+                rationale="should be blocked without seed fallback",
+                source="llm",
+                formula_dsl="rank(volume) * -rank(delta(return_5d, volatility_5d))",
+                input_fields=("volume", "return_5d", "volatility_5d"),
+                expected_direction="positive",
+                universe_constraints=("is_st == false",),
+            ),
+        )
+
+
+class _InvalidThenRepairGenerator(_InvalidNoRepairGenerator):
+    def __init__(self) -> None:
+        self.repair_errors: list[str] = []
+
+    def metadata(self) -> ResearchGenerationMetadata:
+        return ResearchGenerationMetadata(source="llm_hypothesis", provider="test", model="invalid-then-repair")
+
+    def repair_invalid_hypothesis(self, *args, **kwargs):
+        self.repair_errors.append(str(kwargs["validation_error"]))
+        return ResearchHypothesis(
+            text="repaired llm formula",
+            rationale="repair replaces invalid delta argument with an executable return signal",
+            source="llm",
+            source_detail="formula_repair",
+            formula_dsl="rank(return_5d)",
+            input_fields=("return_5d",),
+            expected_direction="positive",
+            universe_constraints=("is_st == false",),
+        )
+
+
+class _MissingFormulaThenRepairGenerator:
+    def __init__(self) -> None:
+        self.repair_errors: list[str] = []
+
+    def metadata(self) -> ResearchGenerationMetadata:
+        return ResearchGenerationMetadata(source="llm_hypothesis", provider="test", model="missing-then-repair")
+
+    def generate_with_context(self, *args, **kwargs):
+        return (
+            ResearchHypothesis(
+                text="missing formula llm idea",
+                rationale="should be repaired before blocking",
+                source="llm",
+                formula_dsl="",
+                expected_direction="positive",
+                universe_constraints=("is_st == false",),
+            ),
+        )
+
+    def repair_invalid_hypothesis(self, *args, **kwargs):
+        self.repair_errors.append(str(kwargs["validation_error"]))
+        return ResearchHypothesis(
+            text="repaired missing formula",
+            rationale="repair adds executable formula",
+            source="llm",
+            source_detail="formula_repair",
+            formula_dsl="rank(return_5d)",
+            input_fields=("return_5d",),
+            expected_direction="positive",
+            universe_constraints=("is_st == false",),
+        )
+
+
+class _InvalidRepairFailsThenFallbackGenerator(_InvalidNoRepairGenerator):
+    def __init__(self) -> None:
+        self.repair_errors: list[str] = []
+
+    def metadata(self) -> ResearchGenerationMetadata:
+        return ResearchGenerationMetadata(source="llm_hypothesis", provider="test", model="invalid-repairs-fail")
+
+    def repair_invalid_hypothesis(self, *args, **kwargs):
+        self.repair_errors.append(str(kwargs["validation_error"]))
+        return ResearchHypothesis(
+            text=f"still invalid repair {len(self.repair_errors)}",
+            rationale="repair attempt intentionally keeps an invalid formula",
+            source="llm",
+            source_detail="formula_repair",
+            formula_dsl="rank(volume) * -rank(delta(return_5d, volatility_5d))",
+            input_fields=("volume", "return_5d", "volatility_5d"),
+            expected_direction="positive",
+            universe_constraints=("is_st == false",),
+        )
 
 
 class _MetadataChangingGenerator:
