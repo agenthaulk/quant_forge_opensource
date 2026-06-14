@@ -24,6 +24,25 @@ class FactorScoreResult:
     computed_rows: int
     factor_values_path: Path | None = None
     factor_values_write_path: Path | None = None
+    compute_mode: str = "computed_formula"
+    compute_reason: str = ""
+    missing_rows: int = 0
+    required_rows: int = 0
+    missing_ratio: float = 0.0
+    lookback_rows: int = 0
+    context_rows: int = 0
+
+
+@dataclass(frozen=True)
+class ScoreComputationPlan:
+    panel: pd.DataFrame
+    mode: str
+    reason: str
+    missing_rows: int
+    required_rows: int
+    missing_ratio: float
+    lookback_rows: int
+    context_rows: int
 
 
 @dataclass(frozen=True)
@@ -70,20 +89,20 @@ class FactorValueStore:
                 computed_rows=0,
                 factor_values_path=factor_paths.primary_dir,
                 factor_values_write_path=factor_paths.write_dir,
+                compute_mode="cache_only",
+                compute_reason="cache_only requested for precomputed factor values",
+                missing_rows=max(0, int(len(required_keys)) - cached_rows),
+                required_rows=int(len(required_keys)),
+                missing_ratio=_missing_ratio(max(0, int(len(required_keys)) - cached_rows), int(len(required_keys))),
+                context_rows=0,
             )
-        cached_available = _restrict_to_panel(
-            _dedupe_scores(cached_for_panel).dropna(subset=["score"]),
-            required_keys,
-        )
+        cached_available = _restrict_to_panel(_trusted_cached_scores(cached_for_panel, panel, formula), required_keys)
         missing_keys = _missing_score_keys(required_keys, cached_available)
         cached_complete = cached_available
         result_missing_keys = _missing_score_keys(panel_keys, cached_complete)
 
-        computed_context = (
-            execute_factor_formula(_panel_with_lookback(panel, missing_keys, formula), formula, universe_filters)
-            if not missing_keys.empty
-            else _empty_scores()
-        )
+        plan = _plan_score_computation(panel, required_keys=required_keys, missing_keys=missing_keys, formula=formula)
+        computed_context = execute_factor_formula(plan.panel, formula, universe_filters) if plan.missing_rows else _empty_scores()
         computed = _restrict_to_panel(computed_context, missing_keys)
         computed_for_result = _restrict_to_panel(computed_context, result_missing_keys)
         if not computed.empty and factor_paths.write_dir is not None:
@@ -113,6 +132,13 @@ class FactorValueStore:
             computed_rows=computed_rows,
             factor_values_path=factor_paths.primary_dir,
             factor_values_write_path=factor_paths.write_dir,
+            compute_mode=plan.mode,
+            compute_reason=plan.reason,
+            missing_rows=plan.missing_rows,
+            required_rows=plan.required_rows,
+            missing_ratio=plan.missing_ratio,
+            lookback_rows=plan.lookback_rows,
+            context_rows=plan.context_rows,
         )
 
     def _resolve_factor_paths(
@@ -231,26 +257,179 @@ def _missing_score_keys(target_keys: pd.DataFrame, cached: pd.DataFrame) -> pd.D
     return missing.reset_index(drop=True)
 
 
+def _trusted_cached_scores(cached: pd.DataFrame, panel: pd.DataFrame, formula: str) -> pd.DataFrame:
+    trusted = _dedupe_scores(cached)
+    if trusted.empty:
+        return trusted
+    lookback = formula_lookback_rows(formula)
+    if lookback <= 0:
+        return trusted.dropna(subset=["score"])
+    warmup_keys = _warmup_score_keys(panel, lookback)
+    if warmup_keys.empty:
+        return trusted.dropna(subset=["score"])
+    normalized = trusted.copy()
+    normalized["trade_date"] = pd.to_datetime(normalized["trade_date"])
+    normalized["instrument"] = normalized["instrument"].astype(str)
+    marked = normalized[["trade_date", "instrument"]].merge(
+        warmup_keys.assign(_warmup=True),
+        on=["trade_date", "instrument"],
+        how="left",
+    )
+    keep = trusted["score"].notna().to_numpy() | marked["_warmup"].eq(True).to_numpy()
+    return trusted.loc[keep].reset_index(drop=True)
+
+
+def _warmup_score_keys(panel: pd.DataFrame, lookback: int) -> pd.DataFrame:
+    if lookback <= 0 or panel.empty:
+        return _score_keys(panel.iloc[0:0])
+    ordered = _score_keys(panel).sort_values(["instrument", "trade_date"]).reset_index(drop=True)
+    warmup = ordered.groupby("instrument", sort=False).cumcount() < lookback
+    return ordered.loc[warmup, ["trade_date", "instrument"]].reset_index(drop=True)
+
+
 def _panel_with_lookback(panel: pd.DataFrame, missing_keys: pd.DataFrame, formula: str) -> pd.DataFrame:
+    return _plan_score_computation(panel, required_keys=_score_keys(panel), missing_keys=missing_keys, formula=formula).panel
+
+
+def _plan_score_computation(
+    panel: pd.DataFrame,
+    *,
+    required_keys: pd.DataFrame,
+    missing_keys: pd.DataFrame,
+    formula: str,
+) -> ScoreComputationPlan:
+    required_rows = int(len(required_keys))
     if missing_keys.empty:
-        return panel.iloc[0:0]
+        return ScoreComputationPlan(
+            panel=panel.iloc[0:0],
+            mode="cache_only",
+            reason="all required factor values were available in cache",
+            missing_rows=0,
+            required_rows=required_rows,
+            missing_ratio=0.0,
+            lookback_rows=0,
+            context_rows=0,
+        )
     lookback = formula_lookback_rows(formula)
     normalized_panel = panel.copy()
     normalized_panel["trade_date"] = pd.to_datetime(normalized_panel["trade_date"])
     normalized_panel["instrument"] = normalized_panel["instrument"].astype(str)
     normalized_missing = _score_keys(missing_keys)
+    missing_rows = int(len(normalized_missing))
+    ratio = _missing_ratio(missing_rows, required_rows)
     context_dates = set(normalized_missing["trade_date"])
-    if lookback > 0:
-        for _, missing_key in normalized_missing.iterrows():
-            instrument_rows = normalized_panel[normalized_panel["instrument"] == missing_key["instrument"]]
-            instrument_rows = instrument_rows.sort_values("trade_date").reset_index(drop=True)
-            positions = instrument_rows.index[instrument_rows["trade_date"] == missing_key["trade_date"]]
-            if len(positions) == 0:
-                continue
-            position = int(positions[0])
-            start = max(0, position - lookback)
-            context_dates.update(instrument_rows.loc[start:position, "trade_date"])
-    return panel[pd.to_datetime(panel["trade_date"]).isin(context_dates)]
+    if lookback <= 0:
+        context_panel = panel[pd.to_datetime(panel["trade_date"]).isin(context_dates)]
+        mode = "date_block_incremental" if ratio >= 0.05 else "sparse_incremental"
+        return ScoreComputationPlan(
+            panel=context_panel,
+            mode=mode,
+            reason=f"formula has no lookback; compute target missing dates only ({missing_rows} rows)",
+            missing_rows=missing_rows,
+            required_rows=required_rows,
+            missing_ratio=ratio,
+            lookback_rows=0,
+            context_rows=int(len(context_panel)),
+        )
+
+    if ratio >= 0.5:
+        return ScoreComputationPlan(
+            panel=panel,
+            mode="full_recompute",
+            reason=f"dense lookback cache miss ratio {ratio:.2%}; full panel is cheaper than incremental context expansion",
+            missing_rows=missing_rows,
+            required_rows=required_rows,
+            missing_ratio=ratio,
+            lookback_rows=lookback,
+            context_rows=int(len(panel)),
+        )
+
+    context_dates.update(_lookback_context_dates(normalized_panel, normalized_missing, lookback))
+    context_panel = panel[pd.to_datetime(panel["trade_date"]).isin(context_dates)]
+    context_rows = int(len(context_panel))
+    if context_rows >= int(len(panel) * 0.8):
+        return ScoreComputationPlan(
+            panel=panel,
+            mode="full_recompute",
+            reason=(
+                f"lookback context expands to {context_rows} of {len(panel)} rows; "
+                "full panel avoids fragmented incremental compute"
+            ),
+            missing_rows=missing_rows,
+            required_rows=required_rows,
+            missing_ratio=ratio,
+            lookback_rows=lookback,
+            context_rows=int(len(panel)),
+        )
+    mode = "date_block_incremental" if ratio >= 0.05 else "sparse_incremental"
+    return ScoreComputationPlan(
+        panel=context_panel,
+        mode=mode,
+        reason=f"lookback context planned with vectorized date expansion over {len(context_dates)} dates",
+        missing_rows=missing_rows,
+        required_rows=required_rows,
+        missing_ratio=ratio,
+        lookback_rows=lookback,
+        context_rows=context_rows,
+    )
+
+
+def _missing_ratio(missing_rows: int, required_rows: int) -> float:
+    if required_rows <= 0:
+        return 0.0
+    return float(missing_rows / required_rows)
+
+
+def _lookback_context_dates(
+    normalized_panel: pd.DataFrame,
+    normalized_missing: pd.DataFrame,
+    lookback: int,
+) -> set[pd.Timestamp]:
+    ordered = (
+        normalized_panel[["trade_date", "instrument"]]
+        .drop_duplicates()
+        .sort_values(["instrument", "trade_date"])
+        .reset_index(drop=True)
+    )
+    ordered["_qf_position"] = ordered.groupby("instrument", sort=False).cumcount()
+    positions = normalized_missing.merge(
+        ordered,
+        on=["trade_date", "instrument"],
+        how="inner",
+    )[["instrument", "_qf_position"]]
+    if positions.empty:
+        return set()
+    dates: set[pd.Timestamp] = set()
+    ordered_by_instrument = {
+        instrument: rows.set_index("_qf_position")["trade_date"]
+        for instrument, rows in ordered.groupby("instrument", sort=False)
+    }
+    for instrument, group in positions.groupby("instrument", sort=False):
+        instrument_dates = ordered_by_instrument.get(instrument)
+        if instrument_dates is None:
+            continue
+        intervals = sorted(
+            (max(0, int(position) - lookback), int(position))
+            for position in group["_qf_position"].drop_duplicates()
+        )
+        for start, end in _merge_position_intervals(intervals):
+            dates.update(instrument_dates.loc[start:end])
+    return dates
+
+
+def _merge_position_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not intervals:
+        return []
+    merged: list[tuple[int, int]] = []
+    current_start, current_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start <= current_end + 1:
+            current_end = max(current_end, end)
+            continue
+        merged.append((current_start, current_end))
+        current_start, current_end = start, end
+    merged.append((current_start, current_end))
+    return merged
 
 
 def _required_score_keys(panel: pd.DataFrame, universe_filters: tuple[str, ...]) -> pd.DataFrame:

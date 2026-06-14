@@ -39,6 +39,9 @@ web:
   # Set true only inside Docker when publishing the container port to host
   # loopback, for example 127.0.0.1:8765:8765.
   allow_docker_bind: false
+  # Required when binding the service to 0.0.0.0. The value is the name of
+  # an environment variable containing the browser control token.
+  control_token_env: ""
 
 research:
   # Used by simple parser defaults and lightweight workflows.

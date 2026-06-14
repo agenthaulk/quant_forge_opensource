@@ -58,6 +58,13 @@ def prepare_factor_scores_result(
     cache_only = is_precomputed_formula(formula)
     read_root = factor_values_root or factor_values_overlay_root
     factor_values_write_path = None
+    compute_mode = "computed_formula"
+    compute_reason = "no factor value store configured; computed formula directly"
+    missing_rows = 0
+    required_rows = 0
+    missing_ratio = 0.0
+    lookback_rows = 0
+    context_rows = 0
     if read_root is not None and factor_id is not None:
         score_result = FactorValueStore(read_root, write_root=factor_values_overlay_root).prepare_scores(
             working_panel,
@@ -73,6 +80,13 @@ def prepare_factor_scores_result(
         computed_rows = score_result.computed_rows
         factor_values_path = score_result.factor_values_path
         factor_values_write_path = score_result.factor_values_write_path
+        compute_mode = score_result.compute_mode
+        compute_reason = score_result.compute_reason
+        missing_rows = score_result.missing_rows
+        required_rows = score_result.required_rows
+        missing_ratio = score_result.missing_ratio
+        lookback_rows = score_result.lookback_rows
+        context_rows = score_result.context_rows
     elif cache_only:
         raise ValueError("precomputed factors require factor_values_root or factor_values_overlay_root")
     else:
@@ -81,6 +95,10 @@ def prepare_factor_scores_result(
         cached_rows = 0
         computed_rows = int(len(scores))
         factor_values_path = None
+        missing_rows = computed_rows
+        required_rows = computed_rows
+        missing_ratio = 1.0 if computed_rows else 0.0
+        context_rows = computed_rows
     if simulation_profile.decay_days > 1:
         scores = _apply_ewma_decay(scores, simulation_profile.decay_days)
     prepared = (
@@ -95,6 +113,13 @@ def prepare_factor_scores_result(
         computed_rows=computed_rows,
         factor_values_path=factor_values_path,
         factor_values_write_path=factor_values_write_path,
+        compute_mode=compute_mode,
+        compute_reason=compute_reason,
+        missing_rows=missing_rows,
+        required_rows=required_rows,
+        missing_ratio=missing_ratio,
+        lookback_rows=lookback_rows,
+        context_rows=context_rows,
     )
 
 

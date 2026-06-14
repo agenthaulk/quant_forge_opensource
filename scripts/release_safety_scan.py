@@ -149,7 +149,7 @@ def _contains_non_loopback_ip(text: str) -> bool:
     ip_pattern = re.compile(r"\b((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b")
     for match in ip_pattern.finditer(text):
         value = match.group(0)
-        if value.startswith("127."):
+        if value == "0.0.0.0" or value.startswith("127."):
             continue
         return True
     return False

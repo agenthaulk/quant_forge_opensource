@@ -148,6 +148,13 @@ class EvaluationResult:
     score_computed_rows: int = 0
     factor_values_path: Path | None = None
     factor_values_write_path: Path | None = None
+    score_compute_mode: str = ""
+    score_compute_reason: str = ""
+    score_missing_rows: int = 0
+    score_required_rows: int = 0
+    score_missing_ratio: float = 0.0
+    score_lookback_rows: int = 0
+    score_context_rows: int = 0
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
 
@@ -224,6 +231,13 @@ class BacktestResult:
     score_computed_rows: int = 0
     factor_values_path: Path | None = None
     factor_values_write_path: Path | None = None
+    score_compute_mode: str = ""
+    score_compute_reason: str = ""
+    score_missing_rows: int = 0
+    score_required_rows: int = 0
+    score_missing_ratio: float = 0.0
+    score_lookback_rows: int = 0
+    score_context_rows: int = 0
 
 
 def _optional_iso_date(value: str | None, label: str) -> date | None:

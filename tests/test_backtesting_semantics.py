@@ -53,6 +53,9 @@ def test_backtest_uses_next_day_execution(tmp_path: Path) -> None:
     assert result.group_returns
     assert result.rebalance_rate >= 0
     assert result.turnover_rate > 0
+    assert payload["score_compute_mode"]
+    assert payload["score_required_rows"] >= payload["score_computed_rows"]
+    assert result.score_compute_mode == payload["score_compute_mode"]
 
 
 def test_backtest_can_run_one_day_holding_path(tmp_path: Path) -> None:

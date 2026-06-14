@@ -9,7 +9,7 @@ from quant_forge.core.contracts import SimulationProfile
 from quant_forge.factor_engine.executor import execute_factor_formula
 from quant_forge.factor_engine.formula_parser import formula_lookback_rows
 from quant_forge.factor_engine.signal_processing import prepare_factor_scores, prepare_factor_scores_result
-from quant_forge.factor_engine.value_store import _formula_signature
+from quant_forge.factor_engine.value_store import _formula_signature, _panel_with_lookback, _plan_score_computation
 
 
 def test_prepare_factor_scores_applies_test_period_and_ewma_decay() -> None:
@@ -363,6 +363,172 @@ def test_prepare_factor_scores_preserves_lookback_when_filling_cache_gaps(tmp_pa
     assert list(incremental["instrument"]) == ["AAA", "BBB"]
     assert list(incremental["factor_value"]) == [3.0, 5.0]
     assert not (factor_dir / "incremental").exists()
+
+
+def test_panel_with_lookback_uses_full_panel_for_dense_missing_cache() -> None:
+    panel = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(
+                [f"2025-01-{day:02d}" for day in range(2, 12) for _ in range(3)]
+            ),
+            "instrument": ["AAA", "BBB", "CCC"] * 10,
+            "close": [float(value) for value in range(30)],
+            "volume": [float(value * 100) for value in range(30)],
+            "market_cap": [float(value * 10) for value in range(30)],
+            "is_st": [False] * 30,
+        }
+    )
+
+    result = _panel_with_lookback(
+        panel,
+        panel[["trade_date", "instrument"]],
+        "rank(volume) * sign(delta(close, 5))",
+    )
+
+    assert result is panel
+
+
+def test_score_computation_plan_reports_dense_lookback_full_recompute() -> None:
+    panel = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(
+                [f"2025-01-{day:02d}" for day in range(2, 12) for _ in range(3)]
+            ),
+            "instrument": ["AAA", "BBB", "CCC"] * 10,
+            "close": [float(value) for value in range(30)],
+            "volume": [float(value * 100) for value in range(30)],
+            "market_cap": [float(value * 10) for value in range(30)],
+            "is_st": [False] * 30,
+        }
+    )
+
+    plan = _plan_score_computation(
+        panel,
+        required_keys=panel[["trade_date", "instrument"]],
+        missing_keys=panel[["trade_date", "instrument"]],
+        formula="rank(volume) * sign(delta(close, 5))",
+    )
+
+    assert plan.panel is panel
+    assert plan.mode == "full_recompute"
+    assert plan.missing_ratio == 1.0
+    assert plan.lookback_rows == 5
+    assert plan.context_rows == len(panel)
+
+
+def test_score_computation_plan_uses_sparse_lookback_context_dates() -> None:
+    panel = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(
+                [f"2025-01-{day:02d}" for day in range(2, 12) for _ in range(3)]
+            ),
+            "instrument": ["AAA", "BBB", "CCC"] * 10,
+            "close": [float(value) for value in range(30)],
+            "volume": [float(value * 100) for value in range(30)],
+            "market_cap": [float(value * 10) for value in range(30)],
+            "is_st": [False] * 30,
+        }
+    )
+    missing = pd.DataFrame(
+        {
+            "trade_date": [pd.Timestamp("2025-01-10")],
+            "instrument": ["AAA"],
+        }
+    )
+
+    plan = _plan_score_computation(
+        panel,
+        required_keys=panel[["trade_date", "instrument"]],
+        missing_keys=missing,
+        formula="rank(volume) * sign(delta(close, 5))",
+    )
+
+    assert plan.mode == "sparse_incremental"
+    assert plan.lookback_rows == 5
+    assert set(plan.panel["trade_date"]) == {
+        pd.Timestamp("2025-01-05"),
+        pd.Timestamp("2025-01-06"),
+        pd.Timestamp("2025-01-07"),
+        pd.Timestamp("2025-01-08"),
+        pd.Timestamp("2025-01-09"),
+        pd.Timestamp("2025-01-10"),
+    }
+    assert plan.context_rows == 18
+
+
+def test_score_computation_plan_does_not_overestimate_clustered_sparse_lookback() -> None:
+    dates = pd.bdate_range("2025-01-02", periods=100)
+    panel = pd.DataFrame(
+        {
+            "trade_date": [date for date in dates for _ in range(3)],
+            "instrument": ["AAA", "BBB", "CCC"] * len(dates),
+            "close": [float(value) for value in range(len(dates) * 3)],
+            "volume": [float(value * 100) for value in range(len(dates) * 3)],
+            "market_cap": [float(value * 10) for value in range(len(dates) * 3)],
+            "is_st": [False] * len(dates) * 3,
+        }
+    )
+    missing = pd.DataFrame(
+        {
+            "trade_date": dates[60:70],
+            "instrument": ["AAA"] * 10,
+        }
+    )
+
+    plan = _plan_score_computation(
+        panel,
+        required_keys=panel[["trade_date", "instrument"]],
+        missing_keys=missing,
+        formula="delta(close, 50)",
+    )
+
+    assert plan.mode == "sparse_incremental"
+    assert plan.context_rows == 180
+    assert set(plan.panel["trade_date"]) == set(dates[10:70])
+
+
+def test_prepare_factor_scores_does_not_count_cached_lookback_warmup_nans_as_missing(
+    tmp_path,
+) -> None:
+    panel = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(
+                [f"2025-01-{day:02d}" for day in range(2, 12) for _ in range(3)]
+            ),
+            "instrument": ["AAA", "BBB", "CCC"] * 10,
+            "close": [float(value) for value in range(30)],
+            "volume": [float(value * 100) for value in range(30)],
+            "market_cap": [float(value * 10) for value in range(30)],
+            "is_st": [False] * 30,
+        }
+    )
+    formula = "rank(volume) * sign(delta(close, 5))"
+    factor_id = "FTR_SPARSE_LOOKBACK"
+    read_root = tmp_path / "canonical"
+    overlay_root = tmp_path / "overlay"
+    factor_dir = read_root / f"factor_id={factor_id}"
+    factor_dir.mkdir(parents=True)
+    signature = _formula_signature(factor_id, formula, ())
+    cached = execute_factor_formula(panel, formula)
+    cached = cached[~((cached["trade_date"] == pd.Timestamp("2025-01-10")) & (cached["instrument"] == "AAA"))]
+    payload = cached.rename(columns={"score": "factor_value"}).copy()
+    payload["trade_date"] = pd.to_datetime(payload["trade_date"]).dt.strftime("%Y-%m-%d")
+    payload["formula_signature"] = signature
+    payload.to_parquet(factor_dir / "2025.parquet", index=False)
+
+    result = prepare_factor_scores_result(
+        panel,
+        formula,
+        factor_id=factor_id,
+        factor_name=factor_id,
+        factor_values_root=read_root,
+        factor_values_overlay_root=overlay_root,
+    )
+
+    assert result.compute_mode == "sparse_incremental"
+    assert result.missing_rows == 1
+    assert result.computed_rows == 1
+    assert result.context_rows == 18
 
 
 def test_prepare_factor_scores_preserves_rolling_lookback_when_filling_cache_gaps(tmp_path) -> None:

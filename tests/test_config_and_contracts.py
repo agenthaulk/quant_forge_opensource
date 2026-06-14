@@ -28,6 +28,7 @@ def test_default_config_uses_relative_paths() -> None:
     assert not config.paths.artifact_root.is_absolute()
     assert config.web.host == "127.0.0.1"
     assert config.web.allow_docker_bind is False
+    assert config.web.control_token_env == ""
     assert config.simulation.decay_days == 0
     assert config.simulation.top_quantile == 0.3
     assert config.llm.provider == "deepseek"

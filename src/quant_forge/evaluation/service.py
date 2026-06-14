@@ -87,6 +87,13 @@ def evaluate_factor(
             "score_source": score_result.source,
             "score_cached_rows": score_result.cached_rows,
             "score_computed_rows": score_result.computed_rows,
+            "score_compute_mode": score_result.compute_mode,
+            "score_compute_reason": score_result.compute_reason,
+            "score_missing_rows": score_result.missing_rows,
+            "score_required_rows": score_result.required_rows,
+            "score_missing_ratio": score_result.missing_ratio,
+            "score_lookback_rows": score_result.lookback_rows,
+            "score_context_rows": score_result.context_rows,
             "factor_values_path": str(score_result.factor_values_path) if score_result.factor_values_path else None,
             "factor_values_write_path": (
                 str(score_result.factor_values_write_path) if score_result.factor_values_write_path else None
@@ -120,6 +127,13 @@ def evaluate_factor(
         score_computed_rows=score_result.computed_rows,
         factor_values_path=score_result.factor_values_path,
         factor_values_write_path=score_result.factor_values_write_path,
+        score_compute_mode=score_result.compute_mode,
+        score_compute_reason=score_result.compute_reason,
+        score_missing_rows=score_result.missing_rows,
+        score_required_rows=score_result.required_rows,
+        score_missing_ratio=score_result.missing_ratio,
+        score_lookback_rows=score_result.lookback_rows,
+        score_context_rows=score_result.context_rows,
         warnings=warnings,
     )
 

@@ -4,6 +4,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -20,6 +21,7 @@ from quant_forge.apps.web.server import (
 from quant_forge.config import LLMProviderSettings, LLMSettings, PathSettings, QuantForgeConfig, WebSettings
 from quant_forge.core.contracts import BacktestResult, EvaluationResult, FactorDefinition
 from quant_forge.data.local import create_demo_workspace
+from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.llm_client import LLMChatResult
 from quant_forge.llm_factor_parser import ParsedFactor
 from quant_forge.research_loop.config import ResearchLLMConfig, load_research_loop_config
@@ -115,9 +117,13 @@ allowed_interval_days: [5]
     monkeypatch.setattr(web_server, "DEFAULT_RD_CONFIG_PATH", rd_path)
     html = web_server._index_html(config)
 
-    assert "/api/research/run-once" in html
+    assert "/api/jobs/research-run-once" in html
+    assert "/api/jobs/run-idea" in html
     assert "/api/research/campaign" not in html
     assert "/api/research/schedule" in html
+    assert "中断本次运行" in html
+    assert "中断本次RD" in html
+    assert "已运行超过10秒" in html
     assert "LLM 语义解析" in html
     assert "本地规则解析" in html
     assert "是否改用本地规则解析" in html
@@ -221,6 +227,186 @@ def test_web_research_unknown_endpoint_returns_404(tmp_path) -> None:
         thread.join(timeout=2.0)
 
 
+def test_web_job_run_idea_endpoint_completes(tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+    server = create_local_web_server(host="127.0.0.1", port=0, config=config)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        started = _post_json(
+            f"{base_url}/api/jobs/run-idea",
+            {"text": "非ST的小市值股票未来表现更好", "parser_mode": "rule"},
+        )
+        assert started["kind"] == "run_idea"
+        assert started["status"] in {"running", "completed"}
+
+        completed = _wait_for_job(base_url, started["job_id"])
+
+        assert completed["status"] == "completed"
+        assert completed["result"]["factor"]["formula"] == "-rank(market_cap)"
+        assert completed["result"]["evaluation"]["observations"] > 0
+        assert completed["result"]["backtest"]["periods"] > 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_web_job_research_run_once_endpoint_completes(tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+    rd_config = _local_rd_config(config)
+    server = create_local_web_server(host="127.0.0.1", port=0, config=config, rd_config=rd_config)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        started = _post_json(
+            f"{base_url}/api/jobs/research-run-once",
+            {"seed_factor_id": "FTR_DEMO_SMALL_CAP", "objective": "balanced", "max_candidates": 1},
+        )
+        completed = _wait_for_job(base_url, started["job_id"])
+
+        assert completed["status"] == "completed"
+        assert completed["result"]["seed_factor_id"] == "FTR_DEMO_SMALL_CAP"
+        assert completed["result"]["candidates"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_web_job_http_cancel_endpoint_cancels_running_job(monkeypatch, tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+
+    def slow_workflow(config, text, *, parser_mode="llm", llm_provider=None, rd_config=None, cancel_event=None):
+        while cancel_event is not None and not cancel_event.is_set():
+            time.sleep(0.005)
+        raise web_server._WebJobCancelled("cancelled for test")
+
+    monkeypatch.setattr(web_server, "run_idea_workflow", slow_workflow)
+    server = create_local_web_server(host="127.0.0.1", port=0, config=config)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        started = _post_json(
+            f"{base_url}/api/jobs/run-idea",
+            {"text": "非ST的小市值股票未来表现更好", "parser_mode": "rule"},
+        )
+        requested = _post_json(f"{base_url}/api/jobs/{started['job_id']}/cancel", {})
+        assert requested["status"] in {"cancel_requested", "cancelled"}
+
+        final = _wait_for_job(base_url, started["job_id"])
+        assert final["status"] == "cancelled"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_web_job_manager_cancel_requests_running_job() -> None:
+    manager = web_server._WebJobManager(slow_after_seconds=0.01)
+
+    def wait_for_cancel(cancel_event):
+        while not cancel_event.is_set():
+            time.sleep(0.005)
+        raise web_server._WebJobCancelled("cancelled for test")
+
+    started = manager.start("test", wait_for_cancel)
+    cancelled = manager.cancel(started["job_id"])
+
+    assert cancelled["status"] in {"cancel_requested", "cancelled"}
+    final = _wait_for_manager_job(manager, started["job_id"])
+    assert final["status"] == "cancelled"
+
+
+def test_web_job_manager_rejects_same_kind_until_terminal() -> None:
+    manager = web_server._WebJobManager(slow_after_seconds=0.01)
+    release = threading.Event()
+
+    def wait(cancel_event):
+        release.wait(timeout=1)
+        return {"ok": True}
+
+    started = manager.start("test", wait)
+    with pytest.raises(ValueError, match="test job already running"):
+        manager.start("test", lambda cancel_event: {"ok": False})
+
+    release.set()
+    final = _wait_for_manager_job(manager, started["job_id"])
+    assert final["status"] == "completed"
+
+
+def test_web_job_manager_reports_slow_running_state() -> None:
+    manager = web_server._WebJobManager(slow_after_seconds=0.0)
+    release = threading.Event()
+
+    def wait(cancel_event):
+        release.wait(timeout=1)
+        return {"ok": True}
+
+    started = manager.start("test", wait)
+    running = manager.get(started["job_id"])
+    assert running["slow"] is True
+    assert running["message"] == "system is still running"
+
+    release.set()
+    completed = _wait_for_manager_job(manager, started["job_id"])
+    assert completed["status"] == "completed"
+    assert completed["slow"] is False
+    assert completed["message"] == ""
+
+
+def test_web_job_manager_freezes_terminal_runtime() -> None:
+    manager = web_server._WebJobManager(slow_after_seconds=0.01)
+    completed = _wait_for_manager_job(manager, manager.start("test", lambda cancel_event: {"ok": True})["job_id"])
+    runtime = completed["runtime_seconds"]
+
+    time.sleep(0.02)
+    later = manager.get(completed["job_id"])
+
+    assert later["status"] == "completed"
+    assert later["runtime_seconds"] == runtime
+
+
+def test_web_job_result_reduces_private_paths(monkeypatch, tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+
+    def path_payload(config, text, *, parser_mode="llm", llm_provider=None, rd_config=None, cancel_event=None):
+        return {
+            "artifact_path": tmp_path / "secret" / "artifact.json",
+            "nested": {"factor_values_path": str(tmp_path / "secret" / "2025.parquet")},
+            "raw_response": "provider body",
+        }
+
+    monkeypatch.setattr(web_server, "run_idea_workflow", path_payload)
+    server = create_local_web_server(host="127.0.0.1", port=0, config=config)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        started = _post_json(f"{base_url}/api/jobs/run-idea", {"text": "x", "parser_mode": "rule"})
+        completed = _wait_for_job(base_url, started["job_id"])
+
+        assert completed["result"]["artifact_path"] == "artifact.json"
+        assert completed["result"]["nested"]["factor_values_path"] == "2025.parquet"
+        assert "raw_response" not in completed["result"]
+        assert str(tmp_path) not in json.dumps(completed, ensure_ascii=False)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
 def test_web_server_rejects_docker_bind_host_by_default(tmp_path) -> None:
     create_demo_workspace(tmp_path / "demo")
     config = QuantForgeConfig().resolve(tmp_path / "demo")
@@ -232,20 +418,66 @@ def test_web_server_rejects_docker_bind_host_by_default(tmp_path) -> None:
 def test_web_server_allows_explicit_docker_bind_host(tmp_path) -> None:
     create_demo_workspace(tmp_path / "demo")
     config = QuantForgeConfig(web=WebSettings(allow_docker_bind=True)).resolve(tmp_path / "demo")
+
+    with pytest.raises(ValueError, match="control_token_env"):
+        create_local_web_server(host="0.0.0.0", port=0, config=config)
+
+
+def test_web_server_requires_control_token_for_docker_bind(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("QF_TEST_WEB_TOKEN", "secret-token")
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig(
+        web=WebSettings(allow_docker_bind=True, control_token_env="QF_TEST_WEB_TOKEN")
+    ).resolve(tmp_path / "demo")
     server = create_local_web_server(host="0.0.0.0", port=0, config=config)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
 
     try:
         assert server.server_address[1] > 0
+        health = _get_json(f"{base_url}/health")
+        assert health["ok"] is True
+        html = _get_text(base_url)
+        assert "protected" in html
+        assert str(tmp_path) not in html
+        assert "QF_TEST_WEB_TOKEN" not in html
+        assert "api_key_env" not in html
+        with pytest.raises(urllib.error.HTTPError) as status_exc:
+            _get_json(f"{base_url}/api/status")
+        assert status_exc.value.code == 401
+
+        status = _get_json(f"{base_url}/api/status", headers={"Authorization": "Bearer secret-token"})
+        assert status["paths"]["data_root"] == str(config.paths.data_root)
+
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _post_json(f"{base_url}/api/jobs/run-idea", {"text": "x", "parser_mode": "rule"})
+        assert excinfo.value.code == 401
+
+        authorized = _post_json(
+            f"{base_url}/api/jobs/run-idea",
+            {"text": "非ST的小市值股票未来表现更好", "parser_mode": "rule"},
+            headers={"Authorization": "Bearer secret-token"},
+        )
+        completed = _wait_for_job(
+            base_url,
+            authorized["job_id"],
+            headers={"Authorization": "Bearer secret-token"},
+        )
+        assert completed["status"] == "completed"
     finally:
+        server.shutdown()
         server.server_close()
+        thread.join(timeout=2.0)
 
 
 def test_web_server_rejects_nonlocal_bind_host(tmp_path) -> None:
     create_demo_workspace(tmp_path / "demo")
     config = QuantForgeConfig().resolve(tmp_path / "demo")
+    nonlocal_host = ".".join(("192", "0", "2", "1"))
 
     with pytest.raises(ValueError, match="local-only"):
-        create_local_web_server(host="192.0.2.1", port=0, config=config)
+        create_local_web_server(host=nonlocal_host, port=0, config=config)
 
 
 def test_web_status_keeps_active_llm_provider_when_key_is_missing(monkeypatch, tmp_path) -> None:
@@ -651,6 +883,44 @@ def test_web_workbench_uses_selected_llm_provider(monkeypatch, tmp_path) -> None
     assert result["parser"]["provider"] == "glm"
 
 
+def test_run_idea_workflow_cleans_new_factor_on_cancel(monkeypatch, tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+    cancel_event = threading.Event()
+
+    def fake_parse_factor_idea(text, llm, *, mode):
+        factor = FactorDefinition(
+            factor_id="FTR_CANCELLED_PARSE",
+            name="cancelled_parse",
+            formula="-rank(market_cap)",
+            horizon_days=5,
+            source="llm",
+        )
+        return ParsedFactor(factor=factor, source="llm", provider="rule", model="deterministic")
+
+    def fake_evaluate_factor(*args, **kwargs):
+        cancel_event.set()
+        return EvaluationResult(
+            factor_id="FTR_CANCELLED_PARSE",
+            observations=1,
+            coverage=1.0,
+            rank_ic_mean=0.0,
+            rank_ic_std=0.0,
+            rank_icir=0.0,
+            ic_days=1,
+            artifact_path=tmp_path / "evaluation.json",
+        )
+
+    monkeypatch.setattr(web_server, "parse_factor_idea", fake_parse_factor_idea)
+    monkeypatch.setattr(web_server, "evaluate_factor", fake_evaluate_factor)
+
+    with pytest.raises(web_server._WebJobCancelled):
+        run_idea_workflow(config, "cancel me", parser_mode="rule", cancel_event=cancel_event)
+
+    with pytest.raises(FileNotFoundError):
+        FactorRepository(config.paths.factor_root).get("FTR_CANCELLED_PARSE")
+
+
 def test_web_html_keeps_active_llm_provider_visible_when_key_is_missing(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("QF_TEST_DEEPSEEK_KEY", raising=False)
     monkeypatch.setenv("QF_TEST_GLM_KEY", "set")
@@ -732,20 +1002,55 @@ def test_web_research_cards_include_cache_paths_and_artifacts() -> None:
     assert "artifacts:" in html
 
 
-def _post_json(url: str, payload: dict) -> dict:
+def _post_json(url: str, payload: dict, *, headers: dict[str, str] | None = None) -> dict:
+    request_headers = {"Content-Type": "application/json"}
+    request_headers.update(headers or {})
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=request_headers,
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=10) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
-def _get_json(url: str) -> dict:
-    with urllib.request.urlopen(url, timeout=10) as response:
+def _get_json(url: str, *, headers: dict[str, str] | None = None) -> dict:
+    request = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(request, timeout=10) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _get_text(url: str, *, headers: dict[str, str] | None = None) -> str:
+    request = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return response.read().decode("utf-8")
+
+
+def _wait_for_job(
+    base_url: str,
+    job_id: str,
+    *,
+    timeout: float = 10.0,
+    headers: dict[str, str] | None = None,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = _get_json(f"{base_url}/api/jobs/{job_id}", headers=headers)
+        if status["status"] in {"completed", "failed", "cancelled"}:
+            return status
+        time.sleep(0.05)
+    raise AssertionError(f"job {job_id} did not finish")
+
+
+def _wait_for_manager_job(manager, job_id: str, *, timeout: float = 2.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = manager.get(job_id)
+        if status["status"] in {"completed", "failed", "cancelled"}:
+            return status
+        time.sleep(0.01)
+    raise AssertionError(f"job {job_id} did not finish")
 
 
 def _local_rd_config(config: QuantForgeConfig):

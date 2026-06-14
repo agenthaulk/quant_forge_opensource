@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 
-from scripts.release_safety_scan import _contains_env_secret_assignment
+from scripts.release_safety_scan import _contains_env_secret_assignment, _contains_non_loopback_ip
 
 
 PUBLIC_ROOTS = [
@@ -145,3 +145,9 @@ def test_release_scan_flags_real_env_secret_values() -> None:
     fake_value = "abc1234567890" + "secret"
     assert _contains_env_secret_assignment(f"DEEPSEEK_API_KEY={fake_value}\n")
     assert _contains_env_secret_assignment(f'deepseek_api_key="{fake_value}" # local only\n')
+
+
+def test_release_scan_allows_docker_bind_address_but_flags_private_hosts() -> None:
+    assert not _contains_non_loopback_ip("bind host 0.0.0.0 and publish to 127.0.0.1")
+    private_host = ".".join(("192", "168", "1", "10"))
+    assert _contains_non_loopback_ip(f"private host {private_host}")

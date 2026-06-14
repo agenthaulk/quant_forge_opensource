@@ -138,9 +138,17 @@ to local rule parsing.
 
 When running inside Docker, bind the container service explicitly and publish
 the port only to the host loopback interface. In the ignored local config used
-inside Docker, set `web.allow_docker_bind: true`.
+inside Docker, set `web.allow_docker_bind: true` and configure
+`web.control_token_env` with the name of an environment variable that contains
+a per-run browser control token. Runtime/read APIs and mutating Web actions
+then require that token.
 
 ```bash
+export QF_WEB_CONTROL_TOKEN="$(python - <<'PY'
+import secrets
+print(secrets.token_urlsafe(24))
+PY
+)"
 qf web --config configs/default.local.yaml --rd-config configs/rd.yaml --host 0.0.0.0 --port 8765
 # docker run example: publish as 127.0.0.1:8765:8765 on the host
 ```
