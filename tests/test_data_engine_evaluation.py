@@ -44,6 +44,9 @@ def test_evaluation_writes_artifact(tmp_path: Path) -> None:
     assert "warnings" in payload
     assert isinstance(result.warnings, tuple)
     assert result.simulation_profile.decay_days == 0
+    assert payload["score_compute_mode"]
+    assert payload["score_required_rows"] >= payload["score_computed_rows"]
+    assert result.score_compute_mode == payload["score_compute_mode"]
 
 
 def test_evaluation_warns_when_oos_decays(tmp_path: Path) -> None:

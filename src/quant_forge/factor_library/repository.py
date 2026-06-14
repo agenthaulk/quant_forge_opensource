@@ -81,6 +81,16 @@ class FactorRepository:
         self._remove_duplicate_files(factor.factor_id, keep=target)
         return target
 
+    def delete(self, factor_id: str) -> int:
+        """Delete all source definitions for one factor id."""
+
+        deleted = 0
+        for path in _matching_factor_files(self.factor_root, factor_id):
+            path.unlink()
+            deleted += 1
+            _remove_empty_factor_dirs(path.parent, stop=self.factor_root)
+        return deleted
+
     def promote(self, factor_id: str, to_status: FactorStatus, reason: str) -> FactorDefinition:
         if not reason.strip():
             raise ValueError("promotion reason is required")
@@ -256,6 +266,17 @@ def _matching_factor_files(factor_root: Path, factor_id: str) -> list[Path]:
     for category_dir in FACTOR_CATEGORY_DIRS.values():
         matches.extend(factor_root.glob(f"{category_dir}/*_factors/{factor_id}/{FACTOR_FILE}"))
     return sorted(set(matches))
+
+
+def _remove_empty_factor_dirs(path: Path, *, stop: Path) -> None:
+    stop = stop.expanduser().resolve(strict=False)
+    current = path.expanduser().resolve(strict=False)
+    while current != stop and stop in current.parents:
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
 
 
 def _preferred_factor_file(matches: list[Path]) -> Path:

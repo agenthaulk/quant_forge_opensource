@@ -310,6 +310,13 @@ If an ignored local RD config explicitly enables an LLM-backed RD mode and the
 active provider cannot be used, that RD action fails with the LLM readiness
 reason instead of silently switching to local rules.
 
+When binding the local web adapter to `0.0.0.0` for Docker port publishing,
+set `web.allow_docker_bind: true` and `web.control_token_env` to an environment
+variable containing a temporary control token. Runtime/read APIs and mutating
+Web actions require that token; the browser asks for it once and stores it only
+in tab session storage. Keep publishing the Docker port to host loopback, for example
+`127.0.0.1:8765:8765`.
+
 Example local setup:
 
 ```bash

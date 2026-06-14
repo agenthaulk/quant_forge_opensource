@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
+from datetime import UTC, datetime
 from html import escape
 import json
+import logging
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import threading
+import time
 from typing import Any
+from urllib.parse import urlparse
+from uuid import uuid4
 
 from quant_forge.backtesting.service import run_factor_backtest
 from quant_forge.config import QuantForgeConfig, validate_llm_runtime
-from quant_forge.core.contracts import BacktestResult, EvaluationResult
+from quant_forge.core.contracts import BacktestResult, EvaluationResult, FactorDefinition
 from quant_forge.evaluation.service import evaluate_factor
 from quant_forge.factor_library.catalog import FactorCatalog
 from quant_forge.factor_library.repository import FactorRepository
@@ -31,6 +38,154 @@ from quant_forge.research_loop.llm import LLMHypothesisGenerator, LLMResearchRev
 from quant_forge.research_loop.service import ResearchLoopResult, ResearchLoopService
 
 
+LOGGER = logging.getLogger(__name__)
+LONG_RUNNING_JOB_SECONDS = 10.0
+_TERMINAL_JOB_STATUSES = {"completed", "failed", "cancelled"}
+_WEB_PATH_KEYS = {
+    "artifact_path",
+    "factor_values_path",
+    "factor_values_write_path",
+    "trace_root",
+    "report_path",
+}
+
+
+class _WebJobCancelled(RuntimeError):
+    pass
+
+
+@dataclass
+class _WebJob:
+    job_id: str
+    kind: str
+    status: str
+    started_at: str
+    updated_at: str
+    finished_at: str | None = None
+    result: dict[str, Any] | None = None
+    error: str = ""
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    thread: threading.Thread | None = field(default=None, repr=False)
+    started_monotonic: float = field(default_factory=time.monotonic, repr=False)
+    finished_monotonic: float | None = None
+
+
+class _WebJobManager:
+    def __init__(self, *, slow_after_seconds: float = LONG_RUNNING_JOB_SECONDS, max_retained_jobs: int = 50) -> None:
+        self._slow_after_seconds = slow_after_seconds
+        self._max_retained_jobs = max(1, max_retained_jobs)
+        self._lock = threading.Lock()
+        self._jobs: dict[str, _WebJob] = {}
+
+    def start(self, kind: str, runner: Any) -> dict[str, Any]:
+        job_id = uuid4().hex[:12]
+        now = _utc_now()
+        job = _WebJob(job_id=job_id, kind=kind, status="running", started_at=now, updated_at=now)
+
+        def run() -> None:
+            try:
+                result = runner(job.cancel_event)
+            except _WebJobCancelled as exc:
+                self._finish(job_id, status="cancelled", error=str(exc))
+            except Exception as exc:
+                if job.cancel_event.is_set():
+                    self._finish(job_id, status="cancelled", error=_client_error_message(exc, fallback="run cancelled by user"))
+                else:
+                    LOGGER.exception("web job %s failed", job_id)
+                    self._finish(job_id, status="failed", error=_client_error_message(exc, fallback="job failed"))
+            else:
+                if job.cancel_event.is_set():
+                    self._finish(job_id, status="cancelled", error="run cancelled by user")
+                else:
+                    self._finish(job_id, status="completed", result=_web_public_json(result))
+
+        thread = threading.Thread(target=run, name=f"qf-web-job-{job_id}", daemon=True)
+        job.thread = thread
+        with self._lock:
+            if any(item.kind == kind and item.status not in _TERMINAL_JOB_STATUSES for item in self._jobs.values()):
+                raise ValueError(f"{kind} job already running")
+            self._jobs[job_id] = job
+            self._prune_locked()
+        thread.start()
+        return self.get(job_id)
+
+    def get(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            job = self._require(job_id)
+            return self._payload(job)
+
+    def cancel(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            job = self._require(job_id)
+            if job.status not in _TERMINAL_JOB_STATUSES:
+                job.cancel_event.set()
+                job.status = "cancel_requested"
+                job.error = "cancel requested by user"
+                job.updated_at = _utc_now()
+            return self._payload(job)
+
+    def _finish(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        result: dict[str, Any] | None = None,
+        error: str = "",
+    ) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            if job.status in _TERMINAL_JOB_STATUSES:
+                return
+            job.status = status
+            job.result = result
+            job.error = error
+            job.finished_at = _utc_now()
+            job.finished_monotonic = time.monotonic()
+            job.updated_at = job.finished_at
+            self._prune_locked()
+
+    def _require(self, job_id: str) -> _WebJob:
+        job = self._jobs.get(job_id)
+        if job is None:
+            raise KeyError(f"unknown job: {job_id}")
+        return job
+
+    def _payload(self, job: _WebJob) -> dict[str, Any]:
+        end_time = job.finished_monotonic if job.finished_monotonic is not None else time.monotonic()
+        runtime_seconds = max(0.0, end_time - job.started_monotonic)
+        running = job.status not in _TERMINAL_JOB_STATUSES
+        slow = running and runtime_seconds >= self._slow_after_seconds
+        message = "system is still running" if slow else ""
+        return {
+            "job_id": job.job_id,
+            "kind": job.kind,
+            "status": job.status,
+            "started_at": job.started_at,
+            "updated_at": job.updated_at,
+            "finished_at": job.finished_at,
+            "runtime_seconds": runtime_seconds,
+            "slow": slow,
+            "slow_after_seconds": self._slow_after_seconds,
+            "message": message,
+            "error": job.error,
+            "result": job.result,
+        }
+
+    def _prune_locked(self) -> None:
+        terminal = [
+            job
+            for job in self._jobs.values()
+            if job.status in _TERMINAL_JOB_STATUSES
+        ]
+        overflow = len(self._jobs) - self._max_retained_jobs
+        if overflow <= 0:
+            return
+        for job in sorted(terminal, key=lambda item: item.started_monotonic)[:overflow]:
+            self._jobs.pop(job.job_id, None)
+
+
 def run_idea_workflow(
     config: QuantForgeConfig,
     text: str,
@@ -38,43 +193,59 @@ def run_idea_workflow(
     parser_mode: str = "llm",
     llm_provider: str | None = None,
     rd_config: ResearchLoopConfig | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Parse an idea, persist the draft, evaluate it, and run a backtest."""
 
     if not text.strip():
         raise ValueError("idea text is required")
+    _raise_if_cancelled(cancel_event)
     research_config = rd_config or load_research_loop_config(DEFAULT_RD_CONFIG_PATH, config.research, config.simulation)
     llm_settings = config.llm.select_provider(llm_provider) if parser_mode == "llm" else config.llm
     if parser_mode == "llm":
         validate_llm_runtime(llm_settings)
+    _raise_if_cancelled(cancel_event)
     parsed = parse_factor_idea(text, llm_settings, mode=parser_mode)
-    FactorRepository(config.paths.factor_root).save(parsed.factor)
-    evaluation = evaluate_factor(
-        parsed.factor.factor_id,
-        factor_root=config.paths.factor_root,
-        data_root=config.paths.data_root,
-        artifact_root=config.paths.artifact_root,
-        horizon_days=parsed.factor.horizon_days,
-        horizon_days_matrix=research_config.horizon_days_matrix,
-        sample_splits=research_config.sample_splits,
-        simulation_profile=research_config.simulation_profile,
-        factor_values_root=config.paths.factor_values_root,
-        factor_values_overlay_root=config.paths.factor_values_overlay_root,
-        factor_values_manifest_root=config.paths.factor_values_manifest_root,
-    )
-    backtest = run_factor_backtest(
-        parsed.factor.factor_id,
-        factor_root=config.paths.factor_root,
-        data_root=config.paths.data_root,
-        artifact_root=config.paths.artifact_root,
-        simulation_profile=research_config.simulation_profile,
-        holding_days=parsed.factor.horizon_days,
-        transaction_costs=research_config.transaction_costs,
-        sample_splits=research_config.sample_splits,
-        factor_values_root=config.paths.factor_values_root,
-        factor_values_overlay_root=config.paths.factor_values_overlay_root,
-        factor_values_manifest_root=config.paths.factor_values_manifest_root,
-    )
+    _raise_if_cancelled(cancel_event)
+    repo = FactorRepository(config.paths.factor_root)
+    previous_factor = _existing_factor(repo, parsed.factor.factor_id)
+    try:
+        repo.save(parsed.factor)
+        _raise_if_cancelled(cancel_event)
+        evaluation = evaluate_factor(
+            parsed.factor.factor_id,
+            factor_root=config.paths.factor_root,
+            data_root=config.paths.data_root,
+            artifact_root=config.paths.artifact_root,
+            horizon_days=parsed.factor.horizon_days,
+            horizon_days_matrix=research_config.horizon_days_matrix,
+            sample_splits=research_config.sample_splits,
+            simulation_profile=research_config.simulation_profile,
+            factor_values_root=config.paths.factor_values_root,
+            factor_values_overlay_root=config.paths.factor_values_overlay_root,
+            factor_values_manifest_root=config.paths.factor_values_manifest_root,
+        )
+        _raise_if_cancelled(cancel_event)
+        backtest = run_factor_backtest(
+            parsed.factor.factor_id,
+            factor_root=config.paths.factor_root,
+            data_root=config.paths.data_root,
+            artifact_root=config.paths.artifact_root,
+            simulation_profile=research_config.simulation_profile,
+            holding_days=parsed.factor.horizon_days,
+            transaction_costs=research_config.transaction_costs,
+            sample_splits=research_config.sample_splits,
+            factor_values_root=config.paths.factor_values_root,
+            factor_values_overlay_root=config.paths.factor_values_overlay_root,
+            factor_values_manifest_root=config.paths.factor_values_manifest_root,
+        )
+        _raise_if_cancelled(cancel_event)
+    except _WebJobCancelled:
+        if previous_factor is None:
+            repo.delete(parsed.factor.factor_id)
+        else:
+            repo.save(previous_factor)
+        raise
     return _workflow_payload(parsed, evaluation, backtest)
 
 
@@ -85,9 +256,11 @@ def run_research_once_workflow(
     objective: str | None = None,
     max_candidates: int | None = None,
     rd_config: ResearchLoopConfig | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Run one local research-development iteration and return JSON-safe data."""
 
+    _raise_if_cancelled(cancel_event)
     research_config = rd_config or load_research_loop_config(DEFAULT_RD_CONFIG_PATH, config.research, config.simulation)
     result = _run_research_once(
         config,
@@ -95,7 +268,9 @@ def run_research_once_workflow(
         seed_factor_id,
         objective=objective or research_config.objective,
         max_candidates=max_candidates if max_candidates is not None else research_config.default_max_candidates,
+        cancel_event=cancel_event,
     )
+    _raise_if_cancelled(cancel_event)
     return _json_safe(result)
 
 
@@ -122,37 +297,64 @@ def create_local_web_server(
         ),
         allowed_interval_days=research_config.allowed_interval_days,
     )
+    job_manager = _WebJobManager()
+    control_token = _control_token_for_bind(host, config)
+    control_token_required = bool(control_token)
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            if self.path == "/health":
-                self._json({"ok": True})
-            elif self.path == "/catalog":
-                self._json({"fields": list_available_fields(), "operators": list_available_operators()})
-            elif self.path == "/api/status":
-                active_llm = _active_llm(config)
-                self._json(
-                    {
-                        "name": "Quant Forge",
-                        "paths": _paths_payload(config),
-                        "llm": {
-                            "provider": active_llm.provider,
-                            "model": active_llm.model,
-                            "api_key_env": active_llm.api_key_env,
-                            "providers": _llm_provider_options(config),
-                        },
-                        "rd": _rd_status_payload(config, research_config),
-                    }
-                )
-            elif self.path == "/api/research/status":
-                self._json(_json_safe(scheduler.status()))
-            else:
-                self._html(_index_html(config, research_config))
+            path = urlparse(self.path).path
+            try:
+                if path == "/health":
+                    self._json({"ok": True})
+                elif path == "/catalog":
+                    self._require_control_token()
+                    self._json({"fields": list_available_fields(), "operators": list_available_operators()})
+                elif path == "/api/status":
+                    self._require_control_token()
+                    active_llm = _active_llm(config)
+                    self._json(
+                        {
+                            "name": "Quant Forge",
+                            "paths": _paths_payload(config),
+                            "llm": {
+                                "provider": active_llm.provider,
+                                "model": active_llm.model,
+                                "api_key_env": active_llm.api_key_env,
+                                "providers": _llm_provider_options(config),
+                            },
+                            "rd": _rd_status_payload(config, research_config),
+                        }
+                    )
+                elif path == "/api/research/status":
+                    self._require_control_token()
+                    self._json(_json_safe(scheduler.status()))
+                elif path.startswith("/api/jobs/"):
+                    self._require_control_token()
+                    self._json(job_manager.get(_job_id_from_path(path)))
+                else:
+                    self._html(
+                        _index_html(
+                            config,
+                            research_config,
+                            control_token_required=control_token_required,
+                            redact_runtime=control_token_required,
+                        )
+                    )
+            except KeyError as exc:
+                self._json({"error": str(exc)}, status=404)
+            except PermissionError:
+                self._json({"error": "unauthorized"}, status=401)
+            except Exception:
+                LOGGER.exception("web GET request failed")
+                self._json({"error": "request failed"}, status=400)
 
         def do_POST(self) -> None:
             try:
+                path = urlparse(self.path).path
+                self._require_control_token()
                 payload = self._read_json()
-                if self.path == "/api/run-idea":
+                if path == "/api/run-idea":
                     result = run_idea_workflow(
                         config,
                         str(payload.get("text", "")),
@@ -162,7 +364,7 @@ def create_local_web_server(
                     )
                     self._json(result)
                     return
-                if self.path == "/api/research/run-once":
+                if path == "/api/research/run-once":
                     result = run_research_once_workflow(
                         config,
                         str(payload.get("seed_factor_id", "")),
@@ -172,7 +374,42 @@ def create_local_web_server(
                     )
                     self._json(result)
                     return
-                if self.path == "/api/research/schedule":
+                if path == "/api/jobs/run-idea":
+                    self._json(
+                        job_manager.start(
+                            "run_idea",
+                            lambda cancel_event: run_idea_workflow(
+                                config,
+                                str(payload.get("text", "")),
+                                parser_mode=str(payload.get("parser_mode", "llm")),
+                                llm_provider=_optional_str(payload.get("llm_provider")),
+                                rd_config=research_config,
+                                cancel_event=cancel_event,
+                            ),
+                        ),
+                        status=202,
+                    )
+                    return
+                if path == "/api/jobs/research-run-once":
+                    self._json(
+                        job_manager.start(
+                            "research_run_once",
+                            lambda cancel_event: run_research_once_workflow(
+                                config,
+                                str(payload.get("seed_factor_id", "")),
+                                objective=str(payload.get("objective", research_config.objective)),
+                                max_candidates=_optional_int(payload.get("max_candidates")),
+                                rd_config=research_config,
+                                cancel_event=cancel_event,
+                            ),
+                        ),
+                        status=202,
+                    )
+                    return
+                if path.startswith("/api/jobs/") and path.endswith("/cancel"):
+                    self._json(job_manager.cancel(_job_id_from_cancel_path(path)))
+                    return
+                if path == "/api/research/schedule":
                     action = str(payload.get("action", "")).strip().lower()
                     if action == "start":
                         request = ResearchScheduleRequest(
@@ -188,9 +425,16 @@ def create_local_web_server(
                         return
                     self._json({"error": "action must be start or stop"}, status=400)
                     return
-                self._json({"error": f"unknown endpoint: {self.path}"}, status=404)
-            except Exception as exc:
+                self._json({"error": f"unknown endpoint: {path}"}, status=404)
+            except KeyError as exc:
+                self._json({"error": str(exc)}, status=404)
+            except PermissionError:
+                self._json({"error": "unauthorized"}, status=401)
+            except ValueError as exc:
                 self._json({"error": str(exc)}, status=400)
+            except Exception as exc:
+                LOGGER.exception("web POST request failed")
+                self._json({"error": _client_error_message(exc, fallback="request failed")}, status=400)
 
         def log_message(self, format: str, *args: object) -> None:
             return
@@ -220,6 +464,13 @@ def create_local_web_server(
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
             self.wfile.write(encoded)
+
+        def _require_control_token(self) -> None:
+            if not control_token_required:
+                return
+            supplied = self.headers.get("Authorization", "")
+            if supplied != f"Bearer {control_token}":
+                raise PermissionError("unauthorized")
 
     return ThreadingHTTPServer((host, port), Handler)
 
@@ -253,9 +504,11 @@ def _run_research_once(
     *,
     objective: str,
     max_candidates: int,
+    cancel_event: threading.Event | None = None,
 ) -> ResearchLoopResult:
     if not seed_factor_id.strip():
         raise ValueError("seed_factor_id is required")
+    _raise_if_cancelled(cancel_event)
     hypothesis_generator = None
     review_generator = None
     if _rd_generation_mode(rd_config.llm.hypothesis_mode) == "llm":
@@ -284,8 +537,10 @@ def _run_research_once(
         llm_formula_repair_attempts=rd_config.llm.max_formula_repair_attempts,
         hypothesis_generator=hypothesis_generator,
         review_generator=review_generator,
+        cancel_event=cancel_event,
     )
     weights = weights_for_objective(rd_config, objective)
+    _raise_if_cancelled(cancel_event)
     return service.run_once(
         seed_factor_id,
         objective=objective,
@@ -293,6 +548,36 @@ def _run_research_once(
         weights=weights,
         gate=rd_config.gate,
     )
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise _WebJobCancelled("run cancelled by user")
+
+
+def _existing_factor(repo: FactorRepository, factor_id: str) -> FactorDefinition | None:
+    try:
+        return repo.get(factor_id)
+    except FileNotFoundError:
+        return None
+
+
+def _job_id_from_path(path: str) -> str:
+    parts = path.strip("/").split("/")
+    if len(parts) != 3 or parts[:2] != ["api", "jobs"] or not parts[2]:
+        raise KeyError(f"unknown job path: {path}")
+    return parts[2]
+
+
+def _job_id_from_cancel_path(path: str) -> str:
+    parts = path.strip("/").split("/")
+    if len(parts) != 4 or parts[:2] != ["api", "jobs"] or parts[3] != "cancel" or not parts[2]:
+        raise KeyError(f"unknown job path: {path}")
+    return parts[2]
 
 
 def _rd_llm_settings(config: QuantForgeConfig, *, feature: str) -> Any:
@@ -308,6 +593,55 @@ def _rd_generation_mode(mode: str) -> str:
     if normalized in {"deterministic", "rule", "local_rule"}:
         return "local"
     return normalized
+
+
+def _control_token_for_bind(host: str, config: QuantForgeConfig) -> str:
+    if host != "0.0.0.0":
+        return ""
+    token_env = config.web.control_token_env.strip()
+    if not token_env:
+        raise ValueError("web.control_token_env is required when binding the web adapter to 0.0.0.0")
+    control_value = os.environ.get(token_env, "")
+    if not control_value:
+        raise ValueError(f"web control token environment variable is not set: {token_env}")
+    return control_value
+
+
+def _client_error_message(exc: Exception, *, fallback: str) -> str:
+    if isinstance(exc, _WebJobCancelled):
+        return str(exc) or "run cancelled by user"
+    if isinstance(exc, PermissionError):
+        return "unauthorized"
+    if isinstance(exc, ValueError):
+        return str(exc)
+    text = str(exc)
+    if "Missing API key" in text or "requires api_key_env" in text:
+        return "LLM runtime is not ready"
+    return fallback
+
+
+def _web_public_json(value: Any) -> Any:
+    if is_dataclass(value) and not isinstance(value, type):
+        return _web_public_json(asdict(value))
+    if isinstance(value, Path):
+        return _path_label(value)
+    if isinstance(value, tuple):
+        return [_web_public_json(item) for item in value]
+    if isinstance(value, list):
+        return [_web_public_json(item) for item in value]
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            name = str(key)
+            if name == "raw_response":
+                continue
+            result[name] = _path_label(Path(item)) if name in _WEB_PATH_KEYS and item else _web_public_json(item)
+        return result
+    return value
+
+
+def _path_label(path: Path) -> str:
+    return path.name or "path"
 
 
 def _json_safe(value: Any) -> Any:
@@ -432,7 +766,13 @@ def _provider_readiness_label(option: dict[str, str]) -> str:
     return " · not ready"
 
 
-def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None = None) -> str:
+def _index_html(
+    config: QuantForgeConfig,
+    rd_config: ResearchLoopConfig | None = None,
+    *,
+    control_token_required: bool = False,
+    redact_runtime: bool = False,
+) -> str:
     research_config = rd_config or load_research_loop_config(DEFAULT_RD_CONFIG_PATH, config.research, config.simulation)
     paths = _paths_payload(config)
     provider_options = _llm_provider_options(config)
@@ -443,6 +783,22 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
     parser_label = escape(active_provider or "未配置 LLM provider")
     rd_optimizer_label = escape(_rd_optimizer_label(config, research_config))
     seed_factor_id = escape(_default_seed_factor_id(config))
+    if redact_runtime:
+        paths = {
+            "data_root": "protected",
+            "factor_root": "protected",
+            "factor_values_root": "protected",
+            "factor_values_overlay_root": "protected",
+            "factor_values_manifest_root": "protected",
+            "artifact_root": "protected",
+        }
+        provider_options = ()
+        active_provider = ""
+        provider = "protected"
+        model = "protected"
+        parser_label = "需要控制令牌"
+        rd_optimizer_label = "需要控制令牌"
+        seed_factor_id = ""
     data_root = escape(paths["data_root"])
     factor_root = escape(paths["factor_root"])
     factor_values_root = escape(paths["factor_values_root"])
@@ -471,7 +827,7 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
         for option in provider_options
     )
     if not llm_provider_options:
-        llm_provider_options = '      <option value="">未配置 LLM provider</option>'
+        llm_provider_options = '      <option value="">需要控制令牌</option>' if redact_runtime else '      <option value="">未配置 LLM provider</option>'
     rd_seed_html = (
         f'<input id="rd-seed" value="{seed_factor_id}">'
         if seed_factor_id
@@ -599,6 +955,14 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
       border-color: var(--line-strong);
       background: #fff;
       color: var(--ink);
+    }}
+    button.danger {{
+      border-color: var(--bad);
+      background: #fff;
+      color: var(--bad);
+    }}
+    button.danger:hover {{
+      background: #fff6f6;
     }}
     button:disabled {{ opacity: .55; cursor: wait; }}
     code {{
@@ -850,6 +1214,7 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
 {llm_provider_options}
       </select>
       <button id="run">解析并验证</button>
+      <button id="cancel-run" class="secondary danger" disabled>中断本次运行</button>
       <p id="status" class="meta"></p>
     </div>
     <div class="form-block">
@@ -874,6 +1239,7 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
         <button id="rd-start" class="secondary">开启</button>
         <button id="rd-stop" class="secondary">停止</button>
       </div>
+      <button id="rd-cancel" class="secondary danger" disabled>中断本次RD</button>
       <p id="rd-status" class="meta"></p>
     </div>
   </aside>
@@ -903,14 +1269,19 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
 </main>
 <script>
 const button = document.getElementById('run');
+const cancelButton = document.getElementById('cancel-run');
 const statusEl = document.getElementById('status');
 const errorEl = document.getElementById('error');
 const resultEl = document.getElementById('result');
 const rdRun = document.getElementById('rd-run');
 const rdStart = document.getElementById('rd-start');
 const rdStop = document.getElementById('rd-stop');
+const rdCancel = document.getElementById('rd-cancel');
 const rdStatusEl = document.getElementById('rd-status');
 const rdResultEl = document.getElementById('rd-result');
+let activeIdeaJobId = null;
+let activeRdJobId = null;
+const controlTokenRequired = {str(control_token_required).lower()};
 
 function pct(value) {{
   return (Number(value) * 100).toFixed(2) + '%';
@@ -1074,22 +1445,82 @@ function rdPayload() {{
     max_candidates: Number(document.getElementById('rd-max').value)
   }};
 }}
-async function submitIdea(parserMode) {{
-  const response = await fetch('/api/run-idea', {{
+function sleep(ms) {{
+  return new Promise(resolve => setTimeout(resolve, ms));
+}}
+function controlHeaders() {{
+  const headers = {{'Content-Type': 'application/json'}};
+  if (!controlTokenRequired) return headers;
+  let token = window.sessionStorage.getItem('qf_control_token') || '';
+  if (!token) {{
+    token = window.prompt('请输入本次 Web 控制令牌') || '';
+    if (token) window.sessionStorage.setItem('qf_control_token', token);
+  }}
+  if (!token) throw new Error('需要 Web 控制令牌');
+  headers.Authorization = `Bearer ${{token}}`;
+  return headers;
+}}
+async function postJson(url, payload) {{
+  const response = await fetch(url, {{
     method: 'POST',
-    headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify({{
+    headers: controlHeaders(),
+    body: JSON.stringify(payload)
+  }});
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error || 'request failed');
+  return body;
+}}
+async function getJob(jobId) {{
+  const response = await fetch(`/api/jobs/${{encodeURIComponent(jobId)}}`, {{
+    headers: controlHeaders()
+  }});
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error || 'request failed');
+  return body;
+}}
+async function cancelJob(jobId) {{
+  return postJson(`/api/jobs/${{encodeURIComponent(jobId)}}/cancel`, {{}});
+}}
+async function waitForJob(jobId, statusEl, slowText, isActive) {{
+  const slowTimer = setTimeout(() => {{
+    if (isActive(jobId)) {{
+      statusEl.innerHTML = `<span class="warn">${{esc(slowText)}}</span>`;
+    }}
+  }}, 10000);
+  try {{
+    while (isActive(jobId)) {{
+      const job = await getJob(jobId);
+      if (job.status === 'completed') return job.result;
+      if (job.status === 'failed') throw new Error(job.error || 'request failed');
+      if (job.status === 'cancelled') throw new Error('运行已中断');
+      if (job.slow) {{
+        statusEl.innerHTML = `<span class="warn">${{esc(slowText)}} · ${{Math.round(job.runtime_seconds)}}s</span>`;
+      }}
+      await sleep(750);
+    }}
+    throw new Error('运行已中断');
+  }} finally {{
+    clearTimeout(slowTimer);
+  }}
+}}
+async function submitIdea(parserMode) {{
+  const job = await postJson('/api/jobs/run-idea', {{
       text: document.getElementById('idea').value,
       parser_mode: parserMode,
       llm_provider: document.getElementById('llm-provider').value
-    }})
   }});
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || 'request failed');
-  return payload;
+  activeIdeaJobId = job.job_id;
+  cancelButton.disabled = false;
+  return waitForJob(
+    job.job_id,
+    statusEl,
+    '已运行超过10秒，系统仍在解析、计算或回测',
+    jobId => activeIdeaJobId === jobId
+  );
 }}
 button.addEventListener('click', async () => {{
   button.disabled = true;
+  cancelButton.disabled = true;
   errorEl.textContent = '';
   statusEl.textContent = '运行中...';
   const parserMode = document.getElementById('parser').value;
@@ -1098,6 +1529,10 @@ button.addEventListener('click', async () => {{
     render(payload);
     statusEl.innerHTML = '<span class="ok">验证完成</span>';
   }} catch (error) {{
+    if (error.message === '运行已中断') {{
+      statusEl.innerHTML = '<span class="warn">运行已中断</span>';
+      return;
+    }}
     if (parserMode === 'llm') {{
       const fallback = window.confirm(`LLM 无法使用：${{error.message}}\n\n是否改用本地规则解析？`);
       if (fallback) {{
@@ -1116,26 +1551,57 @@ button.addEventListener('click', async () => {{
     errorEl.textContent = error.message;
     statusEl.textContent = '运行失败';
   }} finally {{
+    activeIdeaJobId = null;
     button.disabled = false;
+    cancelButton.disabled = true;
+  }}
+}});
+cancelButton.addEventListener('click', async () => {{
+  const jobId = activeIdeaJobId;
+  if (!jobId) return;
+  cancelButton.disabled = true;
+  statusEl.innerHTML = '<span class="warn">已请求中断本次运行；当前安全阶段结束后停止</span>';
+  try {{
+    await cancelJob(jobId);
+  }} catch (error) {{
+    errorEl.textContent = error.message;
+    cancelButton.disabled = false;
   }}
 }});
 rdRun.addEventListener('click', async () => {{
   rdRun.disabled = true;
+  rdCancel.disabled = true;
   rdStatusEl.textContent = 'RD 运行中...';
   try {{
-    const response = await fetch('/api/research/run-once', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify(rdPayload())
-    }});
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || 'request failed');
+    const job = await postJson('/api/jobs/research-run-once', rdPayload());
+    activeRdJobId = job.job_id;
+    rdCancel.disabled = false;
+    const payload = await waitForJob(
+      job.job_id,
+      rdStatusEl,
+      '已运行超过10秒，RD 仍在生成、评价或回测',
+      jobId => activeRdJobId === jobId
+    );
     renderResearch(payload);
     rdStatusEl.innerHTML = '<span class="ok">RD 完成</span>';
   }} catch (error) {{
-    rdStatusEl.textContent = error.message;
+    rdStatusEl.textContent = error.message === '运行已中断' ? 'RD 已中断' : error.message;
   }} finally {{
+    activeRdJobId = null;
     rdRun.disabled = false;
+    rdCancel.disabled = true;
+  }}
+}});
+rdCancel.addEventListener('click', async () => {{
+  const jobId = activeRdJobId;
+  if (!jobId) return;
+  rdCancel.disabled = true;
+  rdStatusEl.innerHTML = '<span class="warn">已请求中断本次RD；当前安全阶段结束后停止</span>';
+  try {{
+    await cancelJob(jobId);
+  }} catch (error) {{
+    rdStatusEl.textContent = error.message;
+    rdCancel.disabled = false;
   }}
 }});
 rdStart.addEventListener('click', async () => {{
@@ -1145,13 +1611,7 @@ rdStart.addEventListener('click', async () => {{
     const payload = rdPayload();
     payload.action = 'start';
     payload.interval_days = Number(document.getElementById('rd-interval').value);
-    const response = await fetch('/api/research/schedule', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify(payload)
-    }});
-    const status = await response.json();
-    if (!response.ok) throw new Error(status.error || 'request failed');
+    const status = await postJson('/api/research/schedule', payload);
     rdStatusEl.innerHTML = '<span class="ok">调度已开启</span>';
     if (status.last_result) renderResearch(status.last_result);
   }} catch (error) {{
@@ -1163,13 +1623,7 @@ rdStart.addEventListener('click', async () => {{
 rdStop.addEventListener('click', async () => {{
   rdStop.disabled = true;
   try {{
-    const response = await fetch('/api/research/schedule', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{action: 'stop'}})
-    }});
-    const status = await response.json();
-    if (!response.ok) throw new Error(status.error || 'request failed');
+    const status = await postJson('/api/research/schedule', {{action: 'stop'}});
     rdStatusEl.textContent = status.run_count ? `调度已停止，累计运行 ${{status.run_count}} 次` : '调度已停止';
   }} catch (error) {{
     rdStatusEl.textContent = error.message;

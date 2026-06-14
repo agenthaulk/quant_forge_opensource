@@ -301,6 +301,9 @@ class ResearchCandidateResult:
     gate_reasons: tuple[str, ...]
     self_review: ResearchSelfReview
     transitioned_to_candidate: bool = False
+    formula_fingerprint: str = ""
+    result_signature: str = ""
+    candidate_shape_fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -361,6 +364,10 @@ class _RepairOutcome:
     exhausted: bool = False
 
 
+class _ResearchRunCancelled(RuntimeError):
+    pass
+
+
 class ResearchLoopService:
     def __init__(
         self,
@@ -389,6 +396,7 @@ class ResearchLoopService:
         experiment_planner: ExperimentPlanner | None = None,
         deduplication: ResearchDeduplicationConfig | None = None,
         llm_formula_repair_attempts: int = DEFAULT_LLM_FORMULA_REPAIR_ATTEMPTS,
+        cancel_event: Any | None = None,
     ) -> None:
         self.factor_root = factor_root
         self.data_root = data_root
@@ -428,6 +436,11 @@ class ResearchLoopService:
         if not 0 <= llm_formula_repair_attempts <= 3:
             raise ValueError("llm_formula_repair_attempts must be between 0 and 3")
         self.llm_formula_repair_attempts = llm_formula_repair_attempts
+        self.cancel_event = cancel_event
+        self._active_run_id: str | None = None
+        self._cancel_written = False
+        self._created_factor_ids: set[str] = set()
+        self._promoted_factor_snapshots: dict[str, FactorDefinition] = {}
 
     def run_once(
         self,
@@ -439,6 +452,7 @@ class ResearchLoopService:
         gate: ResearchGate | None = None,
         hypotheses: tuple[ResearchHypothesis, ...] | None = None,
     ) -> ResearchLoopResult:
+        self._raise_if_cancelled()
         if max_candidates < 1 or max_candidates > 10:
             raise ValueError("max_candidates must be between 1 and 10")
         repo = FactorRepository(self.factor_root)
@@ -451,8 +465,13 @@ class ResearchLoopService:
         objective_weights = weights or objective_weights_for(objective)
         candidate_gate = gate or ResearchGate()
         run_id = _research_run_id(seed_factor_id)
+        self._active_run_id = run_id
+        self._cancel_written = False
+        self._created_factor_ids = set()
+        self._promoted_factor_snapshots = {}
         self.trace_store.ensure_run_dirs(run_id)
         self.trace_store.write_run(run_id, {"run_id": run_id, "status": "running", "started_at": utc_timestamp()})
+        self._raise_if_cancelled()
         context = ResearchContextBuilder(
             factor_root=self.factor_root,
             data_root=self.data_root,
@@ -461,6 +480,7 @@ class ResearchLoopService:
             trace_store=self.trace_store,
         ).build(objective=objective, seed_factor_ids=(seed_factor_id,))
         self.trace_store.write_context(run_id, context)
+        self._raise_if_cancelled()
         planned = hypotheses or _generate_hypotheses(
             self.hypothesis_generator,
             seed,
@@ -517,6 +537,7 @@ class ResearchLoopService:
             "skipped_plans": [],
         }
         for lane_index, raw_hypothesis in enumerate(planned[:max_candidates], start=1):
+            self._raise_if_cancelled()
             hypothesis = _normalize_llm_research_hypothesis(raw_hypothesis, generation)
             if _llm_formula_required_but_missing(hypothesis, generation):
                 structured = _structured_hypothesis_for_missing_formula(hypothesis, generation, lane_index=lane_index)
@@ -618,16 +639,18 @@ class ResearchLoopService:
             candidate = (
                 seed
                 if hypothesis.parameter_search_fallback
-                else _load_or_save_candidate(repo, planned_candidate)
+                else self._load_or_save_candidate(repo, planned_candidate)
             )
             for profile in self.simulation_profiles:
                 trials.append(_ResearchTrial(hypothesis, candidate, profile, plan))
+        self._raise_if_cancelled()
         search_trace, final_trials, failed_quick_results = self._select_final_trials(trials, objective_weights)
         blocked_plans.extend(failed_quick_results)
         for failed in failed_quick_results:
             self._trace_structured_result(run_id, failed, phase="experiment_failed")
         results: list[ResearchCandidateResult] = []
         for trial in final_trials:
+            self._raise_if_cancelled()
             try:
                 candidate_result = self._evaluate_final_trial(
                     repo,
@@ -637,6 +660,8 @@ class ResearchLoopService:
                     candidate_gate,
                     result_signature_index=result_index,
                 )
+            except _ResearchRunCancelled:
+                raise
             except Exception as exc:
                 failed = _failed_structured_result(trial.plan, error=str(exc))
                 blocked_plans.append(failed)
@@ -674,6 +699,7 @@ class ResearchLoopService:
         )
         from quant_forge.research_loop.reporting import write_research_report
 
+        self._raise_if_cancelled()
         result = replace(result, report_path=write_research_report(result, self.artifact_root))
         run_status = (
             "completed"
@@ -694,7 +720,52 @@ class ResearchLoopService:
                 "report_path": result.report_path,
             },
         )
+        self._created_factor_ids.clear()
+        self._promoted_factor_snapshots.clear()
         return result
+
+    def _raise_if_cancelled(self) -> None:
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            self._mark_cancelled()
+            self._rollback_cancelled_mutations()
+            raise _ResearchRunCancelled("research run cancelled by user")
+
+    def _mark_cancelled(self) -> None:
+        if self._active_run_id is None or self._cancel_written:
+            return
+        self.trace_store.write_run(
+            self._active_run_id,
+            {
+                "run_id": self._active_run_id,
+                "status": "cancelled",
+                "finished_at": utc_timestamp(),
+            },
+        )
+        self._cancel_written = True
+
+    def _rollback_cancelled_mutations(self) -> None:
+        if not self._created_factor_ids and not self._promoted_factor_snapshots:
+            return
+        repo = FactorRepository(self.factor_root)
+        for factor_id, original in tuple(self._promoted_factor_snapshots.items()):
+            repo.save(original)
+            self._promoted_factor_snapshots.pop(factor_id, None)
+        for factor_id in tuple(self._created_factor_ids):
+            repo.delete(factor_id)
+            self._created_factor_ids.discard(factor_id)
+
+    def _load_or_save_candidate(self, repo: FactorRepository, draft: FactorDefinition) -> FactorDefinition:
+        existed = _factor_exists(repo, draft.factor_id)
+        candidate = _load_or_save_candidate(repo, draft)
+        if not existed:
+            self._created_factor_ids.add(candidate.factor_id)
+        return candidate
+
+    def _promote_candidate(self, repo: FactorRepository, candidate: FactorDefinition, *, reason: str) -> FactorDefinition:
+        self._promoted_factor_snapshots.setdefault(candidate.factor_id, candidate)
+        promoted = repo.promote(candidate.factor_id, "candidate", reason)
+        self._raise_if_cancelled()
+        return promoted
 
     def _record_blocked_plan_and_maybe_fallback(
         self,
@@ -779,6 +850,7 @@ class ResearchLoopService:
         current_hypothesis = hypothesis
         current_plan = plan
         for attempt in range(1, self.llm_formula_repair_attempts + 1):
+            self._raise_if_cancelled()
             repaired = repair(
                 seed,
                 hypothesis=current_hypothesis,
@@ -881,6 +953,7 @@ class ResearchLoopService:
         scored_trials: list[_ScoredTrial] = []
         failed_results: list[StructuredFactorExperimentResult] = []
         for trial in trials:
+            self._raise_if_cancelled()
             try:
                 scored_trials.append(
                     self._score_trial(
@@ -890,6 +963,8 @@ class ResearchLoopService:
                         sample_splits=self.quick_sample_splits,
                     )
                 )
+            except _ResearchRunCancelled:
+                raise
             except Exception as exc:
                 failed_results.append(_failed_structured_result(trial.plan, error=str(exc)))
         if not scored_trials:
@@ -924,6 +999,7 @@ class ResearchLoopService:
         horizon_days_matrix: tuple[int, ...] | None,
         sample_splits: tuple[SampleSplitSpec, ...] | None,
     ) -> _ScoredTrial:
+        self._raise_if_cancelled()
         evaluation = evaluate_factor(
             trial.factor.factor_id,
             factor_root=self.factor_root,
@@ -937,6 +1013,7 @@ class ResearchLoopService:
             factor_values_overlay_root=self.factor_values_overlay_root,
             factor_values_manifest_root=self.factor_values_manifest_root,
         )
+        self._raise_if_cancelled()
         backtest = run_factor_backtest(
             trial.factor.factor_id,
             factor_root=self.factor_root,
@@ -950,6 +1027,7 @@ class ResearchLoopService:
             factor_values_overlay_root=self.factor_values_overlay_root,
             factor_values_manifest_root=self.factor_values_manifest_root,
         )
+        self._raise_if_cancelled()
         split_weighted_icir = weighted_split_icir(evaluation)
         score = score_candidate(evaluation, backtest, objective_weights, split_weighted_icir)
         return _ScoredTrial(trial, evaluation, backtest, split_weighted_icir, score)
@@ -963,6 +1041,7 @@ class ResearchLoopService:
         candidate_gate: ResearchGate,
         result_signature_index: dict[str, str] | None = None,
     ) -> ResearchCandidateResult:
+        self._raise_if_cancelled()
         scored = self._score_trial(
             trial,
             objective_weights,
@@ -987,16 +1066,12 @@ class ResearchLoopService:
                 result_signature_index[result_signature] = trial.factor.factor_id
         candidate = repo.get(trial.factor.factor_id)
         transitioned_to_candidate = False
+        promote_after_review = False
         if gate_passed:
             if candidate.factor_id == seed.factor_id:
                 pass
             elif candidate.status == "draft":
-                candidate = repo.promote(
-                    candidate.factor_id,
-                    "candidate",
-                    "Research loop smoke gate passed; active promotion still requires user decision.",
-                )
-                transitioned_to_candidate = True
+                promote_after_review = True
             elif candidate.status in {"candidate", "active"}:
                 pass
             else:
@@ -1004,6 +1079,7 @@ class ResearchLoopService:
                 gate_reasons = (*gate_reasons, f"existing {candidate.status} status requires explicit user decision")
         elif candidate.status != "draft":
             gate_reasons = (*gate_reasons, f"existing {candidate.status} status preserved")
+        self._raise_if_cancelled()
         self_review = self.review_generator.review(
             seed=seed,
             candidate=candidate,
@@ -1014,6 +1090,14 @@ class ResearchLoopService:
             gate_passed=gate_passed,
             gate_reasons=gate_reasons,
         )
+        self._raise_if_cancelled()
+        if promote_after_review:
+            candidate = self._promote_candidate(
+                repo,
+                candidate,
+                reason="Research loop smoke gate passed; active promotion still requires user decision.",
+            )
+            transitioned_to_candidate = True
         return ResearchCandidateResult(
             hypothesis=trial.hypothesis,
             factor=candidate,
@@ -1025,6 +1109,9 @@ class ResearchLoopService:
             gate_reasons=gate_reasons,
             self_review=self_review,
             transitioned_to_candidate=transitioned_to_candidate,
+            formula_fingerprint=factor_formula_fingerprint(candidate),
+            result_signature=result_signature,
+            candidate_shape_fingerprint=_candidate_shape_fingerprint(trial.plan, candidate),
         )
 
 
@@ -1695,6 +1782,9 @@ def _evaluation_metrics(evaluation: EvaluationResult) -> dict[str, object]:
         "score_source": evaluation.score_source,
         "score_cached_rows": evaluation.score_cached_rows,
         "score_computed_rows": evaluation.score_computed_rows,
+        "score_compute_mode": evaluation.score_compute_mode,
+        "score_missing_ratio": evaluation.score_missing_ratio,
+        "score_context_rows": evaluation.score_context_rows,
     }
 
 
@@ -1710,6 +1800,9 @@ def _backtest_metrics(backtest: BacktestResult) -> dict[str, object]:
         "score_source": backtest.score_source,
         "score_cached_rows": backtest.score_cached_rows,
         "score_computed_rows": backtest.score_computed_rows,
+        "score_compute_mode": backtest.score_compute_mode,
+        "score_missing_ratio": backtest.score_missing_ratio,
+        "score_context_rows": backtest.score_context_rows,
     }
 
 
@@ -1717,6 +1810,9 @@ def _artifact_refs(candidate: ResearchCandidateResult) -> dict[str, str]:
     return {
         "evaluation": candidate.evaluation.artifact_path.name,
         "backtest": candidate.backtest.artifact_path.name,
+        "formula_fingerprint": candidate.formula_fingerprint,
+        "result_signature": candidate.result_signature,
+        "candidate_shape_fingerprint": candidate.candidate_shape_fingerprint,
     }
 
 
@@ -1733,6 +1829,14 @@ def _load_or_save_candidate(repo: FactorRepository, draft: FactorDefinition) -> 
     ):
         raise ValueError(f"research candidate id collision with different definition: {draft.factor_id}")
     return existing
+
+
+def _factor_exists(repo: FactorRepository, factor_id: str) -> bool:
+    try:
+        repo.get(factor_id)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def _oos_decay(evaluation: EvaluationResult) -> bool:

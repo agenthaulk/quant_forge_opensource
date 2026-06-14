@@ -31,6 +31,7 @@ class WebSettings:
     host: str = "127.0.0.1"
     port: int = 8765
     allow_docker_bind: bool = False
+    control_token_env: str = ""
 
 
 @dataclass(frozen=True)
@@ -180,6 +181,7 @@ def load_config(config_path: Path | None = None, workspace: Path | None = None) 
             host=str(_nested(raw, "web", "host", default="127.0.0.1")),
             port=int(_nested(raw, "web", "port", default=8765)),
             allow_docker_bind=bool(_nested(raw, "web", "allow_docker_bind", default=False)),
+            control_token_env=str(_nested(raw, "web", "control_token_env", default="")),
         ),
         research=ResearchSettings(
             default_horizon_days=int(_nested(raw, "research", "default_horizon_days", default=5)),

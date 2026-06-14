@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -35,6 +36,7 @@ from quant_forge.research_loop.service import (
     ResearchGenerationMetadata,
     ResearchHypothesis,
     ResearchLoopService,
+    ResearchSelfReview,
     _candidate_from_hypothesis,
     apply_gate,
 )
@@ -738,6 +740,137 @@ def test_research_loop_happy_path_has_unique_trace_and_candidate_transition(tmp_
     assert str(paths["workspace"]) not in (first.trace_root / "context.json").read_text(encoding="utf-8")
 
 
+def test_research_loop_cancel_writes_terminal_run_status(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    cancel_event = threading.Event()
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        hypothesis_generator=_CancellingGenerator(cancel_event),
+        cancel_event=cancel_event,
+    )
+
+    with pytest.raises(RuntimeError, match="cancelled"):
+        service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    run_paths = sorted((paths["artifact_root"] / "research_loop" / "runs").glob("rd_FTR_DEMO_SMALL_CAP_*/run.json"))
+    assert run_paths
+    payload = json.loads(run_paths[-1].read_text(encoding="utf-8"))
+    assert payload["status"] == "cancelled"
+    assert payload["finished_at"]
+
+
+def test_research_loop_cancel_cleans_new_candidate_factor(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    cancel_event = threading.Event()
+    repo = FactorRepository(paths["factor_root"])
+    before = {factor.factor_id for factor in repo.list()}
+    service = _CancellingAfterCandidateSaveService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        deduplication=ResearchDeduplicationConfig(enabled=False),
+        hypothesis_generator=_FixedFormulaGenerator(),
+        cancel_event=cancel_event,
+    )
+
+    with pytest.raises(RuntimeError, match="cancelled"):
+        service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    after = {factor.factor_id for factor in repo.list()}
+    assert after == before
+
+
+def test_research_loop_cancel_does_not_promote_existing_draft_candidate(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    cancel_event = threading.Event()
+    repo = FactorRepository(paths["factor_root"])
+    hypothesis = _FixedFormulaGenerator().generate_with_context()[0]
+    draft = _candidate_from_hypothesis(hypothesis, horizon_days=5)
+    repo.save(draft)
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        deduplication=ResearchDeduplicationConfig(enabled=False),
+        hypothesis_generator=_FixedFormulaGenerator(),
+        review_generator=_CancellingReview(cancel_event),
+        cancel_event=cancel_event,
+    )
+
+    with pytest.raises(RuntimeError, match="cancelled"):
+        service.run_once(
+            "FTR_DEMO_SMALL_CAP",
+            max_candidates=1,
+            gate=ResearchGate(min_ic_days=0, min_coverage=0.0, min_backtest_periods=0, min_score=-999.0),
+        )
+
+    assert repo.get(draft.factor_id).status == "draft"
+
+
+def test_research_loop_cancel_during_promote_rolls_back_existing_draft_candidate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    cancel_event = threading.Event()
+    repo = FactorRepository(paths["factor_root"])
+    hypothesis = _FixedFormulaGenerator().generate_with_context()[0]
+    draft = _candidate_from_hypothesis(hypothesis, horizon_days=5)
+    repo.save(draft)
+    original_promote = FactorRepository.promote
+
+    def cancelling_promote(self, *args, **kwargs):
+        result = original_promote(self, *args, **kwargs)
+        cancel_event.set()
+        return result
+
+    monkeypatch.setattr(FactorRepository, "promote", cancelling_promote)
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        deduplication=ResearchDeduplicationConfig(enabled=False),
+        hypothesis_generator=_FixedFormulaGenerator(),
+        cancel_event=cancel_event,
+    )
+
+    with pytest.raises(RuntimeError, match="cancelled"):
+        service.run_once(
+            "FTR_DEMO_SMALL_CAP",
+            max_candidates=1,
+            gate=ResearchGate(min_ic_days=0, min_coverage=0.0, min_backtest_periods=0, min_score=-999.0),
+        )
+
+    assert repo.get(draft.factor_id).status == "draft"
+
+
+def test_research_loop_cancel_after_promote_returns_rolls_back_existing_draft_candidate(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    cancel_event = threading.Event()
+    repo = FactorRepository(paths["factor_root"])
+    hypothesis = _FixedFormulaGenerator().generate_with_context()[0]
+    draft = _candidate_from_hypothesis(hypothesis, horizon_days=5)
+    repo.save(draft)
+    service = _CancellingAfterPromoteService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        deduplication=ResearchDeduplicationConfig(enabled=False),
+        hypothesis_generator=_FixedFormulaGenerator(),
+        cancel_event=cancel_event,
+    )
+
+    with pytest.raises(RuntimeError, match="cancelled"):
+        service.run_once(
+            "FTR_DEMO_SMALL_CAP",
+            max_candidates=1,
+            gate=ResearchGate(min_ic_days=0, min_coverage=0.0, min_backtest_periods=0, min_score=-999.0),
+        )
+
+    assert repo.get(draft.factor_id).status == "draft"
+
+
 def test_research_loop_uses_parameter_search_fallback_when_no_ideas(tmp_path: Path) -> None:
     paths = create_demo_workspace(tmp_path / "demo")
     FactorRepository(paths["factor_root"]).promote(
@@ -1105,9 +1238,16 @@ def test_research_loop_blocks_duplicate_result_signature_before_promotion(
     assert len(result.candidates) == 2
     assert result.candidates[0].gate_passed is True
     assert result.candidates[1].gate_passed is False
+    assert result.candidates[0].formula_fingerprint
+    assert result.candidates[0].result_signature
+    assert result.candidates[0].candidate_shape_fingerprint
     assert "duplicate result signature matches" in "; ".join(result.candidates[1].gate_reasons)
     assert result.deduplication["result_duplicates"] == 1
     assert len(result.accepted_candidate_ids) == 1
+    report = result.report_path.read_text(encoding="utf-8") if result.report_path else ""
+    assert "Formula Fingerprint:" in report
+    assert "Result Signature:" in report
+    assert "Candidate Shape Fingerprint:" in report
 
 
 class _BlockingPlanner:
@@ -1143,6 +1283,64 @@ class _EmptyGenerator:
 
     def generate_with_context(self, *args, **kwargs):
         return ()
+
+
+class _FixedFormulaGenerator:
+    def metadata(self) -> ResearchGenerationMetadata:
+        return ResearchGenerationMetadata(source="fixed_generator", provider="test", model="fixed")
+
+    def generate_with_context(self, *args, **kwargs):
+        return (
+            ResearchHypothesis(
+                text="fixed momentum idea",
+                rationale="fixed executable formula for cancellation tests",
+                source="financial_analyst",
+                formula_dsl="rank(return_5d)",
+                input_fields=("return_5d",),
+                expected_direction="positive",
+                universe_constraints=("is_st == false",),
+            ),
+        )
+
+
+class _CancellingGenerator(_FixedFormulaGenerator):
+    def __init__(self, cancel_event: threading.Event) -> None:
+        self.cancel_event = cancel_event
+
+    def generate_with_context(self, *args, **kwargs):
+        self.cancel_event.set()
+        return super().generate_with_context(*args, **kwargs)
+
+
+class _CancellingAfterCandidateSaveService(ResearchLoopService):
+    def _load_or_save_candidate(self, repo: FactorRepository, draft: FactorDefinition) -> FactorDefinition:
+        candidate = super()._load_or_save_candidate(repo, draft)
+        if self.cancel_event is not None:
+            self.cancel_event.set()
+        return candidate
+
+
+class _CancellingAfterPromoteService(ResearchLoopService):
+    def _promote_candidate(self, repo: FactorRepository, candidate: FactorDefinition, *, reason: str) -> FactorDefinition:
+        promoted = super()._promote_candidate(repo, candidate, reason=reason)
+        if self.cancel_event is not None:
+            self.cancel_event.set()
+        return promoted
+
+
+class _CancellingReview:
+    def __init__(self, cancel_event: threading.Event) -> None:
+        self.cancel_event = cancel_event
+
+    def review(self, **kwargs):
+        self.cancel_event.set()
+        return ResearchSelfReview(
+            source="test",
+            summary="cancel during review",
+            strengths=(),
+            risks=("cancelled",),
+            next_hypotheses=(),
+        )
 
 
 class _InvalidNoRepairGenerator:
