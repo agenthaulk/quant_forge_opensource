@@ -486,99 +486,254 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
   <style>
     :root {{
       color-scheme: light;
-      --ink: #15201a;
-      --muted: #64736a;
-      --line: #d6e1d8;
-      --soft: #f5f8f4;
-      --accent: #27633b;
-      --accent-2: #205b83;
-      --bad: #9c2f2f;
+      --ink: #17211d;
+      --muted: #65736e;
+      --faint: #87948e;
+      --line: #d9e0dc;
+      --line-strong: #b7c4be;
+      --surface: #fbfcfa;
       --panel: #ffffff;
+      --wash: #f2f6f1;
+      --accent: #134b3c;
+      --accent-2: #1f6f63;
+      --blue: #265f8f;
+      --bad: #9b2f31;
+      --warn: #a36213;
+      --mono: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
     }}
     * {{ box-sizing: border-box; }}
+    html {{ min-width: 320px; }}
     body {{
       margin: 0;
-      font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       color: var(--ink);
-      background: linear-gradient(180deg, #f8fbf7 0%, #eef5ef 100%);
+      background:
+        linear-gradient(90deg, rgba(19,75,60,.045) 1px, transparent 1px),
+        linear-gradient(180deg, rgba(38,95,143,.04) 1px, transparent 1px),
+        var(--surface);
+      background-size: 40px 40px;
     }}
-    main {{
+    .app-shell {{
       min-height: 100vh;
       display: grid;
-      grid-template-columns: minmax(320px, 420px) 1fr;
-      gap: 0;
+      grid-template-columns: minmax(300px, 388px) minmax(0, 1fr);
     }}
-    aside {{
-      padding: 28px;
+    .control-rail {{
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow: auto;
+      padding: 22px;
       border-right: 1px solid var(--line);
-      background: rgba(255, 255, 255, 0.82);
+      background: rgba(251, 252, 250, .94);
+      backdrop-filter: blur(8px);
     }}
-    section {{
-      padding: 28px;
+    .workbench {{
+      min-width: 0;
+      padding: 22px 28px 32px;
     }}
     h1, h2, h3, p {{ margin-top: 0; }}
-    h1 {{ font-size: 26px; margin-bottom: 8px; }}
-    h2 {{ font-size: 18px; color: var(--accent); letter-spacing: 0; }}
-    h3 {{ font-size: 15px; margin-bottom: 8px; color: var(--muted); }}
-    label {{ display: block; margin: 20px 0 8px; font-weight: 700; }}
+    h1 {{
+      margin-bottom: 4px;
+      font-size: 26px;
+      line-height: 1.08;
+      letter-spacing: 0;
+    }}
+    h2 {{
+      margin-bottom: 8px;
+      font-size: 15px;
+      color: var(--ink);
+      letter-spacing: 0;
+    }}
+    h3 {{
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }}
+    label {{
+      display: block;
+      margin: 14px 0 7px;
+      font-size: 12px;
+      font-weight: 800;
+      color: var(--muted);
+    }}
     textarea, select, input {{
       width: 100%;
       border: 1px solid var(--line);
-      border-radius: 8px;
+      border-radius: 6px;
       background: #fff;
       color: var(--ink);
       font: inherit;
+      outline: none;
+      transition: border-color .15s ease, box-shadow .15s ease;
+    }}
+    textarea:focus, select:focus, input:focus {{
+      border-color: var(--accent-2);
+      box-shadow: 0 0 0 3px rgba(31, 111, 99, .12);
     }}
     textarea {{
-      min-height: 150px;
+      min-height: 126px;
       resize: vertical;
-      padding: 14px;
+      padding: 12px;
     }}
     select {{ padding: 10px 12px; }}
     input {{ padding: 10px 12px; }}
     button {{
       width: 100%;
-      margin-top: 16px;
-      border: 0;
-      border-radius: 8px;
+      margin-top: 14px;
+      border: 1px solid var(--accent);
+      border-radius: 6px;
       padding: 13px 16px;
       background: var(--accent);
       color: #fff;
       font-weight: 800;
       cursor: pointer;
+      transition: transform .12s ease, background .12s ease;
+    }}
+    button:hover {{ background: #0f3f32; }}
+    button:active {{ transform: translateY(1px); }}
+    button.secondary {{
+      border-color: var(--line-strong);
+      background: #fff;
+      color: var(--ink);
     }}
     button:disabled {{ opacity: .55; cursor: wait; }}
     code {{
       background: #eef5ef;
       border: 1px solid var(--line);
-      border-radius: 6px;
+      border-radius: 5px;
       padding: 2px 6px;
+    }}
+    .brand {{
+      padding-bottom: 18px;
+      border-bottom: 1px solid var(--line);
+    }}
+    .brand-mark {{
+      display: inline-grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      margin-bottom: 12px;
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--accent);
+      font-family: var(--mono);
+      font-weight: 900;
+    }}
+    .brand-subtitle {{
+      margin-bottom: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .sr-only {{
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }}
+    .runtime-strip {{
+      display: grid;
+      gap: 8px;
+      margin: 18px 0;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }}
+    .runtime-row {{
+      display: grid;
+      grid-template-columns: 78px minmax(0, 1fr);
+      gap: 10px;
+      align-items: start;
+      min-width: 0;
+      font-size: 12px;
+    }}
+    .runtime-row span:first-child {{
+      color: var(--faint);
+      font-weight: 800;
     }}
     .meta {{
       color: var(--muted);
       font-size: 13px;
       word-break: break-word;
     }}
+    .path-meta {{
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      line-height: 1.45;
+      word-break: break-all;
+    }}
+    .section-title {{
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 14px;
+      margin: 0 0 14px;
+    }}
+    .section-title p {{
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .form-block {{
+      margin: 18px 0;
+      padding-bottom: 18px;
+      border-bottom: 1px solid var(--line);
+    }}
     .grid {{
       display: grid;
-      grid-template-columns: repeat(4, minmax(150px, 1fr));
-      gap: 14px;
-      margin: 18px 0 26px;
+      grid-template-columns: repeat(4, minmax(132px, 1fr));
+      gap: 10px;
+      margin: 14px 0 20px;
     }}
     .tile, .panel {{
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
-      padding: 18px;
+    }}
+    .tile {{
+      min-height: 94px;
+      padding: 14px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
     }}
     .tile b {{
       display: block;
-      margin-top: 8px;
-      font-size: 27px;
+      margin-top: 10px;
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: clamp(20px, 2.3vw, 28px);
+      line-height: 1.05;
+      letter-spacing: 0;
     }}
-    .panel {{ margin-bottom: 16px; }}
+    .panel {{
+      margin-bottom: 14px;
+      padding: 18px;
+    }}
+    .hero-panel {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 18px;
+      align-items: start;
+      border-top: 4px solid var(--accent);
+    }}
+    .hero-panel > p {{
+      grid-column: 1 / -1;
+      margin: 0;
+    }}
     hr {{
-      margin: 26px 0;
+      margin: 20px 0;
       border: 0;
       border-top: 1px solid var(--line);
     }}
@@ -594,86 +749,154 @@ def _index_html(config: QuantForgeConfig, rd_config: ResearchLoopConfig | None =
     .pill {{
       display: inline-block;
       border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 3px 9px;
+      border-radius: 6px;
+      padding: 4px 8px;
       margin: 2px 4px 2px 0;
       color: var(--muted);
-      font-size: 12px;
+      background: #fff;
+      font-size: 11px;
+      font-family: var(--mono);
     }}
     .ok {{ color: var(--accent-2); font-weight: 800; }}
-    .warn {{ color: #9a5a12; font-weight: 800; }}
+    .warn {{ color: var(--warn); font-weight: 800; }}
     .err {{ color: var(--bad); font-weight: 800; white-space: pre-wrap; }}
     .formula {{
-      font-size: 22px;
+      max-width: 100%;
+      overflow-wrap: anywhere;
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: clamp(18px, 2vw, 24px);
       font-weight: 800;
       margin: 10px 0;
     }}
+    .formula-badge {{
+      justify-self: end;
+      min-width: 104px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--wash);
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      text-align: right;
+    }}
+    .evidence-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }}
+    .empty-state {{
+      min-height: 240px;
+      display: grid;
+      align-content: center;
+      border-style: dashed;
+      background: rgba(255, 255, 255, .72);
+    }}
+    .empty-state h3 {{
+      color: var(--accent);
+      font-size: 13px;
+      letter-spacing: .08em;
+    }}
     @media (max-width: 900px) {{
-      main {{ grid-template-columns: 1fr; }}
-      aside {{ border-right: 0; border-bottom: 1px solid var(--line); }}
+      .app-shell {{ grid-template-columns: 1fr; }}
+      .control-rail {{
+        position: static;
+        height: auto;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }}
+      .workbench {{ padding: 18px; }}
       .grid {{ grid-template-columns: repeat(2, minmax(140px, 1fr)); }}
+      .evidence-grid {{ grid-template-columns: 1fr; }}
+      .hero-panel {{ grid-template-columns: 1fr; }}
+      .formula-badge {{ justify-self: start; text-align: left; }}
     }}
   </style>
 </head>
 <body>
-<main>
-  <aside>
-    <h1>Quant Forge</h1>
-    <p class="meta">LLM parser: {provider} / {model}</p>
-    <p class="meta">RD optimizer: {rd_optimizer_label}</p>
-    <p class="meta">data_root: {data_root}</p>
-    <p class="meta">factor_root: {factor_root}</p>
-    <p class="meta">factor_values_root: {factor_values_root or '未配置'}</p>
-    <p class="meta">factor_values_overlay_root: {factor_values_overlay_root or '未配置'}</p>
-    <p class="meta">artifact_root: {artifact_root}</p>
-    <label for="idea">因子观点</label>
-    <textarea id="idea">非ST的小市值股票未来表现更好</textarea>
-    <label for="parser">解析方式</label>
-    <select id="parser">
-      <option value="llm">LLM 语义解析: {parser_label}</option>
-      <option value="rule">本地规则解析</option>
-    </select>
-    <label for="llm-provider">LLM Provider</label>
-    <select id="llm-provider">
-{llm_provider_options}
-    </select>
-    <button id="run">解析并验证</button>
-    <p id="status" class="meta"></p>
-    <hr>
-    <h2>RD</h2>
-    <label for="rd-seed">Seed Factor</label>
-    {rd_seed_html}
-    <label for="rd-objective">目标优先级</label>
-    <select id="rd-objective">
-{objective_options}
-    </select>
-    <label for="rd-max">候选数量</label>
-    <input id="rd-max" type="number" min="1" max="10" value="{research_config.default_max_candidates}">
-    <label for="rd-interval">自动周期</label>
-    <select id="rd-interval">
-{interval_options}
-    </select>
-    <div class="button-row">
-      <button id="rd-run">运行一次</button>
-      <button id="rd-start">开启</button>
-      <button id="rd-stop">停止</button>
+<main class="app-shell">
+  <aside class="control-rail">
+    <div class="brand">
+      <div class="brand-mark">QF</div>
+      <h1>Quant Forge</h1>
+      <p class="brand-subtitle">Factor research console</p>
     </div>
-    <p id="rd-status" class="meta"></p>
+    <p class="sr-only">LLM parser: {provider} / {model}</p>
+    <p class="sr-only">RD optimizer: {rd_optimizer_label}</p>
+    <div class="runtime-strip">
+      <div class="runtime-row"><span>LLM</span><strong>{provider} / {model}</strong></div>
+      <div class="runtime-row"><span>RD</span><strong>{rd_optimizer_label}</strong></div>
+      <div class="runtime-row"><span>data</span><div class="path-meta">{data_root}</div></div>
+      <div class="runtime-row"><span>factors</span><div class="path-meta">{factor_root}</div></div>
+      <div class="runtime-row"><span>values</span><div class="path-meta">{factor_values_root or '未配置'}</div></div>
+      <div class="runtime-row"><span>overlay</span><div class="path-meta">{factor_values_overlay_root or '未配置'}</div></div>
+      <div class="runtime-row"><span>artifacts</span><div class="path-meta">{artifact_root}</div></div>
+    </div>
+    <div class="form-block">
+      <div class="section-title">
+        <h2>01 Parse</h2>
+        <p>idea → factor</p>
+      </div>
+      <label for="idea">因子观点</label>
+      <textarea id="idea">非ST的小市值股票未来表现更好</textarea>
+      <label for="parser">解析方式</label>
+      <select id="parser">
+        <option value="llm">LLM 语义解析: {parser_label}</option>
+        <option value="rule">本地规则解析</option>
+      </select>
+      <label for="llm-provider">LLM Provider</label>
+      <select id="llm-provider">
+{llm_provider_options}
+      </select>
+      <button id="run">解析并验证</button>
+      <p id="status" class="meta"></p>
+    </div>
+    <div class="form-block">
+      <div class="section-title">
+        <h2>02 Research</h2>
+        <p>seed → candidate</p>
+      </div>
+      <label for="rd-seed">Seed Factor</label>
+      {rd_seed_html}
+      <label for="rd-objective">目标优先级</label>
+      <select id="rd-objective">
+{objective_options}
+      </select>
+      <label for="rd-max">候选数量</label>
+      <input id="rd-max" type="number" min="1" max="10" value="{research_config.default_max_candidates}">
+      <label for="rd-interval">自动周期</label>
+      <select id="rd-interval">
+{interval_options}
+      </select>
+      <div class="button-row">
+        <button id="rd-run">运行一次</button>
+        <button id="rd-start" class="secondary">开启</button>
+        <button id="rd-stop" class="secondary">停止</button>
+      </div>
+      <p id="rd-status" class="meta"></p>
+    </div>
   </aside>
-  <section>
-    <h2>最新结果</h2>
+  <section class="workbench">
+    <div class="section-title">
+      <h2>Factor Tape</h2>
+      <p>解析、评价、回测集中展示</p>
+    </div>
     <div id="error" class="err"></div>
     <div id="result">
-      <div class="panel">
+      <div class="panel empty-state">
         <h3>等待输入</h3>
-        <p class="meta">运行后这里会展示最新的因子公式、评价指标和回测结果。</p>
+        <p class="meta">输入因子观点后运行，公式、IC、回测收益、缓存路径会在这里展开。</p>
       </div>
     </div>
-    <h2>RD 研究循环</h2>
+    <div class="section-title">
+      <h2>RD Loop</h2>
+      <p>候选因子与研究证据</p>
+    </div>
     <div id="rd-result">
-      <div class="panel">
+      <div class="panel empty-state">
         <h3>等待运行</h3>
-        <p class="meta">RD 候选会展示在这里。</p>
+        <p class="meta">RD 候选、gate、report path 和分段证据会展示在这里。</p>
       </div>
     </div>
   </section>
@@ -730,13 +953,18 @@ function render(payload) {{
     backtest.factor_values_path ? `backtest path ${{backtest.factor_values_path}}` : ''
   ].filter(Boolean).map(item => `<span class="pill">${{esc(item)}}</span>`).join('');
   resultEl.innerHTML = `
-    <div class="panel">
-      <h3>${{esc(factor.factor_id)}} · ${{esc(payload.parser.source)}} / ${{esc(payload.parser.provider)}} / ${{esc(payload.parser.model)}}</h3>
-      <div class="formula">${{esc(factor.formula)}}</div>
-      <p>${{esc(factor.description || '')}}</p>
-      <p class="meta">horizon_days: ${{factor.horizon_days}} · filters: ${{esc((factor.universe_filters || []).join(', ') || 'none')}}</p>
-      <p class="meta">test period: ${{esc(profilePeriodText(profile))}}</p>
-      <p class="meta">研究口径，不是生产交易口径。</p>
+    <div class="panel hero-panel">
+      <div>
+        <h3>${{esc(factor.factor_id)}} · ${{esc(payload.parser.source)}} / ${{esc(payload.parser.provider)}} / ${{esc(payload.parser.model)}}</h3>
+        <div class="formula">${{esc(factor.formula)}}</div>
+        <p>${{esc(factor.description || '')}}</p>
+        <p class="meta">test period: ${{esc(profilePeriodText(profile))}}</p>
+        <p class="meta">研究口径，不是生产交易口径。</p>
+      </div>
+      <div class="formula-badge">
+        H${{factor.horizon_days}}<br>
+        ${{esc((factor.universe_filters || []).join(' · ') || 'FULL')}}
+      </div>
     </div>
     <div class="grid">
       <div class="tile">Rank IC<b>${{num(evaluation.rank_ic_mean)}}</b></div>
@@ -757,19 +985,23 @@ function render(payload) {{
       <div class="tile">调仓率<b>${{pct(backtest.rebalance_rate || 0)}}</b></div>
       <div class="tile">换手率<b>${{pct(backtest.turnover_rate || 0)}}</b></div>
     </div>
-    <div class="panel">
-      <h3>三段验证</h3>
-      <p>${{splitRows || '<span class="pill">暂无</span>'}}</p>
-      <h3>回测分段</h3>
-      <p>${{segmentRows || '<span class="pill">暂无</span>'}}</p>
-      <h3>多周期评价</h3>
-      <p>${{horizonRows || '<span class="pill">暂无</span>'}}</p>
-      <h3>分组收益</h3>
-      <p>${{groupRows || '<span class="pill">暂无</span>'}}</p>
-      <h3>风险提示</h3>
-      <p>${{warningRows || '<span class="pill">研究口径，不是生产交易口径</span>'}}</p>
-      <h3>因子值缓存</h3>
-      <p>${{cacheRows || '<span class="pill">computed</span>'}}</p>
+    <div class="evidence-grid">
+      <div class="panel">
+        <h3>三段验证</h3>
+        <p>${{splitRows || '<span class="pill">暂无</span>'}}</p>
+        <h3>回测分段</h3>
+        <p>${{segmentRows || '<span class="pill">暂无</span>'}}</p>
+        <h3>多周期评价</h3>
+        <p>${{horizonRows || '<span class="pill">暂无</span>'}}</p>
+      </div>
+      <div class="panel">
+        <h3>分组收益</h3>
+        <p>${{groupRows || '<span class="pill">暂无</span>'}}</p>
+        <h3>风险提示</h3>
+        <p>${{warningRows || '<span class="pill">研究口径，不是生产交易口径</span>'}}</p>
+        <h3>因子值缓存</h3>
+        <p>${{cacheRows || '<span class="pill">computed</span>'}}</p>
+      </div>
     </div>
     <div class="panel">
       <h3>Artifacts</h3>
@@ -791,13 +1023,18 @@ function renderResearch(payload) {{
     const artifacts = [evaluation.artifact_path, backtest.artifact_path].filter(Boolean).join(' / ');
     const reviewWarnings = ((candidate.self_review && candidate.self_review.normalization_warnings) || []).join('; ');
     return `
-      <div class="panel">
-        <h3>${{esc(factor.factor_id)}} · ${{gate}}</h3>
-        <div class="formula">${{esc(factor.formula)}}</div>
-        <p>${{esc(candidate.hypothesis.text)}}</p>
-        <p class="meta">${{esc(candidate.hypothesis.rationale)}}</p>
-        <p class="meta">test period: ${{esc(profilePeriodText(profile))}}</p>
-        <p class="meta">研究口径，不是生产交易口径。</p>
+      <div class="panel hero-panel">
+        <div>
+          <h3>${{esc(factor.factor_id)}} · ${{gate}}</h3>
+          <div class="formula">${{esc(factor.formula)}}</div>
+          <p>${{esc(candidate.hypothesis.text)}}</p>
+          <p class="meta">${{esc(candidate.hypothesis.rationale)}}</p>
+          <p class="meta">test period: ${{esc(profilePeriodText(profile))}}</p>
+          <p class="meta">研究口径，不是生产交易口径。</p>
+        </div>
+        <div class="formula-badge">
+          score<br>${{num(candidate.score, 4)}}
+        </div>
         <p>
           <span class="pill">score ${{num(candidate.score, 4)}}</span>
           <span class="pill">split ICIR ${{num(candidate.split_weighted_icir || 0, 2)}}</span>
