@@ -18,7 +18,7 @@ from uuid import uuid4
 
 from quant_forge.backtesting.service import run_factor_backtest
 from quant_forge.config import QuantForgeConfig, validate_llm_runtime
-from quant_forge.core.contracts import BacktestResult, EvaluationResult
+from quant_forge.core.contracts import BacktestResult, EvaluationResult, FactorDefinition
 from quant_forge.evaluation.service import evaluate_factor
 from quant_forge.factor_library.catalog import FactorCatalog
 from quant_forge.factor_library.repository import FactorRepository
@@ -208,7 +208,7 @@ def run_idea_workflow(
     parsed = parse_factor_idea(text, llm_settings, mode=parser_mode)
     _raise_if_cancelled(cancel_event)
     repo = FactorRepository(config.paths.factor_root)
-    factor_existed = _factor_exists(repo, parsed.factor.factor_id)
+    previous_factor = _existing_factor(repo, parsed.factor.factor_id)
     try:
         repo.save(parsed.factor)
         _raise_if_cancelled(cancel_event)
@@ -241,8 +241,10 @@ def run_idea_workflow(
         )
         _raise_if_cancelled(cancel_event)
     except _WebJobCancelled:
-        if not factor_existed:
+        if previous_factor is None:
             repo.delete(parsed.factor.factor_id)
+        else:
+            repo.save(previous_factor)
         raise
     return _workflow_payload(parsed, evaluation, backtest)
 
@@ -557,12 +559,11 @@ def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
         raise _WebJobCancelled("run cancelled by user")
 
 
-def _factor_exists(repo: FactorRepository, factor_id: str) -> bool:
+def _existing_factor(repo: FactorRepository, factor_id: str) -> FactorDefinition | None:
     try:
-        repo.get(factor_id)
+        return repo.get(factor_id)
     except FileNotFoundError:
-        return False
-    return True
+        return None
 
 
 def _job_id_from_path(path: str) -> str:

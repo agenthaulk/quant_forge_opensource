@@ -921,6 +921,59 @@ def test_run_idea_workflow_cleans_new_factor_on_cancel(monkeypatch, tmp_path) ->
         FactorRepository(config.paths.factor_root).get("FTR_CANCELLED_PARSE")
 
 
+def test_run_idea_workflow_restores_existing_factor_on_cancel(monkeypatch, tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+    repo = FactorRepository(config.paths.factor_root)
+    original = FactorDefinition(
+        factor_id="FTR_CANCEL_RESTORE",
+        name="cancel_restore",
+        formula="rank(close)",
+        status="candidate",
+        description="Existing candidate should survive cancellation.",
+        horizon_days=10,
+        universe_filters=("is_st == false",),
+        source="research_loop",
+    )
+    original_path = repo.save(original)
+    cancel_event = threading.Event()
+
+    def fake_parse_factor_idea(text, llm, *, mode):
+        factor = FactorDefinition(
+            factor_id=original.factor_id,
+            name="cancelled_reparse",
+            formula="-rank(market_cap)",
+            status="draft",
+            description="Replacement draft must not survive cancellation.",
+            horizon_days=5,
+            source="llm",
+        )
+        return ParsedFactor(factor=factor, source="llm", provider="rule", model="deterministic")
+
+    def fake_evaluate_factor(*args, **kwargs):
+        cancel_event.set()
+        return EvaluationResult(
+            factor_id=original.factor_id,
+            observations=1,
+            coverage=1.0,
+            rank_ic_mean=0.0,
+            rank_ic_std=0.0,
+            rank_icir=0.0,
+            ic_days=1,
+            artifact_path=tmp_path / "evaluation.json",
+        )
+
+    monkeypatch.setattr(web_server, "parse_factor_idea", fake_parse_factor_idea)
+    monkeypatch.setattr(web_server, "evaluate_factor", fake_evaluate_factor)
+
+    with pytest.raises(web_server._WebJobCancelled):
+        run_idea_workflow(config, "cancel me", parser_mode="rule", cancel_event=cancel_event)
+
+    assert repo.get(original.factor_id) == original
+    assert original_path.exists()
+    assert sorted(config.paths.factor_root.glob("**/FTR_CANCEL_RESTORE/factor.yaml")) == [original_path]
+
+
 def test_web_html_keeps_active_llm_provider_visible_when_key_is_missing(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("QF_TEST_DEEPSEEK_KEY", raising=False)
     monkeypatch.setenv("QF_TEST_GLM_KEY", "set")
