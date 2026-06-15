@@ -97,7 +97,17 @@ class _WebJobManager:
                 if job.cancel_event.is_set():
                     self._finish(job_id, status="cancelled", error="run cancelled by user")
                 else:
-                    self._finish(job_id, status="completed", result=_web_public_json(result))
+                    try:
+                        public_result = _web_public_json(result)
+                    except Exception as exc:
+                        LOGGER.exception("web job %s result serialization failed", job_id)
+                        self._finish(
+                            job_id,
+                            status="failed",
+                            error=_client_error_message(exc, fallback="job result serialization failed"),
+                        )
+                    else:
+                        self._finish(job_id, status="completed", result=public_result)
 
         thread = threading.Thread(target=run, name=f"qf-web-job-{job_id}", daemon=True)
         job.thread = thread
@@ -625,8 +635,14 @@ def _web_public_json(value: Any) -> Any:
         return _web_public_json(asdict(value))
     if isinstance(value, Path):
         return _path_label(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
     if isinstance(value, tuple):
         return [_web_public_json(item) for item in value]
+    if isinstance(value, set):
+        return [_web_public_json(item) for item in sorted(value, key=str)]
     if isinstance(value, list):
         return [_web_public_json(item) for item in value]
     if isinstance(value, dict):
@@ -635,9 +651,14 @@ def _web_public_json(value: Any) -> Any:
             name = str(key)
             if name == "raw_response":
                 continue
-            result[name] = _path_label(Path(item)) if name in _WEB_PATH_KEYS and item else _web_public_json(item)
+            if name in _WEB_PATH_KEYS and item:
+                result[name] = _path_label(Path(item)) if isinstance(item, str | os.PathLike) else _web_public_json(item)
+            else:
+                result[name] = _web_public_json(item)
         return result
-    return value
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    return str(value)
 
 
 def _path_label(path: Path) -> str:
@@ -649,13 +670,21 @@ def _json_safe(value: Any) -> Any:
         return _json_safe(asdict(value))
     if isinstance(value, Path):
         return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
     if isinstance(value, tuple):
         return [_json_safe(item) for item in value]
+    if isinstance(value, set):
+        return [_json_safe(item) for item in sorted(value, key=str)]
     if isinstance(value, list):
         return [_json_safe(item) for item in value]
     if isinstance(value, dict):
         return {str(key): _json_safe(item) for key, item in value.items() if str(key) != "raw_response"}
-    return value
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    return str(value)
 
 
 def _optional_int(value: Any) -> int | None:

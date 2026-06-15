@@ -376,6 +376,42 @@ def test_web_job_manager_freezes_terminal_runtime() -> None:
     assert later["runtime_seconds"] == runtime
 
 
+def test_web_job_manager_fails_terminal_when_result_publication_fails(monkeypatch) -> None:
+    manager = web_server._WebJobManager(slow_after_seconds=0.0)
+
+    def fail_public_json(value):
+        raise TypeError("bad result payload")
+
+    monkeypatch.setattr(web_server, "_web_public_json", fail_public_json)
+
+    started = manager.start("test", lambda cancel_event: {"ok": True})
+    failed = _wait_for_manager_job(manager, started["job_id"])
+
+    assert failed["status"] == "failed"
+    assert failed["error"] == "job result serialization failed"
+    assert failed["slow"] is False
+
+
+def test_web_public_json_normalizes_nonstandard_values(tmp_path) -> None:
+    payload = web_server._web_public_json(
+        {
+            "artifact_path": tmp_path / "private" / "result.json",
+            "factor_values_path": {"unexpected": tmp_path / "nested" / "scores.parquet"},
+            "raw_response": "provider body",
+            "seen": {"b", "a"},
+            "stamp": web_server.datetime(2026, 1, 2, tzinfo=web_server.UTC),
+            "blob": b"ok",
+        }
+    )
+
+    assert payload["artifact_path"] == "result.json"
+    assert payload["factor_values_path"] == {"unexpected": "scores.parquet"}
+    assert payload["seen"] == ["a", "b"]
+    assert payload["stamp"] == "2026-01-02T00:00:00+00:00"
+    assert payload["blob"] == "ok"
+    assert "raw_response" not in payload
+
+
 def test_web_job_result_reduces_private_paths(monkeypatch, tmp_path) -> None:
     create_demo_workspace(tmp_path / "demo")
     config = QuantForgeConfig().resolve(tmp_path / "demo")
