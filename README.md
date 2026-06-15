@@ -35,6 +35,23 @@ database-backed platform features.
 
 ## Install / 安装
 
+Recommended first-run baseline:
+
+- Python `3.12.x` on macOS/Linux, or Docker image `python:3.12-slim`.
+- Package dependency floors are in `pyproject.toml`: `numpy>=1.24`,
+  `pandas>=2.0`, `pyarrow>=14.0.1`, `pyyaml>=6.0`, `pytest>=8.0` for dev.
+- Avoid starting a new setup with a bleeding-edge image such as
+  `python:latest` or a new Python minor line until the dependency stack has
+  been checked locally.
+
+推荐首次联调基线：
+
+- 本机使用 Python `3.12.x`，Docker 使用 `python:3.12-slim`。
+- 依赖下限见 `pyproject.toml`：`numpy>=1.24`、`pandas>=2.0`、
+  `pyarrow>=14.0.1`、`pyyaml>=6.0`，开发测试使用 `pytest>=8.0`。
+- 不建议新人第一次就使用 `python:latest` 或过新的 Python 镜像；先用稳定镜像跑通
+  `qf doctor`、smoke test 和 Web，再升级环境。
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
@@ -43,9 +60,10 @@ python3 -m pip install -e ".[dev]"
 
 ### Common Local/Docker Issues / 常见本地与 Docker 问题
 
-- Minimal Docker images such as `python:3.12-slim` may not include `git`.
-  Install it before running the full test suite or release checks:
-  `apt-get update && apt-get install -y --no-install-recommends git`.
+- Minimal Docker images such as `python:3.12-slim` may not include `git`,
+  `curl`, or process-inspection tools. Install the basics before cloning,
+  smoke testing, or debugging:
+  `apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates procps`.
 - Docker containers do not automatically inherit your macOS shell variables.
   Put real LLM keys in an ignored file such as `configs/default.local.env`,
   declare it through `runtime.env_files`, or pass it explicitly with
@@ -60,6 +78,9 @@ python3 -m pip install -e ".[dev]"
   several minutes. For first-time smoke testing, use an ignored local RD config
   with `default_max_candidates: 1` and a small parameter/profile grid; expand
   the grid after `qf doctor` and one `qf research run-once` succeed.
+- If host port `8765` is already in use, choose another host port, for example
+  publish Docker as `127.0.0.1:8876:8765` and open
+  `http://127.0.0.1:8876/`.
 
 最小 Docker 镜像、本机 shell 环境变量继承、挂载盘共享、Python 版本，是新人联调中
 最常见的环境类问题。这些问题不应通过提交本地路径或密钥解决；请通过 ignored local
@@ -110,11 +131,35 @@ not as an optimized factor.
 修复。若 fallback 只是复用 seed，没有产生新公式或新 profile，结果会标记为
 `no_optimization_performed`，这只能说明研究失败或 smoke 闭环完成，不能视为因子优化成功。
 
+LLM semantic parsing is intentionally allowed to be non-deterministic: the same
+natural-language idea may produce a different but valid formula on another run.
+RD candidate results are controlled separately. By default, RD records formula
+fingerprints, result signatures, and candidate-shape fingerprints, then skips
+duplicate formulas, duplicate result signatures, and over-concentrated candidate
+shapes before promoting results. Keep `deduplication.enabled: true` for normal
+research runs unless you are intentionally auditing the duplicate-control layer.
+
+LLM 语义解析保留不确定性：同一条自然语言观点在不同运行中可能得到不同但合法的公式。
+RD 候选结果另行去重。默认配置会记录 formula fingerprint、result signature 和
+candidate-shape fingerprint，并跳过重复公式、重复结果签名以及候选形态过于集中的结果。
+正常研究请保持 `deduplication.enabled: true`，只有在专门审计去重层时才关闭。
+
 The RD command prints a `report_path`. The Markdown report is written under
 the workspace artifact root, usually `./qf-demo/artifacts/research_reports/`.
 
 RD 命令会输出 `report_path`。Markdown 研究报告默认写入工作区的
 `./qf-demo/artifacts/research_reports/`。
+
+RD runtime depends on dataset size, LLM latency, candidate count, and parameter
+search grid size. On a full mounted daily A-share panel, one LLM-backed
+`run-once` can reasonably take tens of seconds to several minutes. The Web UI
+shows a long-running message after 10 seconds and exposes a cooperative cancel
+button; cancellation takes effect at safe checkpoints between LLM, evaluation,
+and backtest stages.
+
+RD 运行时长取决于数据量、LLM 延迟、候选数量和参数搜索网格。在完整挂载盘 A 股日频面板上，
+一次 LLM-backed `run-once` 可能需要几十秒到数分钟。Web 界面会在 10 秒后展示长任务提示，
+并提供协作式中断按钮；中断会在 LLM、评价、回测等安全阶段边界生效。
 
 ## Local Web Workbench / 本地 Web 工作台
 
@@ -144,7 +189,7 @@ a per-run browser control token. Runtime/read APIs and mutating Web actions
 then require that token.
 
 ```bash
-export QF_WEB_CONTROL_TOKEN="$(python - <<'PY'
+export QF_WEB_CONTROL_TOKEN="$(python3 - <<'PY'
 import secrets
 print(secrets.token_urlsafe(24))
 PY
@@ -172,6 +217,33 @@ chmod 600 configs/default.local.env
 qf doctor --config configs/default.local.yaml --rd-config configs/rd.yaml
 qf web --config configs/default.local.yaml --rd-config configs/rd.yaml
 ```
+
+For DeepSeek, the local config should name the environment variable, not the
+secret value. A minimal local snippet looks like this:
+
+```yaml
+runtime:
+  env_files:
+    - configs/default.local.env
+llm:
+  provider: deepseek
+  providers:
+    deepseek:
+      model: deepseek-chat
+      base_url: https://api.deepseek.com
+      api_key_env: DEEPSEEK_API_KEY
+```
+
+`configs/default.local.env` should contain the secret and must remain ignored:
+
+```bash
+DEEPSEEK_API_KEY=<your-api-key>
+DEEPSEEK_MODEL=deepseek-chat
+```
+
+DeepSeek 配置只应写“环境变量名”，不要把真实 key 写进 YAML。真实 key 放在
+`configs/default.local.env` 这类被 git 忽略的本地文件里，或在 Docker 启动时通过
+`--env-file` 传入。
 
 For cloud providers, if a selected provider is missing `model`, `base_url`,
 `api_key_env`, or the named environment variable, Quant Forge raises a precise
