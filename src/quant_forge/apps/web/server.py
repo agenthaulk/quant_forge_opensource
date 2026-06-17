@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, is_dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from html import escape
 import json
 import logging
 import os
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import threading
@@ -46,6 +47,7 @@ from quant_forge.research_loop.service import ResearchLoopResult, ResearchLoopSe
 
 LOGGER = logging.getLogger(__name__)
 LONG_RUNNING_JOB_SECONDS = 10.0
+MAX_RD_ITERATIONS = 5
 _TERMINAL_JOB_STATUSES = {"completed", "failed", "cancelled"}
 _WEB_PATH_KEYS = {
     "artifact_path",
@@ -368,23 +370,23 @@ def run_research_once_workflow(
     *,
     objective: str | None = None,
     max_candidates: int | None = None,
+    iterations: int | None = None,
     rd_config: ResearchLoopConfig | None = None,
     cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
-    """Run one local research-development iteration and return JSON-safe data."""
+    """Run one or more local RD iterations and return JSON-safe data."""
 
     _raise_if_cancelled(cancel_event)
     research_config = rd_config or load_research_loop_config(DEFAULT_RD_CONFIG_PATH, config.research, config.simulation)
-    result = _run_research_once(
+    return _run_research_iterations(
         config,
         research_config,
         seed_factor_id,
         objective=objective or research_config.objective,
         max_candidates=max_candidates if max_candidates is not None else research_config.default_max_candidates,
+        iterations=iterations if iterations is not None else 1,
         cancel_event=cancel_event,
     )
-    _raise_if_cancelled(cancel_event)
-    return _json_safe(result)
 
 
 def create_local_web_server(
@@ -401,12 +403,13 @@ def create_local_web_server(
 
     research_config = rd_config or load_research_loop_config(DEFAULT_RD_CONFIG_PATH, config.research, config.simulation)
     scheduler = ResearchLoopScheduler(
-        lambda seed_factor_id, objective, max_candidates: _run_research_once(
+        lambda seed_factor_id, objective, max_candidates, iterations: run_research_once_workflow(
             config,
-            research_config,
             seed_factor_id,
             objective=objective,
             max_candidates=max_candidates,
+            iterations=iterations,
+            rd_config=research_config,
         ),
         allowed_interval_days=research_config.allowed_interval_days,
     )
@@ -502,7 +505,8 @@ def create_local_web_server(
                         config,
                         str(payload.get("seed_factor_id", "")),
                         objective=str(payload.get("objective", research_config.objective)),
-                        max_candidates=_optional_int(payload.get("max_candidates")),
+                        max_candidates=_optional_int(payload.get("max_candidates"), "max_candidates"),
+                        iterations=_optional_int(payload.get("iterations"), "iterations"),
                         rd_config=research_config,
                     )
                     self._json(result)
@@ -563,7 +567,8 @@ def create_local_web_server(
                                 config,
                                 str(payload.get("seed_factor_id", "")),
                                 objective=str(payload.get("objective", research_config.objective)),
-                                max_candidates=_optional_int(payload.get("max_candidates")),
+                                max_candidates=_optional_int(payload.get("max_candidates"), "max_candidates"),
+                                iterations=_optional_int(payload.get("iterations"), "iterations"),
                                 rd_config=research_config,
                                 cancel_event=cancel_event,
                             ),
@@ -580,8 +585,15 @@ def create_local_web_server(
                         request = ResearchScheduleRequest(
                             seed_factor_id=str(payload.get("seed_factor_id", "")),
                             objective=str(payload.get("objective", research_config.objective)),
-                            interval_days=int(payload.get("interval_days", research_config.default_interval_days)),
-                            max_candidates=int(payload.get("max_candidates", research_config.default_max_candidates)),
+                            interval_days=_int_parameter(
+                                payload.get("interval_days", research_config.default_interval_days),
+                                "interval_days",
+                            ),
+                            max_candidates=_int_parameter(
+                                payload.get("max_candidates", research_config.default_max_candidates),
+                                "max_candidates",
+                            ),
+                            iterations=_int_parameter(payload.get("iterations", 1), "iterations"),
                         )
                         self._json(_json_safe(scheduler.start(request)))
                         return
@@ -696,12 +708,17 @@ def _parser_payload_from_request(parser: dict[str, Any] | None, factor: FactorDe
 
 def _default_validation_parameters(factor: FactorDefinition, rd_config: ResearchLoopConfig) -> dict[str, Any]:
     profile = rd_config.backtest_profile
+    evaluation_profile = rd_config.evaluation_profile
     costs = rd_config.transaction_costs
     return {
         "holding_days": factor.horizon_days,
         "execution_delay_days": profile.execution_delay_days,
         "decay_days": profile.decay_days,
         "top_quantile": profile.top_quantile,
+        "evaluation_start": evaluation_profile.test_period_start,
+        "evaluation_end": evaluation_profile.test_period_end,
+        "backtest_start": profile.test_period_start,
+        "backtest_end": profile.test_period_end,
         "commission_bps": costs.commission_bps,
         "slippage_bps": costs.slippage_bps,
         "short_borrow_bps_annual": costs.short_borrow_bps_annual,
@@ -728,6 +745,10 @@ def _idea_validation_settings(
         profile_overrides["decay_days"] = _nonnegative_int_parameter(raw["decay_days"], "decay_days")
     if "top_quantile" in raw:
         profile_overrides["top_quantile"] = _float_parameter(raw["top_quantile"], "top_quantile")
+    evaluation_overrides = dict(profile_overrides)
+    evaluation_overrides.update(_test_period_override("evaluation", raw))
+    backtest_overrides = dict(profile_overrides)
+    backtest_overrides.update(_test_period_override("backtest", raw))
     transaction_costs = TransactionCostModel(
         commission_bps=_nonnegative_float_parameter(raw.get("commission_bps", defaults["commission_bps"]), "commission_bps"),
         slippage_bps=_nonnegative_float_parameter(raw.get("slippage_bps", defaults["slippage_bps"]), "slippage_bps"),
@@ -736,8 +757,8 @@ def _idea_validation_settings(
             "short_borrow_bps_annual",
         ),
     )
-    evaluation_profile = simulation_profile_from_mapping(profile_overrides, rd_config.evaluation_profile)
-    backtest_profile = simulation_profile_from_mapping(profile_overrides, rd_config.backtest_profile)
+    evaluation_profile = simulation_profile_from_mapping(evaluation_overrides, rd_config.evaluation_profile)
+    backtest_profile = simulation_profile_from_mapping(backtest_overrides, rd_config.backtest_profile)
     return _IdeaValidationSettings(
         holding_days=holding_days,
         evaluation_profile=evaluation_profile,
@@ -748,11 +769,41 @@ def _idea_validation_settings(
             "execution_delay_days": backtest_profile.execution_delay_days,
             "decay_days": backtest_profile.decay_days,
             "top_quantile": backtest_profile.top_quantile,
+            "evaluation_start": evaluation_profile.test_period_start,
+            "evaluation_end": evaluation_profile.test_period_end,
+            "backtest_start": backtest_profile.test_period_start,
+            "backtest_end": backtest_profile.test_period_end,
             "commission_bps": transaction_costs.commission_bps,
             "slippage_bps": transaction_costs.slippage_bps,
             "short_borrow_bps_annual": transaction_costs.short_borrow_bps_annual,
         },
     )
+
+
+def _test_period_override(prefix: str, raw: dict[str, Any]) -> dict[str, dict[str, str | None]]:
+    start_key = f"{prefix}_start"
+    end_key = f"{prefix}_end"
+    test_period: dict[str, str | None] = {}
+    if start_key in raw:
+        test_period["start"] = _optional_date_parameter(raw[start_key], start_key)
+    if end_key in raw:
+        test_period["end"] = _optional_date_parameter(raw[end_key], end_key)
+    if not test_period:
+        return {}
+    return {"test_period": test_period}
+
+
+def _optional_date_parameter(value: Any, name: str) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"{name} must use YYYY-MM-DD") from exc
+    return text
 
 
 def _positive_int_parameter(value: Any, name: str) -> int:
@@ -771,6 +822,17 @@ def _nonnegative_int_parameter(value: Any, name: str) -> int:
 
 def _int_parameter(value: Any, name: str) -> int:
     if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        raise ValueError(f"{name} must be an integer")
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"[+-]?\d+", text):
+            return int(text)
         raise ValueError(f"{name} must be an integer")
     try:
         return int(value)
@@ -892,6 +954,210 @@ def _run_research_once(
         weights=weights,
         gate=rd_config.gate,
     )
+
+
+def _run_research_iterations(
+    config: QuantForgeConfig,
+    rd_config: ResearchLoopConfig,
+    seed_factor_id: str,
+    *,
+    objective: str,
+    max_candidates: int,
+    iterations: int,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    requested_iterations = _rd_iterations_parameter(iterations)
+    original_seed = seed_factor_id
+    current_seed = seed_factor_id
+    rounds: list[dict[str, Any]] = []
+    last_result: ResearchLoopResult | None = None
+    stopped_reason = "completed"
+
+    for round_index in range(1, requested_iterations + 1):
+        _raise_if_cancelled(cancel_event)
+        result = _run_research_once(
+            config,
+            rd_config,
+            current_seed,
+            objective=objective,
+            max_candidates=max_candidates,
+            cancel_event=cancel_event,
+        )
+        last_result = result
+        next_seed, selection_reason = _next_research_seed(result, current_seed)
+        rounds.append(_research_iteration_summary(result, round_index, next_seed, selection_reason))
+        if round_index >= requested_iterations:
+            break
+        if next_seed is None:
+            stopped_reason = selection_reason
+            break
+        if next_seed == current_seed:
+            stopped_reason = "no_new_seed"
+            rounds[-1]["selection_reason"] = stopped_reason
+            break
+        current_seed = next_seed
+
+    if last_result is None:
+        raise ValueError("research iterations require at least one round")
+    payload = _json_safe(last_result)
+    optimization_summary = _research_optimization_summary(rounds)
+    accepted_factor_id = _last_accepted_research_factor_id(rounds)
+    last_explored_factor_id = _last_explored_research_factor_id(last_result, original_seed)
+    recommended_factor_id = accepted_factor_id or original_seed
+    recommendation_basis = "accepted_candidate" if accepted_factor_id else "original_seed_retained"
+    exploration_summary = _research_exploration_seed_summary(rounds)
+    payload["requested_iterations"] = requested_iterations
+    payload["iteration_count"] = len(rounds)
+    payload["seed_factor_id"] = original_seed
+    payload["original_seed_factor_id"] = original_seed
+    payload["last_round_seed_factor_id"] = last_result.seed_factor_id
+    payload["last_accepted_factor_id"] = accepted_factor_id
+    payload["last_explored_factor_id"] = last_explored_factor_id
+    payload["recommended_factor_id"] = recommended_factor_id
+    payload["recommendation_basis"] = recommendation_basis
+    payload["final_factor_id"] = recommended_factor_id
+    payload["stopped_reason"] = stopped_reason
+    payload.update(optimization_summary)
+    payload["optimization_performed"] = optimization_summary["chain_optimization_performed"]
+    payload["no_optimization_performed"] = optimization_summary["chain_no_optimization_performed"]
+    payload.update(exploration_summary)
+    payload["accepted_candidate_ids"] = _aggregate_research_accepted_ids(rounds)
+    payload["round_report_paths"] = [str(item["report_path"]) for item in rounds if item.get("report_path")]
+    payload["iteration_chain"] = {
+        "requested_iterations": requested_iterations,
+        "completed_iterations": len(rounds),
+        "original_seed_factor_id": original_seed,
+        "last_round_seed_factor_id": last_result.seed_factor_id,
+        "final_seed_factor_id": last_result.seed_factor_id,
+        "last_accepted_factor_id": accepted_factor_id,
+        "last_explored_factor_id": last_explored_factor_id,
+        "recommended_factor_id": recommended_factor_id,
+        "recommendation_basis": recommendation_basis,
+        "final_factor_id": payload["final_factor_id"],
+        "stopped_reason": stopped_reason,
+        **optimization_summary,
+        **exploration_summary,
+        "round_report_paths": payload["round_report_paths"],
+        "rounds": rounds,
+    }
+    return payload
+
+
+def _rd_iterations_parameter(value: Any) -> int:
+    iterations = _positive_int_parameter(value, "iterations")
+    if iterations > MAX_RD_ITERATIONS:
+        raise ValueError(f"iterations must be between 1 and {MAX_RD_ITERATIONS}")
+    return iterations
+
+
+def _next_research_seed(result: ResearchLoopResult, current_seed: str) -> tuple[str | None, str]:
+    for factor_id in result.accepted_candidate_ids:
+        if factor_id and factor_id != current_seed:
+            return factor_id, "accepted_candidate"
+    if result.candidates:
+        best = result.candidates[0].factor.factor_id
+        if best and best != current_seed:
+            return best, "fallback_best_score"
+        return best, "best_candidate_is_seed"
+    return None, "no_candidates"
+
+
+def _last_explored_research_factor_id(result: ResearchLoopResult, original_seed: str) -> str:
+    next_seed, reason = _next_research_seed(result, result.seed_factor_id)
+    if next_seed is not None and reason != "best_candidate_is_seed":
+        return next_seed
+    if result.candidates:
+        return result.candidates[0].factor.factor_id
+    return result.seed_factor_id or original_seed
+
+
+def _last_accepted_research_factor_id(rounds: list[dict[str, Any]]) -> str:
+    for item in reversed(rounds):
+        accepted = [str(factor_id) for factor_id in item.get("accepted_candidate_ids") or () if factor_id]
+        if accepted:
+            return accepted[-1]
+    return ""
+
+
+def _research_exploration_seed_summary(rounds: list[dict[str, Any]]) -> dict[str, Any]:
+    if not rounds:
+        return {
+            "next_exploration_seed_factor_id": "",
+            "next_exploration_seed_reason": "no_rounds",
+            "next_exploration_seed_gate_passed": None,
+        }
+    last_round = rounds[-1]
+    selected_seed = str(last_round.get("selected_next_seed_factor_id") or "")
+    reason = str(last_round.get("selection_reason") or "")
+    if not selected_seed or reason in {"no_candidates", "no_new_seed", "best_candidate_is_seed"}:
+        return {
+            "next_exploration_seed_factor_id": "",
+            "next_exploration_seed_reason": reason or "none",
+            "next_exploration_seed_gate_passed": None,
+        }
+    return {
+        "next_exploration_seed_factor_id": selected_seed,
+        "next_exploration_seed_reason": reason,
+        "next_exploration_seed_gate_passed": reason == "accepted_candidate",
+    }
+
+
+def _research_iteration_summary(
+    result: ResearchLoopResult,
+    round_index: int,
+    selected_next_seed: str | None,
+    selection_reason: str,
+) -> dict[str, Any]:
+    top_candidate = result.candidates[0] if result.candidates else None
+    return {
+        "round": round_index,
+        "seed_factor_id": result.seed_factor_id,
+        "candidate_count": len(result.candidates),
+        "accepted_candidate_ids": list(result.accepted_candidate_ids),
+        "top_candidate_id": top_candidate.factor.factor_id if top_candidate is not None else "",
+        "top_score": top_candidate.score if top_candidate is not None else None,
+        "selected_next_seed_factor_id": selected_next_seed,
+        "selection_reason": selection_reason,
+        "optimization_performed": result.optimization_performed,
+        "no_optimization_performed": result.no_optimization_performed,
+        "report_path": str(result.report_path) if result.report_path is not None else "",
+    }
+
+
+def _research_optimization_summary(rounds: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate RD progress across chained rounds for user-facing status."""
+
+    generated = any(
+        int(item.get("candidate_count") or 0) > 0
+        and item.get("selection_reason") not in {"best_candidate_is_seed", "no_new_seed"}
+        for item in rounds
+    )
+    accepted = any(item.get("accepted_candidate_ids") for item in rounds)
+    performed = any(bool(item.get("optimization_performed")) for item in rounds) or accepted
+    if performed:
+        status = "performed"
+    elif generated:
+        status = "attempted_no_acceptance"
+    else:
+        status = "no_optimization_performed"
+    return {
+        "optimization_status": status,
+        "chain_optimization_status": status,
+        "chain_optimization_performed": performed,
+        "chain_candidate_generation_performed": generated,
+        "chain_no_optimization_performed": status == "no_optimization_performed",
+    }
+
+
+def _aggregate_research_accepted_ids(rounds: list[dict[str, Any]]) -> list[str]:
+    accepted: list[str] = []
+    seen: set[str] = set()
+    for item in rounds:
+        for factor_id in item.get("accepted_candidate_ids") or ():
+            if factor_id and factor_id not in seen:
+                accepted.append(str(factor_id))
+                seen.add(str(factor_id))
+    return accepted
 
 
 def _utc_now() -> str:
@@ -1021,10 +1287,10 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
-def _optional_int(value: Any) -> int | None:
+def _optional_int(value: Any, name: str = "value") -> int | None:
     if value in {None, ""}:
         return None
-    return int(value)
+    return _int_parameter(value, name)
 
 
 def _optional_str(value: Any) -> str | None:
@@ -1120,6 +1386,26 @@ def _selected_attr(selected: bool) -> str:
     return " selected" if selected else ""
 
 
+def _script_json(value: Any) -> str:
+    return (
+        json.dumps(_json_safe(value), ensure_ascii=False)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
+
+
+def _provider_options_script_payload(options: tuple[dict[str, str], ...]) -> tuple[dict[str, str], ...]:
+    return tuple(
+        {
+            "provider": option.get("provider", ""),
+            "apiKeyEnv": option.get("api_key_env", ""),
+            "runtimeReady": option.get("runtime_ready", "false"),
+        }
+        for option in options
+    )
+
+
 def _provider_readiness_label(option: dict[str, str]) -> str:
     if option.get("runtime_ready") == "true":
         return " · env " + option["api_key_env"] if option["api_key_env"] else " · no auth"
@@ -1191,6 +1477,7 @@ def _index_html(
     )
     if not llm_provider_options:
         llm_provider_options = '      <option value="">需要控制令牌</option>' if redact_runtime else '      <option value="">未配置 LLM provider</option>'
+    llm_provider_options_json = _script_json(_provider_options_script_payload(provider_options))
     rd_seed_html = (
         f'<input id="rd-seed" value="{seed_factor_id}">'
         if seed_factor_id
@@ -1597,12 +1884,23 @@ def _index_html(
       <select id="llm-provider">
 {llm_provider_options}
       </select>
+      <label for="llm-api-key-mode">LLM API Key</label>
+      <select id="llm-api-key-mode">
+        <option value="config">配置文件 / 环境变量加载</option>
+        <option value="manual">手动输入（仅前端联调）</option>
+      </select>
+      <input id="llm-api-key" type="password" autocomplete="off" data-secret-policy="not-submitted" disabled>
+      <p id="llm-api-key-status" class="meta"></p>
       <label>评测参数</label>
       <div class="param-grid" id="validation-controls">
         <label><span>持有期 / 天</span><input id="param-holding-days" type="number" min="1" step="1" disabled></label>
         <label><span>Decay / 天</span><input id="param-decay-days" type="number" min="0" step="1" disabled></label>
         <label><span>Top Quantile</span><input id="param-top-quantile" type="number" min="0.01" max="0.5" step="0.01" disabled></label>
         <label><span>Delay / 天</span><input id="param-delay-days" type="number" min="1" step="1" disabled></label>
+        <label><span>评测开始</span><input id="param-evaluation-start" type="date" disabled></label>
+        <label><span>评测结束</span><input id="param-evaluation-end" type="date" disabled></label>
+        <label><span>回测开始</span><input id="param-backtest-start" type="date" disabled></label>
+        <label><span>回测结束</span><input id="param-backtest-end" type="date" disabled></label>
         <label><span>手续费 bps</span><input id="param-commission-bps" type="number" min="0" step="0.1" disabled></label>
         <label><span>滑点 bps</span><input id="param-slippage-bps" type="number" min="0" step="0.1" disabled></label>
         <label><span>融券成本 bps/年</span><input id="param-short-borrow-bps" type="number" min="0" step="1" disabled></label>
@@ -1625,6 +1923,8 @@ def _index_html(
       </select>
       <label for="rd-max">候选数量</label>
       <input id="rd-max" type="number" min="1" max="10" value="{research_config.default_max_candidates}">
+      <label for="rd-iterations">RD迭代次数</label>
+      <input id="rd-iterations" type="number" min="1" max="{MAX_RD_ITERATIONS}" step="1" value="1">
       <label for="rd-interval">自动周期</label>
       <select id="rd-interval">
 {interval_options}
@@ -1669,11 +1969,20 @@ const cancelButton = document.getElementById('cancel-run');
 const statusEl = document.getElementById('status');
 const errorEl = document.getElementById('error');
 const resultEl = document.getElementById('result');
+const llmProviderSelect = document.getElementById('llm-provider');
+const llmApiKeyMode = document.getElementById('llm-api-key-mode');
+const llmApiKeyInput = document.getElementById('llm-api-key');
+const llmApiKeyStatus = document.getElementById('llm-api-key-status');
+const llmProviderOptions = {llm_provider_options_json};
 const validationInputs = {{
   holding_days: document.getElementById('param-holding-days'),
   decay_days: document.getElementById('param-decay-days'),
   top_quantile: document.getElementById('param-top-quantile'),
   execution_delay_days: document.getElementById('param-delay-days'),
+  evaluation_start: document.getElementById('param-evaluation-start'),
+  evaluation_end: document.getElementById('param-evaluation-end'),
+  backtest_start: document.getElementById('param-backtest-start'),
+  backtest_end: document.getElementById('param-backtest-end'),
   commission_bps: document.getElementById('param-commission-bps'),
   slippage_bps: document.getElementById('param-slippage-bps'),
   short_borrow_bps_annual: document.getElementById('param-short-borrow-bps')
@@ -1703,11 +2012,60 @@ function profilePeriodText(profile) {{
   const end = profile.test_period_end || 'latest available data';
   return `${{start}} -> ${{end}}`;
 }}
+function clearGlobalError() {{
+  errorEl.textContent = '';
+}}
+function resetIdeaResult(title, message) {{
+  resultEl.innerHTML = `
+    <div class="panel empty-state">
+      <h3>${{esc(title)}}</h3>
+      <p class="meta">${{esc(message)}}</p>
+    </div>`;
+}}
+function resetRdResult(title, message) {{
+  rdResultEl.innerHTML = `
+    <div class="placeholder">
+      <div class="panel">
+        <h3>${{esc(title)}}</h3>
+        <p class="meta">${{esc(message)}}</p>
+      </div>
+    </div>`;
+}}
+function optimizationStatusText(payload) {{
+  const status = payload.optimization_status || (payload.optimization_performed ? 'performed' : 'no_optimization_performed');
+  if (status === 'performed') return 'performed';
+  if (status === 'attempted_no_acceptance') return 'attempted_no_acceptance';
+  return 'no_optimization_performed';
+}}
 function setValidationInputsEnabled(enabled) {{
   Object.values(validationInputs).forEach(input => {{
     input.disabled = !enabled;
   }});
   validateButton.disabled = !enabled;
+}}
+function currentProviderOption() {{
+  return llmProviderOptions.find(option => option.provider === llmProviderSelect.value) || null;
+}}
+function syncLlmApiKeyControls() {{
+  const option = currentProviderOption();
+  const keyEnv = option && option.apiKeyEnv ? option.apiKeyEnv : '';
+  const configReady = option && option.runtimeReady === 'true';
+  const manual = llmApiKeyMode.value === 'manual';
+  llmApiKeyInput.disabled = !manual;
+  if (!manual) llmApiKeyInput.value = '';
+  if (manual) {{
+    llmApiKeyInput.placeholder = '仅前端联调，不提交后端';
+    llmApiKeyStatus.textContent = keyEnv
+      ? `手动输入不会保存或提交；后端正式调用仍读取 ${{keyEnv}}`
+      : '手动输入不会保存或提交；请在 local config 中配置 API key 环境变量名后运行';
+    return;
+  }}
+  llmApiKeyInput.placeholder = configReady
+    ? `已通过 ${{keyEnv || 'provider config'}} 加载`
+    : (keyEnv ? `未检测到 ${{keyEnv}}` : '当前 provider 未配置 API key 环境变量名');
+  llmApiKeyStatus.textContent = configReady
+    ? 'API key 已由配置文件 / 环境变量加载，前端不展示密钥'
+    : 'LLM 运行前需要在本地配置 API key 环境变量名并设置对应环境变量';
 }}
 function fillValidationInputs(parameters) {{
   const values = parameters || {{}};
@@ -1722,10 +2080,42 @@ function validationParameters() {{
     decay_days: Number(validationInputs.decay_days.value),
     top_quantile: Number(validationInputs.top_quantile.value),
     execution_delay_days: Number(validationInputs.execution_delay_days.value),
+    evaluation_start: validationInputs.evaluation_start.value || null,
+    evaluation_end: validationInputs.evaluation_end.value || null,
+    backtest_start: validationInputs.backtest_start.value || null,
+    backtest_end: validationInputs.backtest_end.value || null,
     commission_bps: Number(validationInputs.commission_bps.value),
     slippage_bps: Number(validationInputs.slippage_bps.value),
     short_borrow_bps_annual: Number(validationInputs.short_borrow_bps_annual.value)
   }};
+}}
+function valueOr(value, fallback) {{
+  return value === undefined || value === null ? fallback : value;
+}}
+function hasStableDispersion(periods) {{
+  return Number(periods || 0) > 1;
+}}
+function numIfStable(value, periods, digits = 2) {{
+  return hasStableDispersion(periods) ? num(value, digits) : 'n/a';
+}}
+function pctIfStable(value, periods) {{
+  return hasStableDispersion(periods) ? pct(value) : 'n/a';
+}}
+function parserDefaultParameterMessage(parser) {{
+  const source = (parser && parser.source) || '';
+  if (source.toLowerCase() === 'llm') {{
+    return 'LLM 已生成默认评测参数。确认或修改左侧参数后，点击“验证并评测”。';
+  }}
+  return '解析器已生成默认评测参数。确认或修改左侧参数后，点击“验证并评测”。';
+}}
+function assumptionLabel(text) {{
+  if (text === 'rebalance_rate tracks component replacement per rebalance') {{
+    return '调仓率 = 相邻调仓的成分替换率';
+  }}
+  if (text === 'turnover_rate estimates true portfolio weight turnover') {{
+    return '换手率 = 基于组合权重变化估算的真实换手率';
+  }}
+  return text;
 }}
 function renderParsed(payload) {{
   const factor = payload.factor;
@@ -1735,7 +2125,7 @@ function renderParsed(payload) {{
         <h3>${{esc(factor.factor_id)}} · ${{esc(payload.parser.source)}} / ${{esc(payload.parser.provider)}} / ${{esc(payload.parser.model)}}</h3>
         <div class="formula">${{esc(factor.formula)}}</div>
         <p>${{esc(factor.description || '')}}</p>
-        <p class="meta">LLM 已生成默认评测参数。确认或修改左侧参数后，点击“验证并评测”。</p>
+        <p class="meta">${{esc(parserDefaultParameterMessage(payload.parser))}}</p>
         <p class="meta">研究口径，不是生产交易口径。</p>
       </div>
       <div class="formula-badge">
@@ -1750,6 +2140,8 @@ function renderParsed(payload) {{
         <span class="pill">decay ${{esc(payload.parameters.decay_days)}}</span>
         <span class="pill">top ${{esc(payload.parameters.top_quantile)}}</span>
         <span class="pill">delay ${{esc(payload.parameters.execution_delay_days)}}d</span>
+        <span class="pill">evaluation ${{esc(profilePeriodText({{test_period_start: payload.parameters.evaluation_start, test_period_end: payload.parameters.evaluation_end}}))}}</span>
+        <span class="pill">backtest ${{esc(profilePeriodText({{test_period_start: payload.parameters.backtest_start, test_period_end: payload.parameters.backtest_end}}))}}</span>
         <span class="pill">commission ${{esc(payload.parameters.commission_bps)}} bps</span>
         <span class="pill">slippage ${{esc(payload.parameters.slippage_bps)}} bps</span>
         <span class="pill">short borrow ${{esc(payload.parameters.short_borrow_bps_annual)}} bps/year</span>
@@ -1765,26 +2157,29 @@ function render(payload) {{
   const backtestProfile = backtest.simulation_profile || {{}};
   const profile = Object.keys(backtestProfile).length ? backtestProfile : evaluationProfile;
   const splitRows = (evaluation.split_metrics || []).map(metric =>
-    `<span class="pill">${{esc(metric.name)}} ICIR ${{num(metric.rank_icir, 2)}} · days ${{metric.ic_days}}</span>`
-  ).join('');
+    `<span class="pill">${{esc(metric.name)}} ICIR ${{num(metric.rank_icir, 2)}} · t ${{num(valueOr(metric.rank_ic_t_stat, 0), 2)}} · days ${{metric.ic_days}}</span>`
+  ).join(' ');
   const horizonRows = (evaluation.horizon_metrics || []).map(metric =>
-    `<span class="pill">${{metric.horizon_days}}日 IC ${{num(metric.rank_ic_mean)}} / ICIR ${{num(metric.rank_icir, 2)}}</span>`
-  ).join('');
+    `<span class="pill">${{metric.horizon_days}}日 IC ${{num(metric.rank_ic_mean)}} / ICIR ${{num(metric.rank_icir, 2)}} / t ${{num(valueOr(metric.rank_ic_t_stat, 0), 2)}}</span>`
+  ).join(' ');
   const groupRows = (backtest.group_returns || []).map(metric =>
     `<span class="pill">${{esc(metric.group)}} ${{pct(metric.mean_return)}}</span>`
-  ).join('');
+  ).join(' ');
   const segmentRows = (backtest.segment_metrics || []).map(metric =>
-    `<span class="pill">${{esc(metric.name)}} net ${{pct(metric.net_annualized_return)}} · sharpe ${{num(metric.net_long_short_sharpe || 0, 2)}}</span>`
-  ).join('');
+    `<span class="pill">${{esc(metric.name)}} net ${{pct(metric.net_annualized_return)}} · sharpe ${{numIfStable(valueOr(metric.net_long_short_sharpe, 0), metric.periods, 2)}}</span>`
+  ).join(' ');
   const warningRows = [...(evaluation.warnings || []), ...(backtest.warnings || [])].map(item =>
     `<span class="pill">${{esc(item)}}</span>`
-  ).join('');
+  ).join(' ');
+  const assumptionRows = (backtest.assumptions || []).map(item =>
+    `<span class="pill">${{esc(assumptionLabel(item))}}</span>`
+  ).join(' ');
   const cacheRows = [
     `eval ${{evaluation.score_source || 'computed'}} · cached ${{evaluation.score_cached_rows || 0}} · computed ${{evaluation.score_computed_rows || 0}}`,
     evaluation.factor_values_path ? `eval path ${{evaluation.factor_values_path}}` : '',
     `backtest ${{backtest.score_source || 'computed'}} · cached ${{backtest.score_cached_rows || 0}} · computed ${{backtest.score_computed_rows || 0}}`,
     backtest.factor_values_path ? `backtest path ${{backtest.factor_values_path}}` : ''
-  ].filter(Boolean).map(item => `<span class="pill">${{esc(item)}}</span>`).join('');
+  ].filter(Boolean).map(item => `<span class="pill">${{esc(item)}}</span>`).join(' ');
   resultEl.innerHTML = `
     <div class="panel hero-panel">
       <div>
@@ -1803,21 +2198,23 @@ function render(payload) {{
     <div class="grid">
       <div class="tile">Rank IC<b>${{num(evaluation.rank_ic_mean)}}</b></div>
       <div class="tile">ICIR<b>${{num(evaluation.rank_icir, 2)}}</b></div>
+      <div class="tile">IC t-stat<b>${{num(valueOr(evaluation.rank_ic_t_stat, 0), 2)}}</b></div>
       <div class="tile">覆盖率<b>${{pct(evaluation.coverage)}}</b></div>
       <div class="tile">IC Days<b>${{evaluation.ic_days}}</b></div>
       <div class="tile">毛累计收益<b>${{pct(backtest.gross_cumulative_return ?? backtest.cumulative_return)}}</b></div>
-      <div class="tile">净累计收益<b>${{pct(backtest.net_cumulative_return || 0)}}</b></div>
+      <div class="tile">净累计收益<b>${{pct(valueOr(backtest.net_cumulative_return, 0))}}</b></div>
       <div class="tile">毛年化收益<b>${{pct(backtest.gross_annualized_return ?? backtest.annualized_return)}}</b></div>
-      <div class="tile">净年化收益<b>${{pct(backtest.net_annualized_return || 0)}}</b></div>
-      <div class="tile">年化波动<b>${{pct(backtest.annualized_volatility)}}</b></div>
+      <div class="tile">净年化收益<b>${{pct(valueOr(backtest.net_annualized_return, 0))}}</b></div>
+      <div class="tile">年化波动<b>${{pctIfStable(backtest.annualized_volatility, backtest.periods)}}</b></div>
       <div class="tile">最大回撤<b>${{pct(backtest.max_drawdown)}}</b></div>
+      <div class="tile">回测期数<b>${{backtest.periods}}</b></div>
       <div class="tile">持有期<b>${{backtest.holding_days}}日</b></div>
-      <div class="tile">Decay<b>${{profile.decay_days || 0}}</b></div>
-      <div class="tile">Top Quantile<b>${{num(profile.top_quantile || backtest.top_quantile || 0, 2)}}</b></div>
-      <div class="tile">Delay<b>${{profile.execution_delay_days || 1}}日</b></div>
-      <div class="tile">净多空Sharpe<b>${{num(backtest.net_long_short_sharpe || backtest.long_short_sharpe || 0, 2)}}</b></div>
-      <div class="tile">调仓率<b>${{pct(backtest.rebalance_rate || 0)}}</b></div>
-      <div class="tile">换手率<b>${{pct(backtest.turnover_rate || 0)}}</b></div>
+      <div class="tile">Decay<b>${{valueOr(profile.decay_days, 0)}}</b></div>
+      <div class="tile">Top Quantile<b>${{num(valueOr(profile.top_quantile, valueOr(backtest.top_quantile, 0)), 2)}}</b></div>
+      <div class="tile">Delay<b>${{valueOr(profile.execution_delay_days, 1)}}日</b></div>
+      <div class="tile">净多空Sharpe<b>${{numIfStable(valueOr(backtest.net_long_short_sharpe, valueOr(backtest.long_short_sharpe, 0)), backtest.periods, 2)}}</b></div>
+      <div class="tile">调仓率<b>${{pct(valueOr(backtest.rebalance_rate, 0))}}</b></div>
+      <div class="tile">换手率<b>${{pct(valueOr(backtest.turnover_rate, 0))}}</b></div>
     </div>
     <div class="evidence-grid">
       <div class="panel">
@@ -1833,6 +2230,8 @@ function render(payload) {{
         <p>${{groupRows || '<span class="pill">暂无</span>'}}</p>
         <h3>风险提示</h3>
         <p>${{warningRows || '<span class="pill">研究口径，不是生产交易口径</span>'}}</p>
+        <h3>口径说明</h3>
+        <p>${{assumptionRows || '<span class="pill">研究口径，不是生产交易口径</span>'}}</p>
         <h3>因子值缓存</h3>
         <p>${{cacheRows || '<span class="pill">computed</span>'}}</p>
       </div>
@@ -1845,7 +2244,31 @@ function render(payload) {{
 }}
 function renderResearch(payload) {{
   const candidates = payload.candidates || [];
-  const accepted = payload.accepted_candidate_ids || [];
+  const chain = payload.iteration_chain || {{}};
+  const rounds = chain.rounds || [];
+  const reportPaths = payload.round_report_paths || chain.round_report_paths || [];
+  const aggregateAccepted = Array.from(new Set([
+    ...((payload.accepted_candidate_ids || []).filter(Boolean)),
+    ...rounds.flatMap(item => item.accepted_candidate_ids || []).filter(Boolean)
+  ]));
+  const recommendedFactor = payload.recommended_factor_id || payload.final_factor_id || 'none';
+  const lastAcceptedFactor = payload.last_accepted_factor_id || 'none';
+  const lastExploredFactor = payload.last_explored_factor_id || payload.final_factor_id || 'none';
+  const recommendationBasis = payload.recommendation_basis || (payload.last_accepted_factor_id ? 'accepted_candidate' : 'original_seed_retained');
+  const recommendationLabel = recommendationBasis === 'accepted_candidate'
+    ? '通过 gate 的最终推荐'
+    : '无通过 gate 候选，保留原始 seed';
+  const explorationSeed = payload.next_exploration_seed_factor_id || 'none';
+  const explorationReason = payload.next_exploration_seed_reason || 'none';
+  const explorationGate = payload.next_exploration_seed_gate_passed === true
+    ? '通过 gate'
+    : (payload.next_exploration_seed_gate_passed === false ? '未过 gate，仅用于探索' : '无下一轮探索 seed');
+  const optimizationLabel = optimizationStatusText(payload);
+  const optimizationScope = Number(payload.iteration_count || 1) > 1 ? ' (aggregate)' : '';
+  const roundRows = rounds.map(item =>
+    `<span class="pill">#${{item.round}} seed ${{esc(item.seed_factor_id)}} → ${{esc(item.selected_next_seed_factor_id || item.top_candidate_id || 'stop')}} · ${{esc(item.selection_reason || 'completed')}} · score ${{item.top_score === null || item.top_score === undefined ? 'n/a' : num(item.top_score, 4)}}</span>`
+  ).join(' ');
+  const reportRows = reportPaths.map(path => `<span class="pill">${{esc(path)}}</span>`).join(' ');
   const cards = candidates.map(candidate => {{
     const factor = candidate.factor;
     const evaluation = candidate.evaluation;
@@ -1874,16 +2297,18 @@ function renderResearch(payload) {{
         </div>
         <p>
           <span class="pill">score ${{num(candidate.score, 4)}}</span>
-          <span class="pill">split ICIR ${{num(candidate.split_weighted_icir || 0, 2)}}</span>
+          <span class="pill">split ICIR ${{num(valueOr(candidate.split_weighted_icir, 0), 2)}}</span>
           <span class="pill">IC ${{num(evaluation.rank_ic_mean)}}</span>
           <span class="pill">ICIR ${{num(evaluation.rank_icir, 2)}}</span>
-          <span class="pill">decay ${{profile.decay_days || 0}}</span>
-          <span class="pill">top ${{num(profile.top_quantile || backtest.top_quantile || 0, 2)}}</span>
-          <span class="pill">net LS Sharpe ${{num(backtest.net_long_short_sharpe || backtest.long_short_sharpe || 0, 2)}}</span>
+          <span class="pill">IC t-stat ${{num(valueOr(evaluation.rank_ic_t_stat, 0), 2)}}</span>
+          <span class="pill">decay ${{valueOr(profile.decay_days, 0)}}</span>
+          <span class="pill">top ${{num(valueOr(profile.top_quantile, valueOr(backtest.top_quantile, 0)), 2)}}</span>
+          <span class="pill">periods ${{esc(backtest.periods)}}</span>
+          <span class="pill">net LS Sharpe ${{numIfStable(valueOr(backtest.net_long_short_sharpe, valueOr(backtest.long_short_sharpe, 0)), backtest.periods, 2)}}</span>
           <span class="pill">gross ${{pct(backtest.gross_annualized_return ?? backtest.annualized_return)}}</span>
-          <span class="pill">net ${{pct(backtest.net_annualized_return || 0)}}</span>
-          <span class="pill">rebalance rate ${{pct(backtest.rebalance_rate || 0)}}</span>
-          <span class="pill">turnover rate ${{pct(backtest.turnover_rate || 0)}}</span>
+          <span class="pill">net ${{pct(valueOr(backtest.net_annualized_return, 0))}}</span>
+          <span class="pill">rebalance rate ${{pct(valueOr(backtest.rebalance_rate, 0))}}</span>
+          <span class="pill">turnover rate ${{pct(valueOr(backtest.turnover_rate, 0))}}</span>
           <span class="pill">factor cache ${{esc(cacheText)}}</span>
         </p>
         <p class="meta">${{esc((candidate.self_review && candidate.self_review.summary) || '')}}</p>
@@ -1898,9 +2323,13 @@ function renderResearch(payload) {{
     <div class="panel">
       <h3>${{esc(payload.seed_factor_id)}} · ${{esc(payload.objective)}}</h3>
       <p class="meta">workflow: ${{esc(payload.workflow_type || payload.rd_stage || 'research')}}</p>
-      <p class="meta">optimization: ${{payload.optimization_performed ? 'performed' : 'no_optimization_performed'}}</p>
-      <p class="meta">accepted: ${{esc(accepted.join(', ') || 'none')}}</p>
+      <p class="meta">iterations: ${{esc(payload.iteration_count || 1)}} / ${{esc(payload.requested_iterations || 1)}} · original seed ${{esc(payload.original_seed_factor_id || payload.seed_factor_id)}} · recommended factor ${{esc(recommendedFactor)}} (${{esc(recommendationLabel)}}) · last accepted ${{esc(lastAcceptedFactor)}} · last explored ${{esc(lastExploredFactor)}} · ${{esc(payload.stopped_reason || 'completed')}}</p>
+      <p class="meta">next exploration seed: ${{esc(explorationSeed)}} · ${{esc(explorationReason)}} · ${{esc(explorationGate)}}</p>
+      <p class="meta">optimization: ${{esc(optimizationLabel)}}${{optimizationScope}}</p>
+      <p class="meta">accepted: ${{esc(aggregateAccepted.join(', ') || 'none')}}</p>
       <p class="meta">report: ${{esc(payload.report_path || 'not generated')}}</p>
+      <p class="meta">round reports: ${{reportRows || '<span class="pill">same as report</span>'}}</p>
+      <p>${{roundRows || '<span class="pill">single round</span>'}}</p>
     </div>
     ${{cards || '<div class="panel"><h3>无候选</h3></div>'}}`;
 }}
@@ -1908,7 +2337,8 @@ function rdPayload() {{
   return {{
     seed_factor_id: document.getElementById('rd-seed').value,
     objective: document.getElementById('rd-objective').value,
-    max_candidates: Number(document.getElementById('rd-max').value)
+    max_candidates: Number(document.getElementById('rd-max').value),
+    iterations: Number(document.getElementById('rd-iterations').value)
   }};
 }}
 function sleep(ms) {{
@@ -1973,7 +2403,7 @@ async function submitParse(parserMode) {{
   const job = await postJson('/api/jobs/parse-idea', {{
       text: document.getElementById('idea').value,
       parser_mode: parserMode,
-      llm_provider: document.getElementById('llm-provider').value
+      llm_provider: llmProviderSelect.value
   }});
   activeIdeaJobId = job.job_id;
   cancelButton.disabled = false;
@@ -2000,11 +2430,15 @@ async function submitValidation() {{
     jobId => activeIdeaJobId === jobId
   );
 }}
+llmProviderSelect.addEventListener('change', syncLlmApiKeyControls);
+llmApiKeyMode.addEventListener('change', syncLlmApiKeyControls);
+syncLlmApiKeyControls();
 button.addEventListener('click', async () => {{
   button.disabled = true;
   validateButton.disabled = true;
   cancelButton.disabled = true;
-  errorEl.textContent = '';
+  clearGlobalError();
+  resetIdeaResult('解析中', '因子解析完成后，公式和默认评测参数会在这里刷新。');
   statusEl.textContent = '解析中...';
   parsedIdea = null;
   fillValidationInputs({{}});
@@ -2052,7 +2486,8 @@ validateButton.addEventListener('click', async () => {{
   validateButton.disabled = true;
   button.disabled = true;
   cancelButton.disabled = true;
-  errorEl.textContent = '';
+  clearGlobalError();
+  resetIdeaResult('验证与评测中', '评测完成后，IC、回测收益和 artifact 路径会在这里刷新。');
   statusEl.textContent = '验证与评测中...';
   try {{
     const payload = await submitValidation();
@@ -2083,6 +2518,8 @@ cancelButton.addEventListener('click', async () => {{
   const jobId = activeIdeaJobId;
   if (!jobId) return;
   cancelButton.disabled = true;
+  clearGlobalError();
+  resetIdeaResult('中断中', '已请求取消当前运行，等待后端安全停止。');
   statusEl.innerHTML = '<span class="warn">已请求中断本次运行；当前安全阶段结束后停止</span>';
   try {{
     await cancelJob(jobId);
@@ -2094,6 +2531,8 @@ cancelButton.addEventListener('click', async () => {{
 rdRun.addEventListener('click', async () => {{
   rdRun.disabled = true;
   rdCancel.disabled = true;
+  clearGlobalError();
+  resetRdResult('RD 运行中', 'RD 候选、gate、report path 和分段证据会在本次运行完成后刷新。');
   rdStatusEl.textContent = 'RD 运行中...';
   try {{
     const job = await postJson('/api/jobs/research-run-once', rdPayload());
@@ -2106,9 +2545,15 @@ rdRun.addEventListener('click', async () => {{
       jobId => activeRdJobId === jobId
     );
     renderResearch(payload);
+    clearGlobalError();
     rdStatusEl.innerHTML = '<span class="ok">RD 完成</span>';
   }} catch (error) {{
-    rdStatusEl.textContent = error.message === '运行已中断' ? 'RD 已中断' : error.message;
+    if (error.message === '运行已中断') {{
+      resetRdResult('RD 已中断', '本次 RD 已取消，未产生新的候选结果。');
+      rdStatusEl.textContent = 'RD 已中断';
+    }} else {{
+      rdStatusEl.textContent = error.message;
+    }}
   }} finally {{
     activeRdJobId = null;
     rdRun.disabled = false;
@@ -2119,6 +2564,8 @@ rdCancel.addEventListener('click', async () => {{
   const jobId = activeRdJobId;
   if (!jobId) return;
   rdCancel.disabled = true;
+  clearGlobalError();
+  resetRdResult('RD 中断中', '已请求取消当前 RD，等待后端安全停止。');
   rdStatusEl.innerHTML = '<span class="warn">已请求中断本次RD；当前安全阶段结束后停止</span>';
   try {{
     await cancelJob(jobId);
@@ -2129,6 +2576,8 @@ rdCancel.addEventListener('click', async () => {{
 }});
 rdStart.addEventListener('click', async () => {{
   rdStart.disabled = true;
+  clearGlobalError();
+  resetRdResult('调度启动中', '调度开启后，最近一次 RD 结果会在这里刷新。');
   rdStatusEl.textContent = '调度启动中...';
   try {{
     const payload = rdPayload();
@@ -2145,6 +2594,7 @@ rdStart.addEventListener('click', async () => {{
 }});
 rdStop.addEventListener('click', async () => {{
   rdStop.disabled = true;
+  clearGlobalError();
   try {{
     const status = await postJson('/api/research/schedule', {{action: 'stop'}});
     rdStatusEl.textContent = status.run_count ? `调度已停止，累计运行 ${{status.run_count}} 次` : '调度已停止';

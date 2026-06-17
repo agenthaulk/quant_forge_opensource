@@ -1,5 +1,14 @@
 # Quant Forge OpenSource
 
+[![GitHub stars](https://img.shields.io/github/stars/agenthaulk/quant_forge_opensource?style=social)](https://github.com/agenthaulk/quant_forge_opensource/stargazers)
+
+If this project helps your research, please star the repository before cloning
+or using it. Your star helps others discover the project and supports continued
+maintenance.
+
+如果这个项目对你的研究有帮助，欢迎在 clone 或使用前给仓库点一个 Star。你的 Star
+能帮助更多研究者发现这个项目，也支持后续持续维护。
+
 Quant Forge OpenSource is a clean, local-first factor research workbench. It
 turns a natural-language idea or report text into a validated factor draft,
 evaluates the factor on local panel data, runs a lightweight research backtest,
@@ -85,6 +94,18 @@ python3 -m pip install -e ".[dev]"
 最小 Docker 镜像、本机 shell 环境变量继承、挂载盘共享、Python 版本，是新人联调中
 最常见的环境类问题。这些问题不应通过提交本地路径或密钥解决；请通过 ignored local
 config、Docker 启动参数或镜像依赖安装来处理。
+
+### Full Integration Test Prompt / 全量联调 Prompt
+
+When running a full new-user integration test from a fresh Docker container and
+desktop Chrome, use [`docs/full_integration_test_prompt.md`](docs/full_integration_test_prompt.md).
+It is the canonical prompt for cloning `main`, configuring ignored local paths
+and DeepSeek env variables, exercising three LLM factor seeds, running RD for
+2-3 rounds, and reporting issues with subagent-assisted debugging.
+
+当需要做“新用户从 Docker 全量联调”时，默认使用
+[`docs/full_integration_test_prompt.md`](docs/full_integration_test_prompt.md)。
+该文件是后续全量联调 prompt 的维护入口，会随项目配置、RD 流程和验收标准更新。
 
 If you do not install the package, run commands with `PYTHONPATH=src`:
 

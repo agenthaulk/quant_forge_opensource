@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import threading
-from typing import Callable
+from typing import Any, Callable
 
-from quant_forge.research_loop.service import ResearchLoopResult
+MAX_SCHEDULED_RD_ITERATIONS = 5
 
 
 @dataclass(frozen=True)
@@ -16,12 +16,15 @@ class ResearchScheduleRequest:
     objective: str = "balanced"
     interval_days: int = 1
     max_candidates: int = 3
+    iterations: int = 1
 
     def __post_init__(self) -> None:
         if not self.seed_factor_id.strip():
             raise ValueError("seed_factor_id is required")
         if self.max_candidates < 1 or self.max_candidates > 10:
             raise ValueError("max_candidates must be between 1 and 10")
+        if self.iterations < 1 or self.iterations > MAX_SCHEDULED_RD_ITERATIONS:
+            raise ValueError(f"iterations must be between 1 and {MAX_SCHEDULED_RD_ITERATIONS}")
 
 
 @dataclass(frozen=True)
@@ -32,10 +35,10 @@ class ResearchScheduleStatus:
     last_run_at: str | None = None
     next_run_at: str | None = None
     last_error: str | None = None
-    last_result: ResearchLoopResult | None = None
+    last_result: Any = None
 
 
-ResearchRunner = Callable[[str, str, int], ResearchLoopResult]
+ResearchRunner = Callable[[str, str, int, int], Any]
 
 
 class ResearchLoopScheduler:
@@ -107,7 +110,12 @@ class ResearchLoopScheduler:
         request = current.request
         timestamp = _now()
         try:
-            result = self._runner(request.seed_factor_id, request.objective, request.max_candidates)
+            result = self._runner(
+                request.seed_factor_id,
+                request.objective,
+                request.max_candidates,
+                request.iterations,
+            )
             error = None
         except Exception as exc:
             result = current.last_result

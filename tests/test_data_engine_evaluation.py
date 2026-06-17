@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -47,6 +48,12 @@ def test_evaluation_writes_artifact(tmp_path: Path) -> None:
     assert payload["score_compute_mode"]
     assert payload["score_required_rows"] >= payload["score_computed_rows"]
     assert result.score_compute_mode == payload["score_compute_mode"]
+    assert payload["rank_ic_t_stat"] == result.rank_ic_t_stat
+    assert result.rank_ic_t_stat == pytest.approx(result.rank_icir * math.sqrt(result.ic_days))
+    assert result.rank_icir == pytest.approx(result.rank_ic_mean / result.rank_ic_std)
+    assert result.split_metrics[0].rank_ic_t_stat == pytest.approx(
+        result.split_metrics[0].rank_icir * math.sqrt(result.split_metrics[0].ic_days)
+    )
 
 
 def test_evaluation_warns_when_oos_decays(tmp_path: Path) -> None:

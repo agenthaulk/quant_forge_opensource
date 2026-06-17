@@ -1798,6 +1798,7 @@ def _evaluation_metrics(evaluation: EvaluationResult) -> dict[str, object]:
         "coverage": evaluation.coverage,
         "rank_ic_mean": evaluation.rank_ic_mean,
         "rank_icir": evaluation.rank_icir,
+        "rank_ic_t_stat": evaluation.rank_ic_t_stat,
         "ic_days": evaluation.ic_days,
         "score_source": evaluation.score_source,
         "score_cached_rows": evaluation.score_cached_rows,

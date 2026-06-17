@@ -2,6 +2,10 @@
 
 本文档总结 Quant Forge OpenSource 在本地联调时的推荐流程，以及每个关键节点应该给出的程序反馈。目标是让人类用户和 agent 都能判断：流程是否跑通、数据是否用对、结果是否可信、失败时应该从哪里排查。
 
+当用户要求“项目全量联调”“新用户 Docker 联调”“从 main 拉取并完整跑通”时，默认使用
+[`docs/full_integration_test_prompt.md`](full_integration_test_prompt.md) 作为 Codex/agent
+执行 prompt。该 prompt 会随项目配置、RD 流程和验收标准更新。
+
 ## 1. 联调原则
 
 - 所有路径、时间范围、成本假设、LLM provider、RD 参数都应来自 config、CLI 参数或环境变量。
@@ -9,9 +13,11 @@
 - 程序反馈必须包含可追溯的 artifact 路径，不只说“完成”。
 - 研究回测指标应明确区分研究口径与生产交易口径。
 - LLM API key 只读环境变量，不写入配置文件、日志或报告。
-- 桌面 Chrome 联调属于 agent/orchestration 层；如果 Computer Use 无法读取窗口但
-  AppleScript 能读取 Chrome URL，可继续用桌面 Chrome 的 DOM/fetch 路径，并在反馈中
-  标记 `fallback_used=true`。
+- 前端联调必须优先使用 Computer Use 操作桌面 Chrome app；如果当前会话没有
+  Computer Use 工具，或 Computer Use 无法稳定读取窗口，才允许降级为桌面 Chrome
+  自动化 fallback，并在反馈中标记 `fallback_used=true` 和降级原因。
+- API/HTTP 调用只能用于补充核对 JSON、artifact、trace 和后端参数，不得替代前端
+  输入框、按钮和页面反馈联调。
 
 ## 2. 正常联调主路径
 
@@ -211,6 +217,7 @@ RD 运行反馈应包含：
 - Seed factor id。
 - Objective 和 objective weights。
 - 候选数量。
+- RD 迭代次数；如果大于 1，应展示每轮 seed、下一轮 seed 选择原因和最终 factor id。
 - 每个候选的公式、score、gate 结果。
 - 失败原因或风险原因。
 - Accepted candidates。
@@ -232,9 +239,122 @@ Gate warning: full-sample return is positive, but OOS return or OOS ICIR is weak
 | 页面动作 | 运行中状态 | 成功状态 | 失败状态 |
 | --- | --- | --- | --- |
 | 解析并验证 | `运行中...` | `验证完成`，展示 factor/evaluation/backtest/artifacts | 显示 parser/provider/config/key/field/operator 错误 |
-| RD 运行一次 | `RD 运行中...` | `RD 完成`，展示 accepted candidates 和 report path | 显示 objective/gate/config/data 错误 |
+| RD 运行一次/多轮递进 | `RD 运行中...` | `RD 完成`，展示 iteration chain、accepted candidates 和 report path | 显示 objective/gate/config/data/iterations 错误 |
 | 自动 RD 开启 | `调度启动中...` | `调度已开启`，展示 last result | 显示 interval/objective/config 错误 |
 | 自动 RD 停止 | 按钮 disabled | `调度已停止，累计运行 N 次` | 显示 scheduler 错误 |
+
+### 4.1 前端交互等级
+
+#### Level 1: 严格用户模拟，优先使用
+
+使用 Computer Use 操作桌面已经安装的 Chrome app，以鼠标、键盘和视觉反馈完成
+真实用户路径。必须覆盖：
+
+1. 打开本地 Web URL。
+2. 选择 LLM provider。
+3. 检查 LLM API key 控件状态。
+4. 输入自然语言因子观点。
+5. 点击“解析因子”。
+6. 修改持有期、Decay、Top Quantile、Delay、评价时间窗、回测时间窗和交易成本。
+7. 点击“验证并评测”。
+8. 设置 RD 迭代次数。
+9. 点击 RD “运行一次”。
+
+联调报告必须保留截图、页面状态摘要或逐步操作记录。
+
+#### Level 2: Chrome 自动化 fallback
+
+仅当 Computer Use 不可用或无法稳定读取窗口时使用。允许用 Chrome Plugin、
+`node_repl` + Playwright 或其他可打开桌面 Chrome app 的方式自动化操作，但必须：
+
+- 打开本机 Chrome app，不使用 Codex 内置浏览器。
+- 仍通过前端输入框和按钮完成流程。
+- 在报告中写明 `frontend_interaction.mode=chrome_playwright_fallback`
+  或等价字段。
+- 标记 `fallback_used=true`。
+- 说明降级原因，例如 `computeruse_tool_unavailable`。
+- 不把 Chrome 自动化 fallback 描述为严格 Computer Use。
+
+#### Level 3: API 验证，仅作补充
+
+API/HTTP 调用只允许核对后端 contract、artifact 路径、日期窗口、RD trace 和错误
+细节。不得直接调用 `/api/jobs/parse-idea`、`/api/jobs/validate-idea` 或
+`/api/jobs/research-run-once` 来替代点击“解析因子”“验证并评测”或 RD “运行一次”。
+如果某一步只能通过 API 完成，报告中必须列入 `api_only_steps`，并说明该步骤未完成
+真实前端联调。
+
+### 4.2 前端配置输入框联调清单
+
+每次涉及 Web 前端、LLM provider、时间窗或评价参数的修改后，除正常解析/回测外，还应按下列步骤做浏览器联调：
+
+1. 打开桌面 Chrome，访问本地 Web URL。
+2. 检查左侧 runtime strip 是否展示当前 `LLM`、`data`、`factors`、`values`、`overlay`、`artifacts`。
+3. 在 `LLM Provider` 中选择 DeepSeek 或当前配置的云端 provider。
+4. 检查 `LLM API Key` 控件：
+   - 默认模式应为“配置文件 / 环境变量加载”。
+   - 如果 provider key 已通过配置和环境变量加载，password 输入框必须置灰。
+   - 页面不得显示真实 API key，只能显示环境变量名或状态说明。
+   - 切换到“手动输入（仅前端联调）”时，输入框才可编辑。
+   - 手动输入的内容不得进入 parse/validate 请求体、日志、artifact 或报告；正式调用仍使用后端配置的环境变量。
+5. 输入自然语言因子观点，点击“解析因子”。
+6. 解析完成后应只展示 factor 草稿和待确认参数，不应立即执行评价/回测。
+7. 检查评测参数区是否自动填入默认值：
+   - `持有期 / 天`
+   - `Decay / 天`
+   - `Top Quantile`
+   - `Delay / 天`
+   - `评测开始`、`评测结束`
+   - `回测开始`、`回测结束`
+   - 手续费、滑点、融券成本
+8. 修改一次时间窗并验证是否生效，例如：
+   - 因子评价/验证时间段：`2025-01-01` 到 `2025-12-31`
+   - 因子持仓回测时间段：`2026-01-01` 到最新可用日期或显式结束日期
+9. 点击“验证并评测”。
+10. 成功结果中必须同时展示：
+    - `evaluation period`
+    - `backtest period`
+    - 持有期、Delay、Decay、Top Quantile
+    - 毛收益、净收益、回撤、Sharpe、调仓率、真实换手率
+    - 因子值缓存状态和 artifact 路径
+11. 验证后端实际使用的时间窗：
+    - `evaluation.simulation_profile.test_period_start/end` 应等于前端评测时间窗。
+    - `backtest.simulation_profile.test_period_start/end` 应等于前端回测时间窗。
+    - 两套时间窗不能被一个共享字段互相覆盖。
+12. 负向测试：
+    - 输入非法日期格式时，应在计算前返回可读错误。
+    - 开始日期晚于结束日期时，应在计算前返回可读错误。
+    - 缺少 LLM key 时，应提示 provider 和环境变量名，不打印真实 key，并在用户确认后才改用本地规则解析。
+
+### 4.3 RD 迭代次数联调清单
+
+每次涉及 RD Web 控件、后端 RD workflow 或 scheduler 的修改后，应检查：
+
+1. `RD迭代次数` 输入框存在，默认值为 `1`，只接受正整数，并有上限。
+2. `候选数量` 仍表示每轮候选数，不应被误解为递进轮数。
+3. 点击 `运行一次` 时，前端请求体应同时包含：
+   - `seed_factor_id`
+   - `objective`
+   - `max_candidates`
+   - `iterations`
+4. 当 `iterations=1` 时，行为应与旧版单轮 RD 兼容。
+5. 当 `iterations>1` 时，后端应连续运行多轮：
+   - 第 1 轮使用用户输入 seed。
+   - 下一轮优先使用上一轮 accepted candidate。
+   - 如果没有 accepted candidate 但有候选，则使用最高分候选继续，并标记 `fallback_best_score`。
+   - 如果没有候选，或最高分候选仍是原 seed，应提前停止，并展示停止原因。
+6. 成功结果应展示：
+   - `requested_iterations`
+   - `iteration_count`
+   - `original_seed_factor_id`
+   - `recommended_factor_id` / `final_factor_id`（兼容别名）：最终推荐因子，只能来自通过 gate 的候选；没有通过 gate 的候选时保留原始 seed。
+   - `last_accepted_factor_id`：最近一次通过 gate 的候选。
+   - `last_explored_factor_id`：最近一次探索到的候选，可能未通过 gate。
+   - `next_exploration_seed_factor_id` / `next_exploration_seed_reason`：如果继续 RD，下一轮探索会使用的 seed 及原因。
+   - `stopped_reason`
+   - 每轮 seed、top candidate、next seed、selection reason。
+   - 当前端显示 `fallback_best_score` 且未通过 gate 时，必须明确说明“仅用于探索，不构成最终推荐”。
+7. Web 自动周期如果携带 `iterations`，每次调度触发都应执行同样的 N 轮链式 RD，而不是忽略该参数。
+8. 点击 `中断本次RD` 时，链式 RD 应在轮间或安全检查点响应取消。
 
 Web 页面应始终展示当前生效路径：
 
@@ -267,6 +387,8 @@ artifact_root: ...
 
 - 一份生效 config 和 RD config。
 - 一份 `qf doctor` 输出，且没有 error。
+- 前端交互方式记录：`computeruse`、`chrome_playwright_fallback` 或 `api_only`。
+- `fallback_used`、降级原因、`chrome_app_used` 和 `api_only_steps`。
 - 一个可追溯的 factor definition。
 - 一份 evaluation artifact。
 - 一份 backtest artifact。

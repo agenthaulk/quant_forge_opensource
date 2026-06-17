@@ -103,6 +103,7 @@ def evaluate_factor(
             "rank_ic_mean": primary.rank_ic_mean,
             "rank_ic_std": primary.rank_ic_std,
             "rank_icir": primary.rank_icir,
+            "rank_ic_t_stat": primary.rank_ic_t_stat,
             "ic_days": primary.ic_days,
             "sample_splits": [asdict(split) for split in split_specs],
             "split_metrics": [asdict(metric) for metric in primary.split_metrics],
@@ -119,6 +120,7 @@ def evaluate_factor(
         rank_icir=primary.rank_icir,
         ic_days=primary.ic_days,
         artifact_path=artifact_path,
+        rank_ic_t_stat=primary.rank_ic_t_stat,
         split_metrics=primary.split_metrics,
         horizon_metrics=horizon_metrics,
         simulation_profile=profile,
@@ -169,6 +171,7 @@ def _evaluate_horizon(
         rank_ic_std=overall["rank_ic_std"],
         rank_icir=overall["rank_icir"],
         ic_days=overall["ic_days"],
+        rank_ic_t_stat=overall["rank_ic_t_stat"],
         split_metrics=split_metrics,
     )
 
@@ -188,6 +191,7 @@ def _split_metric(
         rank_ic_std=summary["rank_ic_std"],
         rank_icir=summary["rank_icir"],
         ic_days=summary["ic_days"],
+        rank_ic_t_stat=summary["rank_ic_t_stat"],
         score_weight=spec.score_weight,
     )
 
@@ -229,7 +233,8 @@ def _ic_summary(labeled: pd.DataFrame) -> dict[str, float | int]:
     rank_ic_std = float(np.std(ic_by_date, ddof=1)) if len(ic_by_date) > 1 else 0.0
     if abs(rank_ic_std) < 1e-12:
         rank_ic_std = 0.0
-    rank_icir = float(rank_ic_mean / rank_ic_std * np.sqrt(len(ic_by_date))) if rank_ic_std else 0.0
+    rank_icir = float(rank_ic_mean / rank_ic_std) if rank_ic_std else 0.0
+    rank_ic_t_stat = float(rank_icir * np.sqrt(len(ic_by_date))) if rank_ic_std else 0.0
     possible = len(labeled.dropna(subset=["forward_return"]))
     coverage = float(len(usable) / possible) if possible else 0.0
     return {
@@ -238,6 +243,7 @@ def _ic_summary(labeled: pd.DataFrame) -> dict[str, float | int]:
         "rank_ic_mean": rank_ic_mean,
         "rank_ic_std": rank_ic_std,
         "rank_icir": rank_icir,
+        "rank_ic_t_stat": rank_ic_t_stat,
         "ic_days": len(ic_by_date),
     }
 
