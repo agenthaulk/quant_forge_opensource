@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Quant Forge Operator Registry",
+  "type": "object",
+  "required": ["schema_version", "operators"],
+  "properties": {
+    "schema_version": {"const": "qf.operator_registry.v1"},
+    "operators": {"type": "array"}
+  }
+}

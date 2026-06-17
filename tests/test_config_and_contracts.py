@@ -427,6 +427,8 @@ def test_rd_config_loads_defaults_and_overrides(tmp_path: Path) -> None:
     assert default_config.weights.rank_ic_mean == 0.25
     assert default_config.simulation_profile.decay_days == 0
     assert default_config.simulation_profile.top_quantile == 0.3
+    assert default_config.evaluation_profile == default_config.simulation_profile
+    assert default_config.backtest_profile == default_config.simulation_profile
     assert default_config.transaction_costs.commission_bps == 0.0
     assert default_config.transaction_costs.slippage_bps == 0.0
     assert default_config.gate.max_turnover_rate is None
@@ -454,6 +456,16 @@ allowed_interval_days: [1, 5]
 simulation:
   top_quantile: 0.2
   decay_days: 3
+evaluation:
+  simulation:
+    test_period:
+      start: "2025-01-01"
+      end: "2025-12-31"
+backtest:
+  simulation:
+    test_period:
+      start: "2026-01-01"
+      end: "2026-12-31"
 horizon_days_matrix: [5, 21]
 sample_splits:
   - name: IS
@@ -508,6 +520,12 @@ deduplication:
     assert custom_config.allowed_interval_days == (1, 5)
     assert custom_config.simulation_profile.top_quantile == 0.2
     assert custom_config.simulation_profile.decay_days == 3
+    assert custom_config.evaluation_profile.test_period_start == "2025-01-01"
+    assert custom_config.evaluation_profile.test_period_end == "2025-12-31"
+    assert custom_config.evaluation_profile.top_quantile == 0.2
+    assert custom_config.backtest_profile.test_period_start == "2026-01-01"
+    assert custom_config.backtest_profile.test_period_end == "2026-12-31"
+    assert custom_config.backtest_profile.decay_days == 3
     assert custom_config.parameter_search.method == "successive_halving"
     assert custom_config.parameter_search.keep_ratio == 0.34
     assert custom_config.parameter_search.min_survivors == 2

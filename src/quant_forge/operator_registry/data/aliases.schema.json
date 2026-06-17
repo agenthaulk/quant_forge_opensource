@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Quant Forge Operator Aliases",
+  "type": "object",
+  "required": ["schema_version", "aliases"],
+  "properties": {
+    "schema_version": {"const": "qf.operator_aliases.v1"},
+    "aliases": {"type": "array"}
+  }
+}

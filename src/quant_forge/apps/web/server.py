@@ -17,8 +17,14 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from quant_forge.backtesting.service import run_factor_backtest
-from quant_forge.config import QuantForgeConfig, validate_llm_runtime
-from quant_forge.core.contracts import BacktestResult, EvaluationResult, FactorDefinition
+from quant_forge.config import QuantForgeConfig, simulation_profile_from_mapping, validate_llm_runtime
+from quant_forge.core.contracts import (
+    BacktestResult,
+    EvaluationResult,
+    FactorDefinition,
+    SimulationProfile,
+    TransactionCostModel,
+)
 from quant_forge.evaluation.service import evaluate_factor
 from quant_forge.factor_library.catalog import FactorCatalog
 from quant_forge.factor_library.repository import FactorRepository
@@ -68,6 +74,15 @@ class _WebJob:
     thread: threading.Thread | None = field(default=None, repr=False)
     started_monotonic: float = field(default_factory=time.monotonic, repr=False)
     finished_monotonic: float | None = None
+
+
+@dataclass(frozen=True)
+class _IdeaValidationSettings:
+    holding_days: int
+    evaluation_profile: SimulationProfile
+    backtest_profile: SimulationProfile
+    transaction_costs: TransactionCostModel
+    parameters: dict[str, Any]
 
 
 class _WebJobManager:
@@ -205,46 +220,128 @@ def run_idea_workflow(
     rd_config: ResearchLoopConfig | None = None,
     cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
-    """Parse an idea, persist the draft, evaluate it, and run a backtest."""
+    """Compatibility shim: parse an idea, then validate it with default parameters."""
 
+    research_config = rd_config or load_research_loop_config(DEFAULT_RD_CONFIG_PATH, config.research, config.simulation)
+    parsed = _parse_idea(
+        config,
+        text,
+        parser_mode=parser_mode,
+        llm_provider=llm_provider,
+        cancel_event=cancel_event,
+    )
+    return _validate_factor_workflow(
+        config,
+        parsed.factor,
+        parser=_parser_payload(parsed),
+        parameters=None,
+        rd_config=research_config,
+        cancel_event=cancel_event,
+    )
+
+
+def run_idea_parse_workflow(
+    config: QuantForgeConfig,
+    text: str,
+    *,
+    parser_mode: str = "llm",
+    llm_provider: str | None = None,
+    rd_config: ResearchLoopConfig | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    """Parse natural language into a draft factor and editable validation defaults."""
+
+    research_config = rd_config or load_research_loop_config(DEFAULT_RD_CONFIG_PATH, config.research, config.simulation)
+    parsed = _parse_idea(
+        config,
+        text,
+        parser_mode=parser_mode,
+        llm_provider=llm_provider,
+        cancel_event=cancel_event,
+    )
+    return _parse_payload(parsed, research_config)
+
+
+def run_idea_validation_workflow(
+    config: QuantForgeConfig,
+    factor: dict[str, Any] | FactorDefinition,
+    *,
+    parser: dict[str, Any] | None = None,
+    parameters: dict[str, Any] | None = None,
+    rd_config: ResearchLoopConfig | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    """Persist an edited draft factor, then evaluate and backtest it."""
+
+    research_config = rd_config or load_research_loop_config(DEFAULT_RD_CONFIG_PATH, config.research, config.simulation)
+    return _validate_factor_workflow(
+        config,
+        _factor_from_request(factor),
+        parser=parser,
+        parameters=parameters,
+        rd_config=research_config,
+        cancel_event=cancel_event,
+    )
+
+
+def _parse_idea(
+    config: QuantForgeConfig,
+    text: str,
+    *,
+    parser_mode: str,
+    llm_provider: str | None,
+    cancel_event: threading.Event | None,
+) -> ParsedFactor:
     if not text.strip():
         raise ValueError("idea text is required")
     _raise_if_cancelled(cancel_event)
-    research_config = rd_config or load_research_loop_config(DEFAULT_RD_CONFIG_PATH, config.research, config.simulation)
     llm_settings = config.llm.select_provider(llm_provider) if parser_mode == "llm" else config.llm
     if parser_mode == "llm":
-        validate_llm_runtime(llm_settings)
+        validate_llm_runtime(config.llm, llm_provider)
     _raise_if_cancelled(cancel_event)
     parsed = parse_factor_idea(text, llm_settings, mode=parser_mode)
     _raise_if_cancelled(cancel_event)
+    return parsed
+
+
+def _validate_factor_workflow(
+    config: QuantForgeConfig,
+    factor: FactorDefinition,
+    *,
+    parser: dict[str, Any] | None,
+    parameters: dict[str, Any] | None,
+    rd_config: ResearchLoopConfig,
+    cancel_event: threading.Event | None,
+) -> dict[str, Any]:
+    settings = _idea_validation_settings(factor, parameters, rd_config)
     repo = FactorRepository(config.paths.factor_root)
-    previous_factor = _existing_factor(repo, parsed.factor.factor_id)
+    previous_factor = _existing_factor(repo, factor.factor_id)
     try:
-        repo.save(parsed.factor)
+        repo.save(factor)
         _raise_if_cancelled(cancel_event)
         evaluation = evaluate_factor(
-            parsed.factor.factor_id,
+            factor.factor_id,
             factor_root=config.paths.factor_root,
             data_root=config.paths.data_root,
             artifact_root=config.paths.artifact_root,
-            horizon_days=parsed.factor.horizon_days,
-            horizon_days_matrix=research_config.horizon_days_matrix,
-            sample_splits=research_config.sample_splits,
-            simulation_profile=research_config.simulation_profile,
+            horizon_days=settings.holding_days,
+            horizon_days_matrix=rd_config.horizon_days_matrix,
+            sample_splits=rd_config.sample_splits,
+            simulation_profile=settings.evaluation_profile,
             factor_values_root=config.paths.factor_values_root,
             factor_values_overlay_root=config.paths.factor_values_overlay_root,
             factor_values_manifest_root=config.paths.factor_values_manifest_root,
         )
         _raise_if_cancelled(cancel_event)
         backtest = run_factor_backtest(
-            parsed.factor.factor_id,
+            factor.factor_id,
             factor_root=config.paths.factor_root,
             data_root=config.paths.data_root,
             artifact_root=config.paths.artifact_root,
-            simulation_profile=research_config.simulation_profile,
-            holding_days=parsed.factor.horizon_days,
-            transaction_costs=research_config.transaction_costs,
-            sample_splits=research_config.sample_splits,
+            simulation_profile=settings.backtest_profile,
+            holding_days=settings.holding_days,
+            transaction_costs=settings.transaction_costs,
+            sample_splits=rd_config.sample_splits,
             factor_values_root=config.paths.factor_values_root,
             factor_values_overlay_root=config.paths.factor_values_overlay_root,
             factor_values_manifest_root=config.paths.factor_values_manifest_root,
@@ -252,11 +349,17 @@ def run_idea_workflow(
         _raise_if_cancelled(cancel_event)
     except _WebJobCancelled:
         if previous_factor is None:
-            repo.delete(parsed.factor.factor_id)
+            repo.delete(factor.factor_id)
         else:
             repo.save(previous_factor)
         raise
-    return _workflow_payload(parsed, evaluation, backtest)
+    return _validation_payload(
+        factor,
+        parser=parser,
+        evaluation=evaluation,
+        backtest=backtest,
+        parameters=settings.parameters,
+    )
 
 
 def run_research_once_workflow(
@@ -374,6 +477,26 @@ def create_local_web_server(
                     )
                     self._json(result)
                     return
+                if path == "/api/parse-idea":
+                    result = run_idea_parse_workflow(
+                        config,
+                        str(payload.get("text", "")),
+                        parser_mode=str(payload.get("parser_mode", "llm")),
+                        llm_provider=_optional_str(payload.get("llm_provider")),
+                        rd_config=research_config,
+                    )
+                    self._json(result)
+                    return
+                if path == "/api/validate-idea":
+                    result = run_idea_validation_workflow(
+                        config,
+                        _factor_from_validation_payload(payload, config),
+                        parser=_optional_parser_payload(payload.get("parser")),
+                        parameters=_optional_parameters_payload(payload.get("parameters")),
+                        rd_config=research_config,
+                    )
+                    self._json(result)
+                    return
                 if path == "/api/research/run-once":
                     result = run_research_once_workflow(
                         config,
@@ -393,6 +516,38 @@ def create_local_web_server(
                                 str(payload.get("text", "")),
                                 parser_mode=str(payload.get("parser_mode", "llm")),
                                 llm_provider=_optional_str(payload.get("llm_provider")),
+                                rd_config=research_config,
+                                cancel_event=cancel_event,
+                            ),
+                        ),
+                        status=202,
+                    )
+                    return
+                if path == "/api/jobs/parse-idea":
+                    self._json(
+                        job_manager.start(
+                            "parse_idea",
+                            lambda cancel_event: run_idea_parse_workflow(
+                                config,
+                                str(payload.get("text", "")),
+                                parser_mode=str(payload.get("parser_mode", "llm")),
+                                llm_provider=_optional_str(payload.get("llm_provider")),
+                                rd_config=research_config,
+                                cancel_event=cancel_event,
+                            ),
+                        ),
+                        status=202,
+                    )
+                    return
+                if path == "/api/jobs/validate-idea":
+                    self._json(
+                        job_manager.start(
+                            "validate_idea",
+                            lambda cancel_event: run_idea_validation_workflow(
+                                config,
+                                _factor_from_validation_payload(payload, config),
+                                parser=_optional_parser_payload(payload.get("parser")),
+                                parameters=_optional_parameters_payload(payload.get("parameters")),
                                 rd_config=research_config,
                                 cancel_event=cancel_event,
                             ),
@@ -494,17 +649,194 @@ def run_local_web(
     server.serve_forever()
 
 
-def _workflow_payload(parsed: ParsedFactor, evaluation: EvaluationResult, backtest: BacktestResult) -> dict[str, Any]:
+def _parse_payload(parsed: ParsedFactor, rd_config: ResearchLoopConfig) -> dict[str, Any]:
     return {
-        "parser": {
-            "source": parsed.source,
-            "provider": parsed.provider,
-            "model": parsed.model,
-        },
+        "parser": _parser_payload(parsed),
         "factor": _json_safe(parsed.factor),
+        "parameters": _default_validation_parameters(parsed.factor, rd_config),
+    }
+
+
+def _validation_payload(
+    factor: FactorDefinition,
+    *,
+    parser: dict[str, Any] | None,
+    evaluation: EvaluationResult,
+    backtest: BacktestResult,
+    parameters: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "parser": _parser_payload_from_request(parser, factor),
+        "factor": _json_safe(factor),
+        "parameters": _json_safe(parameters),
         "evaluation": _json_safe(evaluation),
         "backtest": _json_safe(backtest),
     }
+
+
+def _parser_payload(parsed: ParsedFactor) -> dict[str, str]:
+    return {
+        "source": parsed.source,
+        "provider": parsed.provider,
+        "model": parsed.model,
+    }
+
+
+def _parser_payload_from_request(parser: dict[str, Any] | None, factor: FactorDefinition) -> dict[str, str]:
+    raw = parser if isinstance(parser, dict) else {}
+    source = str(raw.get("source") or factor.source or "user")
+    provider = str(raw.get("provider") or source)
+    model = str(raw.get("model") or "")
+    return {
+        "source": source,
+        "provider": provider,
+        "model": model,
+    }
+
+
+def _default_validation_parameters(factor: FactorDefinition, rd_config: ResearchLoopConfig) -> dict[str, Any]:
+    profile = rd_config.backtest_profile
+    costs = rd_config.transaction_costs
+    return {
+        "holding_days": factor.horizon_days,
+        "execution_delay_days": profile.execution_delay_days,
+        "decay_days": profile.decay_days,
+        "top_quantile": profile.top_quantile,
+        "commission_bps": costs.commission_bps,
+        "slippage_bps": costs.slippage_bps,
+        "short_borrow_bps_annual": costs.short_borrow_bps_annual,
+    }
+
+
+def _idea_validation_settings(
+    factor: FactorDefinition,
+    raw_parameters: dict[str, Any] | None,
+    rd_config: ResearchLoopConfig,
+) -> _IdeaValidationSettings:
+    defaults = _default_validation_parameters(factor, rd_config)
+    raw = raw_parameters or {}
+    if not isinstance(raw, dict):
+        raise ValueError("validation parameters must be a JSON object")
+    holding_days = _positive_int_parameter(raw.get("holding_days", defaults["holding_days"]), "holding_days")
+    profile_overrides: dict[str, Any] = {}
+    if "execution_delay_days" in raw:
+        profile_overrides["execution_delay_days"] = _positive_int_parameter(
+            raw["execution_delay_days"],
+            "execution_delay_days",
+        )
+    if "decay_days" in raw:
+        profile_overrides["decay_days"] = _nonnegative_int_parameter(raw["decay_days"], "decay_days")
+    if "top_quantile" in raw:
+        profile_overrides["top_quantile"] = _float_parameter(raw["top_quantile"], "top_quantile")
+    transaction_costs = TransactionCostModel(
+        commission_bps=_nonnegative_float_parameter(raw.get("commission_bps", defaults["commission_bps"]), "commission_bps"),
+        slippage_bps=_nonnegative_float_parameter(raw.get("slippage_bps", defaults["slippage_bps"]), "slippage_bps"),
+        short_borrow_bps_annual=_nonnegative_float_parameter(
+            raw.get("short_borrow_bps_annual", defaults["short_borrow_bps_annual"]),
+            "short_borrow_bps_annual",
+        ),
+    )
+    evaluation_profile = simulation_profile_from_mapping(profile_overrides, rd_config.evaluation_profile)
+    backtest_profile = simulation_profile_from_mapping(profile_overrides, rd_config.backtest_profile)
+    return _IdeaValidationSettings(
+        holding_days=holding_days,
+        evaluation_profile=evaluation_profile,
+        backtest_profile=backtest_profile,
+        transaction_costs=transaction_costs,
+        parameters={
+            "holding_days": holding_days,
+            "execution_delay_days": backtest_profile.execution_delay_days,
+            "decay_days": backtest_profile.decay_days,
+            "top_quantile": backtest_profile.top_quantile,
+            "commission_bps": transaction_costs.commission_bps,
+            "slippage_bps": transaction_costs.slippage_bps,
+            "short_borrow_bps_annual": transaction_costs.short_borrow_bps_annual,
+        },
+    )
+
+
+def _positive_int_parameter(value: Any, name: str) -> int:
+    parsed = _int_parameter(value, name)
+    if parsed < 1:
+        raise ValueError(f"{name} must be positive")
+    return parsed
+
+
+def _nonnegative_int_parameter(value: Any, name: str) -> int:
+    parsed = _int_parameter(value, name)
+    if parsed < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return parsed
+
+
+def _int_parameter(value: Any, name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+
+
+def _float_parameter(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number")
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+
+
+def _nonnegative_float_parameter(value: Any, name: str) -> float:
+    parsed = _float_parameter(value, name)
+    if parsed < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return parsed
+
+
+def _factor_from_request(raw: dict[str, Any] | FactorDefinition) -> FactorDefinition:
+    if isinstance(raw, FactorDefinition):
+        return raw
+    if not isinstance(raw, dict):
+        raise ValueError("factor must be a JSON object")
+    filters_raw = raw.get("universe_filters", ())
+    if not isinstance(filters_raw, list | tuple):
+        raise ValueError("factor.universe_filters must be a list")
+    return FactorDefinition(
+        factor_id=str(raw["factor_id"]),
+        name=str(raw.get("name", raw["factor_id"])),
+        formula=str(raw["formula"]),
+        status=str(raw.get("status", "draft")),  # type: ignore[arg-type]
+        description=str(raw.get("description", "")),
+        horizon_days=_positive_int_parameter(raw.get("horizon_days", 5), "factor.horizon_days"),
+        universe_filters=tuple(str(item) for item in filters_raw),
+        source=str(raw.get("source", "user")),
+    )
+
+
+def _factor_from_validation_payload(payload: dict[str, Any], config: QuantForgeConfig) -> FactorDefinition:
+    if "factor" in payload:
+        return _factor_from_request(payload["factor"])
+    factor_id = str(payload.get("factor_id", "")).strip()
+    if not factor_id:
+        raise ValueError("factor is required")
+    return FactorRepository(config.paths.factor_root).get(factor_id)
+
+
+def _optional_parser_payload(value: Any) -> dict[str, Any] | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("parser must be a JSON object")
+    return value
+
+
+def _optional_parameters_payload(value: Any) -> dict[str, Any] | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("parameters must be a JSON object")
+    return value
 
 
 def _run_research_once(
@@ -534,6 +866,8 @@ def _run_research_once(
         factor_values_manifest_root=config.paths.factor_values_manifest_root,
         simulation_profile=rd_config.simulation_profile,
         simulation_profiles=rd_config.simulation_profiles,
+        evaluation_simulation_profile=rd_config.evaluation_profile,
+        backtest_simulation_profile=rd_config.backtest_profile,
         parameter_search_enabled=rd_config.parameter_search.enabled,
         parameter_search_method=rd_config.parameter_search.method,
         parameter_search_keep_ratio=rd_config.parameter_search.keep_ratio,
@@ -626,7 +960,7 @@ def _client_error_message(exc: Exception, *, fallback: str) -> str:
         return str(exc)
     text = str(exc)
     if "Missing API key" in text or "requires api_key_env" in text:
-        return "LLM runtime is not ready"
+        return text
     return fallback
 
 
@@ -1139,6 +1473,27 @@ def _index_html(
       padding: 11px 10px;
       font-size: 13px;
     }}
+    .param-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }}
+    .param-grid label {{
+      margin: 0;
+    }}
+    .param-grid span {{
+      display: block;
+      margin-bottom: 4px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+    }}
+    .param-grid input {{
+      min-width: 0;
+      padding: 9px 10px;
+      font-family: var(--mono);
+    }}
     .pill {{
       display: inline-block;
       border: 1px solid var(--line);
@@ -1242,7 +1597,18 @@ def _index_html(
       <select id="llm-provider">
 {llm_provider_options}
       </select>
-      <button id="run">解析并验证</button>
+      <label>评测参数</label>
+      <div class="param-grid" id="validation-controls">
+        <label><span>持有期 / 天</span><input id="param-holding-days" type="number" min="1" step="1" disabled></label>
+        <label><span>Decay / 天</span><input id="param-decay-days" type="number" min="0" step="1" disabled></label>
+        <label><span>Top Quantile</span><input id="param-top-quantile" type="number" min="0.01" max="0.5" step="0.01" disabled></label>
+        <label><span>Delay / 天</span><input id="param-delay-days" type="number" min="1" step="1" disabled></label>
+        <label><span>手续费 bps</span><input id="param-commission-bps" type="number" min="0" step="0.1" disabled></label>
+        <label><span>滑点 bps</span><input id="param-slippage-bps" type="number" min="0" step="0.1" disabled></label>
+        <label><span>融券成本 bps/年</span><input id="param-short-borrow-bps" type="number" min="0" step="1" disabled></label>
+      </div>
+      <button id="run">解析因子</button>
+      <button id="validate-run" class="secondary" disabled>验证并评测</button>
       <button id="cancel-run" class="secondary danger" disabled>中断本次运行</button>
       <p id="status" class="meta"></p>
     </div>
@@ -1298,10 +1664,20 @@ def _index_html(
 </main>
 <script>
 const button = document.getElementById('run');
+const validateButton = document.getElementById('validate-run');
 const cancelButton = document.getElementById('cancel-run');
 const statusEl = document.getElementById('status');
 const errorEl = document.getElementById('error');
 const resultEl = document.getElementById('result');
+const validationInputs = {{
+  holding_days: document.getElementById('param-holding-days'),
+  decay_days: document.getElementById('param-decay-days'),
+  top_quantile: document.getElementById('param-top-quantile'),
+  execution_delay_days: document.getElementById('param-delay-days'),
+  commission_bps: document.getElementById('param-commission-bps'),
+  slippage_bps: document.getElementById('param-slippage-bps'),
+  short_borrow_bps_annual: document.getElementById('param-short-borrow-bps')
+}};
 const rdRun = document.getElementById('rd-run');
 const rdStart = document.getElementById('rd-start');
 const rdStop = document.getElementById('rd-stop');
@@ -1310,6 +1686,7 @@ const rdStatusEl = document.getElementById('rd-status');
 const rdResultEl = document.getElementById('rd-result');
 let activeIdeaJobId = null;
 let activeRdJobId = null;
+let parsedIdea = null;
 const controlTokenRequired = {str(control_token_required).lower()};
 
 function pct(value) {{
@@ -1326,11 +1703,67 @@ function profilePeriodText(profile) {{
   const end = profile.test_period_end || 'latest available data';
   return `${{start}} -> ${{end}}`;
 }}
+function setValidationInputsEnabled(enabled) {{
+  Object.values(validationInputs).forEach(input => {{
+    input.disabled = !enabled;
+  }});
+  validateButton.disabled = !enabled;
+}}
+function fillValidationInputs(parameters) {{
+  const values = parameters || {{}};
+  Object.entries(validationInputs).forEach(([name, input]) => {{
+    const value = values[name];
+    input.value = value === undefined || value === null ? '' : value;
+  }});
+}}
+function validationParameters() {{
+  return {{
+    holding_days: Number(validationInputs.holding_days.value),
+    decay_days: Number(validationInputs.decay_days.value),
+    top_quantile: Number(validationInputs.top_quantile.value),
+    execution_delay_days: Number(validationInputs.execution_delay_days.value),
+    commission_bps: Number(validationInputs.commission_bps.value),
+    slippage_bps: Number(validationInputs.slippage_bps.value),
+    short_borrow_bps_annual: Number(validationInputs.short_borrow_bps_annual.value)
+  }};
+}}
+function renderParsed(payload) {{
+  const factor = payload.factor;
+  resultEl.innerHTML = `
+    <div class="panel hero-panel">
+      <div>
+        <h3>${{esc(factor.factor_id)}} · ${{esc(payload.parser.source)}} / ${{esc(payload.parser.provider)}} / ${{esc(payload.parser.model)}}</h3>
+        <div class="formula">${{esc(factor.formula)}}</div>
+        <p>${{esc(factor.description || '')}}</p>
+        <p class="meta">LLM 已生成默认评测参数。确认或修改左侧参数后，点击“验证并评测”。</p>
+        <p class="meta">研究口径，不是生产交易口径。</p>
+      </div>
+      <div class="formula-badge">
+        H${{factor.horizon_days}}<br>
+        ${{esc((factor.universe_filters || []).join(' · ') || 'FULL')}}
+      </div>
+    </div>
+    <div class="panel">
+      <h3>待确认参数</h3>
+      <p>
+        <span class="pill">holding ${{esc(payload.parameters.holding_days)}}d</span>
+        <span class="pill">decay ${{esc(payload.parameters.decay_days)}}</span>
+        <span class="pill">top ${{esc(payload.parameters.top_quantile)}}</span>
+        <span class="pill">delay ${{esc(payload.parameters.execution_delay_days)}}d</span>
+        <span class="pill">commission ${{esc(payload.parameters.commission_bps)}} bps</span>
+        <span class="pill">slippage ${{esc(payload.parameters.slippage_bps)}} bps</span>
+        <span class="pill">short borrow ${{esc(payload.parameters.short_borrow_bps_annual)}} bps/year</span>
+      </p>
+    </div>`;
+}}
 function render(payload) {{
   const factor = payload.factor;
   const evaluation = payload.evaluation;
   const backtest = payload.backtest;
-  const profile = backtest.simulation_profile || evaluation.simulation_profile || {{}};
+  const effectiveHoldingDays = (payload.parameters && payload.parameters.holding_days) || backtest.holding_days || factor.horizon_days;
+  const evaluationProfile = evaluation.simulation_profile || {{}};
+  const backtestProfile = backtest.simulation_profile || {{}};
+  const profile = Object.keys(backtestProfile).length ? backtestProfile : evaluationProfile;
   const splitRows = (evaluation.split_metrics || []).map(metric =>
     `<span class="pill">${{esc(metric.name)}} ICIR ${{num(metric.rank_icir, 2)}} · days ${{metric.ic_days}}</span>`
   ).join('');
@@ -1358,11 +1791,12 @@ function render(payload) {{
         <h3>${{esc(factor.factor_id)}} · ${{esc(payload.parser.source)}} / ${{esc(payload.parser.provider)}} / ${{esc(payload.parser.model)}}</h3>
         <div class="formula">${{esc(factor.formula)}}</div>
         <p>${{esc(factor.description || '')}}</p>
-        <p class="meta">test period: ${{esc(profilePeriodText(profile))}}</p>
+        <p class="meta">evaluation period: ${{esc(profilePeriodText(evaluationProfile))}}</p>
+        <p class="meta">backtest period: ${{esc(profilePeriodText(backtestProfile))}}</p>
         <p class="meta">研究口径，不是生产交易口径。</p>
       </div>
       <div class="formula-badge">
-        H${{factor.horizon_days}}<br>
+        H${{effectiveHoldingDays}}<br>
         ${{esc((factor.universe_filters || []).join(' · ') || 'FULL')}}
       </div>
     </div>
@@ -1416,7 +1850,9 @@ function renderResearch(payload) {{
     const factor = candidate.factor;
     const evaluation = candidate.evaluation;
     const backtest = candidate.backtest;
-    const profile = backtest.simulation_profile || {{}};
+    const evaluationProfile = evaluation.simulation_profile || {{}};
+    const backtestProfile = backtest.simulation_profile || {{}};
+    const profile = Object.keys(backtestProfile).length ? backtestProfile : evaluationProfile;
     const gate = candidate.gate_passed ? '<span class="ok">candidate</span>' : '<span class="err">draft</span>';
     const cacheText = `${{evaluation.score_source || 'computed'}} / ${{backtest.score_source || 'computed'}} · cached ${{evaluation.score_cached_rows || 0}}/${{backtest.score_cached_rows || 0}} · computed ${{evaluation.score_computed_rows || 0}}/${{backtest.score_computed_rows || 0}}`;
     const cachePaths = [evaluation.factor_values_path, backtest.factor_values_path].filter(Boolean).join(' / ');
@@ -1429,7 +1865,8 @@ function renderResearch(payload) {{
           <div class="formula">${{esc(factor.formula)}}</div>
           <p>${{esc(candidate.hypothesis.text)}}</p>
           <p class="meta">${{esc(candidate.hypothesis.rationale)}}</p>
-          <p class="meta">test period: ${{esc(profilePeriodText(profile))}}</p>
+          <p class="meta">evaluation period: ${{esc(profilePeriodText(evaluationProfile))}}</p>
+          <p class="meta">backtest period: ${{esc(profilePeriodText(backtestProfile))}}</p>
           <p class="meta">研究口径，不是生产交易口径。</p>
         </div>
         <div class="formula-badge">
@@ -1532,8 +1969,8 @@ async function waitForJob(jobId, statusEl, slowText, isActive) {{
     clearTimeout(slowTimer);
   }}
 }}
-async function submitIdea(parserMode) {{
-  const job = await postJson('/api/jobs/run-idea', {{
+async function submitParse(parserMode) {{
+  const job = await postJson('/api/jobs/parse-idea', {{
       text: document.getElementById('idea').value,
       parser_mode: parserMode,
       llm_provider: document.getElementById('llm-provider').value
@@ -1543,20 +1980,43 @@ async function submitIdea(parserMode) {{
   return waitForJob(
     job.job_id,
     statusEl,
-    '已运行超过10秒，系统仍在解析、计算或回测',
+    '已运行超过10秒，LLM 仍在解析因子',
+    jobId => activeIdeaJobId === jobId
+  );
+}}
+async function submitValidation() {{
+  if (!parsedIdea) throw new Error('请先解析因子');
+  const job = await postJson('/api/jobs/validate-idea', {{
+      factor: parsedIdea.factor,
+      parser: parsedIdea.parser,
+      parameters: validationParameters()
+  }});
+  activeIdeaJobId = job.job_id;
+  cancelButton.disabled = false;
+  return waitForJob(
+    job.job_id,
+    statusEl,
+    '已运行超过10秒，系统仍在计算因子或回测',
     jobId => activeIdeaJobId === jobId
   );
 }}
 button.addEventListener('click', async () => {{
   button.disabled = true;
+  validateButton.disabled = true;
   cancelButton.disabled = true;
   errorEl.textContent = '';
-  statusEl.textContent = '运行中...';
+  statusEl.textContent = '解析中...';
+  parsedIdea = null;
+  fillValidationInputs({{}});
+  setValidationInputsEnabled(false);
   const parserMode = document.getElementById('parser').value;
   try {{
-    const payload = await submitIdea(parserMode);
-    render(payload);
-    statusEl.innerHTML = '<span class="ok">验证完成</span>';
+    const payload = await submitParse(parserMode);
+    parsedIdea = payload;
+    fillValidationInputs(payload.parameters);
+    setValidationInputsEnabled(true);
+    renderParsed(payload);
+    statusEl.innerHTML = '<span class="ok">解析完成，等待确认参数</span>';
   }} catch (error) {{
     if (error.message === '运行已中断') {{
       statusEl.innerHTML = '<span class="warn">运行已中断</span>';
@@ -1566,9 +2026,12 @@ button.addEventListener('click', async () => {{
       const fallback = window.confirm(`LLM 无法使用：${{error.message}}\n\n是否改用本地规则解析？`);
       if (fallback) {{
         try {{
-          const payload = await submitIdea('rule');
-          render(payload);
-          statusEl.innerHTML = '<span class="ok">已使用本地规则解析完成</span>';
+          const payload = await submitParse('rule');
+          parsedIdea = payload;
+          fillValidationInputs(payload.parameters);
+          setValidationInputsEnabled(true);
+          renderParsed(payload);
+          statusEl.innerHTML = '<span class="ok">已使用本地规则解析，等待确认参数</span>';
           return;
         }} catch (fallbackError) {{
           errorEl.textContent = fallbackError.message;
@@ -1583,6 +2046,37 @@ button.addEventListener('click', async () => {{
     activeIdeaJobId = null;
     button.disabled = false;
     cancelButton.disabled = true;
+  }}
+}});
+validateButton.addEventListener('click', async () => {{
+  validateButton.disabled = true;
+  button.disabled = true;
+  cancelButton.disabled = true;
+  errorEl.textContent = '';
+  statusEl.textContent = '验证与评测中...';
+  try {{
+    const payload = await submitValidation();
+    render(payload);
+    parsedIdea = {{
+      parser: payload.parser,
+      factor: payload.factor,
+      parameters: payload.parameters || validationParameters()
+    }};
+    fillValidationInputs(parsedIdea.parameters);
+    document.getElementById('rd-seed').value = payload.factor.factor_id;
+    statusEl.innerHTML = '<span class="ok">验证完成</span>';
+  }} catch (error) {{
+    if (error.message === '运行已中断') {{
+      statusEl.innerHTML = '<span class="warn">运行已中断</span>';
+      return;
+    }}
+    errorEl.textContent = error.message;
+    statusEl.textContent = '验证失败';
+  }} finally {{
+    activeIdeaJobId = null;
+    button.disabled = false;
+    cancelButton.disabled = true;
+    setValidationInputsEnabled(Boolean(parsedIdea));
   }}
 }});
 cancelButton.addEventListener('click', async () => {{

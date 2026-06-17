@@ -1,0 +1,32 @@
+schema_version: qf.operator_aliases.v1
+aliases:
+  - alias: ts_stddev
+    canonical: stddev
+    match_type: canonical_equivalent
+    confidence: high
+    behavior: rewrite_then_execute
+    notes: External DSL alias for rolling time-series standard deviation.
+  - alias: rolling_std
+    canonical: stddev
+    match_type: likely_equivalent
+    confidence: medium
+    behavior: repair_then_validate
+    notes: Common phrase whose min_periods and alignment semantics vary across libraries.
+  - alias: ts_corr
+    canonical: correlation
+    match_type: likely_equivalent
+    confidence: medium
+    behavior: repair_then_validate
+    notes: Common short alias; repair should use canonical correlation(x, y, window).
+  - alias: ts_cov
+    canonical: covariance
+    match_type: likely_equivalent
+    confidence: medium
+    behavior: repair_then_validate
+    notes: Common short alias; repair should use canonical covariance(x, y, window).
+  - alias: industry_neutralize
+    canonical: null
+    match_type: unknown_requires_draft
+    confidence: low
+    behavior: draft_only
+    notes: Not implemented in the lightweight local kernel.

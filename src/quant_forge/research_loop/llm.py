@@ -22,6 +22,9 @@ from quant_forge.research_loop.service import (
 )
 
 
+CHINESE_RD_REPORT_PROMPT = "通过中文完成RD研究报告"
+
+
 class LLMHypothesisGenerator:
     """Generate bounded RD hypotheses with the configured shared LLM."""
 
@@ -303,7 +306,9 @@ def _review_messages(
     system = (
         "You are Quant Forge's RD reviewer. Return one JSON object only. "
         "Use the provided local evaluation/backtest evidence. Do not claim production readiness. "
-        "Return exactly the requested schema keys. Do not wrap the JSON in markdown."
+        "Return exactly the requested schema keys. Do not wrap the JSON in markdown. "
+        "Write summary, strengths, risks, and next_hypotheses in Chinese. "
+        f"{CHINESE_RD_REPORT_PROMPT}"
     )
     user = json.dumps(
         {

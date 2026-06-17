@@ -4,8 +4,6 @@ import json
 from pathlib import Path
 
 import numpy as np
-import pytest
-
 from quant_forge.backtesting.service import _max_drawdown, _return_summary, run_factor_backtest
 from quant_forge.core.contracts import SampleSplitSpec, SimulationProfile, TransactionCostModel
 from quant_forge.data.local import create_demo_workspace
@@ -126,17 +124,19 @@ def test_backtest_reports_cost_aware_net_metrics_and_turnover(tmp_path: Path) ->
     assert result.turnover_rate > 0
 
 
-def test_backtest_rejects_display_window_shorter_than_six_months(tmp_path: Path) -> None:
+def test_backtest_allows_short_holdout_window_with_warning(tmp_path: Path) -> None:
     paths = create_demo_workspace(tmp_path / "demo")
 
-    with pytest.raises(ValueError, match="at least 126 daily trading dates"):
-        run_factor_backtest(
-            "FTR_DEMO_SMALL_CAP",
-            factor_root=paths["factor_root"],
-            data_root=paths["data_root"],
-            artifact_root=paths["artifact_root"],
-            simulation_profile=SimulationProfile(test_period_end="2024-02-14"),
-        )
+    result = run_factor_backtest(
+        "FTR_DEMO_SMALL_CAP",
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        simulation_profile=SimulationProfile(test_period_end="2024-02-14"),
+    )
+
+    assert result.periods > 0
+    assert "short annualization window" in "; ".join(result.warnings)
 
 
 def test_backtest_warns_when_annualized_holding_exposure_is_short(tmp_path: Path) -> None:

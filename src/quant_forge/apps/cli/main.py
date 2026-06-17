@@ -320,7 +320,7 @@ def _cmd_eval_factor(args: argparse.Namespace) -> int:
         horizon_days=args.horizon_days,
         horizon_days_matrix=rd_config.horizon_days_matrix,
         sample_splits=rd_config.sample_splits,
-        simulation_profile=rd_config.simulation_profile,
+        simulation_profile=rd_config.evaluation_profile,
         factor_values_root=paths.factor_values_root,
         factor_values_overlay_root=paths.factor_values_overlay_root,
         factor_values_manifest_root=paths.factor_values_manifest_root,
@@ -333,7 +333,7 @@ def _cmd_run_backtest(args: argparse.Namespace) -> int:
     config = _config(args)
     rd_config = load_research_loop_config(args.rd_config, config.research, config.simulation)
     paths = _runtime_paths(args)
-    profile = rd_config.simulation_profile
+    profile = rd_config.backtest_profile
     if args.top_quantile is not None:
         profile = replace(profile, top_quantile=args.top_quantile)
     result = run_factor_backtest(
@@ -369,6 +369,8 @@ def _cmd_research_run_once(args: argparse.Namespace) -> int:
         artifact_root=paths.artifact_root,
         simulation_profile=rd_config.simulation_profile,
         simulation_profiles=rd_config.simulation_profiles,
+        evaluation_simulation_profile=rd_config.evaluation_profile,
+        backtest_simulation_profile=rd_config.backtest_profile,
         parameter_search_enabled=rd_config.parameter_search.enabled,
         parameter_search_method=rd_config.parameter_search.method,
         parameter_search_keep_ratio=rd_config.parameter_search.keep_ratio,
@@ -504,6 +506,9 @@ def _doctor_payload(args: argparse.Namespace) -> dict[str, Any]:
         rd_config = load_research_loop_config(rd_config_path, config.research, config.simulation)
         payload["rd"] = {
             "objective": rd_config.objective,
+            "simulation_profile": asdict(rd_config.simulation_profile),
+            "evaluation_profile": asdict(rd_config.evaluation_profile),
+            "backtest_profile": asdict(rd_config.backtest_profile),
             "horizon_days_matrix": list(rd_config.horizon_days_matrix),
             "sample_splits": [asdict(split) for split in rd_config.sample_splits],
             "transaction_costs": asdict(rd_config.transaction_costs),

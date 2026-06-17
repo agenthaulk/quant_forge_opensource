@@ -381,6 +381,8 @@ class ResearchLoopService:
         top_quantile: float | None = None,
         simulation_profile: SimulationProfile | None = None,
         simulation_profiles: tuple[SimulationProfile, ...] | None = None,
+        evaluation_simulation_profile: SimulationProfile | None = None,
+        backtest_simulation_profile: SimulationProfile | None = None,
         horizon_days_matrix: tuple[int, ...] | None = None,
         sample_splits: tuple[SampleSplitSpec, ...] | None = None,
         parameter_search_enabled: bool = False,
@@ -409,6 +411,8 @@ class ResearchLoopService:
             profile = replace(profile, top_quantile=top_quantile)
         self.simulation_profile = profile
         self.simulation_profiles = simulation_profiles or (profile,)
+        self.evaluation_simulation_profile = evaluation_simulation_profile or profile
+        self.backtest_simulation_profile = backtest_simulation_profile or profile
         if not self.simulation_profiles:
             raise ValueError("research loop requires at least one simulation profile")
         self.horizon_days_matrix = horizon_days_matrix
@@ -680,7 +684,7 @@ class ResearchLoopService:
                 and not (result.hypothesis.parameter_search_fallback and result.factor.factor_id == seed_factor_id)
             )
         )
-        optimization_performed = _optimization_performed(results, seed, self.simulation_profile)
+        optimization_performed = _optimization_performed(results, seed, self.backtest_simulation_profile)
         result = ResearchLoopResult(
             rd_stage=RD_RESEARCH_STAGE,
             seed_factor_id=seed_factor_id,
@@ -1000,6 +1004,14 @@ class ResearchLoopService:
         sample_splits: tuple[SampleSplitSpec, ...] | None,
     ) -> _ScoredTrial:
         self._raise_if_cancelled()
+        evaluation_profile = _role_profile_for_trial(
+            trial.simulation_profile,
+            self.evaluation_simulation_profile,
+        )
+        backtest_profile = _role_profile_for_trial(
+            trial.simulation_profile,
+            self.backtest_simulation_profile,
+        )
         evaluation = evaluate_factor(
             trial.factor.factor_id,
             factor_root=self.factor_root,
@@ -1008,7 +1020,7 @@ class ResearchLoopService:
             horizon_days=trial.factor.horizon_days,
             horizon_days_matrix=horizon_days_matrix,
             sample_splits=sample_splits,
-            simulation_profile=trial.simulation_profile,
+            simulation_profile=evaluation_profile,
             factor_values_root=self.factor_values_root,
             factor_values_overlay_root=self.factor_values_overlay_root,
             factor_values_manifest_root=self.factor_values_manifest_root,
@@ -1020,7 +1032,7 @@ class ResearchLoopService:
             data_root=self.data_root,
             artifact_root=self.artifact_root,
             holding_days=trial.factor.horizon_days,
-            simulation_profile=trial.simulation_profile,
+            simulation_profile=backtest_profile,
             transaction_costs=self.transaction_costs,
             sample_splits=sample_splits,
             factor_values_root=self.factor_values_root,
@@ -1569,6 +1581,14 @@ def _optimization_performed(
             or result.backtest.simulation_profile != seed_profile
         )
         for result in results
+    )
+
+
+def _role_profile_for_trial(trial_profile: SimulationProfile, role_profile: SimulationProfile) -> SimulationProfile:
+    return replace(
+        role_profile,
+        top_quantile=trial_profile.top_quantile,
+        decay_days=trial_profile.decay_days,
     )
 
 

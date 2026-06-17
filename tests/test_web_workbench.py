@@ -15,16 +15,18 @@ import quant_forge.apps.web.server as web_server
 import quant_forge.research_loop.llm as rd_llm
 from quant_forge.apps.web.server import (
     create_local_web_server,
+    run_idea_parse_workflow,
+    run_idea_validation_workflow,
     run_idea_workflow,
     run_research_once_workflow,
 )
 from quant_forge.config import LLMProviderSettings, LLMSettings, PathSettings, QuantForgeConfig, WebSettings
-from quant_forge.core.contracts import BacktestResult, EvaluationResult, FactorDefinition
+from quant_forge.core.contracts import BacktestResult, EvaluationResult, FactorDefinition, SimulationProfile
 from quant_forge.data.local import create_demo_workspace
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.llm_client import LLMChatResult
 from quant_forge.llm_factor_parser import ParsedFactor
-from quant_forge.research_loop.config import ResearchLLMConfig, load_research_loop_config
+from quant_forge.research_loop.config import ResearchLLMConfig, ResearchLoopConfig, load_research_loop_config
 
 
 def test_web_workbench_rule_workflow_runs_end_to_end(tmp_path) -> None:
@@ -45,6 +47,289 @@ def test_web_workbench_rule_workflow_runs_end_to_end(tmp_path) -> None:
     assert {metric["name"] for metric in result["backtest"]["segment_metrics"]} == {"IS", "OOS1", "OOS2"}
     assert result["backtest"]["assumptions"]
     assert paths["factor_root"].exists()
+
+
+def test_web_parse_workflow_returns_editable_defaults_without_evaluation(monkeypatch, tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+
+    def fail_evaluate(*args, **kwargs):
+        raise AssertionError("parse-only workflow must not evaluate")
+
+    def fail_backtest(*args, **kwargs):
+        raise AssertionError("parse-only workflow must not backtest")
+
+    monkeypatch.setattr(web_server, "evaluate_factor", fail_evaluate)
+    monkeypatch.setattr(web_server, "run_factor_backtest", fail_backtest)
+
+    result = run_idea_parse_workflow(config, "非ST的小市值股票未来表现更好", parser_mode="rule")
+
+    assert result["parser"]["source"] == "rule"
+    assert result["factor"]["formula"] == "-rank(market_cap)"
+    assert result["parameters"] == {
+        "holding_days": 5,
+        "execution_delay_days": 1,
+        "decay_days": 0,
+        "top_quantile": 0.3,
+        "commission_bps": 0.0,
+        "slippage_bps": 0.0,
+        "short_borrow_bps_annual": 0.0,
+    }
+    with pytest.raises(FileNotFoundError):
+        FactorRepository(config.paths.factor_root).get(result["factor"]["factor_id"])
+
+
+def test_web_validation_workflow_uses_edited_parameters(monkeypatch, tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+    factor = FactorDefinition(
+        factor_id="FTR_EDITABLE_PARAMS",
+        name="editable_params",
+        formula="-rank(market_cap)",
+        horizon_days=5,
+        universe_filters=("is_st == false",),
+        source="llm",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_evaluate_factor(
+        factor_id,
+        *,
+        factor_root,
+        data_root,
+        artifact_root,
+        horizon_days,
+        horizon_days_matrix,
+        sample_splits,
+        simulation_profile,
+        factor_values_root,
+        factor_values_overlay_root,
+        factor_values_manifest_root,
+    ):
+        captured["evaluation_horizon_days"] = horizon_days
+        captured["evaluation_profile"] = simulation_profile
+        return EvaluationResult(
+            factor_id=factor_id,
+            observations=1,
+            coverage=1.0,
+            rank_ic_mean=0.1,
+            rank_ic_std=0.0,
+            rank_icir=0.0,
+            ic_days=1,
+            artifact_path=Path(artifact_root) / "evaluations" / f"{factor_id}.json",
+            simulation_profile=simulation_profile,
+        )
+
+    def fake_run_factor_backtest(
+        factor_id,
+        *,
+        factor_root,
+        data_root,
+        artifact_root,
+        simulation_profile,
+        holding_days,
+        transaction_costs,
+        sample_splits,
+        factor_values_root,
+        factor_values_overlay_root,
+        factor_values_manifest_root,
+    ):
+        captured["backtest_holding_days"] = holding_days
+        captured["backtest_profile"] = simulation_profile
+        captured["transaction_costs"] = transaction_costs
+        return BacktestResult(
+            factor_id=factor_id,
+            periods=1,
+            holding_days=holding_days,
+            cumulative_return=0.01,
+            annualized_return=0.01,
+            annualized_volatility=0.0,
+            max_drawdown=0.0,
+            artifact_path=Path(artifact_root) / "backtests" / f"{factor_id}.json",
+            top_quantile=simulation_profile.top_quantile,
+            transaction_costs=transaction_costs,
+            simulation_profile=simulation_profile,
+        )
+
+    monkeypatch.setattr(web_server, "evaluate_factor", fake_evaluate_factor)
+    monkeypatch.setattr(web_server, "run_factor_backtest", fake_run_factor_backtest)
+
+    rd_config = ResearchLoopConfig(
+        evaluation_simulation_profile=SimulationProfile(test_period_start="2025-01-01", test_period_end="2025-12-31"),
+        backtest_simulation_profile=SimulationProfile(test_period_start="2026-01-01", test_period_end="2026-12-31"),
+    )
+    result = run_idea_validation_workflow(
+        config,
+        factor,
+        parser={"source": "llm", "provider": "deepseek", "model": "fake"},
+        parameters={
+            "holding_days": 21,
+            "decay_days": 3,
+            "top_quantile": 0.2,
+            "execution_delay_days": 2,
+            "commission_bps": 1.5,
+            "slippage_bps": 2.5,
+            "short_borrow_bps_annual": 30.0,
+        },
+        rd_config=rd_config,
+    )
+
+    evaluation_profile = captured["evaluation_profile"]
+    backtest_profile = captured["backtest_profile"]
+    costs = captured["transaction_costs"]
+    assert captured["evaluation_horizon_days"] == 21
+    assert captured["backtest_holding_days"] == 21
+    assert isinstance(evaluation_profile, SimulationProfile)
+    assert evaluation_profile.decay_days == 3
+    assert evaluation_profile.top_quantile == 0.2
+    assert evaluation_profile.execution_delay_days == 2
+    assert evaluation_profile.test_period_start == "2025-01-01"
+    assert isinstance(backtest_profile, SimulationProfile)
+    assert backtest_profile.decay_days == 3
+    assert backtest_profile.top_quantile == 0.2
+    assert backtest_profile.execution_delay_days == 2
+    assert backtest_profile.test_period_start == "2026-01-01"
+    assert costs.commission_bps == 1.5
+    assert costs.slippage_bps == 2.5
+    assert costs.short_borrow_bps_annual == 30.0
+    assert result["factor"]["horizon_days"] == 5
+    assert result["backtest"]["holding_days"] == 21
+    assert result["parameters"]["holding_days"] == 21
+    assert result["parameters"]["top_quantile"] == 0.2
+    assert FactorRepository(config.paths.factor_root).get(factor.factor_id).horizon_days == 5
+
+
+def test_web_validation_rejects_invalid_parameters_before_evaluation(monkeypatch, tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+    factor = FactorDefinition(
+        factor_id="FTR_INVALID_EDITABLE_PARAMS",
+        name="invalid_editable_params",
+        formula="-rank(market_cap)",
+        horizon_days=5,
+    )
+
+    def fail_evaluate(*args, **kwargs):
+        raise AssertionError("invalid validation parameters must not evaluate")
+
+    def fail_backtest(*args, **kwargs):
+        raise AssertionError("invalid validation parameters must not backtest")
+
+    monkeypatch.setattr(web_server, "evaluate_factor", fail_evaluate)
+    monkeypatch.setattr(web_server, "run_factor_backtest", fail_backtest)
+
+    with pytest.raises(ValueError, match="top_quantile"):
+        run_idea_validation_workflow(config, factor, parameters={"top_quantile": 0.8})
+
+    with pytest.raises(FileNotFoundError):
+        FactorRepository(config.paths.factor_root).get(factor.factor_id)
+
+
+def test_web_run_idea_workflow_preserves_distinct_default_profiles(monkeypatch, tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+    captured: dict[str, object] = {}
+
+    def fake_parse_factor_idea(text, llm, *, mode):
+        factor = FactorDefinition(
+            factor_id="FTR_COMPAT_PROFILE",
+            name="compat_profile",
+            formula="-rank(market_cap)",
+            horizon_days=9,
+            source="llm",
+        )
+        return ParsedFactor(factor=factor, source="llm", provider="rule", model="deterministic")
+
+    def fake_evaluate_factor(
+        factor_id,
+        *,
+        factor_root,
+        data_root,
+        artifact_root,
+        horizon_days,
+        horizon_days_matrix,
+        sample_splits,
+        simulation_profile,
+        factor_values_root,
+        factor_values_overlay_root,
+        factor_values_manifest_root,
+    ):
+        captured["evaluation_profile"] = simulation_profile
+        return EvaluationResult(
+            factor_id=factor_id,
+            observations=1,
+            coverage=1.0,
+            rank_ic_mean=0.1,
+            rank_ic_std=0.0,
+            rank_icir=0.0,
+            ic_days=1,
+            artifact_path=Path(artifact_root) / "evaluations" / f"{factor_id}.json",
+            simulation_profile=simulation_profile,
+        )
+
+    def fake_run_factor_backtest(
+        factor_id,
+        *,
+        factor_root,
+        data_root,
+        artifact_root,
+        simulation_profile,
+        holding_days,
+        transaction_costs,
+        sample_splits,
+        factor_values_root,
+        factor_values_overlay_root,
+        factor_values_manifest_root,
+    ):
+        captured["backtest_profile"] = simulation_profile
+        return BacktestResult(
+            factor_id=factor_id,
+            periods=1,
+            holding_days=holding_days,
+            cumulative_return=0.01,
+            annualized_return=0.01,
+            annualized_volatility=0.0,
+            max_drawdown=0.0,
+            artifact_path=Path(artifact_root) / "backtests" / f"{factor_id}.json",
+            top_quantile=simulation_profile.top_quantile,
+            simulation_profile=simulation_profile,
+        )
+
+    monkeypatch.setattr(web_server, "parse_factor_idea", fake_parse_factor_idea)
+    monkeypatch.setattr(web_server, "evaluate_factor", fake_evaluate_factor)
+    monkeypatch.setattr(web_server, "run_factor_backtest", fake_run_factor_backtest)
+
+    rd_config = ResearchLoopConfig(
+        evaluation_simulation_profile=SimulationProfile(
+            execution_delay_days=1,
+            top_quantile=0.1,
+            decay_days=0,
+            test_period_start="2025-01-01",
+        ),
+        backtest_simulation_profile=SimulationProfile(
+            execution_delay_days=2,
+            top_quantile=0.2,
+            decay_days=3,
+            test_period_start="2026-01-01",
+        ),
+    )
+
+    result = run_idea_workflow(config, "小市值", parser_mode="rule", rd_config=rd_config)
+
+    evaluation_profile = captured["evaluation_profile"]
+    backtest_profile = captured["backtest_profile"]
+    assert isinstance(evaluation_profile, SimulationProfile)
+    assert evaluation_profile.execution_delay_days == 1
+    assert evaluation_profile.top_quantile == 0.1
+    assert evaluation_profile.decay_days == 0
+    assert evaluation_profile.test_period_start == "2025-01-01"
+    assert isinstance(backtest_profile, SimulationProfile)
+    assert backtest_profile.execution_delay_days == 2
+    assert backtest_profile.top_quantile == 0.2
+    assert backtest_profile.decay_days == 3
+    assert backtest_profile.test_period_start == "2026-01-01"
+    assert result["parameters"]["holding_days"] == 9
+    assert result["backtest"]["holding_days"] == 9
 
 
 def test_web_research_once_workflow_runs_end_to_end(tmp_path) -> None:
@@ -118,9 +403,15 @@ allowed_interval_days: [5]
     html = web_server._index_html(config)
 
     assert "/api/jobs/research-run-once" in html
-    assert "/api/jobs/run-idea" in html
+    assert "/api/jobs/parse-idea" in html
+    assert "/api/jobs/validate-idea" in html
     assert "/api/research/campaign" not in html
     assert "/api/research/schedule" in html
+    assert "解析因子" in html
+    assert "验证并评测" in html
+    assert "param-holding-days" in html
+    assert "param-decay-days" in html
+    assert "param-top-quantile" in html
     assert "中断本次运行" in html
     assert "中断本次RD" in html
     assert "已运行超过10秒" in html
@@ -249,6 +540,50 @@ def test_web_job_run_idea_endpoint_completes(tmp_path) -> None:
         assert completed["result"]["factor"]["formula"] == "-rank(market_cap)"
         assert completed["result"]["evaluation"]["observations"] > 0
         assert completed["result"]["backtest"]["periods"] > 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_web_job_parse_then_validate_endpoint_completes(tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+    server = create_local_web_server(host="127.0.0.1", port=0, config=config)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        started_parse = _post_json(
+            f"{base_url}/api/jobs/parse-idea",
+            {"text": "非ST的小市值股票未来表现更好", "parser_mode": "rule"},
+        )
+        parsed = _wait_for_job(base_url, started_parse["job_id"])
+
+        assert parsed["status"] == "completed"
+        assert "evaluation" not in parsed["result"]
+        assert parsed["result"]["parameters"]["holding_days"] == 5
+
+        parameters = dict(parsed["result"]["parameters"])
+        parameters["holding_days"] = 7
+        parameters["top_quantile"] = 0.2
+        started_validate = _post_json(
+            f"{base_url}/api/jobs/validate-idea",
+            {
+                "factor": parsed["result"]["factor"],
+                "parser": parsed["result"]["parser"],
+                "parameters": parameters,
+            },
+        )
+        completed = _wait_for_job(base_url, started_validate["job_id"])
+
+        assert completed["status"] == "completed"
+        assert completed["result"]["factor"]["horizon_days"] == 5
+        assert completed["result"]["backtest"]["holding_days"] == 7
+        assert completed["result"]["parameters"]["holding_days"] == 7
+        assert completed["result"]["backtest"]["top_quantile"] == 0.2
+        assert completed["result"]["parameters"]["top_quantile"] == 0.2
     finally:
         server.shutdown()
         server.server_close()
@@ -561,10 +896,23 @@ def test_web_status_keeps_active_llm_provider_when_key_is_missing(monkeypatch, t
     assert providers["glm"]["runtime_ready"] == "true"
 
 
+def test_web_client_error_message_preserves_llm_runtime_detail() -> None:
+    message = web_server._client_error_message(
+        RuntimeError(
+            "Missing API key for active LLM provider deepseek. "
+            "Expected environment variable: DEEPSEEK_API_KEY."
+        ),
+        fallback="job failed",
+    )
+
+    assert "DEEPSEEK_API_KEY" in message
+    assert "Missing API key" in message
+
+
 def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
     paths = create_demo_workspace(tmp_path / "demo")
     config = QuantForgeConfig().resolve(tmp_path / "demo")
-    captured: dict[str, int | None] = {}
+    captured: dict[str, object] = {}
 
     def fake_parse_factor_idea(text, llm, *, mode):
         factor = FactorDefinition(
@@ -598,6 +946,8 @@ def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
         captured["horizon_count"] = len(horizon_days_matrix)
         captured["split_count"] = len(sample_splits)
         captured["decay_days"] = simulation_profile.decay_days
+        captured["evaluation_start"] = simulation_profile.test_period_start
+        captured["evaluation_end"] = simulation_profile.test_period_end
         return EvaluationResult(
             factor_id=factor_id,
             observations=1,
@@ -651,6 +1001,8 @@ def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
         assert factor_values_overlay_root == config.paths.factor_values_overlay_root
         assert factor_values_manifest_root == config.paths.factor_values_manifest_root
         captured["top_quantile_basis_points"] = int(simulation_profile.top_quantile * 10000)
+        captured["backtest_start"] = simulation_profile.test_period_start
+        captured["backtest_end"] = simulation_profile.test_period_end
         return fake_run_factor_backtest(
             factor_id,
             factor_root=factor_root,
@@ -661,12 +1013,20 @@ def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setattr(web_server, "run_factor_backtest", fake_run_factor_backtest_with_holding)
 
-    result = run_idea_workflow(config, "非ST的小市值股票未来表现更好", parser_mode="llm")
+    rd_config = ResearchLoopConfig(
+        evaluation_simulation_profile=SimulationProfile(test_period_start="2025-01-01", test_period_end="2025-12-31"),
+        backtest_simulation_profile=SimulationProfile(test_period_start="2026-01-01", test_period_end="2026-12-31"),
+    )
+    result = run_idea_workflow(config, "非ST的小市值股票未来表现更好", parser_mode="llm", rd_config=rd_config)
 
     assert captured["horizon_days"] == 11
     assert captured["horizon_count"] == 4
     assert captured["split_count"] == 3
     assert captured["decay_days"] == 0
+    assert captured["evaluation_start"] == "2025-01-01"
+    assert captured["evaluation_end"] == "2025-12-31"
+    assert captured["backtest_start"] == "2026-01-01"
+    assert captured["backtest_end"] == "2026-12-31"
     assert captured["top_quantile_basis_points"] == 3000
     assert result["factor"]["horizon_days"] == 11
     assert result["backtest"]["holding_days"] == 11
@@ -748,6 +1108,48 @@ def test_web_research_once_uses_shared_llm_for_hypothesis_and_review(monkeypatch
     assert "raw_response" not in result["generation"]
     assert result["candidates"][0]["self_review"]["source"] == "llm_self_review"
     assert result["candidates"][0]["factor"]["formula"] == "rank(return_5d)"
+
+
+def test_rd_review_prompt_requests_chinese_report_language(tmp_path) -> None:
+    factor = FactorDefinition(
+        factor_id="FTR_PROMPT_SEED",
+        name="prompt_seed",
+        formula="-rank(market_cap)",
+    )
+    evaluation = EvaluationResult(
+        factor_id=factor.factor_id,
+        observations=1,
+        coverage=1.0,
+        rank_ic_mean=0.1,
+        rank_ic_std=0.0,
+        rank_icir=1.0,
+        ic_days=1,
+        artifact_path=tmp_path / "evaluation.json",
+    )
+    backtest = BacktestResult(
+        factor_id=factor.factor_id,
+        periods=1,
+        holding_days=5,
+        cumulative_return=0.01,
+        annualized_return=0.01,
+        annualized_volatility=0.0,
+        max_drawdown=0.0,
+        artifact_path=tmp_path / "backtest.json",
+    )
+
+    messages = rd_llm._review_messages(
+        seed=factor,
+        candidate=factor,
+        evaluation=evaluation,
+        backtest=backtest,
+        split_weighted_icir=1.0,
+        score=1.0,
+        gate_passed=True,
+        gate_reasons=(),
+    )
+
+    assert rd_llm.CHINESE_RD_REPORT_PROMPT in messages[0]["content"]
+    assert "Write summary, strengths, risks, and next_hypotheses in Chinese" in messages[0]["content"]
 
 
 def test_web_research_llm_missing_formula_dsl_repairs_then_falls_back(monkeypatch, tmp_path) -> None:

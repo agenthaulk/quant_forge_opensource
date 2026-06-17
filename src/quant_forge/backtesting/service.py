@@ -76,7 +76,10 @@ def run_factor_backtest(
         raise ValueError("holding_days must be positive")
     panel = LocalPanelDataProvider(data_root).load_panel()
     working_panel = apply_test_period(panel, profile)
-    require_minimum_display_trading_days(working_panel)
+    require_minimum_display_trading_days(
+        working_panel,
+        min_trading_days=max(2, holding + profile.execution_delay_days + 1),
+    )
     score_result = prepare_factor_scores_result(
         working_panel,
         factor.formula,

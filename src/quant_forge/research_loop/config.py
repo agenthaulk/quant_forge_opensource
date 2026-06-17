@@ -129,6 +129,8 @@ class ResearchLoopConfig:
     default_interval_days: int = 1
     allowed_interval_days: tuple[int, ...] = (1, 5, 15, 30)
     simulation_profile: SimulationProfile = field(default_factory=SimulationProfile)
+    evaluation_simulation_profile: SimulationProfile | None = None
+    backtest_simulation_profile: SimulationProfile | None = None
     horizon_days_matrix: tuple[int, ...] = DEFAULT_HORIZON_DAYS
     sample_splits: tuple[SampleSplitSpec, ...] = DEFAULT_SAMPLE_SPLITS
     gate: ResearchGate = field(default_factory=ResearchGate)
@@ -159,6 +161,14 @@ class ResearchLoopConfig:
     @property
     def simulation_profiles(self) -> tuple[SimulationProfile, ...]:
         return self.parameter_search.profiles(self.simulation_profile)
+
+    @property
+    def evaluation_profile(self) -> SimulationProfile:
+        return self.evaluation_simulation_profile or self.simulation_profile
+
+    @property
+    def backtest_profile(self) -> SimulationProfile:
+        return self.backtest_simulation_profile or self.simulation_profile
 
 
 def default_research_loop_config(
@@ -197,6 +207,7 @@ def load_research_loop_config(
     simulation_section = dict(simulation_section_raw or {})
     if "top_quantile" in loaded and "top_quantile" not in simulation_section:
         simulation_section["top_quantile"] = loaded["top_quantile"]
+    primary_profile = simulation_profile_from_mapping(simulation_section, base.simulation_profile)
     return ResearchLoopConfig(
         objective=objective,
         default_max_candidates=int(loaded.get("default_max_candidates", base.default_max_candidates)),
@@ -204,7 +215,9 @@ def load_research_loop_config(
         allowed_interval_days=tuple(
             int(item) for item in loaded.get("allowed_interval_days", base.allowed_interval_days)
         ),
-        simulation_profile=simulation_profile_from_mapping(simulation_section, base.simulation_profile),
+        simulation_profile=primary_profile,
+        evaluation_simulation_profile=_load_role_simulation_profile(loaded, "evaluation", primary_profile),
+        backtest_simulation_profile=_load_role_simulation_profile(loaded, "backtest", primary_profile),
         horizon_days_matrix=tuple(int(item) for item in loaded.get("horizon_days_matrix", base.horizon_days_matrix)),
         sample_splits=_load_sample_splits(loaded.get("sample_splits"), base.sample_splits),
         gate=ResearchGate(
@@ -277,6 +290,20 @@ def _optional_float(value: Any) -> float | None:
     if value is None:
         return None
     return float(value)
+
+
+def _load_role_simulation_profile(raw: dict[str, Any], section: str, base: SimulationProfile) -> SimulationProfile:
+    section_value = raw.get(section)
+    if section_value is None:
+        return base
+    if not isinstance(section_value, dict):
+        raise ValueError(f"RD config {section} section must be a mapping")
+    simulation_value = section_value.get("simulation", section_value)
+    if simulation_value is None:
+        return base
+    if not isinstance(simulation_value, dict):
+        raise ValueError(f"RD config {section}.simulation must be a mapping")
+    return simulation_profile_from_mapping(simulation_value, base)
 
 
 def _load_sample_splits(raw: Any, default: tuple[SampleSplitSpec, ...]) -> tuple[SampleSplitSpec, ...]:

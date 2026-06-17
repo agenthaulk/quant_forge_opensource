@@ -97,8 +97,9 @@ small:
 
 - validate the effective `SimulationProfile`;
 - apply the configured `test_period` to local panel rows;
-- require at least 126 daily trading dates for displayable evaluation and
-  backtest metrics;
+- require at least 126 daily trading dates for displayable evaluation metrics;
+- allow shorter holding-period backtest holdouts when at least one entry/exit
+  path is possible, while surfacing short-window warnings;
 - execute the factor formula and factor-owned universe filters;
 - apply EWMA score decay when `decay_days > 1`;
 - support only `nan_policy: drop`, `neutralization: none`, and `truncation:
@@ -120,6 +121,10 @@ Near-zero IC standard deviation is treated as zero ICIR to avoid falsely large
 scores from numerical noise.
 CLI `eval-factor`, local web idea parsing, and RD runs all use the same
 configured horizon matrix and split definitions when an RD config is supplied.
+The RD config may also define role-specific profiles:
+`evaluation.simulation` controls factor testing and IC/ICIR evidence, while
+`backtest.simulation` controls the holding-period backtest. If those sections
+are omitted, both roles fall back to the legacy `simulation` profile.
 
 ## Research Loop Semantics
 
@@ -168,10 +173,11 @@ server. Long-running distributed workers and non-public platform rebinding remai
 
 If research proposes a formula that needs an unknown operator, the run is marked
 `requires_operator_draft_review`. The workbench writes draft artifacts under
-`artifact_root/operator_drafts/<draft_id>/`, including an operator stub,
-manifest, example formula, generated test requirements, and audit status. Draft
-operators are never imported or executed until Codex/developer review promotes
-them into the formal public operator set.
+`artifact_root/operator_drafts/<draft_id>/`, including JSON/Markdown-only
+metadata: manifest, semantics request, generated test requirements, audit
+status, and a review note. Draft operators are never imported or executed until
+Codex/developer review promotes them into audited source code and the formal
+public operator set.
 
 RD weights, gate thresholds, cost assumptions, allowed schedule intervals, and
 bounded parameter-search profile variants are loaded from `configs/rd.yaml` by

@@ -159,8 +159,64 @@ def test_operator_draft_artifacts_are_written_for_unknown_operator(tmp_path: Pat
 
     assert artifacts is not None
     assert Path(artifacts.manifest_path).exists()
-    assert Path(artifacts.operator_path).read_text(encoding="utf-8").count("NotImplementedError") == 1
+    manifest = json.loads(Path(artifacts.manifest_path).read_text(encoding="utf-8"))
+    assert manifest["security_boundary"] == "not_imported_not_executed_until_reviewed"
+    assert manifest["audit_status"] == "draft"
+    assert Path(artifacts.semantics_request_path).exists()
+    assert Path(artifacts.review_path).read_text(encoding="utf-8").startswith("# Draft Operator Review")
+    assert not (Path(artifacts.draft_root) / "operator.py").exists()
     assert "operator_drafts" in artifacts.draft_root
+
+
+def test_operator_draft_artifacts_use_nested_unknown_resolution_status(tmp_path: Path) -> None:
+    hypothesis = StructuredResearchHypothesis(
+        hypothesis_id="nested_draft_op",
+        text="needs nested draft operator",
+        formula_dsl="rank(industry_neutralize(return_1d))",
+        expected_direction="positive",
+        source="operator_mcp",
+    )
+    plan = ExperimentPlanner().plan(hypothesis, default_context())
+
+    artifacts = write_operator_draft_artifacts(tmp_path, plan)
+
+    assert artifacts is not None
+    manifest = json.loads(Path(artifacts.manifest_path).read_text(encoding="utf-8"))
+    assert manifest["unknown_operator"] == "industry_neutralize"
+    assert manifest["resolution_status"] == "unknown_requires_draft"
+
+
+def test_experiment_planner_canonicalizes_safe_alias_before_ready_plan() -> None:
+    hypothesis = StructuredResearchHypothesis(
+        hypothesis_id="alias_stddev",
+        text="external DSL stddev alias",
+        formula_dsl="rank(-ts_stddev(return_1d, 20))",
+        expected_direction="positive",
+        source="operator_mcp",
+    )
+
+    plan = ExperimentPlanner().plan(hypothesis, default_context())
+
+    assert plan.status == "ready"
+    assert plan.raw_formula_dsl == "rank(-ts_stddev(return_1d, 20))"
+    assert plan.formula_dsl == "rank(-stddev(return_1d, 20))"
+    assert plan.metadata["operator_resolution"]["executable"] is True
+
+
+def test_experiment_planner_blocks_likely_alias_without_draft_execution() -> None:
+    hypothesis = StructuredResearchHypothesis(
+        hypothesis_id="rolling_std",
+        text="ambiguous rolling std alias",
+        formula_dsl="rolling_std(return_1d, 20)",
+        expected_direction="positive",
+        source="operator_mcp",
+    )
+
+    plan = ExperimentPlanner().plan(hypothesis, default_context())
+
+    assert plan.status == "blocked_formula_invalid"
+    assert plan.operator_validation["unknown_operators"] == []
+    assert plan.metadata["operator_resolution"]["executable"] is False
 
 
 def test_experiment_planner_accepts_nested_multi_argument_formula() -> None:

@@ -47,6 +47,8 @@
 - `factor_values_manifest_root`
 - `output_root`
 - `simulation.test_period`
+- `evaluation.simulation.test_period`（如配置，控制因子评价/IC 证据）
+- `backtest.simulation.test_period`（如配置，控制持仓回测证据）
 - `llm.provider`
 - 可选 LLM provider 列表和对应 `api_key_env`
 
@@ -165,7 +167,10 @@ Factor values missing for 2025-06-01 to 2025-06-30; incremental compute required
 如果普通 research 生成了当前公开算子库无法执行的复杂公式，程序应返回
 `requires_operator_draft_review`，并写入
 `artifact_root/operator_drafts/<draft_id>/`。这些草稿算子只供 Codex/开发者审计，
-不会自动 import 或执行。
+不会自动 import 或执行。草稿产物仅包含 JSON/Markdown 元数据，例如
+`manifest.json`、`semantics_request.json`、`generated_tests.json`、
+`audit_status.json` 和 `review.md`，不得在 `artifact_root` 中落地可执行
+Python 算子文件。
 
 ### 3.5 评价反馈
 
@@ -184,6 +189,7 @@ Factor values missing for 2025-06-01 to 2025-06-30; incremental compute required
 回测反馈应同时展示收益和口径：
 
 - `holding_days`
+- evaluation period / backtest period 是否分别符合配置
 - `execution_delay_days`
 - `top_quantile`
 - `gross_annualized_return`

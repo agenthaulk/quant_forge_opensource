@@ -355,6 +355,16 @@ simulation:
   test_period:
     start: null
     end: null
+evaluation:
+  simulation:
+    test_period:
+      start: null
+      end: null
+backtest:
+  simulation:
+    test_period:
+      start: null
+      end: null
 parameter_search:
   enabled: false
   method: successive_halving
@@ -420,6 +430,29 @@ weight_profiles:
     max_drawdown: 0.1
 ```
 
+`simulation` is the legacy/default profile used when no role-specific profile is
+configured. `evaluation.simulation` can override the profile for factor testing
+and IC/ICIR evidence, while `backtest.simulation` can override the profile for
+the holding-period backtest. This lets you keep model selection on one period
+and reserve a later holdout period for portfolio-style evidence. For example,
+to evaluate factors on 2025 and run the holding backtest on 2026:
+
+```yaml
+evaluation:
+  simulation:
+    test_period:
+      start: "2025-01-01"
+      end: "2025-12-31"
+backtest:
+  simulation:
+    test_period:
+      start: "2026-01-01"
+      end: "2026-12-31"
+```
+
+Only use the 2026 backtest result as holdout evidence if RD/parameter search did
+not use that same period for optimization.
+
 The default FactorLab-style evaluation runs a 5/10/21/63-day horizon matrix and
 splits the usable dates chronologically into IS/OOS1/OOS2 at 50%/30%/20%.
 `score_weight` controls the weighted split ICIR score. The default RD score
@@ -456,16 +489,18 @@ configured IS/OOS sample split names. Optional gate fields can reject RD
 candidates for weak OOS net return, excessive rebalance rate, excessive
 turnover rate, low net/gross retention, or OOS net-return decay.
 
-`simulation` is the effective profile shared by evaluation, backtesting, web
-idea workflows, and RD. First-version score preparation applies `test_period`,
-factor formula execution, universe filters, and EWMA `decay_days`; it supports
-only `nan_policy: drop`, `neutralization: none`, and `truncation: null`.
-Unsupported values fail fast.
+`simulation` is the legacy/default profile shared by evaluation, backtesting,
+web idea workflows, and RD unless `evaluation.simulation` or
+`backtest.simulation` overrides it. First-version score preparation applies
+`test_period`, factor formula execution, universe filters, and EWMA
+`decay_days`; it supports only `nan_policy: drop`, `neutralization: none`, and
+`truncation: null`. Unsupported values fail fast.
 
-Displayable evaluation and backtest metrics require at least 126 daily trading
-dates after `simulation.test_period` is applied. This is the public workbench's
-six-month daily-data floor; if a configured period is shorter, expand the
-period or load a longer panel before showing factor metrics.
+Displayable evaluation metrics require at least 126 daily trading dates after
+the effective evaluation `test_period` is applied. Holding-period backtests may
+run on a shorter holdout window when there are enough dates for at least one
+entry/exit path, but the report will warn that annualized return and volatility
+are highly extrapolated.
 
 `top_quantile` controls the long and short tail size. The legacy top-level key
 is still accepted, but the canonical value is `simulation.top_quantile`. Pass
