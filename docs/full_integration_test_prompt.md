@@ -36,15 +36,18 @@
 
 ### Level 2: Chrome 自动化 fallback
 
-仅当当前 Codex 会话没有暴露 Computer Use 工具，或 Computer Use 无法稳定读取桌面窗口时，才允许使用本级。
+仅当当前 Codex 会话没有暴露 Computer Use 工具，或 Computer Use 无法稳定读取桌面窗口时，才允许使用本级。不要因为方便而直接使用 Codex 内置浏览器。
 
-- 使用 Chrome Plugin、`node_repl` + Playwright，或其他可打开桌面 Chrome app 的自动化方式。
-- 必须打开本机 Chrome app，例如 Playwright `channel: "chrome"`；不能使用 Codex 内置浏览器代替。
-- 仍必须通过前端输入框和按钮完成流程。
+- 优先使用 `node_repl` + Playwright 打开 macOS 已安装的 Chrome app：
+  `chromium.launch({ channel: "chrome", headless: false })`。
+- 如果 Computer Use 的 `get_app_state` 能读取桌面 Chrome，但 `click` / `set_value` 被拒绝并提示 action session 不活跃，也视为本级 fallback；记录
+  `fallback_reason=computeruse_action_session_inactive`，然后改用 Chrome 接口控制桌面 Chrome app。
+- 如果使用 Chrome Plugin 或其他自动化方式，也必须打开本机 Chrome app；不能使用 Codex 内置浏览器代替。
+- 仍必须通过前端输入框、下拉框和按钮完成流程。
 - 最终报告必须写明：
-  - `frontend_interaction.mode=chrome_playwright_fallback` 或等价字段。
+  - `frontend_interaction.mode=chrome_playwright_fallback`。
   - `fallback_used=true`。
-  - 降级原因，例如 `computeruse_tool_unavailable`。
+  - `fallback_reason=computeruse_tool_unavailable` 或 `computeruse_action_session_inactive`。
 - 不得把 Chrome 自动化 fallback 描述为严格 Computer Use。
 
 ### Level 3: API 验证，仅作补充
@@ -79,6 +82,7 @@
 - 不要提交任何 API key、挂载盘绝对私密路径、私有数据样本。
 - 不要把 DeepSeek key 写入 git tracked 文件。
 - LLM API key 必须从本机环境变量或 ignored local env 文件继承，例如 DEEPSEEK_API_KEY、DEEPSEEK_API_BASE、DEEPSEEK_MODEL；具体变量名按项目配置文档和代码实际要求确认。
+- 如果仓库中存在 ignored 的 `configs/default.local.yaml`，并且其中声明了 `runtime.env_files`，DeepSeek 联调必须使用该 local config，不得用公开 `configs/default.yaml` 代替。
 - A 股原始数据源、因子定义库、因子值库、artifact/result 路径参考当前机器挂载盘中的已有路径，但必须写入 local/ignored 配置文件或 Docker runtime env，不得写入正式配置。
 - 配置文件中只能写环境变量名，不能写真实 key。
 - 若遇到不确定问题，先通过代码、README、docs、config sample 自查；只有方向性问题才向用户求证。
@@ -122,7 +126,10 @@
    - llm api key env：DeepSeek 环境变量名，不直接写 key
    - evaluation/backtest/RD 的测试时间窗，按项目当前配置文档执行
 5. 确认 Docker 容器能读取 data_root、factor_root、factor_values_root，并能写 artifact/result。
-6. 校验配置加载是否成功。
+6. 校验配置加载是否成功。DeepSeek 联调必须先通过：
+   - `qf doctor --config configs/default.local.yaml --rd-config configs/rd.yaml`
+   - `qf llm-smoke --config configs/default.local.yaml --provider deepseek`
+   `doctor` 必须显示 DeepSeek runtime-ready；`llm-smoke` 必须完成一次真实自然语言解析，但不得打印或记录真实 API key。
 7. 运行项目推荐 smoke test：
    - python -m pytest
    - PYTHONPATH=src python -m quant_forge.apps.cli.main --help
@@ -143,10 +150,10 @@
 
 阶段 3：使用 computeruse 做真实前端联调
 1. 优先使用 Computer Use 操作桌面已经安装的 Chrome app，不使用 Codex 内置浏览器。
-2. 如果 Computer Use 工具不可用或无法稳定读取窗口，可以降级为 Chrome 自动化 fallback，但必须：
-   - 打开桌面 Chrome app，而不是 Codex 内置浏览器。
-   - 通过前端输入框和按钮完成操作。
-   - 在最终报告中记录 `frontend_interaction.mode`、`fallback_used=true` 和降级原因。
+2. 如果 Computer Use 工具不可用、无法稳定读取窗口，或 `get_app_state` 成功但 `click` / `set_value` 被拒绝，不要使用 Codex 内置浏览器；降级为 Chrome 自动化 fallback：
+   - 优先使用 `node_repl` + Playwright，并通过 `chromium.launch({ channel: "chrome", headless: false })` 打开 macOS 已安装的 Chrome app。
+   - 通过前端输入框、下拉框和按钮完成操作，不得用 API 替代用户动作。
+   - 在最终报告中记录 `frontend_interaction.mode=chrome_playwright_fallback`、`fallback_used=true`、`fallback_reason=computeruse_tool_unavailable` 或 `computeruse_action_session_inactive`。
 3. 打开 Chrome，访问项目 Web 前端 URL。
 4. 模拟普通用户操作：
    - 选择 DeepSeek LLM

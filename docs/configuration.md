@@ -58,6 +58,12 @@ file, or to a mounted source snapshot root containing `price/` and
 from close, volume, and market-value fields; deeper PIT and provider-specific
 ETL remain outside the lightweight core.
 
+Custom numeric columns in `panel.parquet` are treated as already point-in-time
+safe. Do not expose forward-looking labels such as future returns, next close,
+or post-event fields as factor inputs unless they have been lagged upstream.
+Backtests and evaluation apply a configurable execution delay, but they cannot
+prove that arbitrary custom columns were produced with PIT-safe ETL.
+
 `paths.factor_root` remains the writable source of truth for user-created factor
 definitions. `paths.factor_values_root` is read as an additional mounted factor
 database. `qf factor list`, evaluation, backtest, Web, MCP catalog, and RD seed
@@ -322,8 +328,14 @@ Example local setup:
 ```bash
 printf 'DEEPSEEK_API_KEY=<your-deepseek-api-key>\n' > configs/default.local.env
 chmod 600 configs/default.local.env
+qf doctor --config configs/default.local.yaml --rd-config configs/rd.yaml
+qf llm-smoke --config configs/default.local.yaml --provider deepseek
 qf web --config configs/default.local.yaml --rd-config configs/rd.yaml
 ```
+
+`qf llm-smoke` performs one real LLM parse through the same config and
+`runtime.env_files` chain used by Web. It reports provider/model/factor metadata
+only; it must not print the API key.
 
 ## Research Loop
 

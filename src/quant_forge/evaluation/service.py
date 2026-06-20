@@ -72,7 +72,16 @@ def evaluate_factor(
     scores = score_result.scores
     split_specs = _validate_sample_splits(sample_splits or DEFAULT_SAMPLE_SPLITS)
     horizons = _unique_horizons(horizon, horizon_days_matrix or DEFAULT_HORIZON_DAYS)
-    horizon_metrics = tuple(_evaluate_horizon(working_panel, scores, item, split_specs) for item in horizons)
+    horizon_metrics = tuple(
+        _evaluate_horizon(
+            working_panel,
+            scores,
+            item,
+            split_specs,
+            execution_delay_days=profile.execution_delay_days,
+        )
+        for item in horizons
+    )
     primary = next(metric for metric in horizon_metrics if metric.horizon_days == horizon)
     warnings = _evaluation_warnings(primary.split_metrics)
 
@@ -140,10 +149,14 @@ def evaluate_factor(
     )
 
 
-def _with_forward_return(panel: pd.DataFrame, horizon_days: int) -> pd.DataFrame:
+def _with_forward_return(panel: pd.DataFrame, horizon_days: int, *, execution_delay_days: int) -> pd.DataFrame:
+    if execution_delay_days < 1:
+        raise ValueError("execution_delay_days must be at least 1")
     labeled = panel[["trade_date", "instrument", "close"]].copy()
-    labeled["future_close"] = labeled.groupby("instrument")["close"].shift(-horizon_days)
-    labeled["forward_return"] = labeled["future_close"] / labeled["close"] - 1.0
+    by_instrument = labeled.groupby("instrument")["close"]
+    labeled["entry_close"] = by_instrument.shift(-execution_delay_days)
+    labeled["future_close"] = by_instrument.shift(-(execution_delay_days + horizon_days))
+    labeled["forward_return"] = labeled["future_close"] / labeled["entry_close"] - 1.0
     return labeled[["trade_date", "instrument", "forward_return"]]
 
 
@@ -152,10 +165,16 @@ def _evaluate_horizon(
     scores: pd.DataFrame,
     horizon_days: int,
     split_specs: tuple[SampleSplitSpec, ...],
+    *,
+    execution_delay_days: int,
 ) -> HorizonEvaluationMetric:
     if horizon_days < 1:
         raise ValueError("horizon_days_matrix values must be positive")
-    labeled = _with_forward_return(panel, horizon_days).merge(scores, on=["trade_date", "instrument"], how="left")
+    labeled = _with_forward_return(
+        panel,
+        horizon_days,
+        execution_delay_days=execution_delay_days,
+    ).merge(scores, on=["trade_date", "instrument"], how="left")
     overall = _ic_summary(labeled)
     dates = list(labeled.dropna(subset=["forward_return"])["trade_date"].drop_duplicates().sort_values())
     split_dates = _split_dates(dates, split_specs)

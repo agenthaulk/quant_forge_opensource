@@ -236,6 +236,7 @@ printf 'DEEPSEEK_API_KEY=<your-api-key>\n' > configs/default.local.env
 chmod 600 configs/default.local.env
 # edit configs/default.local.yaml paths.* and runtime.env_files as needed
 qf doctor --config configs/default.local.yaml --rd-config configs/rd.yaml
+qf llm-smoke --config configs/default.local.yaml --provider deepseek
 qf web --config configs/default.local.yaml --rd-config configs/rd.yaml
 ```
 
@@ -245,7 +246,7 @@ secret value. A minimal local snippet looks like this:
 ```yaml
 runtime:
   env_files:
-    - configs/default.local.env
+    - default.local.env
 llm:
   provider: deepseek
   providers:
@@ -277,6 +278,11 @@ error such as:
 llm.providers.deepseek.base_url is required
 Missing API key for active LLM provider deepseek. Expected environment variable: DEEPSEEK_API_KEY.
 ```
+
+Run `qf llm-smoke --config configs/default.local.yaml --provider deepseek`
+before starting Web when you want to verify the full config → env-file → LLM
+request path. The smoke output names the provider, model, `api_key_env`, and
+parsed factor, but never prints the secret value.
 
 For a local OpenAI-compatible endpoint that does not require auth, set
 `require_api_key` to `false`; then `api_key_env` may be omitted and Quant Forge

@@ -434,6 +434,78 @@ def test_llm_hypothesis_prompt_redacts_precomputed_seed_formula() -> None:
     assert "Do not use placeholder fields such as seed, seed_score, or factor_score" in prompt
 
 
+def test_llm_hypothesis_prompt_guides_mechanism_first_rd() -> None:
+    seed = FactorDefinition(
+        factor_id="FTR_LINEAR_RANK",
+        name="linear_rank_seed",
+        formula="-rank(market_cap) + -rank(volatility_5d) + rank(return_5d)",
+        description="small cap low volatility stable return seed",
+        status="candidate",
+    )
+
+    prompt = "\n".join(
+        message["content"]
+        for message in rd_llm._hypothesis_messages(  # noqa: SLF001 - lock RD prompt contract.
+            seed,
+            context=None,
+            objective="improve OOS stability without cosmetic rank additions",
+            max_candidates=3,
+        )
+    )
+
+    assert "mechanism-first research workflow" in prompt
+    assert "interaction_conjunction" in prompt
+    assert "stability_smoothing" in prompt
+    assert "relationship_consistency" in prompt
+    assert "Do not merely append another rank term to a linear rank-sum seed" in prompt
+    assert "rank((1 - rank(market_cap)) * (1 - rank(volatility_5d)) * rank(return_5d))" in prompt
+    assert "rank(covariance(1 - rank(market_cap), 1 - rank(volatility_5d), 20))" in prompt
+    assert '"seed_formula_shape": "linear_rank_sum"' in prompt
+    assert "source_detail" in prompt
+    assert "expected failure mode" in prompt
+
+
+def test_llm_mechanism_guidance_examples_are_planner_ready() -> None:
+    seed = FactorDefinition(
+        factor_id="FTR_LINEAR_RANK",
+        name="linear_rank_seed",
+        formula="-rank(market_cap) + -rank(volatility_5d) + rank(return_5d)",
+        description="small cap low volatility stable return seed",
+        status="candidate",
+    )
+
+    guidance = rd_llm._mechanism_guidance_for_prompt(seed)  # noqa: SLF001 - lock RD prompt examples.
+    formulas = [lane["example_formula"] for lane in guidance["preferred_lanes"]]
+
+    assert guidance["seed_formula_shape"] == "linear_rank_sum"
+    for index, formula in enumerate(formulas):
+        plan = ExperimentPlanner().plan(
+            StructuredResearchHypothesis(
+                hypothesis_id=f"mechanism_example_{index}",
+                text=f"mechanism example {index}",
+                formula_dsl=formula,
+                expected_direction="positive",
+                source="operator_mcp",
+            ),
+            default_context(),
+        )
+
+        assert plan.status == "ready", formula
+
+
+def test_llm_mechanism_guidance_does_not_misclassify_non_additive_seed() -> None:
+    seed = FactorDefinition(
+        factor_id="FTR_INTERACTION",
+        name="interaction_seed",
+        formula="rank((1 - rank(market_cap)) * rank(return_5d))",
+        status="candidate",
+    )
+
+    guidance = rd_llm._mechanism_guidance_for_prompt(seed)  # noqa: SLF001 - lock RD prompt examples.
+
+    assert guidance["seed_formula_shape"] == "other"
+
+
 def test_llm_hypothesis_payload_ignores_provider_parameter_fallback_flag() -> None:
     hypotheses = rd_llm._hypotheses_from_payload(  # noqa: SLF001 - lock structured LLM contract.
         {
@@ -665,6 +737,9 @@ def test_llm_repair_prompt_includes_validation_error(tmp_path: Path) -> None:
     assert "delta argument 2 must be a number" in prompt
     assert "rank(delta(return_5d, volatility_5d))" in prompt
     assert "Do not request parameter-search fallback" in prompt
+    assert "Preserve the selected research lane" in prompt
+    assert "mechanism_guidance" in prompt
+    assert "interaction_conjunction: formula_repair" in prompt
 
 
 def test_llm_hypothesis_payload_drops_provider_fallback_when_regular_ideas_exist() -> None:
