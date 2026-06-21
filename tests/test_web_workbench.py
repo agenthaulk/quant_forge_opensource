@@ -74,21 +74,71 @@ def test_web_parse_workflow_returns_editable_defaults_without_evaluation(monkeyp
 
     assert result["parser"]["source"] == "rule"
     assert result["factor"]["formula"] == "-rank(market_cap)"
-    assert result["parameters"] == {
-        "holding_days": 5,
-        "execution_delay_days": 1,
-        "decay_days": 0,
-        "top_quantile": 0.3,
-        "evaluation_start": None,
-        "evaluation_end": None,
-        "backtest_start": None,
-        "backtest_end": None,
+    assert result["parameters"]["holding_days"] == 5
+    assert result["parameters"]["execution_delay_days"] == 1
+    assert result["parameters"]["decay_days"] == 0
+    assert result["parameters"]["top_quantile"] == 0.3
+    assert result["parameters"]["evaluation_start"] is None
+    assert result["parameters"]["evaluation_end"] is None
+    assert result["parameters"]["backtest_start"] is None
+    assert result["parameters"]["backtest_end"] is None
+    assert result["parameters"]["commission_bps"] == 0.0
+    assert result["parameters"]["slippage_bps"] == 0.0
+    assert result["parameters"]["short_borrow_bps_annual"] == 0.0
+    assert result["parameters"]["evaluation"] == {
+        "simulation": {"execution_delay_days": 1, "decay_days": 0, "top_quantile": 0.3},
+        "test_period": {"start": None, "end": None},
+    }
+    assert result["parameters"]["backtest"] == {
+        "simulation": {"execution_delay_days": 1, "decay_days": 0, "top_quantile": 0.3},
+        "test_period": {"start": None, "end": None},
+    }
+    assert result["parameters"]["transaction_costs"] == {
         "commission_bps": 0.0,
         "slippage_bps": 0.0,
         "short_borrow_bps_annual": 0.0,
     }
     with pytest.raises(FileNotFoundError):
         FactorRepository(config.paths.factor_root).get(result["factor"]["factor_id"])
+
+
+def test_web_parse_workflow_returns_distinct_role_scoped_defaults(tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+    rd_config = ResearchLoopConfig(
+        evaluation_simulation_profile=SimulationProfile(
+            execution_delay_days=1,
+            top_quantile=0.1,
+            decay_days=0,
+            test_period_start="2025-01-01",
+        ),
+        backtest_simulation_profile=SimulationProfile(
+            execution_delay_days=2,
+            top_quantile=0.2,
+            decay_days=3,
+            test_period_start="2026-01-01",
+        ),
+    )
+
+    result = run_idea_parse_workflow(
+        config,
+        "非ST的小市值股票未来表现更好",
+        parser_mode="rule",
+        rd_config=rd_config,
+    )
+
+    assert result["parameters"]["evaluation"]["simulation"] == {
+        "execution_delay_days": 1,
+        "decay_days": 0,
+        "top_quantile": 0.1,
+    }
+    assert result["parameters"]["evaluation"]["test_period"] == {"start": "2025-01-01", "end": None}
+    assert result["parameters"]["backtest"]["simulation"] == {
+        "execution_delay_days": 2,
+        "decay_days": 3,
+        "top_quantile": 0.2,
+    }
+    assert result["parameters"]["backtest"]["test_period"] == {"start": "2026-01-01", "end": None}
 
 
 def test_web_validation_workflow_uses_edited_parameters(monkeypatch, tmp_path) -> None:
@@ -167,8 +217,20 @@ def test_web_validation_workflow_uses_edited_parameters(monkeypatch, tmp_path) -
     monkeypatch.setattr(web_server, "run_factor_backtest", fake_run_factor_backtest)
 
     rd_config = ResearchLoopConfig(
-        evaluation_simulation_profile=SimulationProfile(test_period_start="2025-01-01", test_period_end="2025-12-31"),
-        backtest_simulation_profile=SimulationProfile(test_period_start="2026-01-01", test_period_end="2026-12-31"),
+        evaluation_simulation_profile=SimulationProfile(
+            execution_delay_days=1,
+            top_quantile=0.1,
+            decay_days=0,
+            test_period_start="2025-01-01",
+            test_period_end="2025-12-31",
+        ),
+        backtest_simulation_profile=SimulationProfile(
+            execution_delay_days=4,
+            top_quantile=0.25,
+            decay_days=5,
+            test_period_start="2026-01-01",
+            test_period_end="2026-12-31",
+        ),
     )
     result = run_idea_validation_workflow(
         config,
@@ -196,9 +258,9 @@ def test_web_validation_workflow_uses_edited_parameters(monkeypatch, tmp_path) -
     assert captured["evaluation_horizon_days"] == 21
     assert captured["backtest_holding_days"] == 21
     assert isinstance(evaluation_profile, SimulationProfile)
-    assert evaluation_profile.decay_days == 3
-    assert evaluation_profile.top_quantile == 0.2
-    assert evaluation_profile.execution_delay_days == 2
+    assert evaluation_profile.decay_days == 0
+    assert evaluation_profile.top_quantile == 0.1
+    assert evaluation_profile.execution_delay_days == 1
     assert evaluation_profile.test_period_start == "2025-02-01"
     assert evaluation_profile.test_period_end == "2025-03-31"
     assert isinstance(backtest_profile, SimulationProfile)
@@ -218,7 +280,84 @@ def test_web_validation_workflow_uses_edited_parameters(monkeypatch, tmp_path) -
     assert result["parameters"]["evaluation_end"] == "2025-03-31"
     assert result["parameters"]["backtest_start"] == "2026-02-01"
     assert result["parameters"]["backtest_end"] == "2026-04-30"
+    assert result["parameters"]["evaluation"]["simulation"] == {
+        "execution_delay_days": 1,
+        "decay_days": 0,
+        "top_quantile": 0.1,
+    }
+    assert result["parameters"]["backtest"]["simulation"] == {
+        "execution_delay_days": 2,
+        "decay_days": 3,
+        "top_quantile": 0.2,
+    }
     assert FactorRepository(config.paths.factor_root).get(factor.factor_id).horizon_days == 5
+
+
+def test_web_validation_settings_accept_role_scoped_profile_overrides() -> None:
+    factor = FactorDefinition(
+        factor_id="FTR_ROLE_SCOPED_PARAMS",
+        name="role_scoped_params",
+        formula="-rank(market_cap)",
+        horizon_days=5,
+    )
+    rd_config = ResearchLoopConfig(
+        evaluation_simulation_profile=SimulationProfile(
+            execution_delay_days=1,
+            top_quantile=0.1,
+            decay_days=0,
+            test_period_start="2025-01-01",
+        ),
+        backtest_simulation_profile=SimulationProfile(
+            execution_delay_days=4,
+            top_quantile=0.25,
+            decay_days=5,
+            test_period_start="2026-01-01",
+        ),
+    )
+
+    settings = web_server._idea_validation_settings(
+        factor,
+        {
+            "holding_days": 21,
+            "decay_days": 9,
+            "top_quantile": 0.4,
+            "execution_delay_days": 5,
+            "commission_bps": 9.0,
+            "slippage_bps": 9.0,
+            "short_borrow_bps_annual": 90.0,
+            "evaluation": {
+                "simulation": {"execution_delay_days": 2, "decay_days": 1, "top_quantile": 0.15},
+                "test_period": {"start": "2025-02-01", "end": "2025-03-31"},
+            },
+            "backtest": {
+                "simulation": {"execution_delay_days": 3, "decay_days": 2, "top_quantile": 0.2},
+                "test_period": {"start": "2026-02-01", "end": "2026-04-30"},
+            },
+            "transaction_costs": {
+                "commission_bps": 1.5,
+                "slippage_bps": 2.5,
+                "short_borrow_bps_annual": 30.0,
+            },
+        },
+        rd_config,
+    )
+
+    assert settings.holding_days == 21
+    assert settings.evaluation_profile.execution_delay_days == 2
+    assert settings.evaluation_profile.decay_days == 1
+    assert settings.evaluation_profile.top_quantile == 0.15
+    assert settings.evaluation_profile.test_period_start == "2025-02-01"
+    assert settings.evaluation_profile.test_period_end == "2025-03-31"
+    assert settings.backtest_profile.execution_delay_days == 3
+    assert settings.backtest_profile.decay_days == 2
+    assert settings.backtest_profile.top_quantile == 0.2
+    assert settings.backtest_profile.test_period_start == "2026-02-01"
+    assert settings.backtest_profile.test_period_end == "2026-04-30"
+    assert settings.transaction_costs.commission_bps == 1.5
+    assert settings.transaction_costs.slippage_bps == 2.5
+    assert settings.transaction_costs.short_borrow_bps_annual == 30.0
+    assert settings.parameters["evaluation"]["simulation"]["top_quantile"] == 0.15
+    assert settings.parameters["backtest"]["simulation"]["top_quantile"] == 0.2
 
 
 def test_web_validation_rejects_invalid_parameters_before_evaluation(monkeypatch, tmp_path) -> None:
@@ -252,6 +391,12 @@ def test_web_validation_rejects_invalid_parameters_before_evaluation(monkeypatch
             factor,
             parameters={"backtest_start": "2026-04-30", "backtest_end": "2026-01-01"},
         )
+
+    with pytest.raises(ValueError, match="evaluation\\.simulation"):
+        run_idea_validation_workflow(config, factor, parameters={"evaluation": {"simulation": "bad"}})
+
+    with pytest.raises(ValueError, match="transaction_costs"):
+        run_idea_validation_workflow(config, factor, parameters={"transaction_costs": "bad"})
 
     with pytest.raises(FileNotFoundError):
         FactorRepository(config.paths.factor_root).get(factor.factor_id)
@@ -977,7 +1122,7 @@ def test_web_job_parse_then_validate_endpoint_completes(tmp_path) -> None:
 
         parameters = dict(parsed["result"]["parameters"])
         parameters["holding_days"] = 7
-        parameters["top_quantile"] = 0.2
+        parameters["backtest"]["simulation"]["top_quantile"] = 0.2
         started_validate = _post_json(
             f"{base_url}/api/jobs/validate-idea",
             {

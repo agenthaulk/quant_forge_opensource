@@ -203,6 +203,25 @@ def test_experiment_planner_canonicalizes_safe_alias_before_ready_plan() -> None
     assert plan.metadata["operator_resolution"]["executable"] is True
 
 
+def test_experiment_planner_canonicalizes_safe_alias_for_parameter_search_fallback() -> None:
+    hypothesis = StructuredResearchHypothesis(
+        hypothesis_id="alias_stddev_fallback",
+        text="parameter search around alias-based seed",
+        formula_dsl="rank(-ts_stddev(return_1d, 20))",
+        expected_direction="positive",
+        source="parameter_search",
+        parameter_search_fallback=True,
+    )
+
+    plan = ExperimentPlanner().plan(hypothesis, default_context())
+
+    assert plan.status == "ready"
+    assert plan.raw_formula_dsl == "rank(-ts_stddev(return_1d, 20))"
+    assert plan.formula_dsl == "rank(-stddev(return_1d, 20))"
+    assert plan.metadata["operator_resolution"]["executable"] is True
+    assert plan.metadata["parameter_search_fallback"] is True
+
+
 def test_experiment_planner_blocks_likely_alias_without_draft_execution() -> None:
     hypothesis = StructuredResearchHypothesis(
         hypothesis_id="rolling_std",

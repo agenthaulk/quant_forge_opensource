@@ -42,7 +42,7 @@ class ExperimentPlanner:
         elif _contains_st_numeric_feature(formula):
             blocking.append("ST status must be a universe filter, not a numeric formula field")
 
-        allow_whole_precomputed = hypothesis.parameter_search_fallback
+        allow_whole_precomputed = hypothesis.parameter_search_fallback and is_precomputed_formula(formula)
         resolution = None
         if formula and formula != "未指定" and not allow_whole_precomputed:
             resolution = resolve_formula_operators(formula)

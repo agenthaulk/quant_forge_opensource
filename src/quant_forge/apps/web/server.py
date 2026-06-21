@@ -707,21 +707,24 @@ def _parser_payload_from_request(parser: dict[str, Any] | None, factor: FactorDe
 
 
 def _default_validation_parameters(factor: FactorDefinition, rd_config: ResearchLoopConfig) -> dict[str, Any]:
-    profile = rd_config.backtest_profile
+    backtest_profile = rd_config.backtest_profile
     evaluation_profile = rd_config.evaluation_profile
     costs = rd_config.transaction_costs
     return {
         "holding_days": factor.horizon_days,
-        "execution_delay_days": profile.execution_delay_days,
-        "decay_days": profile.decay_days,
-        "top_quantile": profile.top_quantile,
+        "execution_delay_days": backtest_profile.execution_delay_days,
+        "decay_days": backtest_profile.decay_days,
+        "top_quantile": backtest_profile.top_quantile,
         "evaluation_start": evaluation_profile.test_period_start,
         "evaluation_end": evaluation_profile.test_period_end,
-        "backtest_start": profile.test_period_start,
-        "backtest_end": profile.test_period_end,
+        "backtest_start": backtest_profile.test_period_start,
+        "backtest_end": backtest_profile.test_period_end,
         "commission_bps": costs.commission_bps,
         "slippage_bps": costs.slippage_bps,
         "short_borrow_bps_annual": costs.short_borrow_bps_annual,
+        "evaluation": _simulation_profile_payload(evaluation_profile),
+        "backtest": _simulation_profile_payload(backtest_profile),
+        "transaction_costs": _transaction_costs_payload(costs),
     }
 
 
@@ -735,25 +738,17 @@ def _idea_validation_settings(
     if not isinstance(raw, dict):
         raise ValueError("validation parameters must be a JSON object")
     holding_days = _positive_int_parameter(raw.get("holding_days", defaults["holding_days"]), "holding_days")
-    profile_overrides: dict[str, Any] = {}
-    if "execution_delay_days" in raw:
-        profile_overrides["execution_delay_days"] = _positive_int_parameter(
-            raw["execution_delay_days"],
-            "execution_delay_days",
-        )
-    if "decay_days" in raw:
-        profile_overrides["decay_days"] = _nonnegative_int_parameter(raw["decay_days"], "decay_days")
-    if "top_quantile" in raw:
-        profile_overrides["top_quantile"] = _float_parameter(raw["top_quantile"], "top_quantile")
-    evaluation_overrides = dict(profile_overrides)
-    evaluation_overrides.update(_test_period_override("evaluation", raw))
-    backtest_overrides = dict(profile_overrides)
+    evaluation_overrides = _test_period_override("evaluation", raw)
+    evaluation_overrides.update(_role_profile_overrides("evaluation", raw))
+    backtest_overrides = _flat_backtest_profile_overrides(raw)
     backtest_overrides.update(_test_period_override("backtest", raw))
+    backtest_overrides.update(_role_profile_overrides("backtest", raw))
+    cost_payload = _cost_parameters(raw, defaults)
     transaction_costs = TransactionCostModel(
-        commission_bps=_nonnegative_float_parameter(raw.get("commission_bps", defaults["commission_bps"]), "commission_bps"),
-        slippage_bps=_nonnegative_float_parameter(raw.get("slippage_bps", defaults["slippage_bps"]), "slippage_bps"),
+        commission_bps=_nonnegative_float_parameter(cost_payload["commission_bps"], "commission_bps"),
+        slippage_bps=_nonnegative_float_parameter(cost_payload["slippage_bps"], "slippage_bps"),
         short_borrow_bps_annual=_nonnegative_float_parameter(
-            raw.get("short_borrow_bps_annual", defaults["short_borrow_bps_annual"]),
+            cost_payload["short_borrow_bps_annual"],
             "short_borrow_bps_annual",
         ),
     )
@@ -776,8 +771,104 @@ def _idea_validation_settings(
             "commission_bps": transaction_costs.commission_bps,
             "slippage_bps": transaction_costs.slippage_bps,
             "short_borrow_bps_annual": transaction_costs.short_borrow_bps_annual,
+            "evaluation": _simulation_profile_payload(evaluation_profile),
+            "backtest": _simulation_profile_payload(backtest_profile),
+            "transaction_costs": _transaction_costs_payload(transaction_costs),
         },
     )
+
+
+def _simulation_profile_payload(profile: SimulationProfile) -> dict[str, Any]:
+    return {
+        "simulation": {
+            "execution_delay_days": profile.execution_delay_days,
+            "decay_days": profile.decay_days,
+            "top_quantile": profile.top_quantile,
+        },
+        "test_period": {
+            "start": profile.test_period_start,
+            "end": profile.test_period_end,
+        },
+    }
+
+
+def _transaction_costs_payload(costs: TransactionCostModel) -> dict[str, float]:
+    return {
+        "commission_bps": costs.commission_bps,
+        "slippage_bps": costs.slippage_bps,
+        "short_borrow_bps_annual": costs.short_borrow_bps_annual,
+    }
+
+
+def _role_profile_overrides(role: str, raw: dict[str, Any]) -> dict[str, Any]:
+    role_payload = raw.get(role)
+    if role_payload is None:
+        return {}
+    if not isinstance(role_payload, dict):
+        raise ValueError(f"{role} parameters must be a JSON object")
+    simulation_payload = role_payload.get("simulation", {})
+    if simulation_payload is None:
+        simulation_payload = {}
+    if not isinstance(simulation_payload, dict):
+        raise ValueError(f"{role}.simulation must be a JSON object")
+    overrides = _simulation_parameter_overrides(simulation_payload, f"{role}.simulation")
+    overrides.update(_role_test_period_override(role, role_payload))
+    return overrides
+
+
+def _flat_backtest_profile_overrides(raw: dict[str, Any]) -> dict[str, Any]:
+    return _simulation_parameter_overrides(raw, "")
+
+
+def _simulation_parameter_overrides(raw: dict[str, Any], prefix: str) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    label = f"{prefix}." if prefix else ""
+    if "execution_delay_days" in raw:
+        overrides["execution_delay_days"] = _positive_int_parameter(
+            raw["execution_delay_days"],
+            f"{label}execution_delay_days",
+        )
+    if "decay_days" in raw:
+        overrides["decay_days"] = _nonnegative_int_parameter(raw["decay_days"], f"{label}decay_days")
+    if "top_quantile" in raw:
+        overrides["top_quantile"] = _float_parameter(raw["top_quantile"], f"{label}top_quantile")
+    return overrides
+
+
+def _role_test_period_override(role: str, role_payload: dict[str, Any]) -> dict[str, Any]:
+    test_period = role_payload.get("test_period", {})
+    if test_period is None:
+        test_period = {}
+    if not isinstance(test_period, dict):
+        raise ValueError(f"{role}.test_period must be a JSON object")
+    overrides: dict[str, dict[str, str | None]] = {}
+    if "start" in test_period:
+        overrides.setdefault("test_period", {})["start"] = _optional_date_parameter(
+            test_period["start"],
+            f"{role}.test_period.start",
+        )
+    if "end" in test_period:
+        overrides.setdefault("test_period", {})["end"] = _optional_date_parameter(
+            test_period["end"],
+            f"{role}.test_period.end",
+        )
+    return overrides
+
+
+def _cost_parameters(raw: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
+    costs = raw.get("transaction_costs")
+    if costs is None:
+        costs = {}
+    if not isinstance(costs, dict):
+        raise ValueError("transaction_costs must be a JSON object")
+    return {
+        "commission_bps": costs.get("commission_bps", raw.get("commission_bps", defaults["commission_bps"])),
+        "slippage_bps": costs.get("slippage_bps", raw.get("slippage_bps", defaults["slippage_bps"])),
+        "short_borrow_bps_annual": costs.get(
+            "short_borrow_bps_annual",
+            raw.get("short_borrow_bps_annual", defaults["short_borrow_bps_annual"]),
+        ),
+    }
 
 
 def _test_period_override(prefix: str, raw: dict[str, Any]) -> dict[str, dict[str, str | None]]:
@@ -2069,25 +2160,87 @@ function syncLlmApiKeyControls() {{
 }}
 function fillValidationInputs(parameters) {{
   const values = parameters || {{}};
+  const evaluationPeriod = ((values.evaluation || {{}}).test_period) || {{}};
+  const backtest = values.backtest || {{}};
+  const backtestSimulation = backtest.simulation || {{}};
+  const backtestPeriod = backtest.test_period || {{}};
+  const costs = values.transaction_costs || {{}};
+  const resolved = {{
+    holding_days: values.holding_days,
+    decay_days: valueOr(values.decay_days, backtestSimulation.decay_days),
+    top_quantile: valueOr(values.top_quantile, backtestSimulation.top_quantile),
+    execution_delay_days: valueOr(values.execution_delay_days, backtestSimulation.execution_delay_days),
+    evaluation_start: valueOr(values.evaluation_start, evaluationPeriod.start),
+    evaluation_end: valueOr(values.evaluation_end, evaluationPeriod.end),
+    backtest_start: valueOr(values.backtest_start, backtestPeriod.start),
+    backtest_end: valueOr(values.backtest_end, backtestPeriod.end),
+    commission_bps: valueOr(values.commission_bps, costs.commission_bps),
+    slippage_bps: valueOr(values.slippage_bps, costs.slippage_bps),
+    short_borrow_bps_annual: valueOr(values.short_borrow_bps_annual, costs.short_borrow_bps_annual)
+  }};
   Object.entries(validationInputs).forEach(([name, input]) => {{
-    const value = values[name];
+    const value = resolved[name];
     input.value = value === undefined || value === null ? '' : value;
   }});
 }}
-function validationParameters() {{
+function currentEvaluationSimulation() {{
+  const source = (parsedIdea && parsedIdea.parameters && parsedIdea.parameters.evaluation) || {{}};
+  const simulation = source.simulation || {{}};
   return {{
-    holding_days: Number(validationInputs.holding_days.value),
-    decay_days: Number(validationInputs.decay_days.value),
-    top_quantile: Number(validationInputs.top_quantile.value),
-    execution_delay_days: Number(validationInputs.execution_delay_days.value),
-    evaluation_start: validationInputs.evaluation_start.value || null,
-    evaluation_end: validationInputs.evaluation_end.value || null,
-    backtest_start: validationInputs.backtest_start.value || null,
-    backtest_end: validationInputs.backtest_end.value || null,
-    commission_bps: Number(validationInputs.commission_bps.value),
-    slippage_bps: Number(validationInputs.slippage_bps.value),
-    short_borrow_bps_annual: Number(validationInputs.short_borrow_bps_annual.value)
+    decay_days: simulation.decay_days,
+    top_quantile: simulation.top_quantile,
+    execution_delay_days: simulation.execution_delay_days
   }};
+}}
+function validationParameters() {{
+  const evaluationStart = validationInputs.evaluation_start.value || null;
+  const evaluationEnd = validationInputs.evaluation_end.value || null;
+  const backtestStart = validationInputs.backtest_start.value || null;
+  const backtestEnd = validationInputs.backtest_end.value || null;
+  const decayDays = Number(validationInputs.decay_days.value);
+  const topQuantile = Number(validationInputs.top_quantile.value);
+  const executionDelayDays = Number(validationInputs.execution_delay_days.value);
+  const commissionBps = Number(validationInputs.commission_bps.value);
+  const slippageBps = Number(validationInputs.slippage_bps.value);
+  const shortBorrowBpsAnnual = Number(validationInputs.short_borrow_bps_annual.value);
+  const payload = {{
+    holding_days: Number(validationInputs.holding_days.value),
+    decay_days: decayDays,
+    top_quantile: topQuantile,
+    execution_delay_days: executionDelayDays,
+    evaluation_start: evaluationStart,
+    evaluation_end: evaluationEnd,
+    backtest_start: backtestStart,
+    backtest_end: backtestEnd,
+    commission_bps: commissionBps,
+    slippage_bps: slippageBps,
+    short_borrow_bps_annual: shortBorrowBpsAnnual,
+    evaluation: {{
+      test_period: {{ start: evaluationStart, end: evaluationEnd }}
+    }},
+    backtest: {{
+      simulation: {{
+        decay_days: decayDays,
+        top_quantile: topQuantile,
+        execution_delay_days: executionDelayDays
+      }},
+      test_period: {{ start: backtestStart, end: backtestEnd }}
+    }},
+    transaction_costs: {{
+      commission_bps: commissionBps,
+      slippage_bps: slippageBps,
+      short_borrow_bps_annual: shortBorrowBpsAnnual
+    }}
+  }};
+  const evaluationSimulation = currentEvaluationSimulation();
+  if (
+    evaluationSimulation.decay_days !== undefined ||
+    evaluationSimulation.top_quantile !== undefined ||
+    evaluationSimulation.execution_delay_days !== undefined
+  ) {{
+    payload.evaluation.simulation = evaluationSimulation;
+  }}
+  return payload;
 }}
 function valueOr(value, fallback) {{
   return value === undefined || value === null ? fallback : value;
