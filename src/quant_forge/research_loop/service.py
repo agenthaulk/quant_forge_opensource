@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import Counter
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from math import ceil
 from pathlib import Path
@@ -340,10 +340,23 @@ class ResearchLoopResult:
 
 
 @dataclass(frozen=True)
+class ResearchTrialSimulationOverlay:
+    top_quantile: float | None = None
+    decay_days: int | None = None
+
+
+@dataclass(frozen=True)
+class ResearchEffectiveTrialConfig:
+    overlay: ResearchTrialSimulationOverlay
+    evaluation_profile: SimulationProfile
+    backtest_profile: SimulationProfile
+
+
+@dataclass(frozen=True)
 class _ResearchTrial:
     hypothesis: ResearchHypothesis
     factor: FactorDefinition
-    simulation_profile: SimulationProfile
+    effective_config: ResearchEffectiveTrialConfig
     plan: FactorExperimentPlan | None = None
 
 
@@ -381,6 +394,7 @@ class ResearchLoopService:
         top_quantile: float | None = None,
         simulation_profile: SimulationProfile | None = None,
         simulation_profiles: tuple[SimulationProfile, ...] | None = None,
+        trial_simulation_overlays: tuple[ResearchTrialSimulationOverlay, ...] | None = None,
         evaluation_simulation_profile: SimulationProfile | None = None,
         backtest_simulation_profile: SimulationProfile | None = None,
         horizon_days_matrix: tuple[int, ...] | None = None,
@@ -411,10 +425,27 @@ class ResearchLoopService:
             profile = replace(profile, top_quantile=top_quantile)
         self.simulation_profile = profile
         self.simulation_profiles = simulation_profiles or (profile,)
+        if trial_simulation_overlays is not None:
+            self.trial_simulation_overlays = trial_simulation_overlays
+        elif simulation_profiles is not None:
+            self.trial_simulation_overlays = _trial_overlays_from_profiles(simulation_profiles)
+        else:
+            self.trial_simulation_overlays = (ResearchTrialSimulationOverlay(),)
         self.evaluation_simulation_profile = evaluation_simulation_profile or profile
         self.backtest_simulation_profile = backtest_simulation_profile or profile
         if not self.simulation_profiles:
             raise ValueError("research loop requires at least one simulation profile")
+        if not self.trial_simulation_overlays:
+            raise ValueError("research loop requires at least one trial simulation overlay")
+        self.effective_trial_configs = tuple(
+            _effective_trial_config(
+                overlay,
+                evaluation_profile=self.evaluation_simulation_profile,
+                backtest_profile=self.backtest_simulation_profile,
+            )
+            for overlay in self.trial_simulation_overlays
+        )
+        self.simulation_profiles = tuple(config.backtest_profile for config in self.effective_trial_configs)
         self.horizon_days_matrix = horizon_days_matrix
         self.sample_splits = sample_splits
         self.parameter_search_enabled = parameter_search_enabled
@@ -512,6 +543,13 @@ class ResearchLoopService:
                 "llm_formula_repair_attempts": self.llm_formula_repair_attempts,
                 "parameter_search_enabled": self.parameter_search_enabled,
                 "parameter_search_method": self.parameter_search_method,
+                "simulation_profile": asdict(self.simulation_profile),
+                "evaluation_profile": asdict(self.evaluation_simulation_profile),
+                "backtest_profile": asdict(self.backtest_simulation_profile),
+                "trial_simulation_overlays": [asdict(overlay) for overlay in self.trial_simulation_overlays],
+                "effective_trial_configs": [
+                    _effective_trial_config_snapshot(config) for config in self.effective_trial_configs
+                ],
                 "deduplication": _deduplication_snapshot(self.deduplication),
             },
         )
@@ -645,8 +683,8 @@ class ResearchLoopService:
                 if hypothesis.parameter_search_fallback
                 else self._load_or_save_candidate(repo, planned_candidate)
             )
-            for profile in self.simulation_profiles:
-                trials.append(_ResearchTrial(hypothesis, candidate, profile, plan))
+            for effective_config in self.effective_trial_configs:
+                trials.append(_ResearchTrial(hypothesis, candidate, effective_config, plan))
         self._raise_if_cancelled()
         search_trace, final_trials, failed_quick_results = self._select_final_trials(trials, objective_weights)
         blocked_plans.extend(failed_quick_results)
@@ -823,8 +861,8 @@ class ResearchLoopService:
         fallback_plan = self.experiment_planner.plan(structured, context)
         self._trace_plan(run_id, structured, fallback_plan)
         if fallback_plan.status == "ready":
-            for profile in self.simulation_profiles:
-                trials.append(_ResearchTrial(fallback, seed, profile, fallback_plan))
+            for effective_config in self.effective_trial_configs:
+                trials.append(_ResearchTrial(fallback, seed, effective_config, fallback_plan))
             return
         fallback_result = _blocked_structured_result(
             fallback_plan,
@@ -987,7 +1025,7 @@ class ResearchLoopService:
                 hypothesis_text=scored.trial.hypothesis.text,
                 factor_id=scored.trial.factor.factor_id,
                 formula=scored.trial.factor.formula,
-                simulation_profile=scored.trial.simulation_profile,
+                simulation_profile=scored.backtest.simulation_profile,
                 split_weighted_icir=scored.split_weighted_icir,
                 score=scored.score,
             )
@@ -1004,14 +1042,8 @@ class ResearchLoopService:
         sample_splits: tuple[SampleSplitSpec, ...] | None,
     ) -> _ScoredTrial:
         self._raise_if_cancelled()
-        evaluation_profile = _role_profile_for_trial(
-            trial.simulation_profile,
-            self.evaluation_simulation_profile,
-        )
-        backtest_profile = _role_profile_for_trial(
-            trial.simulation_profile,
-            self.backtest_simulation_profile,
-        )
+        evaluation_profile = trial.effective_config.evaluation_profile
+        backtest_profile = trial.effective_config.backtest_profile
         evaluation = evaluate_factor(
             trial.factor.factor_id,
             factor_root=self.factor_root,
@@ -1249,8 +1281,8 @@ def _scored_trial_sort_key(scored: _ScoredTrial) -> tuple[float, float, float]:
     return (scored.score, scored.split_weighted_icir, scored.evaluation.rank_ic_mean)
 
 
-def _trial_key(trial: _ResearchTrial) -> tuple[str, SimulationProfile]:
-    return (trial.factor.factor_id, trial.simulation_profile)
+def _trial_key(trial: _ResearchTrial) -> tuple[str, ResearchEffectiveTrialConfig]:
+    return (trial.factor.factor_id, trial.effective_config)
 
 
 def _candidate_from_hypothesis(hypothesis: ResearchHypothesis, horizon_days: int) -> FactorDefinition:
@@ -1299,6 +1331,14 @@ def _deduplication_snapshot(config: ResearchDeduplicationConfig) -> dict[str, ob
         "result_precision": config.result_precision,
         "recent_trace_limit": config.recent_trace_limit,
         "max_same_shape_per_run": config.max_same_shape_per_run,
+    }
+
+
+def _effective_trial_config_snapshot(config: ResearchEffectiveTrialConfig) -> dict[str, object]:
+    return {
+        "overlay": asdict(config.overlay),
+        "evaluation_profile": asdict(config.evaluation_profile),
+        "backtest_profile": asdict(config.backtest_profile),
     }
 
 
@@ -1584,12 +1624,40 @@ def _optimization_performed(
     )
 
 
-def _role_profile_for_trial(trial_profile: SimulationProfile, role_profile: SimulationProfile) -> SimulationProfile:
-    return replace(
-        role_profile,
-        top_quantile=trial_profile.top_quantile,
-        decay_days=trial_profile.decay_days,
+def _trial_overlays_from_profiles(
+    profiles: tuple[SimulationProfile, ...],
+) -> tuple[ResearchTrialSimulationOverlay, ...]:
+    return tuple(
+        ResearchTrialSimulationOverlay(top_quantile=profile.top_quantile, decay_days=profile.decay_days)
+        for profile in profiles
     )
+
+
+def _effective_trial_config(
+    overlay: ResearchTrialSimulationOverlay,
+    *,
+    evaluation_profile: SimulationProfile,
+    backtest_profile: SimulationProfile,
+) -> ResearchEffectiveTrialConfig:
+    return ResearchEffectiveTrialConfig(
+        overlay=overlay,
+        evaluation_profile=_role_profile_for_trial(evaluation_profile, overlay),
+        backtest_profile=_role_profile_for_trial(backtest_profile, overlay),
+    )
+
+
+def _role_profile_for_trial(
+    role_profile: SimulationProfile,
+    overlay: ResearchTrialSimulationOverlay,
+) -> SimulationProfile:
+    updates: dict[str, float | int] = {}
+    if overlay.top_quantile is not None:
+        updates["top_quantile"] = overlay.top_quantile
+    if overlay.decay_days is not None:
+        updates["decay_days"] = overlay.decay_days
+    if not updates:
+        return role_profile
+    return replace(role_profile, **updates)
 
 
 def _llm_formula_required_but_missing(hypothesis: ResearchHypothesis, generation: ResearchGenerationMetadata) -> bool:

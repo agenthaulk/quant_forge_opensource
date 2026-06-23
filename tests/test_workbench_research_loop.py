@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import time
 
@@ -17,6 +18,7 @@ from quant_forge.research_loop.service import (
     ResearchDeduplicationConfig,
     ResearchGate,
     ResearchLoopService,
+    ResearchTrialSimulationOverlay,
     apply_gate,
 )
 from quant_forge.workbench.service import WorkbenchService
@@ -269,6 +271,56 @@ def test_research_loop_can_score_profile_variants(tmp_path: Path) -> None:
     report = result.report_path.read_text(encoding="utf-8")
     assert "No successive-halving trace was recorded for this run." in report
     assert "Parameter search was not enabled for this run." not in report
+
+
+def test_research_loop_disabled_parameter_search_preserves_role_profiles(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    loop = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        simulation_profile=SimulationProfile(top_quantile=0.25, decay_days=1),
+        evaluation_simulation_profile=SimulationProfile(top_quantile=0.10, decay_days=0),
+        backtest_simulation_profile=SimulationProfile(top_quantile=0.30, decay_days=4),
+        parameter_search_enabled=False,
+    )
+
+    result = loop.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert result.candidates
+    assert {candidate.evaluation.simulation_profile.top_quantile for candidate in result.candidates} == {0.10}
+    assert {candidate.evaluation.simulation_profile.decay_days for candidate in result.candidates} == {0}
+    assert {candidate.backtest.simulation_profile.top_quantile for candidate in result.candidates} == {0.30}
+    assert {candidate.backtest.simulation_profile.decay_days for candidate in result.candidates} == {4}
+    assert result.trace_root is not None
+    config_snapshot = json.loads((result.trace_root / "config_snapshot.json").read_text(encoding="utf-8"))
+    assert config_snapshot["trial_simulation_overlays"] == [{"top_quantile": None, "decay_days": None}]
+    assert config_snapshot["effective_trial_configs"][0]["evaluation_profile"]["top_quantile"] == 0.10
+    assert config_snapshot["effective_trial_configs"][0]["evaluation_profile"]["decay_days"] == 0
+    assert config_snapshot["effective_trial_configs"][0]["backtest_profile"]["top_quantile"] == 0.30
+    assert config_snapshot["effective_trial_configs"][0]["backtest_profile"]["decay_days"] == 4
+
+
+def test_research_loop_trial_overlay_only_replaces_explicit_fields(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    loop = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        simulation_profile=SimulationProfile(top_quantile=0.25, decay_days=1),
+        trial_simulation_overlays=(ResearchTrialSimulationOverlay(top_quantile=0.20),),
+        evaluation_simulation_profile=SimulationProfile(top_quantile=0.10, decay_days=0),
+        backtest_simulation_profile=SimulationProfile(top_quantile=0.30, decay_days=4),
+        parameter_search_enabled=True,
+    )
+
+    result = loop.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert result.candidates
+    assert {candidate.evaluation.simulation_profile.top_quantile for candidate in result.candidates} == {0.20}
+    assert {candidate.evaluation.simulation_profile.decay_days for candidate in result.candidates} == {0}
+    assert {candidate.backtest.simulation_profile.top_quantile for candidate in result.candidates} == {0.20}
+    assert {candidate.backtest.simulation_profile.decay_days for candidate in result.candidates} == {4}
 
 
 def test_research_loop_single_round_performed_flags_remain_compatible(tmp_path: Path) -> None:

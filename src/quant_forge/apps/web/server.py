@@ -1018,7 +1018,7 @@ def _run_research_once(
         factor_values_overlay_root=config.paths.factor_values_overlay_root,
         factor_values_manifest_root=config.paths.factor_values_manifest_root,
         simulation_profile=rd_config.simulation_profile,
-        simulation_profiles=rd_config.simulation_profiles,
+        trial_simulation_overlays=rd_config.trial_overlays,
         evaluation_simulation_profile=rd_config.evaluation_profile,
         backtest_simulation_profile=rd_config.backtest_profile,
         parameter_search_enabled=rd_config.parameter_search.enabled,

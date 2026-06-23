@@ -402,7 +402,7 @@ def _cmd_research_run_once(args: argparse.Namespace) -> int:
         data_root=paths.data_root,
         artifact_root=paths.artifact_root,
         simulation_profile=rd_config.simulation_profile,
-        simulation_profiles=rd_config.simulation_profiles,
+        trial_simulation_overlays=rd_config.trial_overlays,
         evaluation_simulation_profile=rd_config.evaluation_profile,
         backtest_simulation_profile=rd_config.backtest_profile,
         parameter_search_enabled=rd_config.parameter_search.enabled,

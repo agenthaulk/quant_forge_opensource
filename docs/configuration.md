@@ -449,6 +449,26 @@ the holding-period backtest. This lets you keep model selection on one period
 and reserve a later holdout period for portfolio-style evidence. For example,
 to evaluate factors on 2025 and run the holding backtest on 2026:
 
+The project keeps source configs split and resolves an effective runtime config
+inside the application. From low to high precedence, the relevant layers are:
+
+1. Code/dataclass defaults.
+2. Runtime config YAML such as `configs/default.yaml`.
+3. Local ignored env/config files loaded by the chosen launch command.
+4. Environment variables referenced by config, for example LLM key env names.
+5. CLI/runtime path overrides for local workspaces and mounted data.
+6. RD legacy top-level fields, used only as compatibility fallbacks.
+7. RD base `simulation`.
+8. RD role profiles: `evaluation.simulation` and `backtest.simulation`.
+9. Request-scoped user edits or RD `parameter_search` trial overlays.
+
+RD execution receives already-resolved effective trial configs. A
+`parameter_search` trial overlay may only replace fields it explicitly lists,
+currently `top_quantile` and `decay_days`; if parameter search is disabled, the
+overlay is empty and role-specific profiles are preserved. Every RD run records
+the resolved base, role, overlay, and effective trial profiles in
+`artifact_root/research_loop/runs/<run_id>/config_snapshot.json`.
+
 ```yaml
 evaluation:
   simulation:

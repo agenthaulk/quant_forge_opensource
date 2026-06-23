@@ -124,7 +124,10 @@ configured horizon matrix and split definitions when an RD config is supplied.
 The RD config may also define role-specific profiles:
 `evaluation.simulation` controls factor testing and IC/ICIR evidence, while
 `backtest.simulation` controls the holding-period backtest. If those sections
-are omitted, both roles fall back to the legacy `simulation` profile.
+are omitted, both roles fall back to the legacy `simulation` profile. Runtime
+RD trials consume an already-resolved effective trial config: parameter-search
+overlays carry only explicitly configured search fields, so disabled or partial
+search grids do not overwrite role-specific profiles.
 
 ## Research Loop Semantics
 

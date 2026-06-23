@@ -26,7 +26,12 @@ from quant_forge.data.local import create_demo_workspace
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.llm_client import LLMChatResult
 from quant_forge.llm_factor_parser import ParsedFactor
-from quant_forge.research_loop.config import ResearchLLMConfig, ResearchLoopConfig, load_research_loop_config
+from quant_forge.research_loop.config import (
+    ResearchLLMConfig,
+    ResearchLoopConfig,
+    ResearchParameterSearchConfig,
+    load_research_loop_config,
+)
 from quant_forge.research_loop.service import (
     ResearchCandidateResult,
     ResearchGate,
@@ -139,6 +144,49 @@ def test_web_parse_workflow_returns_distinct_role_scoped_defaults(tmp_path) -> N
         "top_quantile": 0.2,
     }
     assert result["parameters"]["backtest"]["test_period"] == {"start": "2026-01-01", "end": None}
+
+
+def test_web_parse_workflow_ignores_parameter_search_variants_in_editable_defaults(tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+    rd_config = ResearchLoopConfig(
+        evaluation_simulation_profile=SimulationProfile(
+            execution_delay_days=1,
+            top_quantile=0.1,
+            decay_days=0,
+            test_period_start="2025-01-01",
+        ),
+        backtest_simulation_profile=SimulationProfile(
+            execution_delay_days=2,
+            top_quantile=0.2,
+            decay_days=3,
+            test_period_start="2026-01-01",
+        ),
+        parameter_search=ResearchParameterSearchConfig(
+            enabled=True,
+            top_quantile=(0.15, 0.35),
+            decay_days=(0, 2),
+        ),
+    )
+
+    result = run_idea_parse_workflow(
+        config,
+        "非ST的小市值股票未来表现更好",
+        parser_mode="rule",
+        rd_config=rd_config,
+    )
+
+    assert result["parameters"]["evaluation"]["simulation"] == {
+        "execution_delay_days": 1,
+        "decay_days": 0,
+        "top_quantile": 0.1,
+    }
+    assert result["parameters"]["backtest"]["simulation"] == {
+        "execution_delay_days": 2,
+        "decay_days": 3,
+        "top_quantile": 0.2,
+    }
+    assert result["parameters"]["top_quantile"] == 0.2
 
 
 def test_web_validation_workflow_uses_edited_parameters(monkeypatch, tmp_path) -> None:

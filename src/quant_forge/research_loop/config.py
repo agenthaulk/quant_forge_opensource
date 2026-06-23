@@ -15,6 +15,7 @@ from quant_forge.research_loop.service import (
     ResearchDeduplicationConfig,
     ResearchGate,
     ResearchObjectiveWeights,
+    ResearchTrialSimulationOverlay,
     objective_weights_for,
 )
 
@@ -93,6 +94,21 @@ class ResearchParameterSearchConfig:
                     return tuple(profiles)
         return tuple(profiles)
 
+    def trial_overlays(self) -> tuple[ResearchTrialSimulationOverlay, ...]:
+        if not self.enabled:
+            return (ResearchTrialSimulationOverlay(),)
+        top_quantiles: tuple[float | None, ...] = self.top_quantile or (None,)
+        decay_values: tuple[int | None, ...] = self.decay_days or (None,)
+        overlays: list[ResearchTrialSimulationOverlay] = []
+        for top_quantile in top_quantiles:
+            for decay_days in decay_values:
+                overlay = ResearchTrialSimulationOverlay(top_quantile=top_quantile, decay_days=decay_days)
+                if overlay not in overlays:
+                    overlays.append(overlay)
+                if len(overlays) >= self.max_profile_variants:
+                    return tuple(overlays)
+        return tuple(overlays) or (ResearchTrialSimulationOverlay(),)
+
 
 @dataclass(frozen=True)
 class ResearchLLMConfig:
@@ -161,6 +177,10 @@ class ResearchLoopConfig:
     @property
     def simulation_profiles(self) -> tuple[SimulationProfile, ...]:
         return self.parameter_search.profiles(self.simulation_profile)
+
+    @property
+    def trial_overlays(self) -> tuple[ResearchTrialSimulationOverlay, ...]:
+        return self.parameter_search.trial_overlays()
 
     @property
     def evaluation_profile(self) -> SimulationProfile:
