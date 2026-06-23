@@ -1211,6 +1211,33 @@ def test_research_loop_records_failed_trial_without_leaving_run_running(tmp_path
     assert run_payload["status"] == "partial"
 
 
+def test_research_loop_failed_trial_trace_includes_feedback_for_next_iteration(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        experiment_planner=_BadReadyPlanner(),
+        parameter_search_enabled=False,
+    )
+
+    result = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert result.trace_root is not None
+    rows = [
+        json.loads(line)
+        for line in (result.trace_root / "trace.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    failed = next(row for row in rows if row["phase"] == "experiment_failed")
+    assert "window argument must be a number" in failed["error"]
+    assert failed["feedback"]["status"] == "failed"
+    assert "window argument must be a number" in failed["feedback"]["summary"]
+    assert (
+        failed["next_hypothesis_hint"]
+        == "Repair the runtime or validation error before proposing related variants."
+    )
+
+
 def test_research_loop_blocks_injected_llm_hypothesis_without_formula_dsl(tmp_path: Path) -> None:
     paths = create_demo_workspace(tmp_path / "demo")
     service = ResearchLoopService(

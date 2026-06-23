@@ -273,6 +273,39 @@ def test_research_loop_can_score_profile_variants(tmp_path: Path) -> None:
     assert "Parameter search was not enabled for this run." not in report
 
 
+def test_research_loop_legacy_simulation_profiles_preserve_full_profile_fields(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    profiles = (
+        SimulationProfile(
+            execution_delay_days=1,
+            top_quantile=0.2,
+            decay_days=0,
+            test_period_start="2024-01-10",
+            test_period_end="2024-07-30",
+        ),
+        SimulationProfile(
+            execution_delay_days=2,
+            top_quantile=0.3,
+            decay_days=1,
+            test_period_start="2024-01-15",
+            test_period_end="2024-07-25",
+        ),
+    )
+    loop = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        simulation_profiles=profiles,
+    )
+
+    result = loop.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert len(result.candidates) == 2
+    assert {candidate.backtest.simulation_profile for candidate in result.candidates} == set(profiles)
+    assert {candidate.evaluation.simulation_profile for candidate in result.candidates} == set(profiles)
+    assert loop.simulation_profiles == profiles
+
+
 def test_research_loop_disabled_parameter_search_preserves_role_profiles(tmp_path: Path) -> None:
     paths = create_demo_workspace(tmp_path / "demo")
     loop = ResearchLoopService(
@@ -321,6 +354,35 @@ def test_research_loop_trial_overlay_only_replaces_explicit_fields(tmp_path: Pat
     assert {candidate.evaluation.simulation_profile.decay_days for candidate in result.candidates} == {0}
     assert {candidate.backtest.simulation_profile.top_quantile for candidate in result.candidates} == {0.20}
     assert {candidate.backtest.simulation_profile.decay_days for candidate in result.candidates} == {4}
+
+
+def test_research_loop_trial_overlay_explicit_fields_override_profile_base(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    profile = SimulationProfile(
+        execution_delay_days=2,
+        top_quantile=0.30,
+        decay_days=4,
+        test_period_start="2024-01-10",
+        test_period_end="2024-07-30",
+    )
+    loop = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        trial_simulation_overlays=(ResearchTrialSimulationOverlay(profile=profile, top_quantile=0.20, decay_days=1),),
+        evaluation_simulation_profile=SimulationProfile(top_quantile=0.10, decay_days=0),
+        backtest_simulation_profile=SimulationProfile(top_quantile=0.30, decay_days=4),
+    )
+
+    result = loop.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert result.candidates
+    effective = result.candidates[0].backtest.simulation_profile
+    assert effective.execution_delay_days == 2
+    assert effective.test_period_start == "2024-01-10"
+    assert effective.test_period_end == "2024-07-30"
+    assert effective.top_quantile == 0.20
+    assert effective.decay_days == 1
 
 
 def test_research_loop_single_round_performed_flags_remain_compatible(tmp_path: Path) -> None:

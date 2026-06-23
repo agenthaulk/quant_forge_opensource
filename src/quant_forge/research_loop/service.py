@@ -341,6 +341,7 @@ class ResearchLoopResult:
 
 @dataclass(frozen=True)
 class ResearchTrialSimulationOverlay:
+    profile: SimulationProfile | None = None
     top_quantile: float | None = None
     decay_days: int | None = None
 
@@ -546,7 +547,9 @@ class ResearchLoopService:
                 "simulation_profile": asdict(self.simulation_profile),
                 "evaluation_profile": asdict(self.evaluation_simulation_profile),
                 "backtest_profile": asdict(self.backtest_simulation_profile),
-                "trial_simulation_overlays": [asdict(overlay) for overlay in self.trial_simulation_overlays],
+                "trial_simulation_overlays": [
+                    _trial_simulation_overlay_snapshot(overlay) for overlay in self.trial_simulation_overlays
+                ],
                 "effective_trial_configs": [
                     _effective_trial_config_snapshot(config) for config in self.effective_trial_configs
                 ],
@@ -1336,10 +1339,20 @@ def _deduplication_snapshot(config: ResearchDeduplicationConfig) -> dict[str, ob
 
 def _effective_trial_config_snapshot(config: ResearchEffectiveTrialConfig) -> dict[str, object]:
     return {
-        "overlay": asdict(config.overlay),
+        "overlay": _trial_simulation_overlay_snapshot(config.overlay),
         "evaluation_profile": asdict(config.evaluation_profile),
         "backtest_profile": asdict(config.backtest_profile),
     }
+
+
+def _trial_simulation_overlay_snapshot(overlay: ResearchTrialSimulationOverlay) -> dict[str, object]:
+    snapshot: dict[str, object] = {
+        "top_quantile": overlay.top_quantile,
+        "decay_days": overlay.decay_days,
+    }
+    if overlay.profile is not None:
+        snapshot["profile"] = asdict(overlay.profile)
+    return snapshot
 
 
 def _deduplicate_plan(
@@ -1627,10 +1640,7 @@ def _optimization_performed(
 def _trial_overlays_from_profiles(
     profiles: tuple[SimulationProfile, ...],
 ) -> tuple[ResearchTrialSimulationOverlay, ...]:
-    return tuple(
-        ResearchTrialSimulationOverlay(top_quantile=profile.top_quantile, decay_days=profile.decay_days)
-        for profile in profiles
-    )
+    return tuple(ResearchTrialSimulationOverlay(profile=profile) for profile in profiles)
 
 
 def _effective_trial_config(
@@ -1650,14 +1660,15 @@ def _role_profile_for_trial(
     role_profile: SimulationProfile,
     overlay: ResearchTrialSimulationOverlay,
 ) -> SimulationProfile:
+    profile = overlay.profile or role_profile
     updates: dict[str, float | int] = {}
     if overlay.top_quantile is not None:
         updates["top_quantile"] = overlay.top_quantile
     if overlay.decay_days is not None:
         updates["decay_days"] = overlay.decay_days
     if not updates:
-        return role_profile
-    return replace(role_profile, **updates)
+        return profile
+    return replace(profile, **updates)
 
 
 def _llm_formula_required_but_missing(hypothesis: ResearchHypothesis, generation: ResearchGenerationMetadata) -> bool:

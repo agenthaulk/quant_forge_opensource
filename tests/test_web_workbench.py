@@ -2081,6 +2081,95 @@ def test_run_idea_workflow_restores_existing_factor_on_cancel(monkeypatch, tmp_p
     assert sorted(config.paths.factor_root.glob("**/FTR_CANCEL_RESTORE/factor.yaml")) == [original_path]
 
 
+def test_validation_restores_existing_factor_on_evaluation_failure(monkeypatch, tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+    repo = FactorRepository(config.paths.factor_root)
+    original = FactorDefinition(
+        factor_id="FTR_VALIDATE_RESTORE",
+        name="validate_restore",
+        formula="rank(close)",
+        status="candidate",
+        description="Existing candidate should survive failed validation.",
+        horizon_days=10,
+        universe_filters=("is_st == false",),
+        source="research_loop",
+    )
+    repo.save(original)
+    edited = FactorDefinition(
+        factor_id=original.factor_id,
+        name="validate_restore_bad_edit",
+        formula="unsupported(close)",
+        status="draft",
+        description="Failed edit must not survive validation.",
+        horizon_days=5,
+        source="llm",
+    )
+
+    def fail_evaluate_factor(*args, **kwargs):
+        raise ValueError("formula validation failed")
+
+    monkeypatch.setattr(web_server, "evaluate_factor", fail_evaluate_factor)
+
+    with pytest.raises(ValueError, match="formula validation failed"):
+        run_idea_validation_workflow(config, edited, parser={"source": "llm"}, rd_config=ResearchLoopConfig())
+
+    assert repo.get(original.factor_id) == original
+
+
+def test_validation_removes_new_factor_on_backtest_failure(monkeypatch, tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+    repo = FactorRepository(config.paths.factor_root)
+    factor = FactorDefinition(
+        factor_id="FTR_VALIDATE_REMOVE",
+        name="validate_remove",
+        formula="rank(close)",
+        status="draft",
+        description="New failed edit must be removed.",
+        horizon_days=5,
+        source="llm",
+    )
+
+    def fake_evaluate_factor(
+        factor_id,
+        *,
+        factor_root,
+        data_root,
+        artifact_root,
+        horizon_days,
+        horizon_days_matrix,
+        sample_splits,
+        simulation_profile,
+        factor_values_root,
+        factor_values_overlay_root,
+        factor_values_manifest_root,
+    ):
+        return EvaluationResult(
+            factor_id=factor_id,
+            observations=1,
+            coverage=1.0,
+            rank_ic_mean=0.0,
+            rank_ic_std=0.0,
+            rank_icir=0.0,
+            ic_days=1,
+            artifact_path=Path(artifact_root) / "evaluations" / f"{factor_id}.json",
+            simulation_profile=simulation_profile,
+        )
+
+    def fail_run_factor_backtest(*args, **kwargs):
+        raise ValueError("backtest failed")
+
+    monkeypatch.setattr(web_server, "evaluate_factor", fake_evaluate_factor)
+    monkeypatch.setattr(web_server, "run_factor_backtest", fail_run_factor_backtest)
+
+    with pytest.raises(ValueError, match="backtest failed"):
+        run_idea_validation_workflow(config, factor, parser={"source": "llm"}, rd_config=ResearchLoopConfig())
+
+    with pytest.raises(FileNotFoundError):
+        repo.get(factor.factor_id)
+
+
 def test_web_html_keeps_active_llm_provider_visible_when_key_is_missing(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("QF_TEST_DEEPSEEK_KEY", raising=False)
     monkeypatch.setenv("QF_TEST_GLM_KEY", "set")

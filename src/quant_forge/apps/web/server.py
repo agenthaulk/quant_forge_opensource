@@ -349,11 +349,8 @@ def _validate_factor_workflow(
             factor_values_manifest_root=config.paths.factor_values_manifest_root,
         )
         _raise_if_cancelled(cancel_event)
-    except _WebJobCancelled:
-        if previous_factor is None:
-            repo.delete(factor.factor_id)
-        else:
-            repo.save(previous_factor)
+    except Exception:
+        _restore_factor_after_failed_validation(repo, factor.factor_id, previous_factor)
         raise
     return _validation_payload(
         factor,
@@ -1265,6 +1262,17 @@ def _existing_factor(repo: FactorRepository, factor_id: str) -> FactorDefinition
         return repo.get(factor_id)
     except FileNotFoundError:
         return None
+
+
+def _restore_factor_after_failed_validation(
+    repo: FactorRepository,
+    factor_id: str,
+    previous_factor: FactorDefinition | None,
+) -> None:
+    if previous_factor is None:
+        repo.delete(factor_id)
+    else:
+        repo.save(previous_factor)
 
 
 def _job_id_from_path(path: str) -> str:
