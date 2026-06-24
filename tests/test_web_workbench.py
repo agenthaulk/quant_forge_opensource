@@ -1401,6 +1401,13 @@ def test_web_public_json_normalizes_nonstandard_values(tmp_path) -> None:
         {
             "artifact_path": tmp_path / "private" / "result.json",
             "factor_values_path": {"unexpected": tmp_path / "nested" / "scores.parquet"},
+            "round_report_paths": [
+                tmp_path / "private" / "round-1.md",
+                str(tmp_path / "private" / "round-2.md"),
+            ],
+            "iteration_chain": {
+                "round_report_paths": [tmp_path / "private" / "chain-round.md"],
+            },
             "raw_response": "provider body",
             "seen": {"b", "a"},
             "stamp": web_server.datetime(2026, 1, 2, tzinfo=web_server.UTC),
@@ -1410,6 +1417,8 @@ def test_web_public_json_normalizes_nonstandard_values(tmp_path) -> None:
 
     assert payload["artifact_path"] == "result.json"
     assert payload["factor_values_path"] == {"unexpected": "scores.parquet"}
+    assert payload["round_report_paths"] == ["round-1.md", "round-2.md"]
+    assert payload["iteration_chain"]["round_report_paths"] == ["chain-round.md"]
     assert payload["seen"] == ["a", "b"]
     assert payload["stamp"] == "2026-01-02T00:00:00+00:00"
     assert payload["blob"] == "ok"
@@ -1424,6 +1433,13 @@ def test_web_job_result_reduces_private_paths(monkeypatch, tmp_path) -> None:
         return {
             "artifact_path": tmp_path / "secret" / "artifact.json",
             "nested": {"factor_values_path": str(tmp_path / "secret" / "2025.parquet")},
+            "round_report_paths": [
+                tmp_path / "secret" / "round-1.md",
+                str(tmp_path / "secret" / "round-2.md"),
+            ],
+            "iteration_chain": {
+                "round_report_paths": [tmp_path / "secret" / "chain-round.md"],
+            },
             "raw_response": "provider body",
         }
 
@@ -1439,6 +1455,8 @@ def test_web_job_result_reduces_private_paths(monkeypatch, tmp_path) -> None:
 
         assert completed["result"]["artifact_path"] == "artifact.json"
         assert completed["result"]["nested"]["factor_values_path"] == "2025.parquet"
+        assert completed["result"]["round_report_paths"] == ["round-1.md", "round-2.md"]
+        assert completed["result"]["iteration_chain"]["round_report_paths"] == ["chain-round.md"]
         assert "raw_response" not in completed["result"]
         assert str(tmp_path) not in json.dumps(completed, ensure_ascii=False)
     finally:

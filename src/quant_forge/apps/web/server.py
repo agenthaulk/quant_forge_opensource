@@ -55,6 +55,7 @@ _WEB_PATH_KEYS = {
     "factor_values_write_path",
     "trace_root",
     "report_path",
+    "round_report_paths",
 }
 
 
@@ -1351,7 +1352,7 @@ def _web_public_json(value: Any) -> Any:
             if name == "raw_response":
                 continue
             if name in _WEB_PATH_KEYS and item:
-                result[name] = _path_label(Path(item)) if isinstance(item, str | os.PathLike) else _web_public_json(item)
+                result[name] = _web_public_path_value(item)
             else:
                 result[name] = _web_public_json(item)
         return result
@@ -1362,6 +1363,20 @@ def _web_public_json(value: Any) -> Any:
 
 def _path_label(path: Path) -> str:
     return path.name or "path"
+
+
+def _web_public_path_value(value: Any) -> Any:
+    if isinstance(value, str | os.PathLike):
+        return _path_label(Path(value))
+    if isinstance(value, tuple):
+        return [_web_public_path_value(item) for item in value]
+    if isinstance(value, set):
+        return [_web_public_path_value(item) for item in sorted(value, key=str)]
+    if isinstance(value, list):
+        return [_web_public_path_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _web_public_path_value(item) for key, item in value.items()}
+    return _web_public_json(value)
 
 
 def _json_safe(value: Any) -> Any:
