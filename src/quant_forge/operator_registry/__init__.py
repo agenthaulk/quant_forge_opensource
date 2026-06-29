@@ -10,7 +10,11 @@ from quant_forge.operator_registry.models import (
     OperatorResolutionResult,
     OperatorSpec,
 )
-from quant_forge.operator_registry.resolver import resolve_formula_operators, resolve_operator_name
+from quant_forge.operator_registry.resolver import (
+    resolve_executable_formula,
+    resolve_formula_operators,
+    resolve_operator_name,
+)
 
 __all__ = [
     "AliasSpec",
@@ -22,6 +26,7 @@ __all__ = [
     "canonical_formula_fingerprint",
     "load_default_operator_registry",
     "load_operator_registry",
+    "resolve_executable_formula",
     "resolve_formula_operators",
     "resolve_operator_name",
 ]

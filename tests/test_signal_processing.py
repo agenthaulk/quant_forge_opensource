@@ -78,6 +78,36 @@ def test_execute_factor_formula_supports_time_series_operator_subset() -> None:
     assert corr["score"].iloc[2:].notna().all()
 
 
+def test_prepare_factor_scores_executes_safe_alias_without_value_store() -> None:
+    panel = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(["2025-01-01", "2025-01-02", "2025-01-03"]),
+            "instrument": ["AAA", "AAA", "AAA"],
+            "close": [10.0, 11.0, 13.0],
+        }
+    )
+
+    alias = prepare_factor_scores_result(panel, "ts_stddev(close, 2)")
+    canonical = prepare_factor_scores_result(panel, "stddev(close, 2)")
+
+    assert alias.source == "computed_formula"
+    assert alias.factor_values_path is None
+    pd.testing.assert_frame_equal(alias.scores, canonical.scores)
+
+
+def test_prepare_factor_scores_blocks_non_executable_alias_without_value_store() -> None:
+    panel = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(["2025-01-01", "2025-01-02"]),
+            "instrument": ["AAA", "AAA"],
+            "close": [10.0, 11.0],
+        }
+    )
+
+    with pytest.raises(ValueError, match="factor formula failed operator registry gate"):
+        prepare_factor_scores_result(panel, "rolling_std(close, 2)")
+
+
 def test_formula_lookback_rows_tracks_nested_time_series_requirements() -> None:
     assert formula_lookback_rows("rank(market_cap)") == 0
     assert formula_lookback_rows("delta(close, 2)") == 2

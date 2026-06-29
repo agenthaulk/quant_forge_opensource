@@ -1205,7 +1205,8 @@ def test_research_loop_records_failed_trial_without_leaving_run_running(tmp_path
 
     assert result.candidates == ()
     assert result.blocked_plans
-    assert "window argument must be a number" in result.blocked_plans[0].error
+    assert "factor formula failed operator registry gate" in result.blocked_plans[0].error
+    assert "delay expects 2 arguments" in result.blocked_plans[0].error
     assert result.trace_root is not None
     run_payload = json.loads((result.trace_root / "run.json").read_text(encoding="utf-8"))
     assert run_payload["status"] == "partial"
@@ -1229,9 +1230,11 @@ def test_research_loop_failed_trial_trace_includes_feedback_for_next_iteration(t
         for line in (result.trace_root / "trace.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     failed = next(row for row in rows if row["phase"] == "experiment_failed")
-    assert "window argument must be a number" in failed["error"]
+    assert "factor formula failed operator registry gate" in failed["error"]
+    assert "delay expects 2 arguments" in failed["error"]
     assert failed["feedback"]["status"] == "failed"
-    assert "window argument must be a number" in failed["feedback"]["summary"]
+    assert "factor formula failed operator registry gate" in failed["feedback"]["summary"]
+    assert "delay expects 2 arguments" in failed["feedback"]["summary"]
     assert (
         failed["next_hypothesis_hint"]
         == "Repair the runtime or validation error before proposing related variants."

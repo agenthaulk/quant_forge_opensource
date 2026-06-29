@@ -127,6 +127,16 @@ def resolve_formula_operators(formula: str, registry: OperatorRegistry | None = 
     )
 
 
+def resolve_executable_formula(formula: str, registry: OperatorRegistry | None = None) -> str:
+    if formula.strip().lower().startswith("precomputed:"):
+        return formula
+    resolution = resolve_formula_operators(formula, registry)
+    if resolution.executable:
+        return resolution.canonical_formula
+    reason = "; ".join(resolution.blocking_errors) or "formula is not executable"
+    raise ValueError(f"factor formula failed operator registry gate: {reason}")
+
+
 def _operator_names(node: ast.AST) -> tuple[str, ...]:
     names: list[str] = []
     for child in ast.walk(node):

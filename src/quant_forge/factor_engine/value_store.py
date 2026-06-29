@@ -67,7 +67,9 @@ class FactorValueStore:
         universe_filters: tuple[str, ...],
         cache_only: bool = False,
     ) -> FactorScoreResult:
-        executable_formula = _executable_formula(formula)
+        from quant_forge.operator_registry.resolver import resolve_executable_formula
+
+        executable_formula = resolve_executable_formula(formula)
         factor_paths = self._resolve_factor_paths(factor_id=factor_id, factor_name=factor_name, formula=formula)
         formula_signature = _formula_signature(factor_id, executable_formula, universe_filters)
         legacy_formula_signature = _formula_signature(factor_id, formula, universe_filters)
@@ -297,18 +299,6 @@ def _trusted_cached_scores(cached: pd.DataFrame, panel: pd.DataFrame, formula: s
     )
     keep = trusted["score"].notna().to_numpy() | marked["_warmup"].eq(True).to_numpy()
     return trusted.loc[keep].reset_index(drop=True)
-
-
-def _executable_formula(formula: str) -> str:
-    if formula.strip().lower().startswith("precomputed:"):
-        return formula
-    from quant_forge.operator_registry.resolver import resolve_formula_operators
-
-    resolution = resolve_formula_operators(formula)
-    if resolution.executable:
-        return resolution.canonical_formula
-    reason = "; ".join(resolution.blocking_errors) or "formula is not executable"
-    raise ValueError(f"factor formula failed operator registry gate: {reason}")
 
 
 def _warmup_score_keys(panel: pd.DataFrame, lookback: int) -> pd.DataFrame:
