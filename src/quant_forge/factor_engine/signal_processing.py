@@ -90,7 +90,9 @@ def prepare_factor_scores_result(
     elif cache_only:
         raise ValueError("precomputed factors require factor_values_root or factor_values_overlay_root")
     else:
-        scores = execute_factor_formula(working_panel, formula, universe_filters)
+        from quant_forge.operator_registry.resolver import resolve_executable_formula
+
+        scores = execute_factor_formula(working_panel, resolve_executable_formula(formula), universe_filters)
         source = "computed_formula"
         cached_rows = 0
         computed_rows = int(len(scores))

@@ -1,0 +1,274 @@
+schema_version: qf.operator_registry.v1
+storage_governance:
+  physical_format: repo_shipped_yaml
+  mutability: read_only
+  canonical_key: operator.name
+  portable_metadata_only: true
+operators:
+  - name: abs
+    signature: abs(x)
+    description: Elementwise absolute value.
+    category: elementwise
+    family: transform
+    args: [{name: x, type: series, role: input}]
+    examples: [abs(return_1d)]
+    execution_status: implemented
+    audit_status: core_reviewed
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: abs, allow_generation: true, forbid_alias_generation: true}
+  - name: correlation
+    signature: correlation(x, y, window)
+    description: Rolling time-series correlation by instrument.
+    category: time_series
+    family: rolling_pairwise
+    args:
+      - {name: x, type: series, role: input}
+      - {name: y, type: series, role: input}
+      - {name: window, type: positive_integer, role: lookback_window}
+    examples: [correlation(close, volume, 20)]
+    lookback_rule: {type: window_minus_one, window_arg: window}
+    execution_status: implemented
+    audit_status: core_reviewed
+    numeric_behavior: {scope: by_instrument_rolling, min_periods: window}
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: correlation, allow_generation: true, forbid_alias_generation: true}
+  - name: covariance
+    signature: covariance(x, y, window)
+    description: Rolling time-series covariance by instrument.
+    category: time_series
+    family: rolling_pairwise
+    args:
+      - {name: x, type: series, role: input}
+      - {name: y, type: series, role: input}
+      - {name: window, type: positive_integer, role: lookback_window}
+    examples: [covariance(close, volume, 20)]
+    lookback_rule: {type: window_minus_one, window_arg: window}
+    execution_status: implemented
+    audit_status: core_reviewed
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: covariance, allow_generation: true, forbid_alias_generation: true}
+  - name: decay_linear
+    signature: decay_linear(x, window)
+    description: Rolling linearly weighted average by instrument.
+    category: time_series
+    family: rolling_weighted
+    args:
+      - {name: x, type: series, role: input}
+      - {name: window, type: positive_integer, role: lookback_window}
+    examples: [decay_linear(return_1d, 10)]
+    lookback_rule: {type: window_minus_one, window_arg: window}
+    execution_status: implemented
+    audit_status: core_reviewed
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: decay_linear, allow_generation: true, forbid_alias_generation: true}
+  - name: delay
+    signature: delay(x, window)
+    description: Historical value by instrument.
+    category: time_series
+    family: lag
+    args:
+      - {name: x, type: series, role: input}
+      - {name: window, type: positive_integer, role: lag_window}
+    examples: [delay(close, 5)]
+    lookback_rule: {type: window, window_arg: window}
+    execution_status: implemented
+    audit_status: core_reviewed
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: delay, allow_generation: true, forbid_alias_generation: true}
+  - name: delta
+    signature: delta(x, window)
+    description: Current value minus delayed value by instrument.
+    category: time_series
+    family: lag
+    args:
+      - {name: x, type: series, role: input}
+      - {name: window, type: positive_integer, role: lag_window}
+    examples: [delta(close, 5)]
+    lookback_rule: {type: window, window_arg: window}
+    execution_status: implemented
+    audit_status: core_reviewed
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: delta, allow_generation: true, forbid_alias_generation: true}
+  - name: log
+    signature: log(x)
+    description: Elementwise natural log for positive values.
+    category: elementwise
+    family: transform
+    args: [{name: x, type: series, role: input}]
+    examples: [log(close)]
+    execution_status: implemented
+    audit_status: core_reviewed
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: log, allow_generation: true, forbid_alias_generation: true}
+  - name: rank
+    signature: rank(x)
+    description: Cross-sectional percentile rank by trade date.
+    category: cross_sectional
+    family: ranking
+    args: [{name: x, type: series, role: input}]
+    examples: [rank(return_5d)]
+    execution_status: implemented
+    audit_status: core_reviewed
+    numeric_behavior: {scope: by_trade_date}
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: rank, allow_generation: true, forbid_alias_generation: true}
+  - name: scale
+    signature: scale(x, target)
+    description: Cross-sectional scaling so sum(abs(score)) equals target.
+    category: cross_sectional
+    family: normalization
+    args:
+      - {name: x, type: series, role: input}
+      - {name: target, type: number, role: optional_target, required: false, default: 1.0}
+    examples: [scale(rank(close)), scale(rank(close), 1)]
+    execution_status: implemented
+    audit_status: core_reviewed
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: scale, allow_generation: true, forbid_alias_generation: true}
+  - name: sign
+    signature: sign(x)
+    description: Elementwise sign.
+    category: elementwise
+    family: transform
+    args: [{name: x, type: series, role: input}]
+    examples: [sign(return_1d)]
+    execution_status: implemented
+    audit_status: core_reviewed
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: sign, allow_generation: true, forbid_alias_generation: true}
+  - name: signedpower
+    signature: signedpower(x, power)
+    description: Signed power transform preserving sign.
+    category: elementwise
+    family: transform
+    args:
+      - {name: x, type: series, role: input}
+      - {name: power, type: number_or_series, role: exponent}
+    examples: [signedpower(return_1d, 2)]
+    execution_status: implemented
+    audit_status: core_reviewed
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: signedpower, allow_generation: true, forbid_alias_generation: true}
+  - name: stddev
+    signature: stddev(x, window)
+    description: Rolling time-series standard deviation by instrument.
+    category: time_series
+    family: rolling_stat
+    args:
+      - {name: x, type: series, role: input}
+      - {name: window, type: positive_integer, role: lookback_window}
+    examples: [stddev(return_1d, 20)]
+    lookback_rule: {type: window_minus_one, window_arg: window}
+    execution_status: implemented
+    audit_status: core_reviewed
+    numeric_behavior: {scope: by_instrument_rolling, min_periods: window}
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: stddev, allow_generation: true, forbid_alias_generation: true}
+  - name: ts_max
+    signature: ts_max(x, window)
+    description: Rolling time-series maximum by instrument.
+    category: time_series
+    family: rolling_stat
+    args:
+      - {name: x, type: series, role: input}
+      - {name: window, type: positive_integer, role: lookback_window}
+    examples: [ts_max(close, 20)]
+    lookback_rule: {type: window_minus_one, window_arg: window}
+    execution_status: implemented
+    audit_status: core_reviewed
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: ts_max, allow_generation: true, forbid_alias_generation: true}
+  - name: ts_mean
+    signature: ts_mean(x, window)
+    description: Rolling time-series mean by instrument.
+    category: time_series
+    family: rolling_stat
+    args:
+      - {name: x, type: series, role: input}
+      - {name: window, type: positive_integer, role: lookback_window}
+    examples: [ts_mean(volume, 20)]
+    lookback_rule: {type: window_minus_one, window_arg: window}
+    execution_status: implemented
+    audit_status: core_reviewed
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: ts_mean, allow_generation: true, forbid_alias_generation: true}
+  - name: ts_min
+    signature: ts_min(x, window)
+    description: Rolling time-series minimum by instrument.
+    category: time_series
+    family: rolling_stat
+    args:
+      - {name: x, type: series, role: input}
+      - {name: window, type: positive_integer, role: lookback_window}
+    examples: [ts_min(close, 20)]
+    lookback_rule: {type: window_minus_one, window_arg: window}
+    execution_status: implemented
+    audit_status: core_reviewed
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: ts_min, allow_generation: true, forbid_alias_generation: true}
+  - name: ts_rank
+    signature: ts_rank(x, window)
+    description: Rolling time-series percentile rank of latest value by instrument.
+    category: time_series
+    family: rolling_rank
+    args:
+      - {name: x, type: series, role: input}
+      - {name: window, type: positive_integer, role: lookback_window}
+    examples: [ts_rank(return_1d, 20)]
+    lookback_rule: {type: window_minus_one, window_arg: window}
+    execution_status: implemented
+    audit_status: core_reviewed
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: ts_rank, allow_generation: true, forbid_alias_generation: true}
+  - name: ts_sum
+    signature: ts_sum(x, window)
+    description: Rolling time-series sum by instrument.
+    category: time_series
+    family: rolling_stat
+    args:
+      - {name: x, type: series, role: input}
+      - {name: window, type: positive_integer, role: lookback_window}
+    examples: [ts_sum(volume, 20)]
+    lookback_rule: {type: window_minus_one, window_arg: window}
+    execution_status: implemented
+    audit_status: core_reviewed
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: ts_sum, allow_generation: true, forbid_alias_generation: true}
+  - name: wq_max
+    signature: wq_max(x, y_or_window)
+    description: WorldQuant-style max; scalar second arg maps to ts_max, otherwise pairwise max.
+    category: mixed
+    family: worldquant_compat
+    args:
+      - {name: x, type: series, role: input}
+      - {name: y_or_window, type: number_or_series, role: input_or_window}
+    examples: [wq_max(close, 20), wq_max(close, volume)]
+    execution_status: implemented
+    audit_status: core_reviewed
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: wq_max, allow_generation: true, forbid_alias_generation: true}
+  - name: wq_min
+    signature: wq_min(x, y_or_window)
+    description: WorldQuant-style min; scalar second arg maps to ts_min, otherwise pairwise min.
+    category: mixed
+    family: worldquant_compat
+    args:
+      - {name: x, type: series, role: input}
+      - {name: y_or_window, type: number_or_series, role: input_or_window}
+    examples: [wq_min(close, 20), wq_min(close, volume)]
+    execution_status: implemented
+    audit_status: core_reviewed
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: wq_min, allow_generation: true, forbid_alias_generation: true}
+  - name: zscore
+    signature: zscore(x)
+    description: Cross-sectional z-score by trade date.
+    category: cross_sectional
+    family: normalization
+    args: [{name: x, type: series, role: input}]
+    examples: [zscore(return_5d)]
+    execution_status: implemented
+    audit_status: core_reviewed
+    numeric_behavior: {scope: by_trade_date}
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: zscore, allow_generation: true, forbid_alias_generation: true}

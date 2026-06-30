@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -12,6 +13,7 @@ from quant_forge.core.contracts import FactorDefinition
 from quant_forge.factor_library.repository import parse_idea_to_definition
 from quant_forge.llm_client import extract_json_object, generate_chat_text
 from quant_forge.mcp.read_models import list_available_fields, list_available_operators
+from quant_forge.operator_registry.resolver import resolve_formula_operators
 
 
 @dataclass(frozen=True)
@@ -56,17 +58,20 @@ def _messages(text: str) -> list[dict[str, str]]:
 
 def _prompt_parts(text: str) -> tuple[str, str]:
     fields = ", ".join(field["name"] for field in list_available_fields())
-    operators = ", ".join(operator["name"] for operator in list_available_operators())
+    operators = json.dumps(list_available_operators(), ensure_ascii=False)
     system = (
         "You convert Chinese or English factor ideas into Quant Forge factor JSON. "
         "Return one JSON object only. Do not include markdown. "
+        "Use only canonical operator names from operator_catalog[].name. "
+        "Aliases may appear in aliases_for_recognition_only, but you must never generate aliases. "
+        "Do not invent operators or fields. "
         "Allowed formulas are intentionally small for this public workbench: "
         "-rank(market_cap) for small-cap ideas, rank(return_5d) for recent momentum, "
         "-rank(volatility_5d) for low-volatility ideas, rank(volume) for trading-volume strength, "
         "and rank(close) for close-price strength. "
         "Use universe_filters [\"is_st == false\"] only when the idea excludes ST stocks. "
         "Treat one month or next month as 21 trading days unless the user gives an explicit day count. "
-        f"Available fields: {fields}. Available operators: {operators}."
+        f"Available fields: {fields}. operator_catalog: {operators}."
     )
     user = (
         "请将下述文档或观点，解析为金融交易时的因子。"
@@ -79,7 +84,12 @@ def _prompt_parts(text: str) -> tuple[str, str]:
 
 def _factor_from_llm_json(payload: dict[str, Any], text: str) -> FactorDefinition:
     name = _slug(str(payload.get("name", "llm_factor")))
-    formula = str(payload["formula"]).strip()
+    raw_formula = str(payload["formula"]).strip()
+    resolution = resolve_formula_operators(raw_formula)
+    if not resolution.executable:
+        details = json.dumps(resolution.to_dict(), ensure_ascii=False, sort_keys=True)
+        raise RuntimeError(f"LLM formula failed operator registry gate: {details}")
+    formula = resolution.canonical_formula
     description = str(payload.get("description", "")).strip()
     horizon_days = _normalize_horizon_days(int(payload.get("horizon_days", 5)), text)
     filters_raw = payload.get("universe_filters", [])

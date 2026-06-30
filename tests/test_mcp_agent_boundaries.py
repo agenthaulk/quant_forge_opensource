@@ -18,6 +18,12 @@ def test_mcp_catalogs_are_read_only_shapes() -> None:
     assert any(operator["name"] == "rank" for operator in operators)
     assert any(operator["name"] == "delta" for operator in operators)
     assert any(operator["name"] == "correlation" for operator in operators)
+    rank = next(operator for operator in operators if operator["name"] == "rank")
+    assert rank["description"]
+    assert rank["signature"] == "rank(x)"
+    assert "args" in rank
+    stddev = next(operator for operator in operators if operator["name"] == "stddev")
+    assert "ts_stddev" in stddev["aliases_for_recognition_only"]
 
 
 def test_desktop_chrome_contract_is_prompt_only() -> None:

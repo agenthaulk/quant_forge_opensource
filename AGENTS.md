@@ -21,6 +21,16 @@ config-driven, and safe to publish.
 - Agents may call typed workbench services but must not write source-of-truth
   paths directly.
 
+## Full Integration Testing
+
+- When a user asks for "full integration", "new-user Docker integration",
+  "project-wide 联调", or to verify a fresh clone from `main`, use
+  `docs/full_integration_test_prompt.md` as the canonical execution prompt.
+- Keep that prompt updated as Web configuration, RD workflow, operator
+  validation, cache behavior, or acceptance criteria evolve.
+- Do not put real API keys, private mounted-disk paths, or private data samples
+  into tracked files while preparing or reporting a full integration run.
+
 ## Coding Rules
 
 - Keep modules small, typed, and explicit.

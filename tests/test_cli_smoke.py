@@ -10,7 +10,9 @@ from pathlib import Path
 import pandas as pd
 
 import quant_forge.apps.cli.main as cli_main
+from quant_forge.core.contracts import FactorDefinition
 from quant_forge.data.local import create_demo_workspace
+from quant_forge.llm_factor_parser import ParsedFactor
 
 
 def run_cli(*args: str) -> dict:
@@ -297,6 +299,61 @@ llm:
     assert payload["ok"] is False
     assert payload["llm"]["missing_providers"][0]["api_key_env"] == "QF_DOCTOR_MISSING_KEY"
     assert "QF_DOCTOR_MISSING_KEY" in payload["llm"]["missing_providers"][0]["error"]
+
+
+def test_llm_smoke_loads_ignored_runtime_env_file_without_printing_secret(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    config_path = tmp_path / "default.local.yaml"
+    env_path = tmp_path / "default.local.env"
+    secret = "local-fixture-secret-value"
+    env_path.write_text(f"QF_LLM_SMOKE_KEY={secret}\n", encoding="utf-8")
+    config_path.write_text(
+        """
+runtime:
+  env_files:
+    - default.local.env
+llm:
+  provider: deepseek
+  providers:
+    deepseek:
+      model: fake-deepseek
+      base_url: https://api.deepseek.com
+      api_key_env: QF_LLM_SMOKE_KEY
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("QF_LLM_SMOKE_KEY", raising=False)
+
+    def fake_parse_factor_idea(text, llm, *, mode):
+        assert mode == "llm"
+        assert text == "小市值低波动"
+        assert llm.provider == "deepseek"
+        assert llm.api_key_env == "QF_LLM_SMOKE_KEY"
+        return ParsedFactor(
+            factor=FactorDefinition(
+                factor_id="FTR_LLM_SMOKE",
+                name="llm_smoke",
+                formula="-rank(market_cap)",
+                horizon_days=5,
+                source="llm",
+            ),
+            source="llm",
+            provider="deepseek",
+            model="fake-deepseek",
+        )
+
+    monkeypatch.setattr(cli_main, "parse_factor_idea", fake_parse_factor_idea)
+    args = argparse.Namespace(config=config_path, workspace=None, provider=None, text="小市值低波动")
+
+    assert cli_main._cmd_llm_smoke(args) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["provider"] == "deepseek"
+    assert payload["api_key_env"] == "QF_LLM_SMOKE_KEY"
+    assert payload["factor"]["formula"] == "-rank(market_cap)"
+    assert secret not in json.dumps(payload)
 
 
 def test_doctor_skips_macos_appledouble_entries_before_stat(tmp_path: Path, monkeypatch) -> None:

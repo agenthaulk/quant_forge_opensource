@@ -63,9 +63,9 @@ def render_research_report(result: ResearchLoopResult, *, generated_at: datetime
         [
             "## Candidate Comparison",
             "",
-            "| Factor | Profile | Status | Score | Split ICIR | Rank IC | ICIR | Gross Return "
+            "| Factor | Profile | Status | Score | Split ICIR | Rank IC | ICIR | IC t-stat | Gross Return "
             "| Net Return | Net LS Sharpe | Rebalance Rate | Turnover Rate | Gate |",
-            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
         ]
     )
     if result.candidates:
@@ -73,7 +73,7 @@ def render_research_report(result: ResearchLoopResult, *, generated_at: datetime
             lines.append(_candidate_row(candidate))
     else:
         lines.append(
-            "| none | - | - | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.00% "
+            "| none | - | - | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.00% "
             "| 0.00% | 0.0000 | 0.00% | 0.00% | - |"
         )
     lines.extend(["", "## Blocked / Skipped Plans", ""])
@@ -143,6 +143,7 @@ def _candidate_summary(candidate: ResearchCandidateResult) -> list[str]:
         f"- Weighted Split ICIR: {_fmt(candidate.split_weighted_icir)}",
         f"- Rank IC: {_fmt(candidate.evaluation.rank_ic_mean)}",
         f"- Rank ICIR: {_fmt(candidate.evaluation.rank_icir)}",
+        f"- Rank IC t-stat: {_fmt(candidate.evaluation.rank_ic_t_stat)}",
         f"- Gross Annualized Return: {_pct(candidate.backtest.annualized_return)}",
         f"- Net Annualized Return: {_pct(candidate.backtest.net_annualized_return)}",
         f"- Net Long-Short Sharpe: {_fmt(candidate.backtest.net_long_short_sharpe)}",
@@ -206,7 +207,8 @@ def _candidate_row(candidate: ResearchCandidateResult) -> str:
         f"| `{candidate.factor.factor_id}` | {_profile_label(candidate)} | {candidate.factor.status} "
         f"| {_fmt(candidate.score)} "
         f"| {_fmt(candidate.split_weighted_icir)} | {_fmt(candidate.evaluation.rank_ic_mean)} "
-        f"| {_fmt(candidate.evaluation.rank_icir)} | {_pct(candidate.backtest.annualized_return)} "
+        f"| {_fmt(candidate.evaluation.rank_icir)} | {_fmt(candidate.evaluation.rank_ic_t_stat)} "
+        f"| {_pct(candidate.backtest.annualized_return)} "
         f"| {_pct(candidate.backtest.net_annualized_return)} | {_fmt(candidate.backtest.net_long_short_sharpe)} "
         f"| {_pct(candidate.backtest.rebalance_rate)} "
         f"| {_pct(candidate.backtest.turnover_rate)} | {gate} |"
@@ -239,13 +241,14 @@ def _candidate_detail(candidate: ResearchCandidateResult) -> list[str]:
         "",
         "#### Split Metrics",
         "",
-        "| Split | Dates | IC Days | Coverage | Rank IC | ICIR | Weight |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+        "| Split | Dates | IC Days | Coverage | Rank IC | ICIR | IC t-stat | Weight |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for metric in candidate.evaluation.split_metrics:
         lines.append(
             f"| {metric.name} | {metric.start_date} to {metric.end_date} | {metric.ic_days} "
             f"| {_pct(metric.coverage)} | {_fmt(metric.rank_ic_mean)} | {_fmt(metric.rank_icir)} "
+            f"| {_fmt(metric.rank_ic_t_stat)} "
             f"| {_fmt(metric.score_weight)} |"
         )
     lines.extend(
@@ -253,14 +256,15 @@ def _candidate_detail(candidate: ResearchCandidateResult) -> list[str]:
             "",
             "#### Horizon Matrix",
             "",
-            "| Horizon | Observations | Coverage | Rank IC | ICIR | IC Days |",
-            "| ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Horizon | Observations | Coverage | Rank IC | ICIR | IC t-stat | IC Days |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for metric in candidate.evaluation.horizon_metrics:
         lines.append(
             f"| {metric.horizon_days} | {metric.observations} | {_pct(metric.coverage)} "
-            f"| {_fmt(metric.rank_ic_mean)} | {_fmt(metric.rank_icir)} | {metric.ic_days} |"
+            f"| {_fmt(metric.rank_ic_mean)} | {_fmt(metric.rank_icir)} "
+            f"| {_fmt(metric.rank_ic_t_stat)} | {metric.ic_days} |"
         )
     lines.extend(
         [

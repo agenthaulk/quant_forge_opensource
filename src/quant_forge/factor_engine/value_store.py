@@ -67,14 +67,34 @@ class FactorValueStore:
         universe_filters: tuple[str, ...],
         cache_only: bool = False,
     ) -> FactorScoreResult:
+        from quant_forge.operator_registry.resolver import resolve_executable_formula
+
+        executable_formula = resolve_executable_formula(formula)
         factor_paths = self._resolve_factor_paths(factor_id=factor_id, factor_name=factor_name, formula=formula)
-        formula_signature = _formula_signature(factor_id, formula, universe_filters)
+        formula_signature = _formula_signature(factor_id, executable_formula, universe_filters)
+        legacy_formula_signature = _formula_signature(factor_id, formula, universe_filters)
         cached = self.read_factor_values(
             factor_paths.read_dirs,
             factor_id=factor_id,
             formula_signature=formula_signature,
             allow_unsigned_root_values=cache_only,
         )
+        if legacy_formula_signature != formula_signature:
+            legacy_cached = self.read_factor_values(
+                factor_paths.read_dirs,
+                factor_id=factor_id,
+                formula_signature=legacy_formula_signature,
+                allow_unsigned_root_values=cache_only,
+            )
+            cached = _dedupe_scores(
+                pd.concat(
+                    [
+                        legacy_cached,
+                        cached,
+                    ],
+                    ignore_index=True,
+                )
+            )
         panel_keys = _score_keys(panel)
         required_keys = _required_score_keys(panel, universe_filters)
         cached_for_panel = _restrict_to_panel(cached, panel_keys)
@@ -96,13 +116,15 @@ class FactorValueStore:
                 missing_ratio=_missing_ratio(max(0, int(len(required_keys)) - cached_rows), int(len(required_keys))),
                 context_rows=0,
             )
-        cached_available = _restrict_to_panel(_trusted_cached_scores(cached_for_panel, panel, formula), required_keys)
+        cached_available = _restrict_to_panel(_trusted_cached_scores(cached_for_panel, panel, executable_formula), required_keys)
         missing_keys = _missing_score_keys(required_keys, cached_available)
         cached_complete = cached_available
         result_missing_keys = _missing_score_keys(panel_keys, cached_complete)
 
-        plan = _plan_score_computation(panel, required_keys=required_keys, missing_keys=missing_keys, formula=formula)
-        computed_context = execute_factor_formula(plan.panel, formula, universe_filters) if plan.missing_rows else _empty_scores()
+        plan = _plan_score_computation(panel, required_keys=required_keys, missing_keys=missing_keys, formula=executable_formula)
+        computed_context = (
+            execute_factor_formula(plan.panel, executable_formula, universe_filters) if plan.missing_rows else _empty_scores()
+        )
         computed = _restrict_to_panel(computed_context, missing_keys)
         computed_for_result = _restrict_to_panel(computed_context, result_missing_keys)
         if not computed.empty and factor_paths.write_dir is not None:

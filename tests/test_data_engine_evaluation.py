@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from quant_forge.data.local import LocalPanelDataProvider, create_demo_workspace
-from quant_forge.evaluation.service import evaluate_factor
+from quant_forge.evaluation.service import _with_forward_return, evaluate_factor
 from quant_forge.factor_engine.executor import execute_factor_formula
 from quant_forge.core.contracts import SimulationProfile
 
@@ -23,6 +24,26 @@ def test_local_provider_and_engine(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="unsupported or missing factor field"):
         execute_factor_formula(panel, "rank(unknown_field)")
+
+
+def test_forward_return_respects_execution_delay() -> None:
+    panel = pd.DataFrame(
+        {
+            "trade_date": pd.date_range("2024-01-01", periods=5, freq="D"),
+            "instrument": ["A"] * 5,
+            "close": [10.0, 11.0, 13.0, 16.0, 20.0],
+        }
+    )
+
+    labeled = _with_forward_return(panel, horizon_days=2, execution_delay_days=1)
+
+    assert labeled.loc[0, "forward_return"] == pytest.approx(16.0 / 11.0 - 1.0)
+    assert labeled.loc[1, "forward_return"] == pytest.approx(20.0 / 13.0 - 1.0)
+    assert labeled.loc[2:, "forward_return"].isna().all()
+    delayed = _with_forward_return(panel, horizon_days=1, execution_delay_days=2)
+    assert delayed.loc[0, "forward_return"] == pytest.approx(16.0 / 13.0 - 1.0)
+    assert delayed.loc[1, "forward_return"] == pytest.approx(20.0 / 16.0 - 1.0)
+    assert delayed.loc[2:, "forward_return"].isna().all()
 
 
 def test_evaluation_writes_artifact(tmp_path: Path) -> None:
@@ -47,6 +68,12 @@ def test_evaluation_writes_artifact(tmp_path: Path) -> None:
     assert payload["score_compute_mode"]
     assert payload["score_required_rows"] >= payload["score_computed_rows"]
     assert result.score_compute_mode == payload["score_compute_mode"]
+    assert payload["rank_ic_t_stat"] == result.rank_ic_t_stat
+    assert result.rank_ic_t_stat == pytest.approx(result.rank_icir * math.sqrt(result.ic_days))
+    assert result.rank_icir == pytest.approx(result.rank_ic_mean / result.rank_ic_std)
+    assert result.split_metrics[0].rank_ic_t_stat == pytest.approx(
+        result.split_metrics[0].rank_icir * math.sqrt(result.split_metrics[0].ic_days)
+    )
 
 
 def test_evaluation_warns_when_oos_decays(tmp_path: Path) -> None:
@@ -69,12 +96,30 @@ def test_evaluation_records_non_default_simulation_profile(tmp_path: Path) -> No
         factor_root=paths["factor_root"],
         data_root=paths["data_root"],
         artifact_root=paths["artifact_root"],
-        simulation_profile=SimulationProfile(decay_days=2),
+        simulation_profile=SimulationProfile(execution_delay_days=2, decay_days=2),
     )
     payload = json.loads(result.artifact_path.read_text(encoding="utf-8"))
 
     assert result.artifact_path.name != "FTR_DEMO_SMALL_CAP.json"
+    assert payload["simulation_profile"]["execution_delay_days"] == 2
     assert payload["simulation_profile"]["decay_days"] == 2
+
+
+def test_evaluation_accepts_non_default_execution_delay(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    delayed = evaluate_factor(
+        "FTR_DEMO_SMALL_CAP",
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        simulation_profile=SimulationProfile(execution_delay_days=2),
+    )
+    payload = json.loads(delayed.artifact_path.read_text(encoding="utf-8"))
+
+    assert delayed.ic_days > 0
+    assert delayed.observations > 0
+    assert payload["simulation_profile"]["execution_delay_days"] == 2
+    assert payload["rank_ic_mean"] == delayed.rank_ic_mean
 
 
 def test_evaluation_rejects_display_window_shorter_than_six_months(tmp_path: Path) -> None:

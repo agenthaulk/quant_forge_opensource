@@ -7,6 +7,7 @@ import re
 from quant_forge.factor_engine.formula_parser import inspect_formula
 from quant_forge.factor_library.catalog import is_precomputed_formula
 from quant_forge.mcp.read_models import list_available_fields, list_available_operators
+from quant_forge.operator_registry.resolver import resolve_formula_operators
 from quant_forge.research_loop.contracts import (
     FactorExperimentPlan,
     PlanStatus,
@@ -28,6 +29,9 @@ class ExperimentPlanner:
         context: ResearchContext,
     ) -> FactorExperimentPlan:
         formula = hypothesis.formula_dsl.strip()
+        raw_formula = formula
+        canonical_formula = formula
+        operator_resolution: dict[str, object] = {}
         blocking: list[str] = []
         warnings: list[str] = []
         fields = _available_fields(context)
@@ -38,7 +42,19 @@ class ExperimentPlanner:
         elif _contains_st_numeric_feature(formula):
             blocking.append("ST status must be a universe filter, not a numeric formula field")
 
-        allow_whole_precomputed = hypothesis.parameter_search_fallback
+        allow_whole_precomputed = hypothesis.parameter_search_fallback and is_precomputed_formula(formula)
+        resolution = None
+        if formula and formula != "未指定" and not allow_whole_precomputed:
+            resolution = resolve_formula_operators(formula)
+            operator_resolution = resolution.to_dict()
+            canonical_formula = resolution.canonical_formula
+            if resolution.executable:
+                formula = canonical_formula
+            elif resolution.requires_operator_draft_review:
+                blocking.extend(resolution.blocking_errors or ("operator requires draft review",))
+            else:
+                blocking.extend(resolution.blocking_errors or ("formula validation failed",))
+
         parsed = (
             inspect_formula(
                 formula,
@@ -46,7 +62,7 @@ class ExperimentPlanner:
                 allow_whole_precomputed=allow_whole_precomputed,
                 is_whole_precomputed=is_precomputed_formula,
             )
-            if formula and formula != "未指定"
+            if formula and formula != "未指定" and (resolution is None or resolution.executable)
             else None
         )
         if parsed is not None and parsed.is_valid:
@@ -78,6 +94,7 @@ class ExperimentPlanner:
             and self.canonicalize_to_positive_alpha
         ):
             formula, formula_canonicalized = _canonical_formula(formula)
+            canonical_formula = formula
             plan_direction = "positive"
 
         if self.require_expected_direction and hypothesis.expected_direction == "unknown":
@@ -97,11 +114,8 @@ class ExperimentPlanner:
             "available_operators": sorted(operators),
             "used_operator": parsed.operators[0] if parsed and parsed.operators else "",
             "used_operators": list(parsed.operators) if parsed else [],
-            "unknown_operators": [
-                reason.removeprefix("unknown operator: ")
-                for reason in blocking
-                if reason.startswith("unknown operator: ")
-            ],
+            "unknown_operators": _unknown_operators_from_resolution(operator_resolution, blocking),
+            "operator_resolution": operator_resolution,
             "is_valid": status == "ready",
         }
         if hypothesis.parameter_search_fallback:
@@ -112,6 +126,8 @@ class ExperimentPlanner:
             status=status,
             factor_name=_factor_name(hypothesis),
             formula_dsl=formula,
+            raw_formula_dsl=raw_formula,
+            canonical_formula_dsl=canonical_formula,
             inputs=hypothesis.input_fields or (parsed.fields if parsed else ()),
             universe_filters=tuple(universe_filters),
             expected_direction=plan_direction,
@@ -126,6 +142,7 @@ class ExperimentPlanner:
                 "parameter_search_fallback": hypothesis.parameter_search_fallback,
                 "raw_expected_direction": hypothesis.expected_direction,
                 "formula_canonicalized_to_positive_alpha": formula_canonicalized,
+                "operator_resolution": operator_resolution,
             },
         )
 
@@ -147,7 +164,29 @@ def _available_fields(context: ResearchContext) -> set[str]:
 def _available_operators(context: ResearchContext) -> set[str]:
     if context.available_operators:
         return set(context.available_operators)
-    return {operator["name"] for operator in list_available_operators()}
+    return {str(operator["name"]) for operator in list_available_operators()}
+
+
+def _unknown_operators_from_resolution(
+    operator_resolution: dict[str, object],
+    blocking: list[str],
+) -> list[str]:
+    items = operator_resolution.get("items", []) if operator_resolution else []
+    unknowns: list[str] = []
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("status") in {"unknown_operator", "unknown_requires_draft"}:
+                original = str(item.get("original_name", "")).strip()
+                if original:
+                    unknowns.append(original)
+    unknowns.extend(
+        reason.removeprefix("unknown operator: ")
+        for reason in blocking
+        if reason.startswith("unknown operator: ")
+    )
+    return list(dict.fromkeys(unknowns))
 
 
 def _contains_st_numeric_feature(formula: str) -> bool:
@@ -205,8 +244,10 @@ def _plan_status(blocking_reasons: list[str]) -> PlanStatus:
         return "blocked_missing_formula"
     if "ST status" in text or "ST event" in text:
         return "blocked_pit_event_feature_required"
-    if "operator" in text:
+    if "operator" in text and "draft" in text:
         return "requires_operator_draft_review"
+    if "operator" in text:
+        return "blocked_formula_invalid"
     if "field" in text or "non-ST filter" in text:
         return "blocked_missing_field"
     if "expected_direction" in text:

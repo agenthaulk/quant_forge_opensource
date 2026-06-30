@@ -115,6 +115,7 @@ class EvaluationSplitMetric:
     rank_ic_std: float
     rank_icir: float
     ic_days: int
+    rank_ic_t_stat: float = 0.0
     score_weight: float = 0.0
 
 
@@ -127,6 +128,7 @@ class HorizonEvaluationMetric:
     rank_ic_std: float
     rank_icir: float
     ic_days: int
+    rank_ic_t_stat: float = 0.0
     split_metrics: tuple[EvaluationSplitMetric, ...] = field(default_factory=tuple)
 
 
@@ -140,6 +142,7 @@ class EvaluationResult:
     rank_icir: float
     ic_days: int
     artifact_path: Path
+    rank_ic_t_stat: float = 0.0
     split_metrics: tuple[EvaluationSplitMetric, ...] = field(default_factory=tuple)
     horizon_metrics: tuple[HorizonEvaluationMetric, ...] = field(default_factory=tuple)
     simulation_profile: SimulationProfile = field(default_factory=SimulationProfile)

@@ -72,7 +72,16 @@ def evaluate_factor(
     scores = score_result.scores
     split_specs = _validate_sample_splits(sample_splits or DEFAULT_SAMPLE_SPLITS)
     horizons = _unique_horizons(horizon, horizon_days_matrix or DEFAULT_HORIZON_DAYS)
-    horizon_metrics = tuple(_evaluate_horizon(working_panel, scores, item, split_specs) for item in horizons)
+    horizon_metrics = tuple(
+        _evaluate_horizon(
+            working_panel,
+            scores,
+            item,
+            split_specs,
+            execution_delay_days=profile.execution_delay_days,
+        )
+        for item in horizons
+    )
     primary = next(metric for metric in horizon_metrics if metric.horizon_days == horizon)
     warnings = _evaluation_warnings(primary.split_metrics)
 
@@ -103,6 +112,7 @@ def evaluate_factor(
             "rank_ic_mean": primary.rank_ic_mean,
             "rank_ic_std": primary.rank_ic_std,
             "rank_icir": primary.rank_icir,
+            "rank_ic_t_stat": primary.rank_ic_t_stat,
             "ic_days": primary.ic_days,
             "sample_splits": [asdict(split) for split in split_specs],
             "split_metrics": [asdict(metric) for metric in primary.split_metrics],
@@ -119,6 +129,7 @@ def evaluate_factor(
         rank_icir=primary.rank_icir,
         ic_days=primary.ic_days,
         artifact_path=artifact_path,
+        rank_ic_t_stat=primary.rank_ic_t_stat,
         split_metrics=primary.split_metrics,
         horizon_metrics=horizon_metrics,
         simulation_profile=profile,
@@ -138,10 +149,14 @@ def evaluate_factor(
     )
 
 
-def _with_forward_return(panel: pd.DataFrame, horizon_days: int) -> pd.DataFrame:
+def _with_forward_return(panel: pd.DataFrame, horizon_days: int, *, execution_delay_days: int) -> pd.DataFrame:
+    if execution_delay_days < 1:
+        raise ValueError("execution_delay_days must be at least 1")
     labeled = panel[["trade_date", "instrument", "close"]].copy()
-    labeled["future_close"] = labeled.groupby("instrument")["close"].shift(-horizon_days)
-    labeled["forward_return"] = labeled["future_close"] / labeled["close"] - 1.0
+    by_instrument = labeled.groupby("instrument")["close"]
+    labeled["entry_close"] = by_instrument.shift(-execution_delay_days)
+    labeled["future_close"] = by_instrument.shift(-(execution_delay_days + horizon_days))
+    labeled["forward_return"] = labeled["future_close"] / labeled["entry_close"] - 1.0
     return labeled[["trade_date", "instrument", "forward_return"]]
 
 
@@ -150,10 +165,16 @@ def _evaluate_horizon(
     scores: pd.DataFrame,
     horizon_days: int,
     split_specs: tuple[SampleSplitSpec, ...],
+    *,
+    execution_delay_days: int,
 ) -> HorizonEvaluationMetric:
     if horizon_days < 1:
         raise ValueError("horizon_days_matrix values must be positive")
-    labeled = _with_forward_return(panel, horizon_days).merge(scores, on=["trade_date", "instrument"], how="left")
+    labeled = _with_forward_return(
+        panel,
+        horizon_days,
+        execution_delay_days=execution_delay_days,
+    ).merge(scores, on=["trade_date", "instrument"], how="left")
     overall = _ic_summary(labeled)
     dates = list(labeled.dropna(subset=["forward_return"])["trade_date"].drop_duplicates().sort_values())
     split_dates = _split_dates(dates, split_specs)
@@ -169,6 +190,7 @@ def _evaluate_horizon(
         rank_ic_std=overall["rank_ic_std"],
         rank_icir=overall["rank_icir"],
         ic_days=overall["ic_days"],
+        rank_ic_t_stat=overall["rank_ic_t_stat"],
         split_metrics=split_metrics,
     )
 
@@ -188,6 +210,7 @@ def _split_metric(
         rank_ic_std=summary["rank_ic_std"],
         rank_icir=summary["rank_icir"],
         ic_days=summary["ic_days"],
+        rank_ic_t_stat=summary["rank_ic_t_stat"],
         score_weight=spec.score_weight,
     )
 
@@ -229,7 +252,8 @@ def _ic_summary(labeled: pd.DataFrame) -> dict[str, float | int]:
     rank_ic_std = float(np.std(ic_by_date, ddof=1)) if len(ic_by_date) > 1 else 0.0
     if abs(rank_ic_std) < 1e-12:
         rank_ic_std = 0.0
-    rank_icir = float(rank_ic_mean / rank_ic_std * np.sqrt(len(ic_by_date))) if rank_ic_std else 0.0
+    rank_icir = float(rank_ic_mean / rank_ic_std) if rank_ic_std else 0.0
+    rank_ic_t_stat = float(rank_icir * np.sqrt(len(ic_by_date))) if rank_ic_std else 0.0
     possible = len(labeled.dropna(subset=["forward_return"]))
     coverage = float(len(usable) / possible) if possible else 0.0
     return {
@@ -238,6 +262,7 @@ def _ic_summary(labeled: pd.DataFrame) -> dict[str, float | int]:
         "rank_ic_mean": rank_ic_mean,
         "rank_ic_std": rank_ic_std,
         "rank_icir": rank_icir,
+        "rank_ic_t_stat": rank_ic_t_stat,
         "ic_days": len(ic_by_date),
     }
 

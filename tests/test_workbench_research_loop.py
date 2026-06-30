@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import time
 
@@ -17,6 +18,7 @@ from quant_forge.research_loop.service import (
     ResearchDeduplicationConfig,
     ResearchGate,
     ResearchLoopService,
+    ResearchTrialSimulationOverlay,
     apply_gate,
 )
 from quant_forge.workbench.service import WorkbenchService
@@ -101,7 +103,7 @@ def test_research_loop_scheduler_runs_immediately(tmp_path: Path) -> None:
         artifact_root=paths["artifact_root"],
     )
     scheduler = ResearchLoopScheduler(
-        lambda seed_factor_id, objective, max_candidates: loop.run_once(
+        lambda seed_factor_id, objective, max_candidates, iterations: loop.run_once(
             seed_factor_id,
             objective=objective,
             max_candidates=max_candidates,
@@ -124,6 +126,31 @@ def test_research_loop_scheduler_runs_immediately(tmp_path: Path) -> None:
     assert status.last_result.accepted_candidate_ids
     assert status.last_result.report_path is not None
     assert status.last_result.report_path.exists()
+
+
+def test_research_loop_scheduler_forwards_iteration_count() -> None:
+    captured: list[tuple[str, str, int, int]] = []
+
+    def runner(seed_factor_id: str, objective: str, max_candidates: int, iterations: int) -> dict[str, int | str]:
+        captured.append((seed_factor_id, objective, max_candidates, iterations))
+        return {"seed_factor_id": seed_factor_id, "iterations": iterations}
+
+    scheduler = ResearchLoopScheduler(runner, allowed_interval_days=(1,))
+
+    status = scheduler.start(
+        ResearchScheduleRequest(
+            seed_factor_id="FTR_DEMO_SMALL_CAP",
+            objective="balanced",
+            max_candidates=2,
+            iterations=3,
+        ),
+        run_immediately=True,
+    )
+    scheduler.stop()
+
+    assert captured == [("FTR_DEMO_SMALL_CAP", "balanced", 2, 3)]
+    assert status.last_error is None
+    assert status.last_result == {"seed_factor_id": "FTR_DEMO_SMALL_CAP", "iterations": 3}
 
 
 def test_research_loop_preserves_existing_candidate_status_on_later_gate_failure(tmp_path: Path) -> None:
@@ -244,6 +271,133 @@ def test_research_loop_can_score_profile_variants(tmp_path: Path) -> None:
     report = result.report_path.read_text(encoding="utf-8")
     assert "No successive-halving trace was recorded for this run." in report
     assert "Parameter search was not enabled for this run." not in report
+
+
+def test_research_loop_legacy_simulation_profiles_preserve_full_profile_fields(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    profiles = (
+        SimulationProfile(
+            execution_delay_days=1,
+            top_quantile=0.2,
+            decay_days=0,
+            test_period_start="2024-01-10",
+            test_period_end="2024-07-30",
+        ),
+        SimulationProfile(
+            execution_delay_days=2,
+            top_quantile=0.3,
+            decay_days=1,
+            test_period_start="2024-01-15",
+            test_period_end="2024-07-25",
+        ),
+    )
+    loop = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        simulation_profiles=profiles,
+    )
+
+    result = loop.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert len(result.candidates) == 2
+    assert {candidate.backtest.simulation_profile for candidate in result.candidates} == set(profiles)
+    assert {candidate.evaluation.simulation_profile for candidate in result.candidates} == set(profiles)
+    assert loop.simulation_profiles == profiles
+
+
+def test_research_loop_disabled_parameter_search_preserves_role_profiles(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    loop = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        simulation_profile=SimulationProfile(top_quantile=0.25, decay_days=1),
+        evaluation_simulation_profile=SimulationProfile(top_quantile=0.10, decay_days=0),
+        backtest_simulation_profile=SimulationProfile(top_quantile=0.30, decay_days=4),
+        parameter_search_enabled=False,
+    )
+
+    result = loop.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert result.candidates
+    assert {candidate.evaluation.simulation_profile.top_quantile for candidate in result.candidates} == {0.10}
+    assert {candidate.evaluation.simulation_profile.decay_days for candidate in result.candidates} == {0}
+    assert {candidate.backtest.simulation_profile.top_quantile for candidate in result.candidates} == {0.30}
+    assert {candidate.backtest.simulation_profile.decay_days for candidate in result.candidates} == {4}
+    assert result.trace_root is not None
+    config_snapshot = json.loads((result.trace_root / "config_snapshot.json").read_text(encoding="utf-8"))
+    assert config_snapshot["trial_simulation_overlays"] == [{"top_quantile": None, "decay_days": None}]
+    assert config_snapshot["effective_trial_configs"][0]["evaluation_profile"]["top_quantile"] == 0.10
+    assert config_snapshot["effective_trial_configs"][0]["evaluation_profile"]["decay_days"] == 0
+    assert config_snapshot["effective_trial_configs"][0]["backtest_profile"]["top_quantile"] == 0.30
+    assert config_snapshot["effective_trial_configs"][0]["backtest_profile"]["decay_days"] == 4
+
+
+def test_research_loop_trial_overlay_only_replaces_explicit_fields(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    loop = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        simulation_profile=SimulationProfile(top_quantile=0.25, decay_days=1),
+        trial_simulation_overlays=(ResearchTrialSimulationOverlay(top_quantile=0.20),),
+        evaluation_simulation_profile=SimulationProfile(top_quantile=0.10, decay_days=0),
+        backtest_simulation_profile=SimulationProfile(top_quantile=0.30, decay_days=4),
+        parameter_search_enabled=True,
+    )
+
+    result = loop.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert result.candidates
+    assert {candidate.evaluation.simulation_profile.top_quantile for candidate in result.candidates} == {0.20}
+    assert {candidate.evaluation.simulation_profile.decay_days for candidate in result.candidates} == {0}
+    assert {candidate.backtest.simulation_profile.top_quantile for candidate in result.candidates} == {0.20}
+    assert {candidate.backtest.simulation_profile.decay_days for candidate in result.candidates} == {4}
+
+
+def test_research_loop_trial_overlay_explicit_fields_override_profile_base(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    profile = SimulationProfile(
+        execution_delay_days=2,
+        top_quantile=0.30,
+        decay_days=4,
+        test_period_start="2024-01-10",
+        test_period_end="2024-07-30",
+    )
+    loop = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        trial_simulation_overlays=(ResearchTrialSimulationOverlay(profile=profile, top_quantile=0.20, decay_days=1),),
+        evaluation_simulation_profile=SimulationProfile(top_quantile=0.10, decay_days=0),
+        backtest_simulation_profile=SimulationProfile(top_quantile=0.30, decay_days=4),
+    )
+
+    result = loop.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert result.candidates
+    effective = result.candidates[0].backtest.simulation_profile
+    assert effective.execution_delay_days == 2
+    assert effective.test_period_start == "2024-01-10"
+    assert effective.test_period_end == "2024-07-30"
+    assert effective.top_quantile == 0.20
+    assert effective.decay_days == 1
+
+
+def test_research_loop_single_round_performed_flags_remain_compatible(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    loop = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+    )
+
+    result = loop.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert result.optimization_performed is True
+    assert result.no_optimization_performed is False
+    assert result.accepted_candidate_ids
 
 
 def test_research_loop_successive_halving_keeps_only_survivors_for_full_stage(tmp_path: Path) -> None:

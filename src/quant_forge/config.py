@@ -248,7 +248,9 @@ def validate_llm_runtime(llm: LLMSettings, provider: str | None = None) -> None:
         raise RuntimeError(
             f"Missing API key for active LLM provider {selected.provider}. "
             f"Expected environment variable: {selected.api_key_env}. "
-            "Declare runtime.env_files in the local config before starting Quant Forge."
+            "Declare runtime.env_files in an ignored local config before starting Quant Forge, "
+            "for example configs/default.local.yaml with configs/default.local.env, "
+            "then start commands with --config configs/default.local.yaml."
         )
 
 

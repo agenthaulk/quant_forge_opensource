@@ -17,6 +17,16 @@ simulation:
   test_period:
     start: null
     end: null
+evaluation:
+  simulation:
+    test_period:
+      start: null
+      end: null
+backtest:
+  simulation:
+    test_period:
+      start: null
+      end: null
 parameter_search:
   enabled: false
   method: successive_halving

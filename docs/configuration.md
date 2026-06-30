@@ -58,6 +58,12 @@ file, or to a mounted source snapshot root containing `price/` and
 from close, volume, and market-value fields; deeper PIT and provider-specific
 ETL remain outside the lightweight core.
 
+Custom numeric columns in `panel.parquet` are treated as already point-in-time
+safe. Do not expose forward-looking labels such as future returns, next close,
+or post-event fields as factor inputs unless they have been lagged upstream.
+Backtests and evaluation apply a configurable execution delay, but they cannot
+prove that arbitrary custom columns were produced with PIT-safe ETL.
+
 `paths.factor_root` remains the writable source of truth for user-created factor
 definitions. `paths.factor_values_root` is read as an additional mounted factor
 database. `qf factor list`, evaluation, backtest, Web, MCP catalog, and RD seed
@@ -322,8 +328,14 @@ Example local setup:
 ```bash
 printf 'DEEPSEEK_API_KEY=<your-deepseek-api-key>\n' > configs/default.local.env
 chmod 600 configs/default.local.env
+qf doctor --config configs/default.local.yaml --rd-config configs/rd.yaml
+qf llm-smoke --config configs/default.local.yaml --provider deepseek
 qf web --config configs/default.local.yaml --rd-config configs/rd.yaml
 ```
+
+`qf llm-smoke` performs one real LLM parse through the same config and
+`runtime.env_files` chain used by Web. It reports provider/model/factor metadata
+only; it must not print the API key.
 
 ## Research Loop
 
@@ -355,6 +367,16 @@ simulation:
   test_period:
     start: null
     end: null
+evaluation:
+  simulation:
+    test_period:
+      start: null
+      end: null
+backtest:
+  simulation:
+    test_period:
+      start: null
+      end: null
 parameter_search:
   enabled: false
   method: successive_halving
@@ -420,6 +442,49 @@ weight_profiles:
     max_drawdown: 0.1
 ```
 
+`simulation` is the legacy/default profile used when no role-specific profile is
+configured. `evaluation.simulation` can override the profile for factor testing
+and IC/ICIR evidence, while `backtest.simulation` can override the profile for
+the holding-period backtest. This lets you keep model selection on one period
+and reserve a later holdout period for portfolio-style evidence. For example,
+to evaluate factors on 2025 and run the holding backtest on 2026:
+
+The project keeps source configs split and resolves an effective runtime config
+inside the application. From low to high precedence, the relevant layers are:
+
+1. Code/dataclass defaults.
+2. Runtime config YAML such as `configs/default.yaml`.
+3. Local ignored env/config files loaded by the chosen launch command.
+4. Environment variables referenced by config, for example LLM key env names.
+5. CLI/runtime path overrides for local workspaces and mounted data.
+6. RD legacy top-level fields, used only as compatibility fallbacks.
+7. RD base `simulation`.
+8. RD role profiles: `evaluation.simulation` and `backtest.simulation`.
+9. Request-scoped user edits or RD `parameter_search` trial overlays.
+
+RD execution receives already-resolved effective trial configs. A
+`parameter_search` trial overlay may only replace fields it explicitly lists,
+currently `top_quantile` and `decay_days`; if parameter search is disabled, the
+overlay is empty and role-specific profiles are preserved. Every RD run records
+the resolved base, role, overlay, and effective trial profiles in
+`artifact_root/research_loop/runs/<run_id>/config_snapshot.json`.
+
+```yaml
+evaluation:
+  simulation:
+    test_period:
+      start: "2025-01-01"
+      end: "2025-12-31"
+backtest:
+  simulation:
+    test_period:
+      start: "2026-01-01"
+      end: "2026-12-31"
+```
+
+Only use the 2026 backtest result as holdout evidence if RD/parameter search did
+not use that same period for optimization.
+
 The default FactorLab-style evaluation runs a 5/10/21/63-day horizon matrix and
 splits the usable dates chronologically into IS/OOS1/OOS2 at 50%/30%/20%.
 `score_weight` controls the weighted split ICIR score. The default RD score
@@ -456,16 +521,18 @@ configured IS/OOS sample split names. Optional gate fields can reject RD
 candidates for weak OOS net return, excessive rebalance rate, excessive
 turnover rate, low net/gross retention, or OOS net-return decay.
 
-`simulation` is the effective profile shared by evaluation, backtesting, web
-idea workflows, and RD. First-version score preparation applies `test_period`,
-factor formula execution, universe filters, and EWMA `decay_days`; it supports
-only `nan_policy: drop`, `neutralization: none`, and `truncation: null`.
-Unsupported values fail fast.
+`simulation` is the legacy/default profile shared by evaluation, backtesting,
+web idea workflows, and RD unless `evaluation.simulation` or
+`backtest.simulation` overrides it. First-version score preparation applies
+`test_period`, factor formula execution, universe filters, and EWMA
+`decay_days`; it supports only `nan_policy: drop`, `neutralization: none`, and
+`truncation: null`. Unsupported values fail fast.
 
-Displayable evaluation and backtest metrics require at least 126 daily trading
-dates after `simulation.test_period` is applied. This is the public workbench's
-six-month daily-data floor; if a configured period is shorter, expand the
-period or load a longer panel before showing factor metrics.
+Displayable evaluation metrics require at least 126 daily trading dates after
+the effective evaluation `test_period` is applied. Holding-period backtests may
+run on a shorter holdout window when there are enough dates for at least one
+entry/exit path, but the report will warn that annualized return and volatility
+are highly extrapolated.
 
 `top_quantile` controls the long and short tail size. The legacy top-level key
 is still accepted, but the canonical value is `simulation.top_quantile`. Pass

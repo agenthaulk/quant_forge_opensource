@@ -184,10 +184,11 @@ Purpose:
 - `weight_profiles`: named scoring presets.
 - `parameter_search`: optional profile search settings.
 
-Evaluation, backtest, Web, and RD displays require at least 126 daily trading
-dates after `simulation.test_period` is applied. If the command reports that
-the display window is too short, widen the configured test period or load a
-longer daily panel before comparing factor metrics.
+Evaluation, Web IC evidence, and RD evaluation displays require at least 126
+daily trading dates after the effective evaluation `test_period` is applied.
+Holding-period backtests may run on a shorter holdout window when there are
+enough dates for at least one entry/exit path, but short windows are marked with
+warnings because annualized return and volatility are highly extrapolated.
 
 用途：
 
@@ -200,9 +201,9 @@ longer daily panel before comparing factor metrics.
 - `weight_profiles`：命名评分预设。
 - `parameter_search`：可选参数搜索配置。
 
-评价、回测、Web 和 RD 展示至少需要 `simulation.test_period` 过滤后仍有
-126 个日频交易日。如果系统提示展示窗口过短，请放宽测试区间或加载更长的
-日频面板后再比较因子指标。
+评价、Web IC 证据和 RD 评价展示至少需要有效评价 `test_period` 过滤后仍有
+126 个日频交易日。持仓回测可以在更短的 holdout 窗口上运行，只要仍然足够形成
+至少一次入场/出场路径；短窗口结果会带 warning，因为年化收益和波动会被高度外推。
 
 ### 5.3 Draft Templates / 配置模板
 

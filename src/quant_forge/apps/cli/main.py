@@ -31,6 +31,7 @@ from quant_forge.factor_library.repository import (
     normalize_factor_root_layout,
     parse_idea_to_definition,
 )
+from quant_forge.llm_factor_parser import parse_factor_idea
 from quant_forge.research_loop.config import DEFAULT_RD_CONFIG_PATH, load_research_loop_config, weights_for_objective
 from quant_forge.research_loop.llm import LLMHypothesisGenerator, LLMResearchReviewGenerator
 from quant_forge.research_loop.service import ResearchLoopService
@@ -142,6 +143,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_options(report)
     report.add_argument("--factor-root", type=Path)
     report.set_defaults(handler=_cmd_report_to_factor)
+
+    llm_smoke = subcommands.add_parser("llm-smoke", help="verify configured LLM runtime with a real parse call")
+    llm_smoke.add_argument(
+        "--text",
+        default="选择市值较小、近期波动较低的股票，构造低波动小市值因子。",
+        help="short natural-language idea to parse",
+    )
+    llm_smoke.add_argument("--provider", help="optional configured provider name, for example deepseek")
+    _add_config_options(llm_smoke)
+    llm_smoke.set_defaults(handler=_cmd_llm_smoke)
 
     eval_cmd = subcommands.add_parser("eval-factor", help="evaluate a factor")
     eval_cmd.add_argument("factor_id")
@@ -308,6 +319,29 @@ def _cmd_report_to_factor(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_llm_smoke(args: argparse.Namespace) -> int:
+    config = _config(args)
+    selected = config.llm.select_provider(args.provider)
+    validate_llm_runtime(config.llm, args.provider)
+    parsed = parse_factor_idea(args.text, selected, mode="llm")
+    _print_json(
+        {
+            "ok": True,
+            "provider": parsed.provider,
+            "model": parsed.model,
+            "api_key_env": selected.api_key_env,
+            "factor": {
+                "factor_id": parsed.factor.factor_id,
+                "name": parsed.factor.name,
+                "formula": parsed.factor.formula,
+                "horizon_days": parsed.factor.horizon_days,
+                "source": parsed.factor.source,
+            },
+        }
+    )
+    return 0
+
+
 def _cmd_eval_factor(args: argparse.Namespace) -> int:
     config = _config(args)
     rd_config = load_research_loop_config(args.rd_config, config.research, config.simulation)
@@ -320,7 +354,7 @@ def _cmd_eval_factor(args: argparse.Namespace) -> int:
         horizon_days=args.horizon_days,
         horizon_days_matrix=rd_config.horizon_days_matrix,
         sample_splits=rd_config.sample_splits,
-        simulation_profile=rd_config.simulation_profile,
+        simulation_profile=rd_config.evaluation_profile,
         factor_values_root=paths.factor_values_root,
         factor_values_overlay_root=paths.factor_values_overlay_root,
         factor_values_manifest_root=paths.factor_values_manifest_root,
@@ -333,7 +367,7 @@ def _cmd_run_backtest(args: argparse.Namespace) -> int:
     config = _config(args)
     rd_config = load_research_loop_config(args.rd_config, config.research, config.simulation)
     paths = _runtime_paths(args)
-    profile = rd_config.simulation_profile
+    profile = rd_config.backtest_profile
     if args.top_quantile is not None:
         profile = replace(profile, top_quantile=args.top_quantile)
     result = run_factor_backtest(
@@ -368,7 +402,9 @@ def _cmd_research_run_once(args: argparse.Namespace) -> int:
         data_root=paths.data_root,
         artifact_root=paths.artifact_root,
         simulation_profile=rd_config.simulation_profile,
-        simulation_profiles=rd_config.simulation_profiles,
+        trial_simulation_overlays=rd_config.trial_overlays,
+        evaluation_simulation_profile=rd_config.evaluation_profile,
+        backtest_simulation_profile=rd_config.backtest_profile,
         parameter_search_enabled=rd_config.parameter_search.enabled,
         parameter_search_method=rd_config.parameter_search.method,
         parameter_search_keep_ratio=rd_config.parameter_search.keep_ratio,
@@ -504,6 +540,9 @@ def _doctor_payload(args: argparse.Namespace) -> dict[str, Any]:
         rd_config = load_research_loop_config(rd_config_path, config.research, config.simulation)
         payload["rd"] = {
             "objective": rd_config.objective,
+            "simulation_profile": asdict(rd_config.simulation_profile),
+            "evaluation_profile": asdict(rd_config.evaluation_profile),
+            "backtest_profile": asdict(rd_config.backtest_profile),
             "horizon_days_matrix": list(rd_config.horizon_days_matrix),
             "sample_splits": [asdict(split) for split in rd_config.sample_splits],
             "transaction_costs": asdict(rd_config.transaction_costs),

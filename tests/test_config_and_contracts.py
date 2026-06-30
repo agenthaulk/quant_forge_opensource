@@ -18,7 +18,13 @@ from quant_forge.config import (
 )
 from quant_forge.core.contracts import FactorDefinition, SimulationProfile, TransactionCostModel
 from quant_forge.data.local import LocalPanelDataProvider, create_demo_workspace
-from quant_forge.research_loop.config import ResearchLLMConfig, load_research_loop_config, weights_for_objective
+from quant_forge.research_loop.config import (
+    ResearchLLMConfig,
+    ResearchParameterSearchConfig,
+    load_research_loop_config,
+    weights_for_objective,
+)
+from quant_forge.research_loop.service import ResearchTrialSimulationOverlay
 
 
 def test_default_config_uses_relative_paths() -> None:
@@ -427,10 +433,13 @@ def test_rd_config_loads_defaults_and_overrides(tmp_path: Path) -> None:
     assert default_config.weights.rank_ic_mean == 0.25
     assert default_config.simulation_profile.decay_days == 0
     assert default_config.simulation_profile.top_quantile == 0.3
+    assert default_config.evaluation_profile == default_config.simulation_profile
+    assert default_config.backtest_profile == default_config.simulation_profile
     assert default_config.transaction_costs.commission_bps == 0.0
     assert default_config.transaction_costs.slippage_bps == 0.0
     assert default_config.gate.max_turnover_rate is None
     assert default_config.simulation_profiles == (default_config.simulation_profile,)
+    assert default_config.trial_overlays == (ResearchTrialSimulationOverlay(),)
     assert default_config.horizon_days_matrix == (5, 10, 21, 63)
     assert [split.name for split in default_config.sample_splits] == ["IS", "OOS1", "OOS2"]
     assert weights_for_objective(default_config, "rank_icir").weighted_split_icir == 0.5
@@ -454,6 +463,16 @@ allowed_interval_days: [1, 5]
 simulation:
   top_quantile: 0.2
   decay_days: 3
+evaluation:
+  simulation:
+    test_period:
+      start: "2025-01-01"
+      end: "2025-12-31"
+backtest:
+  simulation:
+    test_period:
+      start: "2026-01-01"
+      end: "2026-12-31"
 horizon_days_matrix: [5, 21]
 sample_splits:
   - name: IS
@@ -508,6 +527,12 @@ deduplication:
     assert custom_config.allowed_interval_days == (1, 5)
     assert custom_config.simulation_profile.top_quantile == 0.2
     assert custom_config.simulation_profile.decay_days == 3
+    assert custom_config.evaluation_profile.test_period_start == "2025-01-01"
+    assert custom_config.evaluation_profile.test_period_end == "2025-12-31"
+    assert custom_config.evaluation_profile.top_quantile == 0.2
+    assert custom_config.backtest_profile.test_period_start == "2026-01-01"
+    assert custom_config.backtest_profile.test_period_end == "2026-12-31"
+    assert custom_config.backtest_profile.decay_days == 3
     assert custom_config.parameter_search.method == "successive_halving"
     assert custom_config.parameter_search.keep_ratio == 0.34
     assert custom_config.parameter_search.min_survivors == 2
@@ -516,6 +541,9 @@ deduplication:
     assert len(custom_config.simulation_profiles) == 4
     assert {profile.decay_days for profile in custom_config.simulation_profiles} == {0, 3}
     assert {profile.top_quantile for profile in custom_config.simulation_profiles} == {0.2, 0.3}
+    assert len(custom_config.trial_overlays) == 4
+    assert {overlay.decay_days for overlay in custom_config.trial_overlays} == {0, 3}
+    assert {overlay.top_quantile for overlay in custom_config.trial_overlays} == {0.2, 0.3}
     assert custom_config.horizon_days_matrix == (5, 21)
     assert [split.name for split in custom_config.sample_splits] == ["IS", "OOS"]
     assert custom_config.gate.min_ic_days == 3
@@ -558,6 +586,103 @@ deduplication:
     )
     with pytest.raises(ValueError, match="llm.campaign_mode is not supported"):
         load_research_loop_config(unsupported_llm_path)
+
+
+def test_rd_config_parameter_search_disabled_preserves_role_profiles(tmp_path: Path) -> None:
+    rd_path = tmp_path / "rd.yaml"
+    rd_path.write_text(
+        """top_quantile: 0.45
+simulation:
+  top_quantile: 0.25
+  decay_days: 1
+evaluation:
+  simulation:
+    top_quantile: 0.10
+    decay_days: 0
+    test_period:
+      start: "2025-01-01"
+      end: "2025-12-31"
+backtest:
+  simulation:
+    top_quantile: 0.30
+    decay_days: 4
+    test_period:
+      start: "2026-01-01"
+      end: "2026-12-31"
+parameter_search:
+  enabled: false
+  top_quantile: [0.4, 0.5]
+  decay_days: [8, 9]
+""",
+        encoding="utf-8",
+    )
+
+    config = load_research_loop_config(rd_path)
+
+    assert config.parameter_search.enabled is False
+    assert config.simulation_profile.top_quantile == 0.25
+    assert config.simulation_profile.decay_days == 1
+    assert config.simulation_profiles == (config.simulation_profile,)
+    assert config.trial_overlays == (ResearchTrialSimulationOverlay(),)
+    assert config.evaluation_profile.top_quantile == 0.10
+    assert config.evaluation_profile.decay_days == 0
+    assert config.evaluation_profile.test_period_start == "2025-01-01"
+    assert config.evaluation_profile.test_period_end == "2025-12-31"
+    assert config.backtest_profile.top_quantile == 0.30
+    assert config.backtest_profile.decay_days == 4
+    assert config.backtest_profile.test_period_start == "2026-01-01"
+    assert config.backtest_profile.test_period_end == "2026-12-31"
+
+
+def test_rd_config_parameter_search_enabled_builds_explicit_trial_overlays(tmp_path: Path) -> None:
+    rd_path = tmp_path / "rd.yaml"
+    rd_path.write_text(
+        """simulation:
+  top_quantile: 0.25
+  decay_days: 1
+  execution_delay_days: 7
+  test_period:
+    start: "2024-01-01"
+evaluation:
+  simulation:
+    top_quantile: 0.10
+    decay_days: 0
+backtest:
+  simulation:
+    top_quantile: 0.30
+    decay_days: 4
+parameter_search:
+  enabled: true
+  max_profile_variants: 4
+  top_quantile: [0.15, 0.35]
+  decay_days: [0, 2]
+""",
+        encoding="utf-8",
+    )
+
+    config = load_research_loop_config(rd_path)
+
+    assert len(config.simulation_profiles) == 4
+    assert {profile.top_quantile for profile in config.simulation_profiles} == {0.15, 0.35}
+    assert {profile.decay_days for profile in config.simulation_profiles} == {0, 2}
+    assert {profile.execution_delay_days for profile in config.simulation_profiles} == {7}
+    assert {profile.test_period_start for profile in config.simulation_profiles} == {"2024-01-01"}
+    assert config.trial_overlays == (
+        ResearchTrialSimulationOverlay(top_quantile=0.15, decay_days=0),
+        ResearchTrialSimulationOverlay(top_quantile=0.15, decay_days=2),
+        ResearchTrialSimulationOverlay(top_quantile=0.35, decay_days=0),
+        ResearchTrialSimulationOverlay(top_quantile=0.35, decay_days=2),
+    )
+    assert config.evaluation_profile.top_quantile == 0.10
+    assert config.evaluation_profile.decay_days == 0
+    assert config.backtest_profile.top_quantile == 0.30
+    assert config.backtest_profile.decay_days == 4
+
+
+def test_rd_parameter_search_overlay_omits_unspecified_fields() -> None:
+    config = ResearchParameterSearchConfig(enabled=True, top_quantile=(0.2,))
+
+    assert config.trial_overlays() == (ResearchTrialSimulationOverlay(top_quantile=0.2),)
 
 
 def test_factor_status_validation() -> None:

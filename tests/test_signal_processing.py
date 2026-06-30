@@ -78,6 +78,36 @@ def test_execute_factor_formula_supports_time_series_operator_subset() -> None:
     assert corr["score"].iloc[2:].notna().all()
 
 
+def test_prepare_factor_scores_executes_safe_alias_without_value_store() -> None:
+    panel = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(["2025-01-01", "2025-01-02", "2025-01-03"]),
+            "instrument": ["AAA", "AAA", "AAA"],
+            "close": [10.0, 11.0, 13.0],
+        }
+    )
+
+    alias = prepare_factor_scores_result(panel, "ts_stddev(close, 2)")
+    canonical = prepare_factor_scores_result(panel, "stddev(close, 2)")
+
+    assert alias.source == "computed_formula"
+    assert alias.factor_values_path is None
+    pd.testing.assert_frame_equal(alias.scores, canonical.scores)
+
+
+def test_prepare_factor_scores_blocks_non_executable_alias_without_value_store() -> None:
+    panel = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(["2025-01-01", "2025-01-02"]),
+            "instrument": ["AAA", "AAA"],
+            "close": [10.0, 11.0],
+        }
+    )
+
+    with pytest.raises(ValueError, match="factor formula failed operator registry gate"):
+        prepare_factor_scores_result(panel, "rolling_std(close, 2)")
+
+
 def test_formula_lookback_rows_tracks_nested_time_series_requirements() -> None:
     assert formula_lookback_rows("rank(market_cap)") == 0
     assert formula_lookback_rows("delta(close, 2)") == 2
@@ -294,6 +324,99 @@ def test_prepare_factor_scores_computes_and_persists_only_missing_dates(tmp_path
     assert list(incremental["factor_value"]) == [0.5, 1.0]
     assert incremental["formula_signature"].nunique() == 1
     assert not (factor_dir / "incremental").exists()
+
+
+def test_prepare_factor_scores_reuses_canonical_cache_for_safe_alias(tmp_path) -> None:
+    panel = _three_day_panel()
+    read_root = tmp_path / "canonical"
+    overlay_root = tmp_path / "overlay"
+
+    first = prepare_factor_scores_result(
+        panel,
+        "stddev(close, 2)",
+        factor_id="FTR_ALIAS_CACHE",
+        factor_name="FTR_ALIAS_CACHE",
+        factor_values_root=read_root,
+        factor_values_overlay_root=overlay_root,
+    )
+    second = prepare_factor_scores_result(
+        panel,
+        "ts_stddev(close, 2)",
+        factor_id="FTR_ALIAS_CACHE",
+        factor_name="FTR_ALIAS_CACHE",
+        factor_values_root=read_root,
+        factor_values_overlay_root=overlay_root,
+    )
+
+    assert first.source == "factor_values_incremental"
+    assert first.computed_rows > 0
+    assert second.source == "factor_values_cached"
+    assert second.cached_rows == len(panel)
+    assert second.computed_rows == 0
+    factor_dir = overlay_root / "原始因子" / "factor_id=FTR_ALIAS_CACHE" / "incremental"
+    incremental = pd.read_parquet(factor_dir / "2025.parquet")
+    assert set(incremental["formula_signature"]) == {
+        _formula_signature("FTR_ALIAS_CACHE", "stddev(close, 2)", ())
+    }
+
+
+def test_prepare_factor_scores_reads_legacy_raw_alias_signature(tmp_path) -> None:
+    panel = _three_day_panel()
+    read_root = tmp_path / "canonical"
+    overlay_root = tmp_path / "overlay"
+    factor_dir = read_root / "原始因子" / "factor_id=FTR_ALIAS_LEGACY"
+    factor_dir.mkdir(parents=True)
+    legacy_signature = _formula_signature("FTR_ALIAS_LEGACY", "ts_stddev(close, 2)", ())
+    pd.DataFrame(
+        {
+            "trade_date": panel["trade_date"].dt.strftime("%Y-%m-%d"),
+            "instrument": panel["instrument"],
+            "formula_signature": [legacy_signature] * len(panel),
+            "factor_value": [0.0, 0.0, 1.414213562, 2.121320344, 2.121320344, 3.535533906],
+        }
+    ).to_parquet(factor_dir / "2025.parquet", index=False)
+
+    result = prepare_factor_scores_result(
+        panel,
+        "ts_stddev(close, 2)",
+        factor_id="FTR_ALIAS_LEGACY",
+        factor_name="FTR_ALIAS_LEGACY",
+        factor_values_root=read_root,
+        factor_values_overlay_root=overlay_root,
+    )
+
+    assert result.source == "factor_values_cached"
+    assert result.cached_rows == len(panel)
+    assert result.computed_rows == 0
+    assert not (overlay_root / "原始因子" / "factor_id=FTR_ALIAS_LEGACY" / "incremental").exists()
+
+
+def test_prepare_factor_scores_prefers_canonical_cache_over_legacy_alias_signature(tmp_path) -> None:
+    panel = _three_day_panel()
+    read_root = tmp_path / "canonical"
+    factor_dir = read_root / "原始因子" / "factor_id=FTR_ALIAS_CONFLICT"
+    factor_dir.mkdir(parents=True)
+    canonical_signature = _formula_signature("FTR_ALIAS_CONFLICT", "stddev(close, 2)", ())
+    legacy_signature = _formula_signature("FTR_ALIAS_CONFLICT", "ts_stddev(close, 2)", ())
+    pd.DataFrame(
+        {
+            "trade_date": list(panel["trade_date"].dt.strftime("%Y-%m-%d")) * 2,
+            "instrument": list(panel["instrument"]) * 2,
+            "formula_signature": [legacy_signature] * len(panel) + [canonical_signature] * len(panel),
+            "factor_value": [9.0] * len(panel) + [1.0] * len(panel),
+        }
+    ).to_parquet(factor_dir / "2025.parquet", index=False)
+
+    result = prepare_factor_scores_result(
+        panel,
+        "ts_stddev(close, 2)",
+        factor_id="FTR_ALIAS_CONFLICT",
+        factor_name="FTR_ALIAS_CONFLICT",
+        factor_values_root=read_root,
+    )
+
+    assert result.source == "factor_values_cached"
+    assert set(result.scores["score"]) == {1.0}
 
 
 def test_prepare_factor_scores_skips_macos_appledouble_entries_before_stat(tmp_path, monkeypatch) -> None:

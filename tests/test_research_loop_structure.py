@@ -159,8 +159,83 @@ def test_operator_draft_artifacts_are_written_for_unknown_operator(tmp_path: Pat
 
     assert artifacts is not None
     assert Path(artifacts.manifest_path).exists()
-    assert Path(artifacts.operator_path).read_text(encoding="utf-8").count("NotImplementedError") == 1
+    manifest = json.loads(Path(artifacts.manifest_path).read_text(encoding="utf-8"))
+    assert manifest["security_boundary"] == "not_imported_not_executed_until_reviewed"
+    assert manifest["audit_status"] == "draft"
+    assert Path(artifacts.semantics_request_path).exists()
+    assert Path(artifacts.review_path).read_text(encoding="utf-8").startswith("# Draft Operator Review")
+    assert not (Path(artifacts.draft_root) / "operator.py").exists()
     assert "operator_drafts" in artifacts.draft_root
+
+
+def test_operator_draft_artifacts_use_nested_unknown_resolution_status(tmp_path: Path) -> None:
+    hypothesis = StructuredResearchHypothesis(
+        hypothesis_id="nested_draft_op",
+        text="needs nested draft operator",
+        formula_dsl="rank(industry_neutralize(return_1d))",
+        expected_direction="positive",
+        source="operator_mcp",
+    )
+    plan = ExperimentPlanner().plan(hypothesis, default_context())
+
+    artifacts = write_operator_draft_artifacts(tmp_path, plan)
+
+    assert artifacts is not None
+    manifest = json.loads(Path(artifacts.manifest_path).read_text(encoding="utf-8"))
+    assert manifest["unknown_operator"] == "industry_neutralize"
+    assert manifest["resolution_status"] == "unknown_requires_draft"
+
+
+def test_experiment_planner_canonicalizes_safe_alias_before_ready_plan() -> None:
+    hypothesis = StructuredResearchHypothesis(
+        hypothesis_id="alias_stddev",
+        text="external DSL stddev alias",
+        formula_dsl="rank(-ts_stddev(return_1d, 20))",
+        expected_direction="positive",
+        source="operator_mcp",
+    )
+
+    plan = ExperimentPlanner().plan(hypothesis, default_context())
+
+    assert plan.status == "ready"
+    assert plan.raw_formula_dsl == "rank(-ts_stddev(return_1d, 20))"
+    assert plan.formula_dsl == "rank(-stddev(return_1d, 20))"
+    assert plan.metadata["operator_resolution"]["executable"] is True
+
+
+def test_experiment_planner_canonicalizes_safe_alias_for_parameter_search_fallback() -> None:
+    hypothesis = StructuredResearchHypothesis(
+        hypothesis_id="alias_stddev_fallback",
+        text="parameter search around alias-based seed",
+        formula_dsl="rank(-ts_stddev(return_1d, 20))",
+        expected_direction="positive",
+        source="parameter_search",
+        parameter_search_fallback=True,
+    )
+
+    plan = ExperimentPlanner().plan(hypothesis, default_context())
+
+    assert plan.status == "ready"
+    assert plan.raw_formula_dsl == "rank(-ts_stddev(return_1d, 20))"
+    assert plan.formula_dsl == "rank(-stddev(return_1d, 20))"
+    assert plan.metadata["operator_resolution"]["executable"] is True
+    assert plan.metadata["parameter_search_fallback"] is True
+
+
+def test_experiment_planner_blocks_likely_alias_without_draft_execution() -> None:
+    hypothesis = StructuredResearchHypothesis(
+        hypothesis_id="rolling_std",
+        text="ambiguous rolling std alias",
+        formula_dsl="rolling_std(return_1d, 20)",
+        expected_direction="positive",
+        source="operator_mcp",
+    )
+
+    plan = ExperimentPlanner().plan(hypothesis, default_context())
+
+    assert plan.status == "blocked_formula_invalid"
+    assert plan.operator_validation["unknown_operators"] == []
+    assert plan.metadata["operator_resolution"]["executable"] is False
 
 
 def test_experiment_planner_accepts_nested_multi_argument_formula() -> None:
@@ -376,6 +451,78 @@ def test_llm_hypothesis_prompt_redacts_precomputed_seed_formula() -> None:
     assert "precomputed:factor_id=FTR_PRE" not in prompt
     assert "<mounted_precomputed_reference_not_usable_in_formula>" in prompt
     assert "Do not use placeholder fields such as seed, seed_score, or factor_score" in prompt
+
+
+def test_llm_hypothesis_prompt_guides_mechanism_first_rd() -> None:
+    seed = FactorDefinition(
+        factor_id="FTR_LINEAR_RANK",
+        name="linear_rank_seed",
+        formula="-rank(market_cap) + -rank(volatility_5d) + rank(return_5d)",
+        description="small cap low volatility stable return seed",
+        status="candidate",
+    )
+
+    prompt = "\n".join(
+        message["content"]
+        for message in rd_llm._hypothesis_messages(  # noqa: SLF001 - lock RD prompt contract.
+            seed,
+            context=None,
+            objective="improve OOS stability without cosmetic rank additions",
+            max_candidates=3,
+        )
+    )
+
+    assert "mechanism-first research workflow" in prompt
+    assert "interaction_conjunction" in prompt
+    assert "stability_smoothing" in prompt
+    assert "relationship_consistency" in prompt
+    assert "Do not merely append another rank term to a linear rank-sum seed" in prompt
+    assert "rank((1 - rank(market_cap)) * (1 - rank(volatility_5d)) * rank(return_5d))" in prompt
+    assert "rank(covariance(1 - rank(market_cap), 1 - rank(volatility_5d), 20))" in prompt
+    assert '"seed_formula_shape": "linear_rank_sum"' in prompt
+    assert "source_detail" in prompt
+    assert "expected failure mode" in prompt
+
+
+def test_llm_mechanism_guidance_examples_are_planner_ready() -> None:
+    seed = FactorDefinition(
+        factor_id="FTR_LINEAR_RANK",
+        name="linear_rank_seed",
+        formula="-rank(market_cap) + -rank(volatility_5d) + rank(return_5d)",
+        description="small cap low volatility stable return seed",
+        status="candidate",
+    )
+
+    guidance = rd_llm._mechanism_guidance_for_prompt(seed)  # noqa: SLF001 - lock RD prompt examples.
+    formulas = [lane["example_formula"] for lane in guidance["preferred_lanes"]]
+
+    assert guidance["seed_formula_shape"] == "linear_rank_sum"
+    for index, formula in enumerate(formulas):
+        plan = ExperimentPlanner().plan(
+            StructuredResearchHypothesis(
+                hypothesis_id=f"mechanism_example_{index}",
+                text=f"mechanism example {index}",
+                formula_dsl=formula,
+                expected_direction="positive",
+                source="operator_mcp",
+            ),
+            default_context(),
+        )
+
+        assert plan.status == "ready", formula
+
+
+def test_llm_mechanism_guidance_does_not_misclassify_non_additive_seed() -> None:
+    seed = FactorDefinition(
+        factor_id="FTR_INTERACTION",
+        name="interaction_seed",
+        formula="rank((1 - rank(market_cap)) * rank(return_5d))",
+        status="candidate",
+    )
+
+    guidance = rd_llm._mechanism_guidance_for_prompt(seed)  # noqa: SLF001 - lock RD prompt examples.
+
+    assert guidance["seed_formula_shape"] == "other"
 
 
 def test_llm_hypothesis_payload_ignores_provider_parameter_fallback_flag() -> None:
@@ -609,6 +756,9 @@ def test_llm_repair_prompt_includes_validation_error(tmp_path: Path) -> None:
     assert "delta argument 2 must be a number" in prompt
     assert "rank(delta(return_5d, volatility_5d))" in prompt
     assert "Do not request parameter-search fallback" in prompt
+    assert "Preserve the selected research lane" in prompt
+    assert "mechanism_guidance" in prompt
+    assert "interaction_conjunction: formula_repair" in prompt
 
 
 def test_llm_hypothesis_payload_drops_provider_fallback_when_regular_ideas_exist() -> None:
@@ -1055,10 +1205,40 @@ def test_research_loop_records_failed_trial_without_leaving_run_running(tmp_path
 
     assert result.candidates == ()
     assert result.blocked_plans
-    assert "window argument must be a number" in result.blocked_plans[0].error
+    assert "factor formula failed operator registry gate" in result.blocked_plans[0].error
+    assert "delay expects 2 arguments" in result.blocked_plans[0].error
     assert result.trace_root is not None
     run_payload = json.loads((result.trace_root / "run.json").read_text(encoding="utf-8"))
     assert run_payload["status"] == "partial"
+
+
+def test_research_loop_failed_trial_trace_includes_feedback_for_next_iteration(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        experiment_planner=_BadReadyPlanner(),
+        parameter_search_enabled=False,
+    )
+
+    result = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert result.trace_root is not None
+    rows = [
+        json.loads(line)
+        for line in (result.trace_root / "trace.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    failed = next(row for row in rows if row["phase"] == "experiment_failed")
+    assert "factor formula failed operator registry gate" in failed["error"]
+    assert "delay expects 2 arguments" in failed["error"]
+    assert failed["feedback"]["status"] == "failed"
+    assert "factor formula failed operator registry gate" in failed["feedback"]["summary"]
+    assert "delay expects 2 arguments" in failed["feedback"]["summary"]
+    assert (
+        failed["next_hypothesis_hint"]
+        == "Repair the runtime or validation error before proposing related variants."
+    )
 
 
 def test_research_loop_blocks_injected_llm_hypothesis_without_formula_dsl(tmp_path: Path) -> None:

@@ -22,6 +22,9 @@ from quant_forge.research_loop.service import (
 )
 
 
+CHINESE_RD_REPORT_PROMPT = "通过中文完成RD研究报告"
+
+
 class LLMHypothesisGenerator:
     """Generate bounded RD hypotheses with the configured shared LLM."""
 
@@ -181,10 +184,22 @@ def _hypothesis_messages(
     )
     effective_ideas = list(context.effective_ideas)[:10] if context is not None else []
     next_hints = list(context.next_focus_hints)[:10] if context is not None else []
+    mechanism_guidance = _mechanism_guidance_for_prompt(seed)
     system = (
         "You are Quant Forge's RD hypothesis generator. Return one JSON object only. "
         "Generate bounded factor research hypotheses with executable formula_dsl. "
+        "Use a mechanism-first research workflow inspired by R&D-Agent style loops: first state the "
+        "research lane, then translate the lane into an executable formula, then make the hypothesis "
+        "easy for local validation and feedback. "
         "Use financial analyst reasoning, effective-idea replay, and operator-aware variants. "
+        "Every hypothesis must pick one lane: interaction_conjunction, stability_smoothing, "
+        "relationship_consistency, horizon_retiming, or risk_cost_control. "
+        "Do not merely append another rank term to a linear rank-sum seed unless additive exposure "
+        "is the explicit research thesis. "
+        "For small-cap/low-volatility/stable-return seeds, prefer non-additive interaction or "
+        "stability transformations that require the concepts to jointly hold. "
+        "Use covariance/correlation only for an interpretable co-movement or consistency thesis, "
+        "not as a decorative wrapper around an existing score. "
         "Use only listed fields, listed operators, and safe arithmetic (+, -, *, /). "
         "Never include precomputed: factor references inside formula_dsl; the local system handles seed "
         "parameter search separately. Do not use placeholder fields such as seed, seed_score, or factor_score. "
@@ -199,7 +214,12 @@ def _hypothesis_messages(
         f"Available operators: {json.dumps(operator_catalog, ensure_ascii=False)}\n"
         f"Effective ideas: {json.dumps(effective_ideas, ensure_ascii=False)}\n"
         f"Recent failure hints: {json.dumps(next_hints, ensure_ascii=False)}\n"
+        f"Mechanism guidance: {json.dumps(mechanism_guidance, ensure_ascii=False)}\n"
         f"Generate up to {max_candidates} distinct hypotheses. "
+        "Each rationale must include: economic mechanism, formula transformation, expected failure mode, "
+        "and how this candidate differs from the seed formula. "
+        "Put the selected lane at the start of source_detail, for example "
+        "\"interaction_conjunction: joint small-cap low-vol stability gate\". "
         "Return JSON shape: "
         "{\"schema_version\":\"qf.rd.llm.v1\",\"task_type\":\"rd_research_hypotheses\","
         "\"hypotheses\":[{\"text\":\"...\",\"rationale\":\"...\","
@@ -225,10 +245,13 @@ def _repair_messages(
 ) -> list[dict[str, str]]:
     field_catalog = _catalog_for_prompt(context.field_catalog or tuple(list_available_fields()))
     operator_catalog = _catalog_for_prompt(context.operator_catalog or tuple(list_available_operators()))
+    mechanism_guidance = _mechanism_guidance_for_prompt(seed)
     system = (
         "You are Quant Forge's RD formula repair adapter. Return one JSON object only. "
         "Repair the given hypothesis so formula_dsl passes local validation. "
         "Use only listed fields, listed operators, numeric window arguments where required, and safe arithmetic. "
+        "Preserve the selected research lane and economic mechanism whenever possible. "
+        "If the exact formula cannot be repaired, choose the closest executable formula from the same lane. "
         "Do not change the research intent unless needed to make the formula executable. "
         "Do not request parameter-search fallback. If you cannot repair it, return an empty hypotheses list."
     )
@@ -251,6 +274,7 @@ def _repair_messages(
             },
             "available_fields": field_catalog,
             "available_operators": operator_catalog,
+            "mechanism_guidance": mechanism_guidance,
             "return_shape": {
                 "schema_version": RD_LLM_SCHEMA_VERSION,
                 "task_type": "rd_research_hypotheses",
@@ -263,7 +287,7 @@ def _repair_messages(
                         "expected_direction": "positive",
                         "universe_constraints": ["is_st == false"],
                         "source": "llm",
-                        "source_detail": "formula_repair",
+                        "source_detail": "interaction_conjunction: formula_repair",
                         "parameter_search_fallback": False,
                     }
                 ],
@@ -303,7 +327,9 @@ def _review_messages(
     system = (
         "You are Quant Forge's RD reviewer. Return one JSON object only. "
         "Use the provided local evaluation/backtest evidence. Do not claim production readiness. "
-        "Return exactly the requested schema keys. Do not wrap the JSON in markdown."
+        "Return exactly the requested schema keys. Do not wrap the JSON in markdown. "
+        "Write summary, strengths, risks, and next_hypotheses in Chinese. "
+        f"{CHINESE_RD_REPORT_PROMPT}"
     )
     user = json.dumps(
         {
@@ -356,6 +382,67 @@ def _formula_for_prompt(formula: str) -> str:
     if is_precomputed_formula(formula):
         return "<mounted_precomputed_reference_not_usable_in_formula>"
     return formula
+
+
+def _mechanism_guidance_for_prompt(seed: FactorDefinition) -> dict[str, Any]:
+    formula = _formula_for_prompt(seed.formula)
+    seed_formula_shape = "linear_rank_sum" if _looks_like_linear_rank_sum(formula) else "other"
+    return {
+        "seed_formula_shape": seed_formula_shape,
+        "research_loop": [
+            "Research: choose a mechanism lane before proposing formula_dsl.",
+            "Development: translate the mechanism into one executable formula using only available fields/operators.",
+            "Feedback: design the candidate so local validation, duplicate checks, and evaluation can reject it clearly.",
+        ],
+        "must_avoid": [
+            "Do not merely add another rank term to a linear rank-sum seed.",
+            "Do not use covariance or correlation unless the rationale names the co-movement being measured.",
+            "Do not return multiple candidates with the same formula family and only cosmetic wording changes.",
+        ],
+        "preferred_lanes": [
+            {
+                "name": "interaction_conjunction",
+                "purpose": "Require the seed concepts to be jointly present instead of linearly adding exposures.",
+                "use_when": "small-cap, low-volatility, quality, stability, or momentum ideas should work only together.",
+                "example_formula": "rank((1 - rank(market_cap)) * (1 - rank(volatility_5d)) * rank(return_5d))",
+            },
+            {
+                "name": "stability_smoothing",
+                "purpose": "Replace raw recent return exposure with low dispersion or smoothed persistence.",
+                "use_when": "a seed says stable returns, low volatility, or noisy short-term reversal.",
+                "example_formula": "rank((1 - rank(market_cap)) * (1 - rank(volatility_5d)) * (1 - rank(stddev(return_5d, 20))))",
+            },
+            {
+                "name": "relationship_consistency",
+                "purpose": "Measure whether two interpretable components co-move persistently through time.",
+                "use_when": "covariance/correlation expresses a real relationship such as size-volatility consistency.",
+                "example_formula": "rank(covariance(1 - rank(market_cap), 1 - rank(volatility_5d), 20))",
+            },
+            {
+                "name": "horizon_retiming",
+                "purpose": "Change the lookback horizon to test whether the effect is short-lived or persistent.",
+                "use_when": "feedback shows weak OOS, high turnover, or unstable IC.",
+                "example_formula": "rank(ts_mean(return_5d, 10) - stddev(return_5d, 20))",
+            },
+            {
+                "name": "risk_cost_control",
+                "purpose": "Reduce candidates likely to fail after costs by penalizing noisy or high-turnover components.",
+                "use_when": "feedback mentions high turnover, OOS decay, or cost sensitivity.",
+                "example_formula": "rank(ts_mean(return_5d, 10) - stddev(return_1d, 20))",
+            },
+        ],
+        "rationale_requirements": [
+            "Name the economic thesis in one sentence.",
+            "Explain why the formula shape is not a cosmetic variation of the seed.",
+            "Name one expected failure mode such as OOS decay, crowding, turnover, or data sparsity.",
+        ],
+    }
+
+
+def _looks_like_linear_rank_sum(formula: str) -> bool:
+    if formula == "<mounted_precomputed_reference_not_usable_in_formula>":
+        return False
+    return formula.count("rank(") >= 2 and "+" in formula and "*" not in formula and "covariance(" not in formula
 
 
 def _hypotheses_from_payload(payload: dict[str, Any], *, max_candidates: int) -> tuple[ResearchHypothesis, ...]:

@@ -114,6 +114,8 @@ class FactorExperimentPlan:
     status: PlanStatus
     factor_name: str
     formula_dsl: str
+    raw_formula_dsl: str = ""
+    canonical_formula_dsl: str = ""
     inputs: tuple[str, ...] = ()
     universe_filters: tuple[str, ...] = ()
     expected_direction: ExpectedDirection = "unknown"

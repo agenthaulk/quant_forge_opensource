@@ -133,6 +133,47 @@ def test_deepseek_parser_reads_openai_compatible_response(monkeypatch: pytest.Mo
     assert parsed.factor.universe_filters == ("is_st == false",)
 
 
+def test_llm_factor_json_canonicalizes_safe_alias() -> None:
+    factor = _factor_from_llm_json(
+        {
+            "name": "alias_stddev",
+            "formula": "rank(-ts_stddev(return_1d, 20))",
+            "description": "alias test",
+            "horizon_days": 5,
+            "universe_filters": [],
+        },
+        "alias stddev",
+    )
+
+    assert factor.formula == "rank(-stddev(return_1d, 20))"
+
+
+def test_llm_factor_json_rejects_likely_alias_and_draft_operator() -> None:
+    with pytest.raises(RuntimeError, match="operator registry gate"):
+        _factor_from_llm_json(
+            {
+                "name": "rolling_std",
+                "formula": "rolling_std(return_1d, 20)",
+                "description": "ambiguous alias",
+                "horizon_days": 5,
+                "universe_filters": [],
+            },
+            "rolling std",
+        )
+
+    with pytest.raises(RuntimeError, match="operator registry gate"):
+        _factor_from_llm_json(
+            {
+                "name": "industry_neutral",
+                "formula": "industry_neutralize(rank(return_1d), industry)",
+                "description": "draft operator",
+                "horizon_days": 5,
+                "universe_filters": [],
+            },
+            "industry neutral",
+        )
+
+
 def test_openai_parser_reads_provider_default_env(monkeypatch: pytest.MonkeyPatch) -> None:
     server = ThreadingHTTPServer(("127.0.0.1", 0), FakeOpenAICompatibleHandler)
     thread = Thread(target=server.serve_forever, daemon=True)
