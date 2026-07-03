@@ -3,6 +3,13 @@
 This branch is the clean public Quant Forge workbench. Keep it local-first,
 config-driven, and safe to publish.
 
+## Agent Entrypoint
+
+- All AI coding agents should use `docs/agent_entrypoint.md` as the shared boot
+  protocol before analysis, edits, reviews, or handoffs.
+- Tool-specific shims must not define a second project policy; they should only
+  point back to `AGENTS.md` and `docs/agent_entrypoint.md`.
+
 ## License Boundary
 
 - The repository is source-available under BUSL-1.1 until 2027-12-31, with

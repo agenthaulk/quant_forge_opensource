@@ -101,15 +101,24 @@ class FactorCatalog:
             return _canonicalize_precomputed_factor(FactorRepository(self.factor_root).get(factor_id))
         except FileNotFoundError:
             pass
-        requested = _factor_id_values(factor_id)
+        requested_keys = _resolution_keys(factor_id)
+        matches: list[FactorDefinition] = []
         for factor in discover_precomputed_factors(
             self.factor_values_root,
             manifest_root=self.factor_values_manifest_root,
         ):
-            values = _factor_id_values(factor.factor_id)
-            values.update(_factor_id_values(factor.name))
-            if requested.intersection(values):
-                return factor
+            candidate_keys = _resolution_keys(factor.factor_id)
+            candidate_keys.add(_factor_key(factor.name))
+            if requested_keys & candidate_keys:
+                matches.append(factor)
+        distinct = {factor.factor_id: factor for factor in matches}
+        if len(distinct) == 1:
+            return next(iter(distinct.values()))
+        if len(distinct) > 1:
+            raise ValueError(
+                "ambiguous factor id resolves to multiple precomputed factors: "
+                f"{factor_id} -> {sorted(distinct)}"
+            )
         raise FileNotFoundError(f"factor not found in factor_root or factor_values_root: {factor_id}")
 
 
@@ -466,16 +475,71 @@ def _factor_from_store(directory: Path, metadata: dict[str, Any]) -> FactorDefin
     formula_dsl = metadata.get("formula_dsl") or metadata.get("formula") or metadata.get("expression")
     if formula_dsl:
         description_bits.append("source_formula=metadata.")
+    dir_factor_id = _canonical_factor_id(_factor_id_from_name(directory.name))
+    horizon_days = _horizon_days_from_metadata(metadata, dir_factor_id)
     return FactorDefinition(
         factor_id=factor_id,
         name=name,
         formula=precomputed_formula(store_key),
         status="candidate",
         description=" ".join(description_bits),
-        horizon_days=5,
+        horizon_days=horizon_days,
         universe_filters=(),
         source="precomputed",
     )
+
+
+_DEFAULT_HORIZON_DAYS = 5
+
+
+def _horizon_days_from_metadata(metadata: dict[str, Any], dir_factor_id: str) -> int:
+    """Read the horizon from validated manifest metadata, defaulting to 5.
+
+    Only trusts the metadata horizon when the metadata's own ``factor_id``
+    canonicalizes to the directory-derived id (per CAT-3's "verify manifest
+    factor_id matches the dir"). Coerces defensively so a malformed manifest can
+    never crash discovery.
+    """
+
+    raw_meta_id = str(metadata.get("factor_id") or "").strip()
+    if raw_meta_id and dir_factor_id:
+        canonical_meta_id = _canonical_factor_id(raw_meta_id)
+        if not canonical_meta_id or _factor_key(canonical_meta_id) != _factor_key(dir_factor_id):
+            return _DEFAULT_HORIZON_DAYS
+    for key in ("horizon_days", "horizon", "forward_horizon_days"):
+        if key not in metadata:
+            continue
+        coerced = _coerce_positive_int(metadata.get(key))
+        if coerced is not None:
+            return coerced
+    return _DEFAULT_HORIZON_DAYS
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        if value != value or value <= 0:  # NaN or non-positive
+            return None
+        return int(value) if float(int(value)) == value else None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            parsed = int(stripped)
+        except ValueError:
+            try:
+                as_float = float(stripped)
+            except ValueError:
+                return None
+            if as_float != as_float or as_float <= 0 or float(int(as_float)) != as_float:
+                return None
+            return int(as_float)
+        return parsed if parsed > 0 else None
+    return None
 
 
 def _canonicalize_precomputed_factor(factor: FactorDefinition) -> FactorDefinition:
@@ -492,8 +556,18 @@ def _dedupe_factors(factors: list[FactorDefinition]) -> list[FactorDefinition]:
     for factor in factors:
         key = _factor_key(factor.factor_id)
         current = result_by_key.get(key)
-        if current is None or _factor_priority(factor) > _factor_priority(current):
+        if current is None:
             result_by_key[key] = factor
+            continue
+        current_priority = _factor_priority(current)
+        candidate_priority = _factor_priority(factor)
+        if candidate_priority > current_priority:
+            result_by_key[key] = factor
+        elif candidate_priority == current_priority and factor != current:
+            # Two distinct factors share a key at equal priority: walk order
+            # would otherwise decide the winner. Mirror the repository layer
+            # (_preferred_factor_file), which raises on this conflict.
+            raise ValueError(f"factor appears more than once across categories: {factor.factor_id}")
     return list(result_by_key.values())
 
 
@@ -575,6 +649,26 @@ def _safe_store_key(value: str) -> str:
 
 def _factor_key(value: str) -> str:
     return value.strip().lower().replace("-", "_")
+
+
+def _resolution_keys(value: str) -> set[str]:
+    """Strict resolution keys for a factor id/name.
+
+    Uses the same ``_factor_key`` as ``list()`` plus the canonical id key so
+    aliases like ``alpha_003``/``wq-alpha-003`` still resolve to the canonical
+    ``WQ_ALPHA_003`` without the old fuzzy alias-intersection that could return
+    the wrong factor.
+    """
+
+    keys: set[str] = set()
+    normalized = value.strip()
+    if not normalized:
+        return keys
+    keys.add(_factor_key(normalized))
+    canonical = _canonical_factor_id(normalized)
+    if canonical:
+        keys.add(_factor_key(canonical))
+    return keys
 
 
 def _factor_id_values(value: str) -> set[str]:

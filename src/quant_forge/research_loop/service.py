@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
@@ -12,12 +13,14 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
-from quant_forge.backtesting.service import run_factor_backtest
+from quant_forge.backtesting.service import EXTERNAL_OOS_ROLE, IN_SAMPLE_ROLE, run_factor_backtest
 from quant_forge.core.contracts import (
     BacktestResult,
     BacktestSegmentMetric,
     EvaluationResult,
+    FactorAssessmentBundle,
     FactorDefinition,
+    MetricValue,
     SampleSplitSpec,
     SimulationProfile,
     TransactionCostModel,
@@ -250,19 +253,20 @@ class LocalSelfReviewGenerator:
             strengths.append("positive weighted split ICIR")
         else:
             risks.append("weighted split ICIR is not positive")
-        if backtest.net_long_short_sharpe > 0:
-            strengths.append("positive net long-short Sharpe")
-        else:
-            risks.append("net long-short Sharpe is not positive")
-        if backtest.rebalance_rate > 0.8:
+        if backtest.net_long_short_sharpe is not None:
+            if backtest.net_long_short_sharpe > 0:
+                strengths.append("positive net long-short Sharpe")
+            else:
+                risks.append("net long-short Sharpe is not positive")
+        if backtest.rebalance_rate is not None and backtest.rebalance_rate > 0.8:
             risks.append("high rebalance rate")
             next_hypotheses.append(f"smooth or slow down {candidate.name} to reduce rebalance rate")
-        if backtest.turnover_rate > 1.5:
+        if backtest.turnover_rate is not None and backtest.turnover_rate > 1.5:
             risks.append("high turnover rate")
             next_hypotheses.append(f"smooth or slow down {candidate.name} to reduce turnover rate")
         if _cost_sensitive(backtest):
             risks.append("net performance is sensitive to transaction costs")
-        if backtest.net_max_drawdown < -0.2:
+        if backtest.net_max_drawdown is not None and backtest.net_max_drawdown < -0.2:
             risks.append("large net drawdown in lightweight backtest")
         if _oos_decay(evaluation):
             risks.append("OOS2 ICIR decays versus IS")
@@ -289,6 +293,17 @@ class LocalSelfReviewGenerator:
         )
 
 
+def _failed_self_review(exc: Exception, candidate: FactorDefinition) -> ResearchSelfReview:
+    error = str(exc).strip() or exc.__class__.__name__
+    return ResearchSelfReview(
+        source="llm_self_review_error",
+        summary=f"LLM self-review unavailable for {candidate.factor_id}: {error[:300]}",
+        strengths=(),
+        risks=(f"LLM self-review failed: {error[:300]}",),
+        next_hypotheses=(),
+    )
+
+
 @dataclass(frozen=True)
 class ResearchCandidateResult:
     hypothesis: ResearchHypothesis
@@ -304,6 +319,9 @@ class ResearchCandidateResult:
     formula_fingerprint: str = ""
     result_signature: str = ""
     candidate_shape_fingerprint: str = ""
+    selection_backtest: BacktestResult | None = None
+    external_oos_backtest: BacktestResult | None = None
+    assessment: FactorAssessmentBundle | None = None
 
 
 @dataclass(frozen=True)
@@ -328,6 +346,8 @@ class ResearchLoopResult:
     gate: ResearchGate
     candidates: tuple[ResearchCandidateResult, ...]
     accepted_candidate_ids: tuple[str, ...]
+    seed_assessment: FactorAssessmentBundle | None = None
+    comparison_rows: tuple[dict[str, object], ...] = ()
     generation: ResearchGenerationMetadata = field(default_factory=ResearchGenerationMetadata)
     search_trace: tuple[ResearchSearchTraceEntry, ...] = ()
     blocked_plans: tuple[StructuredFactorExperimentResult, ...] = ()
@@ -368,6 +388,7 @@ class _ScoredTrial:
     backtest: BacktestResult
     split_weighted_icir: float
     score: float
+    external_oos_backtest: BacktestResult | None = None
 
 
 @dataclass(frozen=True)
@@ -556,6 +577,13 @@ class ResearchLoopService:
                 "deduplication": _deduplication_snapshot(self.deduplication),
             },
         )
+        seed_assessment = self._assess_factor(
+            seed,
+            role="seed",
+            parent_seed_factor_id=seed.factor_id,
+            objective_weights=objective_weights,
+            gate=candidate_gate,
+        )
 
         trials: list[_ResearchTrial] = []
         blocked_plans: list[StructuredFactorExperimentResult] = []
@@ -574,6 +602,7 @@ class ResearchLoopService:
             else {}
         )
         shape_counts: Counter[str] = Counter()
+        duplicate_fallback_requests: list[tuple[int, FactorExperimentPlan, _RepairOutcome | None]] = []
         dedup_summary: dict[str, object] = {
             "enabled": self.deduplication.enabled,
             "formula_skipped": 0,
@@ -603,15 +632,10 @@ class ResearchLoopService:
                     draft = repair.draft
                     plan = repair.plan
                 else:
-                    self._record_blocked_plan_and_maybe_fallback(
+                    self._record_blocked_plan(
                         run_id=run_id,
-                        seed=seed,
-                        context=context,
-                        generation=generation,
-                        lane_index=lane_index,
                         plan=plan,
                         repair=repair,
-                        trials=trials,
                         blocked_plans=blocked_plans,
                     )
                     continue
@@ -640,15 +664,10 @@ class ResearchLoopService:
                     draft = repair.draft
                     plan = repair.plan
                 else:
-                    self._record_blocked_plan_and_maybe_fallback(
+                    self._record_blocked_plan(
                         run_id=run_id,
-                        seed=seed,
-                        context=context,
-                        generation=generation,
-                        lane_index=lane_index,
                         plan=plan,
                         repair=repair,
-                        trials=trials,
                         blocked_plans=blocked_plans,
                     )
                     continue
@@ -676,11 +695,44 @@ class ResearchLoopService:
                 allow_existing=hypothesis.parameter_search_fallback,
             )
             if duplicate_plan is not None:
-                duplicate_result = _blocked_structured_result(duplicate_plan)
-                blocked_plans.append(duplicate_result)
-                _record_dedup_skip(dedup_summary, duplicate_plan)
-                self._trace_structured_result(run_id, duplicate_result, phase="plan_blocked")
-                continue
+                repair = self._repair_duplicate_llm_plan(
+                    run_id=run_id,
+                    seed=seed,
+                    context=context,
+                    objective=objective,
+                    generation=generation,
+                    hypothesis=hypothesis,
+                    duplicate_plan=duplicate_plan,
+                    lane_index=lane_index,
+                    formula_index=formula_index,
+                    shape_counts=shape_counts,
+                )
+                if repair is not None and repair.hypothesis is not None and repair.draft is not None:
+                    hypothesis = repair.hypothesis
+                    draft = repair.draft
+                    plan = repair.plan
+                    planned_candidate = (
+                        seed
+                        if hypothesis.parameter_search_fallback
+                        else replace(
+                            draft,
+                            formula=plan.formula_dsl,
+                            universe_filters=plan.universe_filters,
+                        )
+                    )
+                else:
+                    if repair is not None and repair.exhausted:
+                        duplicate_plan = repair.plan
+                    _record_dedup_skip(dedup_summary, duplicate_plan)
+                    duplicate_result = _blocked_structured_result(
+                        duplicate_plan,
+                        artifact_refs=_operator_draft_refs(self.artifact_root, duplicate_plan),
+                    )
+                    blocked_plans.append(duplicate_result)
+                    self._trace_structured_result(run_id, duplicate_result, phase="plan_blocked")
+                    if repair is not None and repair.exhausted:
+                        duplicate_fallback_requests.append((lane_index, duplicate_plan, repair))
+                    continue
             candidate = (
                 seed
                 if hypothesis.parameter_search_fallback
@@ -688,6 +740,21 @@ class ResearchLoopService:
             )
             for effective_config in self.effective_trial_configs:
                 trials.append(_ResearchTrial(hypothesis, candidate, effective_config, plan))
+        if not trials and duplicate_fallback_requests:
+            lane_index, duplicate_plan, repair = duplicate_fallback_requests[0]
+            self._append_duplicate_exhaustion_formula_fallback_trials(
+                run_id=run_id,
+                repo=repo,
+                seed=seed,
+                context=context,
+                generation=generation,
+                lane_index=lane_index,
+                formula_index=formula_index,
+                shape_counts=shape_counts,
+                dedup_summary=dedup_summary,
+                trials=trials,
+                blocked_plans=blocked_plans,
+            )
         self._raise_if_cancelled()
         search_trace, final_trials, failed_quick_results = self._select_final_trials(trials, objective_weights)
         blocked_plans.extend(failed_quick_results)
@@ -725,7 +792,7 @@ class ResearchLoopService:
                 and not (result.hypothesis.parameter_search_fallback and result.factor.factor_id == seed_factor_id)
             )
         )
-        optimization_performed = _optimization_performed(results, seed, self.backtest_simulation_profile)
+        optimization_performed = _optimization_performed(results, seed, self.evaluation_simulation_profile)
         result = ResearchLoopResult(
             rd_stage=RD_RESEARCH_STAGE,
             seed_factor_id=seed_factor_id,
@@ -734,6 +801,15 @@ class ResearchLoopService:
             gate=candidate_gate,
             candidates=tuple(results),
             accepted_candidate_ids=accepted,
+            seed_assessment=seed_assessment,
+            comparison_rows=(
+                _assessment_comparison_row(seed_assessment, seed),
+                *tuple(
+                    _assessment_comparison_row(candidate.assessment, candidate.factor, candidate.hypothesis.text)
+                    for candidate in results
+                    if candidate.assessment is not None
+                ),
+            ),
             generation=generation,
             search_trace=search_trace,
             blocked_plans=tuple(blocked_plans),
@@ -812,17 +888,12 @@ class ResearchLoopService:
         self._raise_if_cancelled()
         return promoted
 
-    def _record_blocked_plan_and_maybe_fallback(
+    def _record_blocked_plan(
         self,
         *,
         run_id: str,
-        seed: FactorDefinition,
-        context: ResearchContext,
-        generation: ResearchGenerationMetadata,
-        lane_index: int,
         plan: FactorExperimentPlan,
         repair: _RepairOutcome | None,
-        trials: list[_ResearchTrial],
         blocked_plans: list[StructuredFactorExperimentResult],
     ) -> None:
         blocked_plan = repair.plan if repair is not None else plan
@@ -832,16 +903,6 @@ class ResearchLoopService:
         )
         blocked_plans.append(blocked_result)
         self._trace_structured_result(run_id, blocked_result, phase="plan_blocked")
-        if repair is not None and repair.exhausted and self.parameter_search_enabled:
-            self._append_parameter_search_fallback_trials(
-                run_id=run_id,
-                seed=seed,
-                context=context,
-                generation=generation,
-                lane_index=lane_index,
-                trials=trials,
-                blocked_plans=blocked_plans,
-            )
 
     def _append_parameter_search_fallback_trials(
         self,
@@ -874,6 +935,61 @@ class ResearchLoopService:
         blocked_plans.append(fallback_result)
         self._trace_structured_result(run_id, fallback_result, phase="plan_blocked")
 
+    def _append_duplicate_exhaustion_formula_fallback_trials(
+        self,
+        *,
+        run_id: str,
+        repo: FactorRepository,
+        seed: FactorDefinition,
+        context: ResearchContext,
+        generation: ResearchGenerationMetadata,
+        lane_index: int,
+        formula_index: dict[str, str],
+        shape_counts: Counter[str],
+        dedup_summary: dict[str, object],
+        trials: list[_ResearchTrial],
+        blocked_plans: list[StructuredFactorExperimentResult],
+    ) -> None:
+        for fallback in _duplicate_exhaustion_fallback_hypotheses(seed):
+            draft = _candidate_from_hypothesis(fallback, seed.horizon_days)
+            structured = _structured_hypothesis_from_candidate(fallback, draft, generation, lane_index=lane_index)
+            fallback_plan = self.experiment_planner.plan(structured, context)
+            self._trace_plan(run_id, structured, fallback_plan)
+            if fallback_plan.status != "ready":
+                fallback_result = _blocked_structured_result(
+                    fallback_plan,
+                    artifact_refs=_operator_draft_refs(self.artifact_root, fallback_plan),
+                )
+                blocked_plans.append(fallback_result)
+                self._trace_structured_result(run_id, fallback_result, phase="plan_blocked")
+                continue
+            planned_candidate = replace(
+                draft,
+                formula=fallback_plan.formula_dsl,
+                universe_filters=fallback_plan.universe_filters,
+            )
+            duplicate_plan = _deduplicate_plan(
+                fallback_plan,
+                planned_candidate,
+                formula_index=formula_index,
+                shape_counts=shape_counts,
+                config=self.deduplication,
+                allow_existing=False,
+            )
+            if duplicate_plan is not None:
+                _record_dedup_skip(dedup_summary, duplicate_plan)
+                duplicate_result = _blocked_structured_result(
+                    duplicate_plan,
+                    artifact_refs=_operator_draft_refs(self.artifact_root, duplicate_plan),
+                )
+                blocked_plans.append(duplicate_result)
+                self._trace_structured_result(run_id, duplicate_result, phase="plan_blocked")
+                continue
+            candidate = self._load_or_save_candidate(repo, planned_candidate)
+            for effective_config in self.effective_trial_configs:
+                trials.append(_ResearchTrial(fallback, candidate, effective_config, fallback_plan))
+            return
+
     def _repair_invalid_llm_plan(
         self,
         *,
@@ -896,15 +1012,18 @@ class ResearchLoopService:
         current_plan = plan
         for attempt in range(1, self.llm_formula_repair_attempts + 1):
             self._raise_if_cancelled()
-            repaired = repair(
-                seed,
-                hypothesis=current_hypothesis,
-                context=context,
-                objective=objective,
-                validation_error=_plan_validation_error(current_plan),
-                attempt=attempt,
-                max_attempts=self.llm_formula_repair_attempts,
-            )
+            try:
+                repaired = repair(
+                    seed,
+                    hypothesis=current_hypothesis,
+                    context=context,
+                    objective=objective,
+                    validation_error=_plan_validation_error(current_plan),
+                    attempt=attempt,
+                    max_attempts=self.llm_formula_repair_attempts,
+                )
+            except Exception as exc:
+                return _RepairOutcome(None, None, _repair_failed_plan(current_plan, exc), exhausted=True)
             if not isinstance(repaired, ResearchHypothesis):
                 continue
             repaired = _normalize_llm_research_hypothesis(repaired, generation)
@@ -920,6 +1039,78 @@ class ResearchLoopService:
             current_plan = repaired_plan
             if repaired_plan.status == "ready" and draft is not None:
                 return _RepairOutcome(repaired, draft, repaired_plan)
+        return _RepairOutcome(None, None, current_plan, exhausted=True)
+
+    def _repair_duplicate_llm_plan(
+        self,
+        *,
+        run_id: str,
+        seed: FactorDefinition,
+        context: ResearchContext,
+        objective: str,
+        generation: ResearchGenerationMetadata,
+        hypothesis: ResearchHypothesis,
+        duplicate_plan: FactorExperimentPlan,
+        lane_index: int,
+        formula_index: dict[str, str],
+        shape_counts: Counter[str],
+    ) -> _RepairOutcome | None:
+        if not _should_repair_llm_plan(hypothesis, generation, duplicate_plan, self.llm_formula_repair_attempts):
+            return None
+        repair = getattr(self.hypothesis_generator, "repair_invalid_hypothesis", None)
+        if not callable(repair):
+            return None
+
+        current_hypothesis = hypothesis
+        current_plan = duplicate_plan
+        forbidden_formulas: list[str] = [duplicate_plan.formula_dsl]
+        for attempt in range(1, self.llm_formula_repair_attempts + 1):
+            self._raise_if_cancelled()
+            try:
+                repaired = repair(
+                    seed,
+                    hypothesis=current_hypothesis,
+                    context=context,
+                    objective=objective,
+                    validation_error=_duplicate_repair_validation_error(current_plan, forbidden_formulas),
+                    attempt=attempt,
+                    max_attempts=self.llm_formula_repair_attempts,
+                )
+            except Exception as exc:
+                return _RepairOutcome(None, None, _repair_failed_plan(current_plan, exc), exhausted=True)
+            if not isinstance(repaired, ResearchHypothesis):
+                continue
+            repaired = _normalize_llm_research_hypothesis(repaired, generation)
+            if _llm_formula_required_but_missing(repaired, generation):
+                structured = _structured_hypothesis_for_missing_formula(repaired, generation, lane_index=lane_index)
+                draft = None
+            else:
+                draft = _candidate_from_hypothesis(repaired, seed.horizon_days)
+                structured = _structured_hypothesis_from_candidate(repaired, draft, generation, lane_index=lane_index)
+            repaired_plan = self.experiment_planner.plan(structured, context)
+            self._trace_plan(run_id, structured, repaired_plan)
+            current_hypothesis = repaired
+            current_plan = repaired_plan
+            if repaired_plan.status != "ready" or draft is None:
+                continue
+            planned_candidate = replace(
+                draft,
+                formula=repaired_plan.formula_dsl,
+                universe_filters=repaired_plan.universe_filters,
+            )
+            duplicate_again = _deduplicate_plan(
+                repaired_plan,
+                planned_candidate,
+                formula_index=formula_index,
+                shape_counts=shape_counts,
+                config=self.deduplication,
+                allow_existing=repaired.parameter_search_fallback,
+            )
+            if duplicate_again is None:
+                return _RepairOutcome(repaired, draft, repaired_plan)
+            current_plan = duplicate_again
+            if duplicate_again.formula_dsl:
+                forbidden_formulas.append(duplicate_again.formula_dsl)
         return _RepairOutcome(None, None, current_plan, exhausted=True)
 
     def _trace_plan(self, run_id: str, hypothesis: StructuredResearchHypothesis, plan: FactorExperimentPlan) -> None:
@@ -1043,6 +1234,7 @@ class ResearchLoopService:
         *,
         horizon_days_matrix: tuple[int, ...] | None,
         sample_splits: tuple[SampleSplitSpec, ...] | None,
+        include_external_oos: bool = False,
     ) -> _ScoredTrial:
         self._raise_if_cancelled()
         evaluation_profile = trial.effective_config.evaluation_profile
@@ -1067,17 +1259,35 @@ class ResearchLoopService:
             data_root=self.data_root,
             artifact_root=self.artifact_root,
             holding_days=trial.factor.horizon_days,
-            simulation_profile=backtest_profile,
+            simulation_profile=evaluation_profile,
             transaction_costs=self.transaction_costs,
             sample_splits=sample_splits,
             factor_values_root=self.factor_values_root,
             factor_values_overlay_root=self.factor_values_overlay_root,
             factor_values_manifest_root=self.factor_values_manifest_root,
+            sample_role=IN_SAMPLE_ROLE,
         )
         self._raise_if_cancelled()
+        external_oos_backtest = None
+        if include_external_oos:
+            external_oos_backtest = run_factor_backtest(
+                trial.factor.factor_id,
+                factor_root=self.factor_root,
+                data_root=self.data_root,
+                artifact_root=self.artifact_root,
+                holding_days=trial.factor.horizon_days,
+                simulation_profile=backtest_profile,
+                transaction_costs=self.transaction_costs,
+                sample_splits=sample_splits,
+                factor_values_root=self.factor_values_root,
+                factor_values_overlay_root=self.factor_values_overlay_root,
+                factor_values_manifest_root=self.factor_values_manifest_root,
+                sample_role=EXTERNAL_OOS_ROLE,
+            )
+            self._raise_if_cancelled()
         split_weighted_icir = weighted_split_icir(evaluation)
         score = score_candidate(evaluation, backtest, objective_weights, split_weighted_icir)
-        return _ScoredTrial(trial, evaluation, backtest, split_weighted_icir, score)
+        return _ScoredTrial(trial, evaluation, backtest, split_weighted_icir, score, external_oos_backtest)
 
     def _evaluate_final_trial(
         self,
@@ -1094,8 +1304,15 @@ class ResearchLoopService:
             objective_weights,
             horizon_days_matrix=self.horizon_days_matrix,
             sample_splits=self.sample_splits,
+            include_external_oos=True,
         )
-        gate_passed, gate_reasons = apply_gate(scored.evaluation, scored.backtest, scored.score, candidate_gate)
+        gate_passed, gate_reasons = apply_gate(
+            scored.evaluation,
+            scored.backtest,
+            scored.score,
+            candidate_gate,
+            oos_backtest=scored.external_oos_backtest,
+        )
         result_signature = (
             _result_signature_from_scored(scored, precision=self.deduplication.result_precision)
             if result_signature_index is not None
@@ -1127,16 +1344,21 @@ class ResearchLoopService:
         elif candidate.status != "draft":
             gate_reasons = (*gate_reasons, f"existing {candidate.status} status preserved")
         self._raise_if_cancelled()
-        self_review = self.review_generator.review(
-            seed=seed,
-            candidate=candidate,
-            evaluation=scored.evaluation,
-            backtest=scored.backtest,
-            split_weighted_icir=scored.split_weighted_icir,
-            score=scored.score,
-            gate_passed=gate_passed,
-            gate_reasons=gate_reasons,
-        )
+        try:
+            self_review = self.review_generator.review(
+                seed=seed,
+                candidate=candidate,
+                evaluation=scored.evaluation,
+                backtest=scored.backtest,
+                split_weighted_icir=scored.split_weighted_icir,
+                score=scored.score,
+                gate_passed=gate_passed,
+                gate_reasons=gate_reasons,
+            )
+        except _ResearchRunCancelled:
+            raise
+        except Exception as exc:
+            self_review = _failed_self_review(exc, candidate)
         self._raise_if_cancelled()
         if promote_after_review:
             candidate = self._promote_candidate(
@@ -1145,11 +1367,24 @@ class ResearchLoopService:
                 reason="Research loop smoke gate passed; active promotion still requires user decision.",
             )
             transitioned_to_candidate = True
+        external_oos_backtest = scored.external_oos_backtest or scored.backtest
+        assessment = FactorAssessmentBundle(
+            factor_id=candidate.factor_id,
+            role="candidate",
+            evaluation=scored.evaluation,
+            selection_backtest=scored.backtest,
+            external_oos_backtest=external_oos_backtest,
+            selection_score=scored.score,
+            split_weighted_icir=scored.split_weighted_icir,
+            gate_passed=gate_passed,
+            gate_reasons=gate_reasons,
+            parent_seed_factor_id=seed.factor_id,
+        )
         return ResearchCandidateResult(
             hypothesis=trial.hypothesis,
             factor=candidate,
             evaluation=scored.evaluation,
-            backtest=scored.backtest,
+            backtest=external_oos_backtest,
             split_weighted_icir=scored.split_weighted_icir,
             score=scored.score,
             gate_passed=gate_passed,
@@ -1159,6 +1394,80 @@ class ResearchLoopService:
             formula_fingerprint=factor_formula_fingerprint(candidate),
             result_signature=result_signature,
             candidate_shape_fingerprint=_candidate_shape_fingerprint(trial.plan, candidate),
+            selection_backtest=scored.backtest,
+            external_oos_backtest=external_oos_backtest,
+            assessment=assessment,
+        )
+
+    def _assess_factor(
+        self,
+        factor: FactorDefinition,
+        *,
+        role: str,
+        parent_seed_factor_id: str,
+        objective_weights: ResearchObjectiveWeights,
+        gate: ResearchGate,
+    ) -> FactorAssessmentBundle:
+        evaluation = evaluate_factor(
+            factor.factor_id,
+            factor_root=self.factor_root,
+            data_root=self.data_root,
+            artifact_root=self.artifact_root,
+            horizon_days=factor.horizon_days,
+            horizon_days_matrix=self.horizon_days_matrix,
+            sample_splits=self.sample_splits,
+            simulation_profile=self.evaluation_simulation_profile,
+            factor_values_root=self.factor_values_root,
+            factor_values_overlay_root=self.factor_values_overlay_root,
+            factor_values_manifest_root=self.factor_values_manifest_root,
+        )
+        self._raise_if_cancelled()
+        selection_backtest = run_factor_backtest(
+            factor.factor_id,
+            factor_root=self.factor_root,
+            data_root=self.data_root,
+            artifact_root=self.artifact_root,
+            holding_days=factor.horizon_days,
+            simulation_profile=self.evaluation_simulation_profile,
+            transaction_costs=self.transaction_costs,
+            sample_splits=self.sample_splits,
+            factor_values_root=self.factor_values_root,
+            factor_values_overlay_root=self.factor_values_overlay_root,
+            factor_values_manifest_root=self.factor_values_manifest_root,
+            sample_role=IN_SAMPLE_ROLE,
+        )
+        self._raise_if_cancelled()
+        external_oos_backtest = run_factor_backtest(
+            factor.factor_id,
+            factor_root=self.factor_root,
+            data_root=self.data_root,
+            artifact_root=self.artifact_root,
+            holding_days=factor.horizon_days,
+            simulation_profile=self.backtest_simulation_profile,
+            transaction_costs=self.transaction_costs,
+            sample_splits=self.sample_splits,
+            factor_values_root=self.factor_values_root,
+            factor_values_overlay_root=self.factor_values_overlay_root,
+            factor_values_manifest_root=self.factor_values_manifest_root,
+            sample_role=EXTERNAL_OOS_ROLE,
+        )
+        self._raise_if_cancelled()
+        split_weighted = weighted_split_icir(evaluation)
+        score = score_candidate(evaluation, selection_backtest, objective_weights, split_weighted)
+        gate_passed, gate_reasons = apply_gate(
+            evaluation, selection_backtest, score, gate, oos_backtest=external_oos_backtest
+        )
+        return FactorAssessmentBundle(
+            factor_id=factor.factor_id,
+            role=role,
+            evaluation=evaluation,
+            selection_backtest=selection_backtest,
+            external_oos_backtest=external_oos_backtest,
+            selection_score=score,
+            split_weighted_icir=split_weighted,
+            gate_passed=gate_passed,
+            gate_reasons=gate_reasons,
+            parent_seed_factor_id=parent_seed_factor_id,
         )
 
 
@@ -1187,17 +1496,37 @@ def score_candidate(
     weights: ResearchObjectiveWeights,
     split_weighted_icir: float | None = None,
 ) -> float:
-    split_component = (
-        split_weighted_icir if split_weighted_icir is not None else weighted_split_icir(evaluation)
-    ) / 10.0
+    split_component = 0.0
+    if weights.weighted_split_icir > 0:
+        split_component = (
+            split_weighted_icir if split_weighted_icir is not None else weighted_split_icir(evaluation)
+        ) / 10.0
     normalized_icir = evaluation.rank_icir / 10.0
-    return float(
+    score = (
         split_component * weights.weighted_split_icir
         + evaluation.rank_ic_mean * weights.rank_ic_mean
         + normalized_icir * weights.rank_icir
-        + backtest.net_annualized_return * weights.annualized_return
-        + backtest.net_max_drawdown * weights.max_drawdown
     )
+    if weights.annualized_return > 0:
+        score += _required_backtest_metric(backtest, "net_annualized_return") * weights.annualized_return
+    if weights.max_drawdown > 0:
+        score += _required_backtest_metric(backtest, "net_max_drawdown") * weights.max_drawdown
+    return float(score)
+
+
+def _required_backtest_metric(backtest: BacktestResult, name: str) -> float:
+    metric = backtest.metrics.get(name)
+    if isinstance(metric, MetricValue):
+        if metric.status != "available" or metric.value is None:
+            detail = metric.status
+            if metric.warning_codes:
+                detail = f"{detail}: {', '.join(metric.warning_codes)}"
+            raise ValueError(f"{name} is unavailable ({detail})")
+        return float(metric.value)
+    value = getattr(backtest, name)
+    if value is None:
+        raise ValueError(f"{name} is unavailable")
+    return float(value)
 
 
 def weighted_split_icir(evaluation: EvaluationResult) -> float:
@@ -1214,9 +1543,63 @@ def weighted_split_icir(evaluation: EvaluationResult) -> float:
     return float(sum(value * weight for value, weight in weighted) / total_weight)
 
 
+def _assessment_comparison_row(
+    assessment: FactorAssessmentBundle,
+    factor: FactorDefinition,
+    hypothesis_text: str = "",
+) -> dict[str, object]:
+    selection = assessment.selection_backtest
+    external = assessment.external_oos_backtest
+    return {
+        "role": assessment.role,
+        "factor_id": assessment.factor_id,
+        "parent_seed_factor_id": assessment.parent_seed_factor_id,
+        "factor_status": factor.status,
+        "formula": factor.formula,
+        "hypothesis": hypothesis_text,
+        "selection_basis": assessment.selection_basis,
+        "audit_basis": assessment.audit_basis,
+        "selection_score": assessment.selection_score,
+        "split_weighted_icir": assessment.split_weighted_icir,
+        "gate_passed": assessment.gate_passed,
+        "gate_reasons": list(assessment.gate_reasons),
+        "selection_rank_ic": assessment.evaluation.rank_ic_mean,
+        "selection_icir": assessment.evaluation.rank_icir,
+        "selection_ic_days": assessment.evaluation.ic_days,
+        "selection_coverage": assessment.evaluation.coverage,
+        "selection_backtest_periods": selection.periods,
+        "selection_completed_periods": selection.completed_periods,
+        "selection_net_cumulative_return": selection.net_cumulative_return,
+        "selection_net_annualized_return": selection.net_annualized_return,
+        "selection_net_long_short_sharpe": selection.net_long_short_sharpe,
+        "selection_turnover_rate": selection.turnover_rate,
+        "selection_rebalance_rate": selection.rebalance_rate,
+        "external_oos_periods": external.periods,
+        "external_oos_completed_periods": external.completed_periods,
+        "external_oos_net_cumulative_return": external.net_cumulative_return,
+        "external_oos_net_annualized_return": external.net_annualized_return,
+        "external_oos_net_long_short_sharpe": external.net_long_short_sharpe,
+        "external_oos_turnover_rate": external.turnover_rate,
+        "external_oos_rebalance_rate": external.rebalance_rate,
+        "evaluation_artifact_path": assessment.evaluation.artifact_path,
+        "selection_backtest_artifact_path": selection.artifact_path,
+        "external_oos_artifact_path": external.artifact_path,
+    }
+
+
 def apply_gate(
-    evaluation: EvaluationResult, backtest: BacktestResult, score: float, gate: ResearchGate
+    evaluation: EvaluationResult,
+    backtest: BacktestResult,
+    score: float,
+    gate: ResearchGate,
+    *,
+    oos_backtest: BacktestResult | None = None,
 ) -> tuple[bool, tuple[str, ...]]:
+    # The OOS-specific gate clauses must judge the external out-of-sample
+    # backtest when a distinct holdout window is configured; when no external
+    # OOS backtest is supplied we fall back to the in-sample backtest so the
+    # default (evaluation_profile == backtest_profile) behavior is unchanged.
+    oos = oos_backtest if oos_backtest is not None else backtest
     reasons: list[str] = []
     if evaluation.ic_days < gate.min_ic_days:
         reasons.append(f"ic_days {evaluation.ic_days} < {gate.min_ic_days}")
@@ -1227,24 +1610,26 @@ def apply_gate(
     if score < gate.min_score:
         reasons.append(f"score {score:.6f} < {gate.min_score:.6f}")
     if gate.min_oos_net_annualized_return is not None:
-        for metric in _oos_segments(backtest):
-            if metric.net_annualized_return < gate.min_oos_net_annualized_return:
+        for metric in _oos_segments(oos):
+            if metric.net_annualized_return is None:
+                reasons.append(f"{metric.name} net_annualized_return unavailable")
+            elif metric.net_annualized_return < gate.min_oos_net_annualized_return:
                 reasons.append(
                     f"{metric.name} net_annualized_return {metric.net_annualized_return:.6f} "
                     f"< {gate.min_oos_net_annualized_return:.6f}"
                 )
-    if gate.max_rebalance_rate is not None and backtest.rebalance_rate > gate.max_rebalance_rate:
+    if gate.max_rebalance_rate is not None and backtest.rebalance_rate is not None and backtest.rebalance_rate > gate.max_rebalance_rate:
         reasons.append(
             f"rebalance_rate {backtest.rebalance_rate:.6f} "
             f"> {gate.max_rebalance_rate:.6f}"
         )
-    if gate.max_turnover_rate is not None and backtest.turnover_rate > gate.max_turnover_rate:
+    if gate.max_turnover_rate is not None and backtest.turnover_rate is not None and backtest.turnover_rate > gate.max_turnover_rate:
         reasons.append(f"turnover_rate {backtest.turnover_rate:.6f} > {gate.max_turnover_rate:.6f}")
     if gate.min_net_return_retention is not None:
-        retention = _net_return_retention(backtest)
+        retention = _net_return_retention(oos)
         if retention < gate.min_net_return_retention:
             reasons.append(f"net_return_retention {retention:.6f} < {gate.min_net_return_retention:.6f}")
-    if gate.max_oos_net_return_decay is not None and _oos_net_decay(backtest, gate.max_oos_net_return_decay):
+    if gate.max_oos_net_return_decay is not None and _oos_net_decay(oos, gate.max_oos_net_return_decay):
         reasons.append(f"OOS net return decay exceeds {gate.max_oos_net_return_decay:.6f}")
     if not reasons:
         reasons.append("passed smoke research gate")
@@ -1592,6 +1977,51 @@ def _parameter_search_fallback_hypothesis(seed: FactorDefinition) -> ResearchHyp
     )
 
 
+def _duplicate_exhaustion_fallback_hypotheses(seed: FactorDefinition) -> tuple[ResearchHypothesis, ...]:
+    horizon = f"{seed.horizon_days}日"
+    return (
+        ResearchHypothesis(
+            text=f"重复公式耗尽兜底：用{horizon}收益的时间序排名替换线性收益腿",
+            rationale=(
+                "LLM duplicate repair did not produce a distinct executable formula; use a bounded "
+                "non-additive momentum-persistence variant that differs from the seed formula."
+            ),
+            source="local",
+            source_detail="duplicate_exhaustion_bounded_formula_fallback: momentum persistence",
+            formula_dsl="rank((1 - rank(market_cap)) * rank(ts_rank(return_5d, 10)))",
+            input_fields=("market_cap", "return_5d"),
+            expected_direction="positive",
+            universe_constraints=seed.universe_filters,
+        ),
+        ResearchHypothesis(
+            text=f"重复公式耗尽兜底：用低波动和短期均值收益构造{horizon}防御动量",
+            rationale=(
+                "LLM duplicate repair repeated existing formulas; use a bounded low-volatility "
+                "and smoothed-return interaction to keep the candidate distinct from the seed."
+            ),
+            source="local",
+            source_detail="duplicate_exhaustion_bounded_formula_fallback: defensive smoothed momentum",
+            formula_dsl="rank((1 - rank(volatility_5d)) * rank(ts_mean(return_5d, 5)))",
+            input_fields=("volatility_5d", "return_5d"),
+            expected_direction="positive",
+            universe_constraints=seed.universe_filters,
+        ),
+        ResearchHypothesis(
+            text=f"重复公式耗尽兜底：用小市值和收益稳定性构造{horizon}稳健候选",
+            rationale=(
+                "LLM duplicate repair was exhausted; use a bounded small-cap and return-stability "
+                "variant so the fallback is a real formula candidate instead of seed reuse."
+            ),
+            source="local",
+            source_detail="duplicate_exhaustion_bounded_formula_fallback: return stability",
+            formula_dsl="rank((1 - rank(market_cap)) * (1 - rank(stddev(return_5d, 20))))",
+            input_fields=("market_cap", "return_5d"),
+            expected_direction="positive",
+            universe_constraints=seed.universe_filters,
+        ),
+    )
+
+
 def _should_repair_llm_plan(
     hypothesis: ResearchHypothesis,
     generation: ResearchGenerationMetadata,
@@ -1607,6 +2037,7 @@ def _should_repair_llm_plan(
         "blocked_missing_field",
         "blocked_missing_formula",
         "blocked_direction_unknown",
+        "blocked_duplicate_formula",
     }
 
 
@@ -1617,6 +2048,22 @@ def _plan_validation_error(plan: FactorExperimentPlan) -> str:
     if not plan.operator_validation.get("is_valid", True):
         return "formula validation failed"
     return f"plan status is {plan.status}"
+
+
+def _repair_failed_plan(plan: FactorExperimentPlan, exc: Exception) -> FactorExperimentPlan:
+    message = f"LLM formula repair failed: {exc.__class__.__name__}: {exc}"
+    return replace(plan, blocking_reasons=tuple(dict.fromkeys((*plan.blocking_reasons, message))))
+
+
+def _duplicate_repair_validation_error(plan: FactorExperimentPlan, forbidden_formulas: list[str]) -> str:
+    error = _plan_validation_error(plan)
+    formulas = tuple(dict.fromkeys(formula for formula in forbidden_formulas if formula))
+    if not formulas:
+        return error
+    return (
+        f"{error}; forbidden_formula_dsl={json.dumps(formulas, ensure_ascii=False)}; "
+        "return a formula_dsl not equal to any forbidden_formula_dsl and not already present in the factor library"
+    )
 
 
 def _optimization_performed(
@@ -1631,7 +2078,7 @@ def _optimization_performed(
             or result.factor.formula != seed.formula
             or result.factor.universe_filters != seed.universe_filters
             or result.factor.horizon_days != seed.horizon_days
-            or result.backtest.simulation_profile != seed_profile
+            or (result.selection_backtest or result.backtest).simulation_profile != seed_profile
         )
         for result in results
     )
@@ -1821,6 +2268,7 @@ def _structured_result_from_candidate(
     candidate: ResearchCandidateResult,
     plan: FactorExperimentPlan | None,
 ) -> StructuredFactorExperimentResult:
+    selection_backtest = candidate.selection_backtest or candidate.backtest
     experiment_plan = plan or FactorExperimentPlan(
         plan_id=f"{candidate.factor.factor_id}-p01",
         hypothesis_id=candidate.factor.factor_id,
@@ -1838,7 +2286,7 @@ def _structured_result_from_candidate(
             evaluation_status="completed",
             evaluation_metrics=_evaluation_metrics(candidate.evaluation),
             backtest_status="completed",
-            backtest_metrics=_backtest_metrics(candidate.backtest),
+            backtest_metrics=_backtest_metrics(selection_backtest),
             artifact_refs=_artifact_refs(candidate),
         )
     )
@@ -1865,7 +2313,7 @@ def _structured_result_from_candidate(
         evaluation_status="completed",
         evaluation_metrics=_evaluation_metrics(candidate.evaluation),
         backtest_status="completed",
-        backtest_metrics=_backtest_metrics(candidate.backtest),
+        backtest_metrics=_backtest_metrics(selection_backtest),
         artifact_refs=_artifact_refs(candidate),
         gate_decision=decision,
     )
@@ -1894,6 +2342,7 @@ def _backtest_metrics(backtest: BacktestResult) -> dict[str, object]:
         "annualized_return": backtest.annualized_return,
         "net_annualized_return": backtest.net_annualized_return,
         "max_drawdown": backtest.max_drawdown,
+        "net_max_drawdown": backtest.net_max_drawdown,
         "net_long_short_sharpe": backtest.net_long_short_sharpe,
         "rebalance_rate": backtest.rebalance_rate,
         "turnover_rate": backtest.turnover_rate,
@@ -1907,9 +2356,13 @@ def _backtest_metrics(backtest: BacktestResult) -> dict[str, object]:
 
 
 def _artifact_refs(candidate: ResearchCandidateResult) -> dict[str, str]:
+    selection_backtest = candidate.selection_backtest or candidate.backtest
+    external_oos_backtest = candidate.external_oos_backtest or candidate.backtest
     return {
         "evaluation": candidate.evaluation.artifact_path.name,
-        "backtest": candidate.backtest.artifact_path.name,
+        "backtest": selection_backtest.artifact_path.name,
+        "selection_backtest": selection_backtest.artifact_path.name,
+        "external_oos_backtest": external_oos_backtest.artifact_path.name,
         "formula_fingerprint": candidate.formula_fingerprint,
         "result_signature": candidate.result_signature,
         "candidate_shape_fingerprint": candidate.candidate_shape_fingerprint,
@@ -1955,10 +2408,14 @@ def _oos_segments(backtest: BacktestResult) -> tuple[BacktestSegmentMetric, ...]
 
 
 def _cost_sensitive(backtest: BacktestResult) -> bool:
+    if backtest.annualized_return is None or backtest.net_annualized_return is None:
+        return False
     return backtest.annualized_return > 0 and backtest.net_annualized_return < backtest.annualized_return * 0.5
 
 
 def _net_return_retention(backtest: BacktestResult) -> float:
+    if backtest.annualized_return is None or backtest.net_annualized_return is None:
+        return 1.0
     if backtest.annualized_return <= 0:
         return 1.0 if backtest.net_annualized_return >= backtest.annualized_return else 0.0
     return float(backtest.net_annualized_return / backtest.annualized_return)
@@ -1967,10 +2424,10 @@ def _net_return_retention(backtest: BacktestResult) -> float:
 def _oos_net_decay(backtest: BacktestResult, max_decay: float = 0.5) -> bool:
     split_by_name = {metric.name.upper(): metric for metric in backtest.segment_metrics}
     is_metric = split_by_name.get("IS")
-    if is_metric is None or is_metric.periods == 0:
+    if is_metric is None or is_metric.periods == 0 or is_metric.net_annualized_return is None:
         return False
     for name, metric in split_by_name.items():
-        if name.startswith("OOS") and metric.periods > 0:
+        if name.startswith("OOS") and metric.periods > 0 and metric.net_annualized_return is not None:
             if is_metric.net_annualized_return <= 0:
                 if metric.net_annualized_return < is_metric.net_annualized_return:
                     return True

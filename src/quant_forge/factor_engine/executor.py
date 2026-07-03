@@ -22,11 +22,41 @@ def execute_factor_formula(panel: pd.DataFrame, formula: str, universe_filters: 
     if missing:
         raise ValueError(f"panel missing required columns: {sorted(missing)}")
 
-    result = panel[["trade_date", "instrument"]].copy()
-    result["score"] = _eval_expression(panel, formula.strip())
+    # Rolling operators (ts_*, decay_linear, correlation, ...) assume each
+    # instrument's rows are in ascending trade_date order. Sort by
+    # (instrument, trade_date) before evaluating so the result is independent of
+    # the caller's row order, then restore the caller's original order so
+    # positionally-aligned consumers are unaffected.
+    ordered_positions = _stable_panel_order(panel)
+    ordered = panel.iloc[ordered_positions].reset_index(drop=True)
+
+    result = ordered[["trade_date", "instrument"]].copy()
+    result["score"] = _eval_expression(ordered, formula.strip())
     for filter_expression in universe_filters:
-        result.loc[~_eval_filter(panel, filter_expression), "score"] = pd.NA
-    return result
+        result.loc[~_eval_filter(ordered, filter_expression), "score"] = pd.NA
+
+    # Reorder rows back to the caller's original input order.
+    restore = np.empty(len(panel), dtype=int)
+    restore[ordered_positions] = np.arange(len(panel))
+    return result.iloc[restore].reset_index(drop=True)
+
+
+def _stable_panel_order(panel: pd.DataFrame) -> np.ndarray:
+    """Positional order that sorts rows by (instrument, trade_date) stably.
+
+    Returns integer positions into ``panel`` (0..n-1) rather than index labels,
+    so the caller can restore the original row order regardless of the panel's
+    index. Uses a stable mergesort so ties preserve input order.
+    """
+
+    keyframe = pd.DataFrame(
+        {
+            "instrument": panel["instrument"].to_numpy(),
+            "trade_date": panel["trade_date"].to_numpy(),
+        }
+    )
+    order = keyframe.sort_values(["instrument", "trade_date"], kind="stable").index
+    return np.asarray(order, dtype=int)
 
 
 def _eval_expression(panel: pd.DataFrame, expression: str) -> pd.Series:
@@ -142,19 +172,11 @@ def _rolling_operator(panel: pd.DataFrame, operator: str, args: list[ast.AST]) -
     if operator == "stddev":
         return grouped.rolling(window, min_periods=window).std().reset_index(level=0, drop=True)
     if operator == "ts_rank":
-        return (
-            grouped.rolling(window, min_periods=window)
-            .apply(_last_rank_pct, raw=False)
-            .reset_index(level=0, drop=True)
-        )
+        return _rolling_last_rank_pct(panel, values, window=window)
     if operator == "decay_linear":
         weights = np.arange(1, window + 1, dtype=float)
         weights = weights / weights.sum()
-        return (
-            grouped.rolling(window, min_periods=window)
-            .apply(lambda window_values: float(np.dot(window_values, weights)), raw=True)
-            .reset_index(level=0, drop=True)
-        )
+        return _rolling_weighted_sum(panel, values, weights=weights)
     raise ValueError(f"unsupported rolling operator: {operator}")
 
 
@@ -183,14 +205,44 @@ def _by_instrument(panel: pd.DataFrame, values: pd.Series, transform) -> pd.Seri
     return values.groupby(panel["instrument"], sort=False).transform(transform)
 
 
+def _rolling_last_rank_pct(panel: pd.DataFrame, values: pd.Series, *, window: int) -> pd.Series:
+    result = pd.Series(np.nan, index=panel.index, dtype="float64")
+    for _, positions in panel.groupby("instrument", sort=False).groups.items():
+        group_values = values.loc[positions].to_numpy(dtype=float)
+        if group_values.size < window:
+            continue
+        windows = np.lib.stride_tricks.sliding_window_view(group_values, window)
+        last = windows[:, -1]
+        finite = np.isfinite(windows)
+        valid_count = finite.sum(axis=1)
+        valid_last = np.isfinite(last)
+        less = ((windows < last[:, None]) & finite).sum(axis=1)
+        equal = ((windows == last[:, None]) & finite).sum(axis=1)
+        ranks = (less + (equal + 1) / 2) / valid_count
+        ranks[(valid_count == 0) | ~valid_last] = np.nan
+        group_result = np.full(group_values.size, np.nan, dtype=float)
+        group_result[window - 1 :] = ranks
+        result.loc[positions] = group_result
+    return result
+
+
+def _rolling_weighted_sum(panel: pd.DataFrame, values: pd.Series, *, weights: np.ndarray) -> pd.Series:
+    result = pd.Series(np.nan, index=panel.index, dtype="float64")
+    window = int(weights.size)
+    for _, positions in panel.groupby("instrument", sort=False).groups.items():
+        group_values = values.loc[positions].to_numpy(dtype=float)
+        if group_values.size < window:
+            continue
+        group_result = np.full(group_values.size, np.nan, dtype=float)
+        group_result[window - 1 :] = np.correlate(group_values, weights, mode="valid")
+        result.loc[positions] = group_result
+    return result
+
+
 def _window(args: list[ast.AST], index: int) -> int:
     if index >= len(args):
         raise ValueError("window argument must be a number")
     return max(int(math.floor(_number_arg(args[index], "window argument"))), 1)
-
-
-def _last_rank_pct(values: pd.Series) -> float:
-    return float(values.rank(pct=True).iloc[-1])
 
 
 def _number_arg(node: ast.AST, label: str) -> float:

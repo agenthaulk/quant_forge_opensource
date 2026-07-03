@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import os
 import re
+import time
 from typing import Any
 import urllib.error
 import urllib.request
@@ -67,6 +68,10 @@ _PROVIDER_ALIASES = {
     "bigmodel": "glm",
 }
 
+_TRANSIENT_HTTP_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+_MAX_HTTP_ATTEMPTS = 3
+_HTTP_RETRY_BACKOFF_SECONDS = (0.25, 1.0)
+
 
 @dataclass(frozen=True)
 class LLMChatResult:
@@ -81,6 +86,7 @@ def generate_chat_text(
     *,
     temperature: float = 0.0,
     max_tokens: int = 1200,
+    retry_timeouts: bool = True,
 ) -> LLMChatResult:
     """Call the configured LLM and return text content.
 
@@ -97,6 +103,7 @@ def generate_chat_text(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            retry_timeouts=retry_timeouts,
         )
     elif protocol == "anthropic_messages":
         content = _generate_anthropic_messages_text(
@@ -105,6 +112,7 @@ def generate_chat_text(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            retry_timeouts=retry_timeouts,
         )
     else:
         raise ValueError(f"unsupported LLM protocol: {protocol}")
@@ -153,13 +161,29 @@ def extract_json_object(content: str) -> dict[str, Any]:
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", cleaned, flags=re.S)
-        if not match:
-            raise RuntimeError("LLM response is not valid JSON")
-        parsed = json.loads(match.group(0))
+        parsed = _decode_first_json_object(cleaned)
     if not isinstance(parsed, dict):
         raise RuntimeError("LLM response JSON must be an object")
     return parsed
+
+
+def _decode_first_json_object(cleaned: str) -> Any:
+    """Return the first complete JSON object embedded in ``cleaned``.
+
+    Scans from each ``{`` in order, attempting a raw decode so that trailing
+    prose or stray braces after a valid object do not corrupt the parse.
+    """
+
+    decoder = json.JSONDecoder()
+    index = cleaned.find("{")
+    while index != -1:
+        try:
+            parsed, _ = decoder.raw_decode(cleaned[index:])
+        except json.JSONDecodeError:
+            index = cleaned.find("{", index + 1)
+            continue
+        return parsed
+    raise RuntimeError("LLM response is not valid JSON")
 
 
 def _generate_openai_compatible_text(
@@ -169,33 +193,31 @@ def _generate_openai_compatible_text(
     *,
     temperature: float,
     max_tokens: int,
+    retry_timeouts: bool,
 ) -> str:
     headers = {"Content-Type": "application/json"}
     if credential:
         headers["Authorization"] = f"Bearer {credential}"
-    request = urllib.request.Request(
-        _chat_completions_url(settings.base_url),
-        data=json.dumps(
-            {
-                "model": settings.model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "stream": False,
-            },
-            ensure_ascii=False,
-        ).encode("utf-8"),
-        headers=headers,
-        method="POST",
+    body = json.dumps(
+        {
+            "model": settings.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": False,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    payload = _urlopen_json_with_retries(
+        lambda: urllib.request.Request(
+            _chat_completions_url(settings.base_url),
+            data=body,
+            headers=headers,
+            method="POST",
+        ),
+        timeout_seconds=settings.timeout_seconds,
+        retry_timeouts=retry_timeouts,
     )
-    try:
-        with urllib.request.urlopen(request, timeout=settings.timeout_seconds) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"LLM request failed with HTTP {exc.code}: {body[:500]}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"LLM request failed: {exc.reason}") from exc
     return _message_content(payload)
 
 
@@ -206,6 +228,7 @@ def _generate_anthropic_messages_text(
     *,
     temperature: float,
     max_tokens: int,
+    retry_timeouts: bool,
 ) -> str:
     system = "\n\n".join(message["content"] for message in messages if message.get("role") == "system")
     user_content = "\n\n".join(message["content"] for message in messages if message.get("role") != "system")
@@ -215,31 +238,66 @@ def _generate_anthropic_messages_text(
     }
     if credential:
         headers["x-api-key"] = credential
-    request = urllib.request.Request(
-        _anthropic_messages_url(settings.base_url),
-        data=json.dumps(
-            {
-                "model": settings.model,
-                "system": system,
-                "messages": [{"role": "user", "content": user_content}],
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "stream": False,
-            },
-            ensure_ascii=False,
-        ).encode("utf-8"),
-        headers=headers,
-        method="POST",
+    body = json.dumps(
+        {
+            "model": settings.model,
+            "system": system,
+            "messages": [{"role": "user", "content": user_content}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": False,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    payload = _urlopen_json_with_retries(
+        lambda: urllib.request.Request(
+            _anthropic_messages_url(settings.base_url),
+            data=body,
+            headers=headers,
+            method="POST",
+        ),
+        timeout_seconds=settings.timeout_seconds,
+        retry_timeouts=retry_timeouts,
     )
-    try:
-        with urllib.request.urlopen(request, timeout=settings.timeout_seconds) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"LLM request failed with HTTP {exc.code}: {body[:500]}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"LLM request failed: {exc.reason}") from exc
     return _anthropic_message_content(payload)
+
+
+def _urlopen_json_with_retries(
+    request_factory: Any,
+    *,
+    timeout_seconds: float,
+    retry_timeouts: bool = True,
+) -> dict[str, Any]:
+    for attempt in range(1, _MAX_HTTP_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(request_factory(), timeout=timeout_seconds) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            if _should_retry_http(exc.code, attempt):
+                _sleep_before_retry(attempt)
+                continue
+            raise RuntimeError(f"LLM request failed with HTTP {exc.code}: {body[:500]}") from exc
+        except urllib.error.URLError as exc:
+            if attempt < _MAX_HTTP_ATTEMPTS:
+                _sleep_before_retry(attempt)
+                continue
+            raise RuntimeError(f"LLM request failed: {exc.reason}") from exc
+        except TimeoutError as exc:
+            if retry_timeouts and attempt < _MAX_HTTP_ATTEMPTS:
+                _sleep_before_retry(attempt)
+                continue
+            raise RuntimeError("LLM request timed out") from exc
+    raise RuntimeError("LLM request failed after retries")
+
+
+def _should_retry_http(status_code: int, attempt: int) -> bool:
+    return status_code in _TRANSIENT_HTTP_STATUS_CODES and attempt < _MAX_HTTP_ATTEMPTS
+
+
+def _sleep_before_retry(attempt: int) -> None:
+    delay_index = min(max(attempt - 1, 0), len(_HTTP_RETRY_BACKOFF_SECONDS) - 1)
+    time.sleep(_HTTP_RETRY_BACKOFF_SECONDS[delay_index])
 
 
 def _canonical_provider(provider: str) -> str:

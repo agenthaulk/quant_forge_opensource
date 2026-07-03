@@ -44,13 +44,14 @@ class LocalPanelDataProvider:
         panel = pd.read_parquet(self.panel_path)
         missing = tuple(column for column in REQUIRED_COLUMNS if column not in panel.columns)
         dates = pd.to_datetime(panel["trade_date"]) if "trade_date" in panel.columns and not panel.empty else None
+        problems = _panel_quality_problems(panel) if not missing and not panel.empty else ()
         return DataValidationResult(
             data_root=self.data_root,
-            ok=not missing and not panel.empty,
+            ok=not missing and not panel.empty and not problems,
             rows=len(panel),
             instruments=int(panel["instrument"].nunique()) if "instrument" in panel.columns else 0,
             date_count=int(panel["trade_date"].nunique()) if "trade_date" in panel.columns else 0,
-            missing_columns=missing,
+            missing_columns=missing + problems,
             panel_path=self.panel_path,
             start_date=dates.min().date().isoformat() if dates is not None else "",
             end_date=dates.max().date().isoformat() if dates is not None else "",
@@ -74,6 +75,42 @@ class LocalPanelDataProvider:
             missing = ", ".join(validation.missing_columns) or "no rows"
             raise ValueError(f"invalid data_root {self.data_root}: missing {missing}")
         return _load_source_snapshot_panel(source_root)
+
+
+def _panel_quality_problems(panel: pd.DataFrame) -> tuple[str, ...]:
+    """Detect data-quality issues that presence/non-empty checks miss.
+
+    Returns problem tokens surfaced through ``missing_columns`` so that
+    ``load_panel`` renders them and downstream callers treat the panel as
+    invalid. Covers duplicate keys, NaNs in required columns, and dtype issues.
+    Defensive: any check that raises is skipped rather than crashing validate.
+    """
+
+    problems: list[str] = []
+    try:
+        if panel.duplicated(subset=["trade_date", "instrument"]).any():
+            problems.append("duplicate_keys")
+    except Exception:  # pragma: no cover - defensive
+        pass
+    for column in REQUIRED_COLUMNS:
+        try:
+            if panel[column].isna().any():
+                problems.append(f"null:{column}")
+        except Exception:  # pragma: no cover - defensive
+            pass
+    for numeric_column in ("close", "market_cap"):
+        try:
+            if not pd.api.types.is_numeric_dtype(panel[numeric_column]):
+                problems.append(f"dtype:{numeric_column}")
+        except Exception:  # pragma: no cover - defensive
+            pass
+    try:
+        parsed_dates = pd.to_datetime(panel["trade_date"], errors="coerce")
+        if parsed_dates.isna().any() and not panel["trade_date"].isna().any():
+            problems.append("dtype:trade_date")
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return tuple(problems)
 
 
 def validate_data_root(data_root: Path) -> DataValidationResult:

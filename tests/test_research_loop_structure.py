@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from quant_forge.config import LLMSettings
 from quant_forge.core.contracts import (
     BacktestResult,
     BacktestSegmentMetric,
@@ -31,13 +32,18 @@ import quant_forge.research_loop.llm as rd_llm
 from quant_forge.research_loop.llm_contracts import normalize_review_payload
 from quant_forge.research_loop.operator_drafts import write_operator_draft_artifacts
 from quant_forge.research_loop.service import (
+    LocalSelfReviewGenerator,
     ResearchDeduplicationConfig,
     ResearchGate,
     ResearchGenerationMetadata,
     ResearchHypothesis,
     ResearchLoopService,
     ResearchSelfReview,
+    _backtest_metrics,
     _candidate_from_hypothesis,
+    _evaluation_metrics,
+    _result_signature_from_scored,
+    _result_signature_from_trace_entry,
     apply_gate,
 )
 from quant_forge.research_loop.trace_store import ResearchTraceStore, utc_timestamp
@@ -813,6 +819,68 @@ def test_llm_review_summary_falls_back_when_payload_omits_summary() -> None:
     assert "provider echoed private prompt" not in normalized.normalization_warnings
 
 
+def test_llm_review_disables_timeout_retries(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_generate_chat_text(llm, messages, *, temperature=0.0, max_tokens=1200, retry_timeouts=True):
+        seen["retry_timeouts"] = retry_timeouts
+        return SimpleNamespace(
+            content=json.dumps(
+                {
+                    "summary": "review ok",
+                    "strengths": ["stable"],
+                    "risks": ["none"],
+                    "next_hypotheses": ["continue"],
+                }
+            ),
+            provider="deepseek",
+            model="deepseek-chat",
+        )
+
+    monkeypatch.setattr(rd_llm, "generate_chat_text", fake_generate_chat_text)
+    factor = FactorDefinition(factor_id="FTR_TEST", name="test", formula="rank(close)", status="draft")
+    reviewer = rd_llm.LLMResearchReviewGenerator(
+        LLMSettings(
+            provider="deepseek",
+            model="deepseek-chat",
+            base_url="https://api.deepseek.com",
+            api_key_env="QF_TEST_DEEPSEEK_KEY",
+        )
+    )
+
+    review = reviewer.review(
+        seed=factor,
+        candidate=factor,
+        evaluation=EvaluationResult(
+            factor_id="FTR_TEST",
+            observations=1,
+            coverage=1.0,
+            rank_ic_mean=0.1,
+            rank_ic_std=0.0,
+            rank_icir=1.0,
+            ic_days=1,
+            artifact_path=Path("evaluation.json"),
+        ),
+        backtest=BacktestResult(
+            factor_id="FTR_TEST",
+            periods=1,
+            holding_days=5,
+            cumulative_return=0.01,
+            annualized_return=0.01,
+            annualized_volatility=0.0,
+            max_drawdown=0.0,
+            artifact_path=Path("backtest.json"),
+        ),
+        split_weighted_icir=0.1,
+        score=0.2,
+        gate_passed=True,
+        gate_reasons=(),
+    )
+
+    assert seen["retry_timeouts"] is False
+    assert review.source == "llm_self_review"
+
+
 def test_context_builder_only_classifies_terminal_trace_entries_and_redacts_roots(tmp_path: Path) -> None:
     paths = create_demo_workspace(tmp_path / "demo")
     store = ResearchTraceStore(tmp_path / "trace")
@@ -1105,6 +1173,27 @@ def test_research_loop_repairs_missing_llm_formula_before_blocking(tmp_path: Pat
     assert result.optimization_performed is True
 
 
+def test_research_loop_repairs_duplicate_llm_formula_before_empty_run(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    generator = _DuplicateFormulaThenRepairGenerator()
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        hypothesis_generator=generator,
+    )
+
+    result = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert len(generator.repair_errors) == 1
+    assert "formula fingerprint already exists: FTR_DEMO_SMALL_CAP" in generator.repair_errors[0]
+    assert "forbidden_formula_dsl" in generator.repair_errors[0]
+    assert result.blocked_plans == ()
+    assert result.candidates
+    assert result.candidates[0].factor.formula == "-rank(volatility_5d)"
+    assert result.optimization_performed is True
+
+
 def test_research_loop_does_not_parameter_fallback_after_invalid_llm_formula(tmp_path: Path) -> None:
     paths = create_demo_workspace(tmp_path / "demo")
     service = ResearchLoopService(
@@ -1131,7 +1220,7 @@ def test_research_loop_does_not_parameter_fallback_after_invalid_llm_formula(tmp
     assert run_payload["optimization_performed"] is False
 
 
-def test_research_loop_falls_back_only_after_repeated_llm_formula_failures(tmp_path: Path) -> None:
+def test_research_loop_does_not_parameter_fallback_after_repeated_invalid_llm_repairs(tmp_path: Path) -> None:
     paths = create_demo_workspace(tmp_path / "demo")
     FactorRepository(paths["factor_root"]).promote(
         "FTR_DEMO_SMALL_CAP",
@@ -1156,21 +1245,154 @@ def test_research_loop_falls_back_only_after_repeated_llm_formula_failures(tmp_p
     assert all("delta argument 2 must be a number" in error for error in generator.repair_errors)
     assert result.blocked_plans
     assert result.blocked_plans[0].plan.status == "blocked_formula_invalid"
-    assert result.candidates
-    assert len(result.candidates) == 2
-    assert result.candidates[0].factor.factor_id == "FTR_DEMO_SMALL_CAP"
-    assert result.candidates[0].hypothesis.parameter_search_fallback is True
+    assert result.candidates == ()
     assert result.accepted_candidate_ids == ()
     assert result.optimization_performed is False
     assert result.no_optimization_performed is True
     assert result.trace_root is not None
     trace_text = (result.trace_root / "trace.jsonl").read_text(encoding="utf-8")
     assert trace_text.count("delta(return_5d, volatility_5d)") >= 3
-    assert '"parameter_search_fallback": true' in trace_text
+    assert '"parameter_search_fallback": true' not in trace_text
     config_snapshot = json.loads((result.trace_root / "config_snapshot.json").read_text(encoding="utf-8"))
     assert config_snapshot["llm_formula_repair_attempts"] == 2
     run_payload = json.loads((result.trace_root / "run.json").read_text(encoding="utf-8"))
-    assert run_payload["status"] == "no_optimization_performed"
+    assert run_payload["status"] == "partial"
+    assert run_payload["candidate_count"] == 0
+
+
+def test_research_loop_does_not_seed_fallback_after_missing_field_repair_timeout(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        parameter_search_enabled=True,
+        hypothesis_generator=_MissingFieldRepairTimeoutGenerator(),
+        llm_formula_repair_attempts=1,
+    )
+
+    result = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert result.candidates == ()
+    assert len(result.blocked_plans) == 1
+    assert result.blocked_plans[0].plan.status == "blocked_missing_field"
+    assert "market_cp" in result.blocked_plans[0].error
+    assert "LLM formula repair failed" in result.blocked_plans[0].error
+    assert result.optimization_performed is False
+    assert result.no_optimization_performed is True
+    assert result.trace_root is not None
+    trace_text = (result.trace_root / "trace.jsonl").read_text(encoding="utf-8")
+    assert "FTR_DEMO_SMALL_CAP_h01-p01" not in trace_text
+    assert '"parameter_search_fallback": true' not in trace_text
+
+
+def test_research_loop_keeps_candidate_when_llm_review_times_out(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        review_generator=_TimeoutReviewGenerator(),
+    )
+
+    result = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert result.candidates
+    assert result.candidates[0].self_review.source == "llm_self_review_error"
+    assert "LLM self-review failed" in result.candidates[0].self_review.risks[0]
+    assert result.trace_root is not None
+
+
+def test_research_loop_falls_back_after_repeated_duplicate_llm_repairs(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    FactorRepository(paths["factor_root"]).promote(
+        "FTR_DEMO_SMALL_CAP",
+        "candidate",
+        "test existing candidate fallback after duplicate repair exhaustion",
+    )
+    generator = _DuplicateFormulaRepairStillDuplicatesGenerator()
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        simulation_profile=SimulationProfile(top_quantile=0.2),
+        simulation_profiles=(SimulationProfile(top_quantile=0.2), SimulationProfile(top_quantile=0.3)),
+        parameter_search_enabled=True,
+        hypothesis_generator=generator,
+        llm_formula_repair_attempts=2,
+    )
+
+    result = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert len(generator.repair_errors) == 2
+    assert all("forbidden_formula_dsl" in error for error in generator.repair_errors)
+    assert result.blocked_plans
+    assert result.blocked_plans[0].plan.status == "blocked_duplicate_formula"
+    assert result.candidates
+    assert result.candidates[0].hypothesis.parameter_search_fallback is False
+    assert result.candidates[0].hypothesis.source_detail.startswith("duplicate_exhaustion_bounded_formula_fallback")
+    assert result.candidates[0].factor.factor_id != "FTR_DEMO_SMALL_CAP"
+    assert result.candidates[0].factor.formula != "-rank(market_cap)"
+    assert result.trace_root is not None
+    trace_text = (result.trace_root / "trace.jsonl").read_text(encoding="utf-8")
+    assert '"parameter_search_fallback": true' not in trace_text
+    assert "duplicate_exhaustion_bounded_formula_fallback" in trace_text
+    run_payload = json.loads((result.trace_root / "run.json").read_text(encoding="utf-8"))
+    assert run_payload["candidate_count"] > 0
+
+
+def test_research_loop_skips_duplicate_fallback_when_other_trials_exist(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    FactorRepository(paths["factor_root"]).promote(
+        "FTR_DEMO_SMALL_CAP",
+        "candidate",
+        "test duplicate fallback is not eager when a valid LLM candidate exists",
+    )
+    generator = _DuplicateAndUniqueFormulaGenerator()
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        simulation_profile=SimulationProfile(top_quantile=0.2),
+        simulation_profiles=(SimulationProfile(top_quantile=0.2), SimulationProfile(top_quantile=0.3)),
+        parameter_search_enabled=True,
+        hypothesis_generator=generator,
+        llm_formula_repair_attempts=1,
+    )
+
+    result = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=2)
+
+    assert result.candidates
+    assert all(candidate.factor.factor_id != "FTR_DEMO_SMALL_CAP" for candidate in result.candidates)
+    assert result.trace_root is not None
+    trace_text = (result.trace_root / "trace.jsonl").read_text(encoding="utf-8")
+    assert '"parameter_search_fallback": true' not in trace_text
+
+
+def test_research_loop_continues_when_duplicate_repair_times_out(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    FactorRepository(paths["factor_root"]).promote(
+        "FTR_DEMO_SMALL_CAP",
+        "candidate",
+        "test duplicate repair timeout does not fail run",
+    )
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        parameter_search_enabled=True,
+        hypothesis_generator=_DuplicateRepairTimeoutWithUniqueFormulaGenerator(),
+        llm_formula_repair_attempts=1,
+    )
+
+    result = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=2)
+
+    assert result.candidates
+    assert result.blocked_plans
+    assert "LLM formula repair failed: TimeoutError" in result.blocked_plans[0].error
+    assert result.trace_root is not None
+    run_payload = json.loads((result.trace_root / "run.json").read_text(encoding="utf-8"))
+    assert run_payload["candidate_count"] > 0
 
 
 def test_research_loop_refreshes_generation_metadata_after_generation(tmp_path: Path) -> None:
@@ -1385,13 +1607,21 @@ def test_research_loop_blocks_duplicate_result_signature_before_promotion(
         turnover_rate=0.3,
     )
 
-    def fake_score_trial(trial, objective_weights, *, horizon_days_matrix, sample_splits):
+    def fake_score_trial(
+        trial,
+        objective_weights,
+        *,
+        horizon_days_matrix,
+        sample_splits,
+        include_external_oos=False,
+    ):
         return SimpleNamespace(
             trial=trial,
             evaluation=evaluation,
             backtest=backtest,
             split_weighted_icir=1.0,
             score=0.5,
+            external_oos_backtest=backtest if include_external_oos else None,
         )
 
     monkeypatch.setattr(service, "_score_trial", fake_score_trial)
@@ -1595,6 +1825,93 @@ class _MissingFormulaThenRepairGenerator:
         )
 
 
+class _DuplicateFormulaThenRepairGenerator:
+    def __init__(self) -> None:
+        self.repair_errors: list[str] = []
+
+    def metadata(self) -> ResearchGenerationMetadata:
+        return ResearchGenerationMetadata(source="llm_hypothesis", provider="test", model="duplicate-then-repair")
+
+    def generate_with_context(self, *args, **kwargs):
+        return (
+            ResearchHypothesis(
+                text="duplicate seed formula",
+                rationale="initial LLM idea accidentally repeats the seed formula",
+                source="llm",
+                formula_dsl="-rank(market_cap)",
+                input_fields=("market_cap",),
+                expected_direction="positive",
+                universe_constraints=("is_st == false",),
+            ),
+        )
+
+    def repair_invalid_hypothesis(self, *args, **kwargs):
+        self.repair_errors.append(str(kwargs["validation_error"]))
+        return ResearchHypothesis(
+            text="repaired low volatility formula",
+            rationale="repair changes the duplicated seed into a distinct defensive formula",
+            source="llm",
+            source_detail="formula_repair",
+            formula_dsl="-rank(volatility_5d)",
+            input_fields=("volatility_5d",),
+            expected_direction="positive",
+            universe_constraints=("is_st == false",),
+        )
+
+
+class _DuplicateFormulaRepairStillDuplicatesGenerator(_DuplicateFormulaThenRepairGenerator):
+    def metadata(self) -> ResearchGenerationMetadata:
+        return ResearchGenerationMetadata(source="llm_hypothesis", provider="test", model="duplicate-repairs-fail")
+
+    def repair_invalid_hypothesis(self, *args, **kwargs):
+        self.repair_errors.append(str(kwargs["validation_error"]))
+        return ResearchHypothesis(
+            text="still duplicate seed formula",
+            rationale="repair attempt intentionally repeats the duplicate formula",
+            source="llm",
+            source_detail="formula_repair",
+            formula_dsl="-rank(market_cap)",
+            input_fields=("market_cap",),
+            expected_direction="positive",
+            universe_constraints=("is_st == false",),
+        )
+
+
+class _DuplicateAndUniqueFormulaGenerator(_DuplicateFormulaRepairStillDuplicatesGenerator):
+    def metadata(self) -> ResearchGenerationMetadata:
+        return ResearchGenerationMetadata(source="llm_hypothesis", provider="test", model="duplicate-and-unique")
+
+    def generate_with_context(self, *args, **kwargs):
+        return (
+            ResearchHypothesis(
+                text="duplicate seed formula",
+                rationale="first LLM idea repeats the seed formula",
+                source="llm",
+                formula_dsl="-rank(market_cap)",
+                input_fields=("market_cap",),
+                expected_direction="positive",
+                universe_constraints=("is_st == false",),
+            ),
+            ResearchHypothesis(
+                text="unique return formula",
+                rationale="second LLM idea is executable and distinct",
+                source="llm",
+                formula_dsl="rank(return_5d)",
+                input_fields=("return_5d",),
+                expected_direction="positive",
+                universe_constraints=("is_st == false",),
+            ),
+        )
+
+
+class _DuplicateRepairTimeoutWithUniqueFormulaGenerator(_DuplicateAndUniqueFormulaGenerator):
+    def metadata(self) -> ResearchGenerationMetadata:
+        return ResearchGenerationMetadata(source="llm_hypothesis", provider="test", model="duplicate-timeout-unique")
+
+    def repair_invalid_hypothesis(self, *args, **kwargs):
+        raise TimeoutError("test repair timeout")
+
+
 class _InvalidRepairFailsThenFallbackGenerator(_InvalidNoRepairGenerator):
     def __init__(self) -> None:
         self.repair_errors: list[str] = []
@@ -1614,6 +1931,32 @@ class _InvalidRepairFailsThenFallbackGenerator(_InvalidNoRepairGenerator):
             expected_direction="positive",
             universe_constraints=("is_st == false",),
         )
+
+
+class _MissingFieldRepairTimeoutGenerator:
+    def metadata(self) -> ResearchGenerationMetadata:
+        return ResearchGenerationMetadata(source="llm_hypothesis", provider="test", model="missing-field-timeout")
+
+    def generate_with_context(self, *args, **kwargs):
+        return (
+            ResearchHypothesis(
+                text="llm misspells market_cap",
+                rationale="should be blocked without seed fallback when repair times out",
+                source="llm",
+                formula_dsl="rank((1 - rank(market_cp)) * rank(return_5d))",
+                input_fields=("market_cp", "return_5d"),
+                expected_direction="positive",
+                universe_constraints=("is_st == false",),
+            ),
+        )
+
+    def repair_invalid_hypothesis(self, *args, **kwargs):
+        raise TimeoutError("test missing-field repair timeout")
+
+
+class _TimeoutReviewGenerator:
+    def review(self, **kwargs):
+        raise TimeoutError("test LLM review timeout")
 
 
 class _MetadataChangingGenerator:
@@ -1639,3 +1982,240 @@ class _MetadataChangingGenerator:
                 source="financial_analyst",
             ),
         )
+
+
+def _segment_metric(
+    name: str,
+    *,
+    net_annualized_return: float | None,
+    periods: int = 1,
+) -> BacktestSegmentMetric:
+    return BacktestSegmentMetric(
+        name=name,
+        start_date="2024-01-01",
+        end_date="2024-01-05",
+        periods=periods,
+        gross_cumulative_return=0.1,
+        gross_annualized_return=net_annualized_return,
+        gross_long_short_sharpe=0.0,
+        gross_max_drawdown=-0.1,
+        net_cumulative_return=0.1,
+        net_annualized_return=net_annualized_return,
+        net_long_short_sharpe=0.0,
+        net_max_drawdown=-0.1,
+    )
+
+
+def test_result_signature_round_trips_between_scored_and_trace_entry(tmp_path: Path) -> None:
+    # COR-1 regression: the persisted trace side must carry the same canonical
+    # net_max_drawdown key as the live/read side so a byte-identical rerun
+    # produces an identical signature (cross-run dedup actually fires).
+    evaluation = EvaluationResult(
+        factor_id="FTR_SIG",
+        observations=10,
+        coverage=0.95,
+        rank_ic_mean=0.12,
+        rank_ic_std=0.1,
+        rank_icir=1.2,
+        ic_days=5,
+        artifact_path=tmp_path / "eval.json",
+    )
+    backtest = BacktestResult(
+        factor_id="FTR_SIG",
+        periods=3,
+        holding_days=5,
+        cumulative_return=0.2,
+        annualized_return=0.18,
+        annualized_volatility=0.1,
+        max_drawdown=-0.11,
+        artifact_path=tmp_path / "backtest.json",
+        net_annualized_return=0.15,
+        net_long_short_sharpe=0.9,
+        net_max_drawdown=-0.137,
+        rebalance_rate=0.42,
+        turnover_rate=0.63,
+    )
+    scored = SimpleNamespace(evaluation=evaluation, backtest=backtest)
+    entry = {
+        "evaluation_summary": _evaluation_metrics(evaluation),
+        "backtest_summary": _backtest_metrics(backtest),
+    }
+
+    assert _result_signature_from_trace_entry(entry, precision=6) == _result_signature_from_scored(
+        scored, precision=6
+    )
+
+
+def test_apply_gate_blocks_is_strong_oos_weak_when_external_oos_supplied(tmp_path: Path) -> None:
+    # COR-2 regression: OOS gate clauses must judge the external OOS backtest,
+    # not the in-sample-role backtest.
+    evaluation = EvaluationResult(
+        factor_id="FTR_OOS",
+        observations=10,
+        coverage=1.0,
+        rank_ic_mean=0.1,
+        rank_ic_std=0.1,
+        rank_icir=1.0,
+        ic_days=5,
+        artifact_path=tmp_path / "eval.json",
+    )
+    is_backtest = BacktestResult(
+        factor_id="FTR_OOS",
+        periods=4,
+        holding_days=5,
+        cumulative_return=0.2,
+        annualized_return=0.2,
+        annualized_volatility=0.1,
+        max_drawdown=-0.1,
+        artifact_path=tmp_path / "is_backtest.json",
+        net_annualized_return=0.2,
+        segment_metrics=(
+            _segment_metric("IS", net_annualized_return=0.2),
+            _segment_metric("OOS1", net_annualized_return=0.2),
+        ),
+    )
+    oos_backtest = BacktestResult(
+        factor_id="FTR_OOS",
+        periods=4,
+        holding_days=5,
+        cumulative_return=-0.05,
+        annualized_return=-0.05,
+        annualized_volatility=0.1,
+        max_drawdown=-0.2,
+        artifact_path=tmp_path / "oos_backtest.json",
+        net_annualized_return=-0.05,
+        segment_metrics=(
+            _segment_metric("IS", net_annualized_return=0.2),
+            _segment_metric("OOS1", net_annualized_return=-0.05),
+        ),
+    )
+    gate = ResearchGate(min_oos_net_annualized_return=0.05)
+
+    # IS-strong alone (no external OOS window) passes the OOS clause.
+    passed_is, _ = apply_gate(evaluation, is_backtest, 0.5, gate)
+    assert passed_is is True
+
+    # With a distinct external OOS window that is weak, the gate must block.
+    passed_oos, reasons = apply_gate(evaluation, is_backtest, 0.5, gate, oos_backtest=oos_backtest)
+    assert passed_oos is False
+    assert any("net_annualized_return" in reason for reason in reasons)
+
+
+def test_local_self_review_survives_null_backtest_metrics(tmp_path: Path) -> None:
+    # COR-3 regression: short-window backtests carry None-valued metrics; the
+    # local reviewer must not raise (which was previously swallowed into a
+    # failed self-review).
+    seed = FactorDefinition(factor_id="FTR_SEED", name="seed", formula="rank(close)", status="candidate")
+    candidate = FactorDefinition(factor_id="FTR_CAND", name="cand", formula="rank(close)", status="draft")
+    evaluation = EvaluationResult(
+        factor_id="FTR_CAND",
+        observations=1,
+        coverage=1.0,
+        rank_ic_mean=0.1,
+        rank_ic_std=0.0,
+        rank_icir=1.0,
+        ic_days=1,
+        artifact_path=tmp_path / "eval.json",
+    )
+    backtest = BacktestResult(
+        factor_id="FTR_CAND",
+        periods=1,
+        holding_days=5,
+        cumulative_return=0.01,
+        annualized_return=0.01,
+        annualized_volatility=0.0,
+        max_drawdown=0.0,
+        artifact_path=tmp_path / "backtest.json",
+        net_long_short_sharpe=None,
+        rebalance_rate=None,
+        turnover_rate=None,
+        net_max_drawdown=None,
+    )
+
+    review = LocalSelfReviewGenerator().review(
+        seed=seed,
+        candidate=candidate,
+        evaluation=evaluation,
+        backtest=backtest,
+        split_weighted_icir=0.1,
+        score=0.2,
+        gate_passed=True,
+        gate_reasons=(),
+    )
+
+    assert review.source == "local_self_review"
+
+
+def test_hypotheses_from_payload_warns_on_schema_or_task_mismatch() -> None:
+    # COR-10 regression: schema/task drift is recorded (warned), not silently
+    # accepted, but parsing still succeeds.
+    valid_body = [
+        {
+            "text": "Use close/volume rolling correlation",
+            "formula_dsl": "rank(correlation(close, volume, 2))",
+            "expected_direction": "positive",
+        }
+    ]
+    with pytest.warns(UserWarning):
+        hypotheses = rd_llm._hypotheses_from_payload(  # noqa: SLF001 - lock schema contract.
+            {"hypotheses": valid_body},
+            max_candidates=1,
+        )
+    assert len(hypotheses) == 1
+    assert hypotheses[0].formula_dsl == "rank(correlation(close, volume, 2))"
+
+    import warnings as _warnings
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error")
+        ok = rd_llm._hypotheses_from_payload(  # noqa: SLF001 - correctly-versioned payload must not warn.
+            {
+                "schema_version": "qf.rd.llm.v1",
+                "task_type": "rd_research_hypotheses",
+                "hypotheses": valid_body,
+            },
+            max_candidates=1,
+        )
+    assert len(ok) == 1
+
+
+def test_hypothesis_generator_temperature_defaults_to_zero(monkeypatch) -> None:
+    # COR-11 regression: hypothesis-gen must default to deterministic temperature.
+    seen: dict[str, object] = {}
+
+    def fake_generate_chat_text(llm, messages, *, temperature=0.0, max_tokens=1200, retry_timeouts=True):
+        seen["temperature"] = temperature
+        return SimpleNamespace(
+            content=json.dumps(
+                {
+                    "schema_version": "qf.rd.llm.v1",
+                    "task_type": "rd_research_hypotheses",
+                    "hypotheses": [
+                        {
+                            "text": "Use close/volume rolling correlation",
+                            "formula_dsl": "rank(correlation(close, volume, 2))",
+                            "expected_direction": "positive",
+                        }
+                    ],
+                }
+            ),
+            provider="deepseek",
+            model="deepseek-chat",
+        )
+
+    monkeypatch.setattr(rd_llm, "generate_chat_text", fake_generate_chat_text)
+    settings = LLMSettings(
+        provider="deepseek",
+        model="deepseek-chat",
+        base_url="https://api.deepseek.com",
+        api_key_env="QF_TEST_DEEPSEEK_KEY",
+    )
+    seed = FactorDefinition(factor_id="FTR_SEED", name="seed", formula="rank(close)", status="candidate")
+
+    generator = rd_llm.LLMHypothesisGenerator(settings)
+    generator.generate_with_context(seed, context=None, objective="balanced", max_candidates=1)
+    assert seen["temperature"] == 0.0
+
+    explicit = rd_llm.LLMHypothesisGenerator(settings, hypothesis_temperature=0.2)
+    explicit.generate_with_context(seed, context=None, objective="balanced", max_candidates=1)
+    assert seen["temperature"] == 0.2

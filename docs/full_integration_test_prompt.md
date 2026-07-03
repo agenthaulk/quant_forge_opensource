@@ -94,6 +94,10 @@
 - 不引入 PostgreSQL、复杂前端框架、私有 provider 代码或重依赖。
 - 不使用 silent fallback 掩盖错误。
 - 对 LLM 输出使用明确 JSON schema / contract 校验。
+- 对 evaluation/backtest 输出使用 `qf.metrics.v2`；不可用指标必须是 `null`/status，
+  不得回填为 `0.0`。
+- 常量或近常量 IC 序列不得展示极端 HAC t-stat；应输出 `null`/`n/a`
+  并带有 `DEGENERATE_IC_SERIES`。
 - 对新用户常见错误给出可操作错误信息。
 - 前端联调必须优先使用 Computer Use 操作桌面 Chrome app。只有当前会话没有 Computer Use 工具，或 Computer Use 无法稳定读取窗口时，才允许降级为 Chrome 自动化 fallback。降级时必须记录 `fallback_used=true` 和降级原因。API/HTTP 调用只能作为补充验证，不得替代前端点击流程。
 
@@ -138,6 +142,7 @@
 阶段 2：启动后端和前端
 1. 在 Docker 中启动项目 Web 服务。
 2. 确认服务绑定到 host 可访问端口，例如 http://127.0.0.1:8765/ 或冲突后的替代端口。
+   (Confirm the service binds to a host-reachable port, e.g. http://127.0.0.1:8765/ or a fallback port after a conflict.)
 3. 检查服务日志，确认：
    - 配置已加载
    - DeepSeek provider 已识别
@@ -187,12 +192,22 @@
 - 解析按钮和验证按钮是否按预期拆分，解析阶段是否没有提前触发评价/回测
 - LLM API key 输入框状态是否符合配置加载置灰、手动联调才可编辑、真实 key 不展示/不提交
 - 收益、Sharpe、回撤、调仓率、真实换手率、成本后表现
+- HAC t-stat、coverage lineage、metric status/method/N
+- reportable annualization 与 extrapolated annualization
+- daily NAV 最大回撤
+- initial build turnover 与 rebalance turnover
 - IS / OOS1 / OOS2 表现
 - 报告和 artifact 路径
 
 阶段 4：RD 模块联调
 1. 将上述 3 个因子作为 RD seed。
 2. 使用 DeepSeek 对每个因子进行 2-3 轮 RD research。
+   - `iterations=1` 是快速 smoke；`iterations=2` 或 `3` 是标准新用户联调。
+   - `iterations=5` 是重型回归/验收模式，只在需要验证长链 RD 时使用。运行前应把
+     `max_candidates` 控制在较小值，并预期真实 DeepSeek + 全量挂载盘数据可能耗时
+     很长。
+   - 若要求 5 轮，必须记录每轮 run directory、trace 最新 phase、运行时长和是否进入
+     下一轮；不得因为 job 仍在 running 就声明通过。
 3. RD 优化路径必须包括：
    - idea research：提出改进假设
    - 参数搜索：对窗口、权重、阈值、profile 等做轻量搜索
@@ -224,6 +239,9 @@
    - last_explored_factor_id：最近一次探索到的候选，可能未通过 gate
    - next_exploration_seed_factor_id、next_exploration_seed_reason、next_exploration_seed_gate_passed
    - stopped_reason
+   - 如果后续轮次失败但前序轮次已完成，记录 `partial_result=true`、
+     `failed_round_index` 和 `chain_error`；前端应继续展示已完成轮次、候选和
+     对比表，而不是空白结果。
    - 如果 `selection_reason=fallback_best_score` 且 `next_exploration_seed_gate_passed=false`，前端和报告必须明确说明该候选仅用于下一轮探索，不构成最终推荐
 8. 如果 LLM 生成非法公式：
    - 将 validation error 回传给 LLM 修复
@@ -264,6 +282,18 @@
    - 不把真实 key、挂载盘绝对私密路径、私有数据样本写入 tracked 文件
 5. 修复后继续从失败阶段重跑。
 
+长任务诊断规则：
+- 如果 Web RD job 超过 10 分钟仍无终态，先查询 job 状态、run directory、`run.json`
+  和 `trace.jsonl` 最新 phase；不要直接判断为失败。
+- 如果进程 CPU 低且 trace 停止更新，优先怀疑 LLM provider/network/self-review 等等待点；
+  LLM review 超时应允许快速记录为 `llm_self_review_error` 并继续，不应拖垮整条 RD 链。
+- 如果进程 CPU 高且 trace 停止更新，优先采样定位本地算子/回测热点，例如
+  `ts_rank`、`decay_linear`、`correlation`、`covariance` 或 factor-value cache miss。
+- 对本地算子性能修复，必须增加 focused tests，例如
+  `tests/test_signal_processing.py` 中的 `ts_rank` / `decay_linear` 语义与性能敏感路径。
+- 对 LLM 网络韧性修复，必须增加 focused tests，例如
+  `tests/test_llm_client.py` 和 RD review timeout 行为测试。
+
 阶段 6：最终验收报告
 完成后必须给出完整报告，包含：
 
@@ -294,8 +324,11 @@
    - 校验结果
    - 计算结果路径
    - 评价指标
+   - IC series / naive t-stat / HAC t-stat
+   - 常量或近常量 IC 的 `DEGENERATE_IC_SERIES` 诊断
    - IS/OOS 表现
-   - 成本后表现
+   - 成本后表现、daily NAV 回撤、reportable/extrapolated 年化
+   - initial build turnover、rebalance turnover、replacement rate
 
 4. RD 研究结果
    - 每轮 hypothesis

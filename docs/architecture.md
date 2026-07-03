@@ -32,7 +32,7 @@ Local Data Provider
 | `quant_forge.research_loop` | Local RD loop: hypotheses, candidate scoring, smoke gates, Markdown reports, and in-process web scheduling. |
 | `quant_forge.workbench` | Use-case orchestration. |
 | `quant_forge.mcp` | Read-only catalogs for agents and LLM tooling. |
-| `quant_forge.agent_workspace` | Safe agent tool facade. Proposals are returned as data and are not persisted directly. |
+| `quant_forge.agent_workspace` | Safe agent tool facade. Factor proposals are returned as data (not persisted) and promotion is refused; `evaluate_factor` writes a standard evaluation artifact under `artifact_root`, identical to the CLI/Web path. Artifact growth is bounded by the retention policy (`scripts/prune_artifacts.py`). |
 | `quant_forge.apps` | CLI and local web adapters only. |
 
 ## Public Boundary
@@ -88,6 +88,18 @@ The public backtest also emits FactorLab-style research diagnostics:
 
 Rebalance rate is not true traded turnover. Turnover rate and net
 returns are still local research estimates, not production execution results.
+The main return series remains non-overlapping H-day close-to-close period
+returns. Backtest artifacts also include a daily mark-to-market NAV that holds
+the entry-date long/short baskets through each completed period. Reportable
+max drawdown comes from this daily NAV instead of period endpoints.
+
+Annualized return, volatility, and Sharpe are reportable only when exposure
+history is sufficient. Short-window mechanical annualization is retained as an
+`extrapolated_annualization` diagnostic, while primary annualized fields are
+`null` with `INSUFFICIENT_ANNUALIZATION_HISTORY` when the sample is too short.
+Initial build turnover is recorded separately from rebalance turnover: the
+initial build still incurs transaction costs, but it is not included in ongoing
+rebalance turnover averages.
 
 ## Signal Preparation
 
@@ -119,6 +131,22 @@ and adds a configurable FactorLab-style evidence matrix:
 
 Near-zero IC standard deviation is treated as zero ICIR to avoid falsely large
 scores from numerical noise.
+Metric artifacts use the `qf.metrics.v2` contract for availability-aware
+outputs. A metric with insufficient evidence is serialized as `null` with a
+stable status such as `insufficient_sample` or `not_applicable`; it is not
+serialized as `0.0`. Legacy top-level numeric fields remain as compatibility
+aliases, but Web, RD, and reports should prefer the `metrics` map when deciding
+whether a value is reportable.
+
+For overlapping forward-return horizons such as H21, the legacy independent
+sample statistic is retained as `rank_ic_t_stat_naive`. The primary
+`rank_ic_t_stat` uses a Bartlett/Newey-West HAC standard error with default lag
+`horizon_days - 1`. Artifacts persist the full daily IC series, HAC lag,
+method, coverage lineage, and boundary diagnostics so the statistic can be
+independently replayed. If the IC series is constant or numerically
+near-constant, HAC t-stat is not reportable and the artifact emits
+`DEGENERATE_IC_SERIES` instead of converting a near-zero standard error into an
+extreme t-stat.
 CLI `eval-factor`, local web idea parsing, and RD runs all use the same
 configured horizon matrix and split definitions when an RD config is supplied.
 The RD config may also define role-specific profiles:
@@ -172,7 +200,7 @@ One `research run-once` cycle:
 `active` promotion remains a separate user decision through `qf factor promote`.
 The local web scheduler is an in-process convenience scheduler for one local
 server. Long-running distributed workers and non-public platform rebinding remain
-未指定 for the public clean branch.
+unspecified for the public clean branch.
 
 If research proposes a formula that needs an unknown operator, the run is marked
 `requires_operator_draft_review`. The workbench writes draft artifacts under

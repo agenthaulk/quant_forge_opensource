@@ -355,11 +355,15 @@ def _profile_label_from_profile(profile) -> str:
     return f"top={_fmt(profile.top_quantile)}, decay={profile.decay_days}, delay={profile.execution_delay_days}"
 
 
-def _fmt(value: float) -> str:
+def _fmt(value: float | None) -> str:
+    if value is None:
+        return "n/a"
     return f"{value:.4f}"
 
 
-def _pct(value: float) -> str:
+def _pct(value: float | None) -> str:
+    if value is None:
+        return "n/a"
     return f"{value * 100:.2f}%"
 
 

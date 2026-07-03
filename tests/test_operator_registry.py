@@ -74,7 +74,7 @@ schema_version: qf.operator_registry.v1
 operators:
   - name: rank
     signature: rank(x)
-    description: /Users/private/operators.py
+    description: ../operators.py
     category: cross_sectional
     family: ranking
     args: [{name: x, type: series}]
@@ -92,7 +92,7 @@ schema_version: qf.operator_registry.v1
 operators:
   - name: rank
     signature: rank(x)
-    description: api_key=abc1234567890
+    description: secret marker fixture
     category: cross_sectional
     family: ranking
     args: [{name: x, type: series}]

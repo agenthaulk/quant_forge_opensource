@@ -9,9 +9,10 @@ authors = [
 ]
 license = { file = "LICENSE" }
 classifiers = [
-  "License :: Other/Proprietary License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
   "numpy>=1.24",
