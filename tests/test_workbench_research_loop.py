@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 import time
 
+import pytest
+import quant_forge.research_loop.service as rd_service
 from quant_forge.data.local import create_demo_workspace
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.core.contracts import (
@@ -18,6 +20,8 @@ from quant_forge.research_loop.service import (
     ResearchDeduplicationConfig,
     ResearchGate,
     ResearchLoopService,
+    ResearchHypothesis,
+    ResearchObjectiveWeights,
     ResearchTrialSimulationOverlay,
     apply_gate,
 )
@@ -400,6 +404,100 @@ def test_research_loop_single_round_performed_flags_remain_compatible(tmp_path: 
     assert result.accepted_candidate_ids
 
 
+def test_research_loop_emits_seed_and_candidate_assessment_bundle(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    loop = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        evaluation_simulation_profile=SimulationProfile(test_period_end="2024-07-01"),
+        backtest_simulation_profile=SimulationProfile(test_period_start="2024-07-02"),
+    )
+
+    result = loop.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert result.seed_assessment is not None
+    assert result.seed_assessment.factor_id == "FTR_DEMO_SMALL_CAP"
+    assert result.seed_assessment.role == "seed"
+    assert result.seed_assessment.selection_backtest.sample_role == "in_sample_backtest"
+    assert result.seed_assessment.external_oos_backtest.sample_role == "external_oos_backtest"
+    assert result.candidates[0].assessment is not None
+    assert result.candidates[0].assessment.role == "candidate"
+    assert result.candidates[0].assessment.selection_backtest.sample_role == "in_sample_backtest"
+    assert result.candidates[0].assessment.external_oos_backtest.sample_role == "external_oos_backtest"
+    assert result.comparison_rows[0]["role"] == "seed"
+    assert {row["role"] for row in result.comparison_rows} == {"seed", "candidate"}
+    assert all("selection_score" in row for row in result.comparison_rows)
+    assert all("external_oos_net_cumulative_return" in row for row in result.comparison_rows)
+
+
+def test_research_loop_selection_ignores_external_oos_audit(monkeypatch, tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    repo = FactorRepository(paths["factor_root"])
+
+    def fake_backtest(factor_id: str, **kwargs) -> BacktestResult:
+        formula = repo.get(factor_id).formula
+        sample_role = str(kwargs.get("sample_role") or "external_oos_backtest")
+        selection_return = 0.20 if formula == "-rank(volatility_5d)" else 0.05
+        external_return = -0.50 if formula == "-rank(volatility_5d)" else 0.50
+        value = selection_return if sample_role == "in_sample_backtest" else external_return
+        return BacktestResult(
+            factor_id=factor_id,
+            periods=6,
+            holding_days=5,
+            cumulative_return=value,
+            annualized_return=value,
+            annualized_volatility=0.05,
+            max_drawdown=-0.01,
+            artifact_path=paths["artifact_root"] / f"{factor_id}_{sample_role}.json",
+            net_cumulative_return=value,
+            net_annualized_return=value,
+            net_annualized_volatility=0.05,
+            net_long_short_sharpe=value * 10.0,
+            net_max_drawdown=-0.01,
+            sample_role=sample_role,
+        )
+
+    monkeypatch.setattr(rd_service, "run_factor_backtest", fake_backtest)
+    loop = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        deduplication=ResearchDeduplicationConfig(enabled=False),
+    )
+
+    result = loop.run_once(
+        "FTR_DEMO_SMALL_CAP",
+        max_candidates=2,
+        weights=ResearchObjectiveWeights(
+            weighted_split_icir=0.0,
+            rank_ic_mean=0.0,
+            rank_icir=0.0,
+            annualized_return=1.0,
+            max_drawdown=0.0,
+        ),
+        hypotheses=(
+            ResearchHypothesis(
+                text="momentum",
+                rationale="external OOS looks better but selection is weaker",
+                formula_dsl="rank(return_5d)",
+            ),
+            ResearchHypothesis(
+                text="low volatility",
+                rationale="selection evidence is stronger",
+                formula_dsl="-rank(volatility_5d)",
+            ),
+        ),
+    )
+
+    assert result.candidates[0].factor.formula == "-rank(volatility_5d)"
+    assert result.candidates[0].selection_backtest is not None
+    assert result.candidates[0].selection_backtest.sample_role == "in_sample_backtest"
+    assert result.candidates[0].external_oos_backtest is not None
+    assert result.candidates[0].external_oos_backtest.net_cumulative_return == pytest.approx(-0.50)
+    assert result.accepted_candidate_ids[0] == result.candidates[0].factor.factor_id
+
+
 def test_research_loop_successive_halving_keeps_only_survivors_for_full_stage(tmp_path: Path) -> None:
     paths = create_demo_workspace(tmp_path / "demo")
     profiles = (
@@ -428,3 +526,47 @@ def test_research_loop_successive_halving_keeps_only_survivors_for_full_stage(tm
     assert {candidate.backtest.simulation_profile for candidate in result.candidates} == survivor_profiles
     assert result.report_path is not None
     assert "Successive Halving Trace" in result.report_path.read_text(encoding="utf-8")
+
+
+def test_research_loop_scheduler_sanitizes_last_error() -> None:
+    # SEC-4 regression: a raw exception carrying a local path / internal detail
+    # must not surface on the token-gated status; ValueError passes through.
+    sensitive = "/home/agent/secret/path leaked internal detail"
+
+    def leaky_runner(seed_factor_id, objective, max_candidates, iterations):
+        raise RuntimeError(sensitive)
+
+    scheduler = ResearchLoopScheduler(leaky_runner, allowed_interval_days=(1,))
+    scheduler.start(
+        ResearchScheduleRequest(seed_factor_id="FTR_DEMO_SMALL_CAP", objective="balanced", max_candidates=1),
+        run_immediately=True,
+    )
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and scheduler.status().run_count == 0:
+        time.sleep(0.05)
+    status = scheduler.stop()
+
+    assert status.run_count == 1
+    assert status.last_error is not None
+    assert sensitive not in status.last_error
+    assert "secret" not in status.last_error
+    assert status.last_error == "scheduled research run failed"
+
+
+def test_research_loop_scheduler_passes_value_error_through() -> None:
+    # SEC-4: ValueError is user-actionable and mirrors the web allowlist.
+    def value_error_runner(seed_factor_id, objective, max_candidates, iterations):
+        raise ValueError("bad seed")
+
+    scheduler = ResearchLoopScheduler(value_error_runner, allowed_interval_days=(1,))
+    scheduler.start(
+        ResearchScheduleRequest(seed_factor_id="FTR_DEMO_SMALL_CAP", objective="balanced", max_candidates=1),
+        run_immediately=True,
+    )
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and scheduler.status().run_count == 0:
+        time.sleep(0.05)
+    status = scheduler.stop()
+
+    assert status.run_count == 1
+    assert status.last_error == "bad seed"

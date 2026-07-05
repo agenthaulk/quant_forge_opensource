@@ -183,10 +183,14 @@ Python 算子文件。
 评价反馈应至少包含：
 
 - Rank IC、Rank ICIR。
-- Coverage、IC days。
+- HAC t-stat，并保留 naive t-stat 作为诊断字段。
+- Coverage、IC days 和 coverage lineage。
 - Horizon matrix：如 5/10/21/63 日。
 - IS/OOS1/OOS2 split metrics。
 - Evaluation artifact path。
+- `schema_version=qf.metrics.v2`、metric status/method/N 和 warning codes。
+- 常量或近常量 IC 序列应显示 HAC t-stat `n/a`，并带有
+  `DEGENERATE_IC_SERIES` warning code。
 
 如果 OOS 明显弱于 IS，程序应给出 warning，而不是只展示全样本均值。
 
@@ -200,8 +204,13 @@ Python 算子文件。
 - `top_quantile`
 - `gross_annualized_return`
 - `net_annualized_return`
+- `reportable_annualization` 与 `extrapolated_annualization`，短样本时主年化应为
+  `null` 而不是机械外推值
 - `max_drawdown`
 - `long_short_sharpe`
+- `daily_nav`，最大回撤应来自日频 mark-to-market NAV
+- `initial_build_turnover`
+- `rebalance_turnover_mean`
 - `rebalance_rate`，即成分替换率/调仓。
 - `turnover_rate`，即按组合权重变化计算的真实换手率。
 - transaction cost assumptions
@@ -209,6 +218,9 @@ Python 算子文件。
 
 特别注意：UI 和报告必须区分 `rebalance_rate` 与 `turnover_rate`，不能把成分替换率
 包装成真实交易换手。
+首期从空仓建立 long/short 组合的 `initial_build_turnover` 可以产生交易成本，但不得
+进入持续再平衡换手均值。样本不足、无再平衡观测或来源序列缺失时，JSON 和页面应
+显示 `null`/`n/a` 加 status，不得显示为 `0.00%`。
 
 ### 3.7 RD 反馈
 
@@ -224,6 +236,12 @@ RD 运行反馈应包含：
 - Report path。
 - `workflow_type=research`；普通 research 只做 idea research 和参数/profile search。
 - 如果 LLM review 返回不完整 JSON，应展示 `normalization_warnings`，但不泄露 raw key。
+- 如果多轮 RD 在第 2 轮或之后失败，应展示已完成轮次的候选、报告和对比表，同时返回
+  `partial_result=true`、`failed_round_index` 和 `chain_error`。只有第 1 轮没有任何
+  可用结果时，才应把整个 RD job 视为无结果失败。
+- LLM self-review 是辅助复盘，不应阻塞已完成候选评价。self-review 超时可以记录为
+  `llm_self_review_error` 并继续；LLM hypothesis generation 超时则必须明确写入
+  失败原因或部分结果停止原因。
 
 如果未来增加因子合成，应作为独立 workflow 重新设计，不应混入普通 research 的
 单因子 idea 生成逻辑。
@@ -314,7 +332,9 @@ API/HTTP 调用只允许核对后端 contract、artifact 路径、日期窗口�
     - `evaluation period`
     - `backtest period`
     - 持有期、Delay、Decay、Top Quantile
-    - 毛收益、净收益、回撤、Sharpe、调仓率、真实换手率
+    - 毛收益、净收益、日频回撤、Sharpe、initial build turnover、rebalance turnover、真实换手率
+    - `reportable annualization` 和 `extrapolated annualization` 的区别
+    - 样本充分性 warning code 与 metric status/method/N
     - 因子值缓存状态和 artifact 路径
 11. 验证后端实际使用的时间窗：
     - `evaluation.simulation_profile.test_period_start/end` 应等于前端评测时间窗。
@@ -353,8 +373,31 @@ API/HTTP 调用只允许核对后端 contract、artifact 路径、日期窗口�
    - `stopped_reason`
    - 每轮 seed、top candidate、next seed、selection reason。
    - 当前端显示 `fallback_best_score` 且未通过 gate 时，必须明确说明“仅用于探索，不构成最终推荐”。
-7. Web 自动周期如果携带 `iterations`，每次调度触发都应执行同样的 N 轮链式 RD，而不是忽略该参数。
-8. 点击 `中断本次RD` 时，链式 RD 应在轮间或安全检查点响应取消。
+7. 如果第 N 轮失败但前 N-1 轮已经完成，结果应保留：
+   - `iteration_count` 等于已完成轮次。
+   - `failed_round_index` 等于失败轮次。
+   - `stopped_reason=iteration_failed`。
+   - `chain_error` 展示可读错误摘要。
+8. Web 自动周期如果携带 `iterations`，每次调度触发都应执行同样的 N 轮链式 RD，而不是忽略该参数。
+9. 点击 `中断本次RD` 时，链式 RD 应在轮间或安全检查点响应取消。
+
+### 4.4 RD 长任务与性能诊断清单
+
+真实 DeepSeek + 挂载盘全量数据的 RD 不是毫秒级 smoke。联调模板应区分三档：
+
+1. 快速 smoke：`iterations=1`，小 `max_candidates`，验证配置、LLM、评价/回测和报告路径。
+2. 标准联调：`iterations=2` 或 `3`，验证递进 seed、部分失败保留和前端对比表。
+3. 重型验收：`iterations=5`，只在明确要求长链 RD 时运行，并记录每轮 trace、耗时和终态。
+
+当 RD job 超过 10 分钟仍无终态：
+
+- 查询 `/api/jobs/<job_id>`、`run.json` 和 `trace.jsonl` 最新事件。
+- 如果 CPU 低且 trace 停止更新，优先排查 LLM/network/self-review 等等待点。
+- 如果 CPU 高且 trace 停止更新，优先采样本地 Python 进程，检查是否卡在滚动算子或
+  factor-value cache miss，例如 `ts_rank`、`decay_linear`、`correlation`、`covariance`。
+- 对滚动算子性能修复，必须保留语义测试，至少覆盖 `ts_rank` 的最后值百分位排名和
+  `decay_linear` 的“越近权重越大”方向。
+- 对 LLM 超时韧性修复，必须分别测试普通生成请求的有限重试和 self-review 快速降级。
 
 Web 页面应始终展示当前生效路径：
 

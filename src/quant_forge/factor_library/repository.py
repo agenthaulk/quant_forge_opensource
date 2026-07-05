@@ -14,6 +14,19 @@ from quant_forge.factor_library.classification import FACTOR_CATEGORY_DIRS, fact
 from quant_forge.utils import read_yaml, write_yaml
 
 FACTOR_FILE = "factor.yaml"
+_FACTOR_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9_=-]*")
+
+
+def _validate_factor_id(factor_id: str) -> None:
+    """Reject traversal/glob/wildcard ids before any filesystem access.
+
+    Mirrors the FactorDefinition id contract (``[A-Za-z][A-Za-z0-9_=-]*``) so
+    ``../x``, ``*``, ``**``, ``..`` and empty ids raise before hitting the glob.
+    """
+
+    if not _FACTOR_ID_RE.fullmatch(factor_id):
+        raise ValueError(f"invalid factor_id: {factor_id!r}")
+
 STATUS_DIRS: dict[str, str] = {
     "active": "active_factors",
     "draft": "inactive_factors",
@@ -67,6 +80,7 @@ class FactorRepository:
         return definitions
 
     def get(self, factor_id: str) -> FactorDefinition:
+        _validate_factor_id(factor_id)
         matches = _matching_factor_files(self.factor_root, factor_id)
         if not matches:
             raise FileNotFoundError(f"factor not found in factor_root: {factor_id}")
@@ -84,6 +98,7 @@ class FactorRepository:
     def delete(self, factor_id: str) -> int:
         """Delete all source definitions for one factor id."""
 
+        _validate_factor_id(factor_id)
         deleted = 0
         for path in _matching_factor_files(self.factor_root, factor_id):
             path.unlink()
@@ -262,6 +277,7 @@ def _factor_files(factor_root: Path) -> list[Path]:
 
 
 def _matching_factor_files(factor_root: Path, factor_id: str) -> list[Path]:
+    _validate_factor_id(factor_id)
     matches = list(factor_root.glob(f"*_factors/{factor_id}/{FACTOR_FILE}"))
     for category_dir in FACTOR_CATEGORY_DIRS.values():
         matches.extend(factor_root.glob(f"{category_dir}/*_factors/{factor_id}/{FACTOR_FILE}"))

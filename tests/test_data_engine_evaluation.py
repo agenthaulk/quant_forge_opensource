@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from quant_forge.data.local import LocalPanelDataProvider, create_demo_workspace
-from quant_forge.evaluation.service import _with_forward_return, evaluate_factor
+from quant_forge.evaluation.service import _hac_mean_standard_error, _ic_summary, _with_forward_return, evaluate_factor
 from quant_forge.factor_engine.executor import execute_factor_formula
 from quant_forge.core.contracts import SimulationProfile
 
@@ -69,9 +69,10 @@ def test_evaluation_writes_artifact(tmp_path: Path) -> None:
     assert payload["score_required_rows"] >= payload["score_computed_rows"]
     assert result.score_compute_mode == payload["score_compute_mode"]
     assert payload["rank_ic_t_stat"] == result.rank_ic_t_stat
-    assert result.rank_ic_t_stat == pytest.approx(result.rank_icir * math.sqrt(result.ic_days))
+    assert result.rank_ic_t_stat_naive == pytest.approx(result.rank_icir * math.sqrt(result.ic_days))
+    assert result.rank_ic_t_stat == result.rank_ic_t_stat_hac
     assert result.rank_icir == pytest.approx(result.rank_ic_mean / result.rank_ic_std)
-    assert result.split_metrics[0].rank_ic_t_stat == pytest.approx(
+    assert result.split_metrics[0].rank_ic_t_stat_naive == pytest.approx(
         result.split_metrics[0].rank_icir * math.sqrt(result.split_metrics[0].ic_days)
     )
 
@@ -174,3 +175,108 @@ def test_evaluation_loads_precomputed_factor_without_local_definition(tmp_path: 
     assert result.score_cached_rows == len(panel)
     assert result.score_computed_rows == 0
     assert result.factor_values_path == factor_dir
+
+
+def test_hac_mean_standard_error_matches_reference_series() -> None:
+    values = [0.1, 0.2, -0.1, 0.0, 0.3]
+
+    assert _hac_mean_standard_error(values, lag=2) == pytest.approx(0.04)
+
+
+def test_h21_ic_reports_naive_and_hac_t_stat() -> None:
+    dates = pd.date_range("2025-01-01", periods=5, freq="D")
+    labeled = pd.DataFrame(
+        {
+            "trade_date": [date for date in dates for _ in range(3)],
+            "instrument": ["A", "B", "C"] * len(dates),
+            "score": [1.0, 2.0, 3.0] * len(dates),
+            "forward_return": [
+                1.0,
+                2.0,
+                3.0,
+                2.0,
+                3.0,
+                1.0,
+                3.0,
+                2.0,
+                1.0,
+                1.0,
+                3.0,
+                2.0,
+                2.0,
+                1.0,
+                3.0,
+            ],
+        }
+    )
+
+    summary = _ic_summary(labeled, horizon_days=21, execution_delay_days=1)
+
+    assert summary["rank_ic_t_stat_naive"] != summary["rank_ic_t_stat_hac"]
+    assert summary["rank_ic_t_stat"] == summary["rank_ic_t_stat_hac"]
+    assert summary["rank_ic_hac_lag"] == 20
+    assert "OVERLAPPING_IC_REQUIRES_HAC" in summary["warning_codes"]
+    assert len(summary["ic_series"]) == 5
+    assert summary["metrics"]["rank_ic_t_stat"].method == "newey_west_bartlett"
+
+
+def test_single_ic_observation_is_insufficient_not_zero() -> None:
+    labeled = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(["2025-01-01"] * 3),
+            "instrument": ["A", "B", "C"],
+            "score": [1.0, 2.0, 3.0],
+            "forward_return": [3.0, 2.0, 1.0],
+        }
+    )
+
+    summary = _ic_summary(labeled, horizon_days=21, execution_delay_days=1)
+
+    assert summary["rank_ic_t_stat"] is None
+    assert summary["rank_icir"] == 0.0
+    assert summary["metrics"]["rank_ic_t_stat"].value is None
+    assert summary["metrics"]["rank_ic_t_stat"].status == "insufficient_sample"
+
+
+def test_constant_ic_series_does_not_report_pathological_hac_t_stat() -> None:
+    dates = pd.date_range("2025-01-01", periods=5, freq="D")
+    labeled = pd.DataFrame(
+        {
+            "trade_date": [date for date in dates for _ in range(3)],
+            "instrument": ["A", "B", "C"] * len(dates),
+            "score": [1.0, 2.0, 3.0] * len(dates),
+            "forward_return": [1.0, 2.0, 3.0] * len(dates),
+        }
+    )
+
+    summary = _ic_summary(labeled, horizon_days=21, execution_delay_days=1)
+
+    assert summary["rank_ic_mean"] == pytest.approx(1.0)
+    assert summary["rank_ic_std"] == 0.0
+    assert summary["rank_ic_t_stat"] is None
+    assert summary["rank_ic_t_stat_hac"] is None
+    assert summary["rank_ic_hac_standard_error"] is None
+    assert summary["metrics"]["rank_ic_t_stat"].value is None
+    assert summary["metrics"]["rank_ic_t_stat"].status == "insufficient_sample"
+    assert "DEGENERATE_IC_SERIES" in summary["warning_codes"]
+
+
+def test_evaluation_artifact_contains_ic_series_and_method(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    result = evaluate_factor(
+        "FTR_DEMO_SMALL_CAP",
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        horizon_days=21,
+    )
+    payload = json.loads(result.artifact_path.read_text(encoding="utf-8"))
+
+    assert payload["schema_version"] == "qf.metrics.v2"
+    assert payload["sample_role"] == "research_evaluation"
+    assert payload["ic_series"]
+    assert "rank_ic_t_stat_naive" in payload
+    assert "rank_ic_t_stat_hac" in payload
+    assert payload["rank_ic_hac_lag"] == 20
+    assert payload["metric_provenance"]["rank_ic_t_stat"]["method"] == "newey_west_bartlett"
+    assert payload["coverage_lineage"]["joint_valid_rows"] == payload["observations"]

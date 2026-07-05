@@ -165,6 +165,7 @@ def load_config(config_path: Path | None = None, workspace: Path | None = None) 
             raise ValueError("config file must contain a mapping")
         raw = loaded
 
+    _reject_unknown_paths_keys(raw)
     runtime = runtime_settings_from_mapping(raw.get("runtime"), base_dir=config_dir)
     load_runtime_env_files(runtime.env_files)
     config = QuantForgeConfig(
@@ -492,6 +493,38 @@ def _require_gitless_runtime_env_file_pattern(relative: Path, env_file: Path) ->
         raise ValueError(
             "git executable is unavailable; runtime env files inside a worktree "
             f"must be named *.local.env or *.secrets.env: {env_file}"
+        )
+
+
+_KNOWN_PATHS_KEYS = (
+    "data_root",
+    "factor_root",
+    "factor_values_root",
+    "factor_values_overlay_root",
+    "factor_values_manifest_root",
+    "artifact_root",
+    "output_root",
+)
+
+
+def _reject_unknown_paths_keys(raw: dict[str, Any]) -> None:
+    """Fail loudly on typo'd optional path keys.
+
+    A misspelled optional key (e.g. ``factor_values_rooot``) would otherwise be
+    silently ignored, making a mounted precomputed store disappear with no
+    warning. Reject any key under ``paths:`` that is not a known setting.
+    """
+
+    section = raw.get("paths")
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        raise ValueError("config section must be a mapping: paths")
+    unknown = sorted(key for key in section if key not in _KNOWN_PATHS_KEYS)
+    if unknown:
+        accepted = ", ".join(_KNOWN_PATHS_KEYS)
+        raise ValueError(
+            f"unknown paths keys in config: {', '.join(unknown)}. Accepted paths keys: {accepted}."
         )
 
 

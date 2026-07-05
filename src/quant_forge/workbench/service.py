@@ -32,6 +32,7 @@ class WorkbenchService:
         simulation_profile: SimulationProfile | None = None,
         transaction_costs: TransactionCostModel | None = None,
         sample_splits: tuple[SampleSplitSpec, ...] | None = None,
+        horizon_days_matrix: tuple[int, ...] | None = None,
     ) -> None:
         self.factor_root = factor_root
         self.data_root = data_root
@@ -42,6 +43,7 @@ class WorkbenchService:
         self.simulation_profile = simulation_profile or SimulationProfile()
         self.transaction_costs = transaction_costs or TransactionCostModel()
         self.sample_splits = sample_splits
+        self.horizon_days_matrix = horizon_days_matrix
 
     def list_factors(self) -> list[FactorDefinition]:
         return FactorCatalog(
@@ -64,6 +66,8 @@ class WorkbenchService:
             data_root=self.data_root,
             artifact_root=self.artifact_root,
             horizon_days=horizon_days,
+            horizon_days_matrix=self.horizon_days_matrix,
+            sample_splits=self.sample_splits,
             simulation_profile=simulation_profile or self.simulation_profile,
             factor_values_root=self.factor_values_root,
             factor_values_overlay_root=self.factor_values_overlay_root,

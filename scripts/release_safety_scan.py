@@ -164,7 +164,12 @@ def _contains_env_secret_assignment(text: str) -> bool:
             continue
         if value.startswith(("sk-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_")):
             return True
-        if len(value) >= 16 and re.search(r"[A-Za-z]", value) and re.search(r"\d", value):
+        # Flag any surviving non-placeholder value that looks like a single secret
+        # token (no whitespace, token-shaped, length >= 16), regardless of char
+        # class. Dropping the earlier digit requirement catches purely alphabetic
+        # keys such as an alpha-only DEEPSEEK_API_KEY; the whitespace-free token
+        # regex plus the placeholder allowlist keep prose values from tripping.
+        if re.fullmatch(r"[A-Za-z0-9._\-/+=]{16,}", value):
             return True
     return False
 
@@ -179,7 +184,25 @@ def _is_placeholder_secret_value(value: str) -> bool:
     normalized = value.strip().lower()
     if normalized in PLACEHOLDER_SECRET_VALUES:
         return True
-    return normalized.startswith("<") and normalized.endswith(">")
+    if normalized.startswith("<") and normalized.endswith(">"):
+        return True
+    return _looks_like_hyphenated_word_placeholder(normalized)
+
+
+def _looks_like_hyphenated_word_placeholder(normalized: str) -> bool:
+    """Treat multi-word ``-``/``_``-delimited fixtures as placeholders.
+
+    A real leaked key is a single dense token (e.g. ``abcdefghijklmnopqrstuvwx``
+    or ``abc1234567890secret``). A documentation/test fixture such as
+    ``local-fixture-secret-value`` splits into several short lowercase
+    dictionary-like words. This keeps such prose fixtures from tripping the
+    length-only secret heuristic without weakening detection of dense tokens.
+    """
+
+    segments = re.split(r"[-_]", normalized)
+    if len(segments) < 3:
+        return False
+    return all(bool(seg) and seg.isalpha() for seg in segments)
 
 
 if __name__ == "__main__":

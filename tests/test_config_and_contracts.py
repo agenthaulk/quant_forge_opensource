@@ -812,6 +812,73 @@ llm:
         load_config(config_path)
 
 
+def test_config_rejects_unknown_paths_key(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+paths:
+  factor_values_rooot: factor_values
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"factor_values_rooot"):
+        load_config(config_path)
+
+
+def test_config_accepts_all_known_paths_keys(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+paths:
+  data_root: data
+  factor_root: factor_root
+  factor_values_root: factor_values
+  factor_values_overlay_root: factor_values_overlay
+  factor_values_manifest_root: manifests/factor_values
+  artifact_root: artifacts
+  output_root: outputs
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path, workspace=tmp_path)
+
+    assert config.paths.factor_values_root == tmp_path / "factor_values"
+    assert config.paths.output_root == tmp_path / "outputs"
+
+
+def test_workbench_evaluate_threads_horizon_matrix_and_splits(tmp_path: Path) -> None:
+    from quant_forge.core.contracts import SampleSplitSpec
+    from quant_forge.workbench.service import WorkbenchService
+
+    paths = create_demo_workspace(tmp_path / "demo")
+    splits = (
+        SampleSplitSpec(name="IS", fraction=0.6, score_weight=0.6),
+        SampleSplitSpec(name="OOS", fraction=0.4, score_weight=0.4),
+    )
+    horizon_matrix = (5, 10)
+
+    configured = WorkbenchService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        sample_splits=splits,
+        horizon_days_matrix=horizon_matrix,
+    ).evaluate("FTR_DEMO_SMALL_CAP")
+
+    default = WorkbenchService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+    ).evaluate("FTR_DEMO_SMALL_CAP")
+
+    assert [metric.horizon_days for metric in configured.horizon_metrics] == list(horizon_matrix)
+    assert [split.name for split in configured.split_metrics] == ["IS", "OOS"]
+    # The default-constructed service must differ, proving the values flow through.
+    assert [split.name for split in default.split_metrics] != ["IS", "OOS"]
+
+
 def test_config_reports_empty_path_settings(tmp_path: Path) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(

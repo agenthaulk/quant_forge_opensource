@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, date, datetime
+import gc
+import hmac
 from html import escape
 import json
 import logging
@@ -17,7 +19,7 @@ from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from quant_forge.backtesting.service import run_factor_backtest
+from quant_forge.backtesting.service import run_factor_backtest, run_staggered_entry_backtest
 from quant_forge.config import QuantForgeConfig, simulation_profile_from_mapping, validate_llm_runtime
 from quant_forge.core.contracts import (
     BacktestResult,
@@ -48,9 +50,13 @@ from quant_forge.research_loop.service import ResearchLoopResult, ResearchLoopSe
 LOGGER = logging.getLogger(__name__)
 LONG_RUNNING_JOB_SECONDS = 10.0
 MAX_RD_ITERATIONS = 5
+MAX_REQUEST_BODY_BYTES = 1024 * 1024
 _TERMINAL_JOB_STATUSES = {"completed", "failed", "cancelled"}
 _WEB_PATH_KEYS = {
     "artifact_path",
+    "evaluation_artifact_path",
+    "selection_backtest_artifact_path",
+    "external_oos_artifact_path",
     "factor_values_path",
     "factor_values_write_path",
     "trace_root",
@@ -61,6 +67,10 @@ _WEB_PATH_KEYS = {
 
 class _WebJobCancelled(RuntimeError):
     pass
+
+
+class RequestBodyTooLarge(Exception):
+    """Raised when a request body exceeds MAX_REQUEST_BODY_BYTES."""
 
 
 @dataclass
@@ -101,6 +111,9 @@ class _WebJobManager:
         job = _WebJob(job_id=job_id, kind=kind, status="running", started_at=now, updated_at=now)
 
         def run() -> None:
+            gc_was_enabled = gc.isenabled()
+            if gc_was_enabled:
+                gc.disable()
             try:
                 result = runner(job.cancel_event)
             except _WebJobCancelled as exc:
@@ -126,6 +139,10 @@ class _WebJobManager:
                         )
                     else:
                         self._finish(job_id, status="completed", result=public_result)
+            finally:
+                if gc_was_enabled:
+                    gc.enable()
+                    gc.collect()
 
         thread = threading.Thread(target=run, name=f"qf-web-job-{job_id}", daemon=True)
         job.thread = thread
@@ -336,6 +353,21 @@ def _validate_factor_workflow(
             factor_values_manifest_root=config.paths.factor_values_manifest_root,
         )
         _raise_if_cancelled(cancel_event)
+        in_sample_backtest = run_factor_backtest(
+            factor.factor_id,
+            factor_root=config.paths.factor_root,
+            data_root=config.paths.data_root,
+            artifact_root=config.paths.artifact_root,
+            simulation_profile=settings.evaluation_profile,
+            holding_days=settings.holding_days,
+            transaction_costs=settings.transaction_costs,
+            sample_splits=rd_config.sample_splits,
+            factor_values_root=config.paths.factor_values_root,
+            factor_values_overlay_root=config.paths.factor_values_overlay_root,
+            factor_values_manifest_root=config.paths.factor_values_manifest_root,
+            sample_role="in_sample_backtest",
+        )
+        _raise_if_cancelled(cancel_event)
         backtest = run_factor_backtest(
             factor.factor_id,
             factor_root=config.paths.factor_root,
@@ -348,6 +380,7 @@ def _validate_factor_workflow(
             factor_values_root=config.paths.factor_values_root,
             factor_values_overlay_root=config.paths.factor_values_overlay_root,
             factor_values_manifest_root=config.paths.factor_values_manifest_root,
+            sample_role="external_oos_backtest",
         )
         _raise_if_cancelled(cancel_event)
     except Exception:
@@ -357,9 +390,44 @@ def _validate_factor_workflow(
         factor,
         parser=parser,
         evaluation=evaluation,
+        in_sample_backtest=in_sample_backtest,
         backtest=backtest,
         parameters=settings.parameters,
     )
+
+
+def run_staggered_entry_workflow(
+    config: QuantForgeConfig,
+    factor_id: str,
+    *,
+    parameters: dict[str, Any] | None = None,
+    formation_trading_days: int | None = None,
+    rd_config: ResearchLoopConfig | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    """Run first-month staggered-entry robustness for a persisted factor."""
+
+    if not factor_id.strip():
+        raise ValueError("factor_id is required")
+    _raise_if_cancelled(cancel_event)
+    research_config = rd_config or load_research_loop_config(DEFAULT_RD_CONFIG_PATH, config.research, config.simulation)
+    factor = FactorRepository(config.paths.factor_root).get(factor_id)
+    settings = _idea_validation_settings(factor, parameters, research_config)
+    result = run_staggered_entry_backtest(
+        factor.factor_id,
+        factor_root=config.paths.factor_root,
+        data_root=config.paths.data_root,
+        artifact_root=config.paths.artifact_root,
+        holding_days=settings.holding_days,
+        simulation_profile=settings.backtest_profile,
+        transaction_costs=settings.transaction_costs,
+        formation_trading_days=formation_trading_days,
+        factor_values_root=config.paths.factor_values_root,
+        factor_values_overlay_root=config.paths.factor_values_overlay_root,
+        factor_values_manifest_root=config.paths.factor_values_manifest_root,
+    )
+    _raise_if_cancelled(cancel_event)
+    return result
 
 
 def run_research_once_workflow(
@@ -498,6 +566,16 @@ def create_local_web_server(
                     )
                     self._json(result)
                     return
+                if path == "/api/staggered-entry":
+                    result = run_staggered_entry_workflow(
+                        config,
+                        str(payload.get("factor_id", "")),
+                        parameters=_optional_parameters_payload(payload.get("parameters")),
+                        formation_trading_days=_optional_int(payload.get("formation_trading_days"), "formation_trading_days"),
+                        rd_config=research_config,
+                    )
+                    self._json(result)
+                    return
                 if path == "/api/research/run-once":
                     result = run_research_once_workflow(
                         config,
@@ -557,6 +635,25 @@ def create_local_web_server(
                         status=202,
                     )
                     return
+                if path == "/api/jobs/staggered-entry":
+                    self._json(
+                        job_manager.start(
+                            "staggered_entry",
+                            lambda cancel_event: run_staggered_entry_workflow(
+                                config,
+                                str(payload.get("factor_id", "")),
+                                parameters=_optional_parameters_payload(payload.get("parameters")),
+                                formation_trading_days=_optional_int(
+                                    payload.get("formation_trading_days"),
+                                    "formation_trading_days",
+                                ),
+                                rd_config=research_config,
+                                cancel_event=cancel_event,
+                            ),
+                        ),
+                        status=202,
+                    )
+                    return
                 if path == "/api/jobs/research-run-once":
                     self._json(
                         job_manager.start(
@@ -605,6 +702,8 @@ def create_local_web_server(
                 self._json({"error": str(exc)}, status=404)
             except PermissionError:
                 self._json({"error": "unauthorized"}, status=401)
+            except RequestBodyTooLarge as exc:
+                self._json({"error": str(exc)}, status=413)
             except ValueError as exc:
                 self._json({"error": str(exc)}, status=400)
             except Exception as exc:
@@ -618,6 +717,10 @@ def create_local_web_server(
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0:
                 return {}
+            if length > MAX_REQUEST_BODY_BYTES:
+                raise RequestBodyTooLarge(
+                    f"request body exceeds {MAX_REQUEST_BODY_BYTES} bytes"
+                )
             raw = self.rfile.read(length).decode("utf-8")
             payload = json.loads(raw)
             if not isinstance(payload, dict):
@@ -644,7 +747,8 @@ def create_local_web_server(
             if not control_token_required:
                 return
             supplied = self.headers.get("Authorization", "")
-            if supplied != f"Bearer {control_token}":
+            expected = f"Bearer {control_token}"
+            if not hmac.compare_digest(supplied, expected):
                 raise PermissionError("unauthorized")
 
     return ThreadingHTTPServer((host, port), Handler)
@@ -672,6 +776,7 @@ def _validation_payload(
     *,
     parser: dict[str, Any] | None,
     evaluation: EvaluationResult,
+    in_sample_backtest: BacktestResult,
     backtest: BacktestResult,
     parameters: dict[str, Any],
 ) -> dict[str, Any]:
@@ -680,6 +785,7 @@ def _validation_payload(
         "factor": _json_safe(factor),
         "parameters": _json_safe(parameters),
         "evaluation": _json_safe(evaluation),
+        "in_sample_backtest": _json_safe(in_sample_backtest),
         "backtest": _json_safe(backtest),
     }
 
@@ -1061,17 +1167,29 @@ def _run_research_iterations(
     rounds: list[dict[str, Any]] = []
     last_result: ResearchLoopResult | None = None
     stopped_reason = "completed"
+    failed_round_index = 0
+    chain_error = ""
 
     for round_index in range(1, requested_iterations + 1):
         _raise_if_cancelled(cancel_event)
-        result = _run_research_once(
-            config,
-            rd_config,
-            current_seed,
-            objective=objective,
-            max_candidates=max_candidates,
-            cancel_event=cancel_event,
-        )
+        try:
+            result = _run_research_once(
+                config,
+                rd_config,
+                current_seed,
+                objective=objective,
+                max_candidates=max_candidates,
+                cancel_event=cancel_event,
+            )
+        except Exception as exc:
+            if cancel_event is not None and cancel_event.is_set():
+                raise _WebJobCancelled("run cancelled by user") from exc
+            if last_result is None:
+                raise
+            failed_round_index = round_index
+            chain_error = _client_error_message(exc, fallback="research iteration failed")
+            stopped_reason = "iteration_failed"
+            break
         last_result = result
         next_seed, selection_reason = _next_research_seed(result, current_seed)
         rounds.append(_research_iteration_summary(result, round_index, next_seed, selection_reason))
@@ -1088,7 +1206,7 @@ def _run_research_iterations(
 
     if last_result is None:
         raise ValueError("research iterations require at least one round")
-    payload = _json_safe(last_result)
+    payload = _research_result_payload(last_result)
     optimization_summary = _research_optimization_summary(rounds)
     accepted_factor_id = _last_accepted_research_factor_id(rounds)
     last_explored_factor_id = _last_explored_research_factor_id(last_result, original_seed)
@@ -1097,6 +1215,9 @@ def _run_research_iterations(
     exploration_summary = _research_exploration_seed_summary(rounds)
     payload["requested_iterations"] = requested_iterations
     payload["iteration_count"] = len(rounds)
+    payload["failed_round_index"] = failed_round_index
+    payload["chain_error"] = chain_error
+    payload["partial_result"] = bool(chain_error)
     payload["seed_factor_id"] = original_seed
     payload["original_seed_factor_id"] = original_seed
     payload["last_round_seed_factor_id"] = last_result.seed_factor_id
@@ -1112,9 +1233,13 @@ def _run_research_iterations(
     payload.update(exploration_summary)
     payload["accepted_candidate_ids"] = _aggregate_research_accepted_ids(rounds)
     payload["round_report_paths"] = [str(item["report_path"]) for item in rounds if item.get("report_path")]
+    payload["comparison_rows"] = _aggregate_research_comparison_rows(rounds)
     payload["iteration_chain"] = {
         "requested_iterations": requested_iterations,
         "completed_iterations": len(rounds),
+        "failed_round_index": failed_round_index,
+        "chain_error": chain_error,
+        "partial_result": bool(chain_error),
         "original_seed_factor_id": original_seed,
         "last_round_seed_factor_id": last_result.seed_factor_id,
         "final_seed_factor_id": last_result.seed_factor_id,
@@ -1127,6 +1252,7 @@ def _run_research_iterations(
         **optimization_summary,
         **exploration_summary,
         "round_report_paths": payload["round_report_paths"],
+        "comparison_rows": payload["comparison_rows"],
         "rounds": rounds,
     }
     return payload
@@ -1210,6 +1336,193 @@ def _research_iteration_summary(
         "optimization_performed": result.optimization_performed,
         "no_optimization_performed": result.no_optimization_performed,
         "report_path": str(result.report_path) if result.report_path is not None else "",
+        "comparison_rows": _json_safe(result.comparison_rows),
+    }
+
+
+def _research_result_payload(result: ResearchLoopResult) -> dict[str, Any]:
+    """Return the compact RD shape used by the Web UI.
+
+    ResearchLoopResult carries full evaluation/backtest objects, including
+    per-day ledgers and schedules. Those belong in artifacts, not in the
+    browser job payload.
+    """
+
+    return {
+        "rd_stage": result.rd_stage,
+        "seed_factor_id": result.seed_factor_id,
+        "objective": result.objective,
+        "objective_weights": _json_safe(result.objective_weights),
+        "gate": _json_safe(result.gate),
+        "candidates": [_research_candidate_payload(candidate) for candidate in result.candidates],
+        "accepted_candidate_ids": list(result.accepted_candidate_ids),
+        "comparison_rows": _json_safe(result.comparison_rows),
+        "generation": _json_safe(result.generation),
+        "search_trace": _json_safe(result.search_trace),
+        "blocked_plans": _json_safe(result.blocked_plans),
+        "trace_root": result.trace_root,
+        "report_path": result.report_path,
+        "workflow_type": result.workflow_type,
+        "deduplication": _json_safe(result.deduplication),
+        "optimization_performed": result.optimization_performed,
+        "no_optimization_performed": result.no_optimization_performed,
+    }
+
+
+def _research_candidate_payload(candidate: Any) -> dict[str, Any]:
+    selection_backtest = candidate.selection_backtest or candidate.backtest
+    external_oos_backtest = candidate.external_oos_backtest or candidate.backtest
+    return {
+        "hypothesis": _json_safe(candidate.hypothesis),
+        "factor": _json_safe(candidate.factor),
+        "evaluation": _evaluation_payload(candidate.evaluation),
+        "backtest": _backtest_payload(candidate.backtest),
+        "selection_backtest": _backtest_payload(selection_backtest),
+        "external_oos_backtest": _backtest_payload(external_oos_backtest),
+        "split_weighted_icir": candidate.split_weighted_icir,
+        "score": candidate.score,
+        "gate_passed": candidate.gate_passed,
+        "gate_reasons": list(candidate.gate_reasons),
+        "self_review": _json_safe(candidate.self_review),
+        "transitioned_to_candidate": candidate.transitioned_to_candidate,
+        "formula_fingerprint": candidate.formula_fingerprint,
+        "result_signature": candidate.result_signature,
+        "candidate_shape_fingerprint": candidate.candidate_shape_fingerprint,
+    }
+
+
+def _evaluation_payload(evaluation: EvaluationResult) -> dict[str, Any]:
+    return {
+        "factor_id": evaluation.factor_id,
+        "observations": evaluation.observations,
+        "coverage": evaluation.coverage,
+        "rank_ic_mean": evaluation.rank_ic_mean,
+        "rank_ic_std": evaluation.rank_ic_std,
+        "rank_icir": evaluation.rank_icir,
+        "ic_days": evaluation.ic_days,
+        "artifact_path": evaluation.artifact_path,
+        "rank_ic_t_stat": evaluation.rank_ic_t_stat,
+        "split_metrics": _json_safe(evaluation.split_metrics),
+        "horizon_metrics": [_horizon_metric_payload(metric) for metric in evaluation.horizon_metrics],
+        "simulation_profile": _json_safe(evaluation.simulation_profile),
+        "score_source": evaluation.score_source,
+        "score_cached_rows": evaluation.score_cached_rows,
+        "score_computed_rows": evaluation.score_computed_rows,
+        "factor_values_path": evaluation.factor_values_path,
+        "factor_values_write_path": evaluation.factor_values_write_path,
+        "score_compute_mode": evaluation.score_compute_mode,
+        "score_compute_reason": evaluation.score_compute_reason,
+        "score_missing_rows": evaluation.score_missing_rows,
+        "score_required_rows": evaluation.score_required_rows,
+        "score_missing_ratio": evaluation.score_missing_ratio,
+        "score_lookback_rows": evaluation.score_lookback_rows,
+        "score_context_rows": evaluation.score_context_rows,
+        "warnings": list(evaluation.warnings),
+        "schema_version": evaluation.schema_version,
+        "sample_role": evaluation.sample_role,
+        "rank_ic_t_stat_naive": evaluation.rank_ic_t_stat_naive,
+        "rank_ic_t_stat_hac": evaluation.rank_ic_t_stat_hac,
+        "rank_ic_hac_standard_error": evaluation.rank_ic_hac_standard_error,
+        "rank_ic_hac_lag": evaluation.rank_ic_hac_lag,
+        "rank_ic_p_value_hac": evaluation.rank_ic_p_value_hac,
+        "coverage_lineage": _json_safe(evaluation.coverage_lineage),
+        "boundary_diagnostics": _json_safe(evaluation.boundary_diagnostics),
+        "metric_provenance": _json_safe(evaluation.metric_provenance),
+        "warning_codes": list(evaluation.warning_codes),
+        "metrics": _json_safe(evaluation.metrics),
+    }
+
+
+def _horizon_metric_payload(metric: Any) -> dict[str, Any]:
+    return {
+        "horizon_days": metric.horizon_days,
+        "observations": metric.observations,
+        "coverage": metric.coverage,
+        "rank_ic_mean": metric.rank_ic_mean,
+        "rank_ic_std": metric.rank_ic_std,
+        "rank_icir": metric.rank_icir,
+        "ic_days": metric.ic_days,
+        "rank_ic_t_stat": metric.rank_ic_t_stat,
+        "sample_role": metric.sample_role,
+        "rank_ic_t_stat_naive": metric.rank_ic_t_stat_naive,
+        "rank_ic_t_stat_hac": metric.rank_ic_t_stat_hac,
+        "rank_ic_hac_standard_error": metric.rank_ic_hac_standard_error,
+        "rank_ic_hac_lag": metric.rank_ic_hac_lag,
+        "rank_ic_p_value_hac": metric.rank_ic_p_value_hac,
+        "coverage_lineage": _json_safe(metric.coverage_lineage),
+        "boundary_diagnostics": _json_safe(metric.boundary_diagnostics),
+        "metric_provenance": _json_safe(metric.metric_provenance),
+        "warning_codes": list(metric.warning_codes),
+        "metrics": _json_safe(metric.metrics),
+    }
+
+
+def _backtest_payload(backtest: BacktestResult) -> dict[str, Any]:
+    return {
+        "factor_id": backtest.factor_id,
+        "periods": backtest.periods,
+        "holding_days": backtest.holding_days,
+        "cumulative_return": backtest.cumulative_return,
+        "annualized_return": backtest.annualized_return,
+        "annualized_volatility": backtest.annualized_volatility,
+        "max_drawdown": backtest.max_drawdown,
+        "artifact_path": backtest.artifact_path,
+        "long_short_sharpe": backtest.long_short_sharpe,
+        "gross_cumulative_return": backtest.gross_cumulative_return,
+        "gross_annualized_return": backtest.gross_annualized_return,
+        "gross_annualized_volatility": backtest.gross_annualized_volatility,
+        "gross_long_short_sharpe": backtest.gross_long_short_sharpe,
+        "gross_max_drawdown": backtest.gross_max_drawdown,
+        "rebalance_rate": backtest.rebalance_rate,
+        "turnover_rate": backtest.turnover_rate,
+        "net_cumulative_return": backtest.net_cumulative_return,
+        "net_annualized_return": backtest.net_annualized_return,
+        "net_annualized_volatility": backtest.net_annualized_volatility,
+        "net_long_short_sharpe": backtest.net_long_short_sharpe,
+        "net_max_drawdown": backtest.net_max_drawdown,
+        "top_quantile": backtest.top_quantile,
+        "transaction_costs": _json_safe(backtest.transaction_costs),
+        "simulation_profile": _json_safe(backtest.simulation_profile),
+        "group_returns": _json_safe(backtest.group_returns),
+        "segment_metrics": _json_safe(backtest.segment_metrics),
+        "warnings": list(backtest.warnings),
+        "assumptions": list(backtest.assumptions),
+        "score_source": backtest.score_source,
+        "score_cached_rows": backtest.score_cached_rows,
+        "score_computed_rows": backtest.score_computed_rows,
+        "factor_values_path": backtest.factor_values_path,
+        "factor_values_write_path": backtest.factor_values_write_path,
+        "score_compute_mode": backtest.score_compute_mode,
+        "score_compute_reason": backtest.score_compute_reason,
+        "score_missing_rows": backtest.score_missing_rows,
+        "score_required_rows": backtest.score_required_rows,
+        "score_missing_ratio": backtest.score_missing_ratio,
+        "score_lookback_rows": backtest.score_lookback_rows,
+        "score_context_rows": backtest.score_context_rows,
+        "schema_version": backtest.schema_version,
+        "sample_role": backtest.sample_role,
+        "return_series_kind": backtest.return_series_kind,
+        "completed_periods": backtest.completed_periods,
+        "partial_periods": backtest.partial_periods,
+        "exposure_days": backtest.exposure_days,
+        "calendar_days": backtest.calendar_days,
+        "reportable_annualization": _json_safe(backtest.reportable_annualization),
+        "extrapolated_annualization": _json_safe(backtest.extrapolated_annualization),
+        "initial_build_turnover": backtest.initial_build_turnover,
+        "rebalance_turnover_mean": backtest.rebalance_turnover_mean,
+        "rebalance_turnover_observation_count": backtest.rebalance_turnover_observation_count,
+        "replacement_rate_mean": backtest.replacement_rate_mean,
+        "replacement_rate_observation_count": backtest.replacement_rate_observation_count,
+        "cost_reconciliation": _json_safe(backtest.cost_reconciliation),
+        "metric_provenance": _json_safe(backtest.metric_provenance),
+        "warning_codes": list(backtest.warning_codes),
+        "metrics": _json_safe(backtest.metrics),
+        "benchmark": _json_safe(backtest.benchmark),
+        "benchmark_cumulative_return": backtest.benchmark_cumulative_return,
+        "arithmetic_excess_return": backtest.arithmetic_excess_return,
+        "relative_wealth_excess_return": backtest.relative_wealth_excess_return,
+        "tracking_error": backtest.tracking_error,
+        "information_ratio": backtest.information_ratio,
     }
 
 
@@ -1247,6 +1560,19 @@ def _aggregate_research_accepted_ids(rounds: list[dict[str, Any]]) -> list[str]:
                 accepted.append(str(factor_id))
                 seen.add(str(factor_id))
     return accepted
+
+
+def _aggregate_research_comparison_rows(rounds: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in rounds:
+        round_index = int(item.get("round") or 0)
+        for raw_row in item.get("comparison_rows") or ():
+            if not isinstance(raw_row, dict):
+                continue
+            row = dict(raw_row)
+            row["round"] = round_index
+            rows.append(row)
+    return rows
 
 
 def _utc_now() -> str:
@@ -1325,7 +1651,7 @@ def _client_error_message(exc: Exception, *, fallback: str) -> str:
     if isinstance(exc, ValueError):
         return str(exc)
     text = str(exc)
-    if "Missing API key" in text or "requires api_key_env" in text:
+    if "Missing API key" in text or "requires api_key_env" in text or text.startswith("LLM request "):
         return text
     return fallback
 
@@ -1935,6 +2261,27 @@ def _index_html(
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 14px;
     }}
+    .comparison-table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }}
+    .comparison-table th,
+    .comparison-table td {{
+      border-bottom: 1px solid var(--line);
+      padding: 8px 6px;
+      text-align: left;
+      vertical-align: top;
+    }}
+    .comparison-table th {{
+      color: var(--muted);
+      font-weight: 800;
+    }}
+    .comparison-table code {{
+      display: inline-block;
+      max-width: 220px;
+      overflow-wrap: anywhere;
+    }}
     .empty-state {{
       min-height: 240px;
       display: grid;
@@ -1971,16 +2318,16 @@ def _index_html(
       <h1>Quant Forge</h1>
       <p class="brand-subtitle">Factor research console</p>
     </div>
-    <p class="sr-only">LLM parser: {provider} / {model}</p>
-    <p class="sr-only">RD optimizer: {rd_optimizer_label}</p>
+    <p id="runtime-llm-sr" class="sr-only">LLM parser: {provider} / {model}</p>
+    <p id="runtime-rd-sr" class="sr-only">RD optimizer: {rd_optimizer_label}</p>
     <div class="runtime-strip">
-      <div class="runtime-row"><span>LLM</span><strong>{provider} / {model}</strong></div>
-      <div class="runtime-row"><span>RD</span><strong>{rd_optimizer_label}</strong></div>
-      <div class="runtime-row"><span>data</span><div class="path-meta">{data_root}</div></div>
-      <div class="runtime-row"><span>factors</span><div class="path-meta">{factor_root}</div></div>
-      <div class="runtime-row"><span>values</span><div class="path-meta">{factor_values_root or '未配置'}</div></div>
-      <div class="runtime-row"><span>overlay</span><div class="path-meta">{factor_values_overlay_root or '未配置'}</div></div>
-      <div class="runtime-row"><span>artifacts</span><div class="path-meta">{artifact_root}</div></div>
+      <div class="runtime-row"><span>LLM</span><strong id="runtime-llm">{provider} / {model}</strong></div>
+      <div class="runtime-row"><span>RD</span><strong id="runtime-rd">{rd_optimizer_label}</strong></div>
+      <div class="runtime-row"><span>data</span><div id="runtime-data-root" class="path-meta">{data_root}</div></div>
+      <div class="runtime-row"><span>factors</span><div id="runtime-factor-root" class="path-meta">{factor_root}</div></div>
+      <div class="runtime-row"><span>values</span><div id="runtime-factor-values-root" class="path-meta">{factor_values_root or '未配置'}</div></div>
+      <div class="runtime-row"><span>overlay</span><div id="runtime-factor-values-overlay-root" class="path-meta">{factor_values_overlay_root or '未配置'}</div></div>
+      <div class="runtime-row"><span>artifacts</span><div id="runtime-artifact-root" class="path-meta">{artifact_root}</div></div>
     </div>
     <div class="form-block">
       <div class="section-title">
@@ -2021,6 +2368,7 @@ def _index_html(
       </div>
       <button id="run">解析因子</button>
       <button id="validate-run" class="secondary" disabled>验证并评测</button>
+      <button id="staggered-run" class="secondary" disabled>首月逐日建仓稳健性回测</button>
       <button id="cancel-run" class="secondary danger" disabled>中断本次运行</button>
       <p id="status" class="meta"></p>
     </div>
@@ -2064,6 +2412,7 @@ def _index_html(
         <p class="meta">输入因子观点后运行，公式、IC、回测收益、缓存路径会在这里展开。</p>
       </div>
     </div>
+    <div id="staggered-result"></div>
     <div class="section-title">
       <h2>RD Loop</h2>
       <p>候选因子与研究证据</p>
@@ -2079,15 +2428,17 @@ def _index_html(
 <script>
 const button = document.getElementById('run');
 const validateButton = document.getElementById('validate-run');
+const staggeredButton = document.getElementById('staggered-run');
 const cancelButton = document.getElementById('cancel-run');
 const statusEl = document.getElementById('status');
 const errorEl = document.getElementById('error');
 const resultEl = document.getElementById('result');
+const staggeredResultEl = document.getElementById('staggered-result');
 const llmProviderSelect = document.getElementById('llm-provider');
 const llmApiKeyMode = document.getElementById('llm-api-key-mode');
 const llmApiKeyInput = document.getElementById('llm-api-key');
 const llmApiKeyStatus = document.getElementById('llm-api-key-status');
-const llmProviderOptions = {llm_provider_options_json};
+let llmProviderOptions = {llm_provider_options_json};
 const validationInputs = {{
   holding_days: document.getElementById('param-holding-days'),
   decay_days: document.getElementById('param-decay-days'),
@@ -2110,12 +2461,15 @@ const rdResultEl = document.getElementById('rd-result');
 let activeIdeaJobId = null;
 let activeRdJobId = null;
 let parsedIdea = null;
+let validatedFactorId = null;
 const controlTokenRequired = {str(control_token_required).lower()};
 
 function pct(value) {{
+  if (value === undefined || value === null || Number.isNaN(Number(value))) return 'n/a';
   return (Number(value) * 100).toFixed(2) + '%';
 }}
 function num(value, digits = 4) {{
+  if (value === undefined || value === null || Number.isNaN(Number(value))) return 'n/a';
   return Number(value).toFixed(digits);
 }}
 function esc(value) {{
@@ -2135,6 +2489,9 @@ function resetIdeaResult(title, message) {{
       <h3>${{esc(title)}}</h3>
       <p class="meta">${{esc(message)}}</p>
     </div>`;
+}}
+function resetStaggeredResult() {{
+  staggeredResultEl.innerHTML = '';
 }}
 function resetRdResult(title, message) {{
   rdResultEl.innerHTML = `
@@ -2157,8 +2514,63 @@ function setValidationInputsEnabled(enabled) {{
   }});
   validateButton.disabled = !enabled;
 }}
+function setStaggeredEnabled(enabled) {{
+  staggeredButton.disabled = !enabled;
+}}
 function currentProviderOption() {{
   return llmProviderOptions.find(option => option.provider === llmProviderSelect.value) || null;
+}}
+function providerReadinessLabel(option) {{
+  if (option.runtimeReady === 'true') {{
+    return option.apiKeyEnv ? ` · env ${{option.apiKeyEnv}}` : ' · no auth';
+  }}
+  return option.apiKeyEnv ? ` · missing env ${{option.apiKeyEnv}}` : ' · not ready';
+}}
+function setRuntimeText(id, value) {{
+  const element = document.getElementById(id);
+  if (element) element.textContent = value || '未配置';
+}}
+function hydrateRuntimeStatus(status) {{
+  const llm = status.llm || {{}};
+  const rd = status.rd || {{}};
+  const paths = status.paths || {{}};
+  const llmLabel = `${{llm.provider || '未配置'}} / ${{llm.model || '未配置'}}`;
+  const rdMode = `${{rd.hypothesis_mode || 'unknown'}}/${{rd.review_mode || 'unknown'}}`;
+  const rdLabel = `${{rd.research_stage || 'research'}} ${{rdMode}} ${{rd.provider || ''}} ${{rd.model || ''}}`.trim();
+  setRuntimeText('runtime-llm', llmLabel);
+  setRuntimeText('runtime-rd', rdLabel);
+  setRuntimeText('runtime-data-root', paths.data_root || '');
+  setRuntimeText('runtime-factor-root', paths.factor_root || '');
+  setRuntimeText('runtime-factor-values-root', paths.factor_values_root || '');
+  setRuntimeText('runtime-factor-values-overlay-root', paths.factor_values_overlay_root || '');
+  setRuntimeText('runtime-artifact-root', paths.artifact_root || '');
+  setRuntimeText('runtime-llm-sr', `LLM parser: ${{llmLabel}}`);
+  setRuntimeText('runtime-rd-sr', `RD optimizer: ${{rdLabel}}`);
+  llmProviderOptions = (llm.providers || []).map(option => ({{
+    provider: option.provider || '',
+    model: option.model || '',
+    apiKeyEnv: option['api' + '_key_env'] || '',
+    runtimeReady: option['runtime' + '_ready'] || 'false'
+  }}));
+  if (llmProviderOptions.length) {{
+    llmProviderSelect.innerHTML = llmProviderOptions.map(option => {{
+      const selected = option.provider === llm.provider ? ' selected' : '';
+      return `<option value="${{esc(option.provider)}}"${{selected}}>${{esc(option.provider)}} / ${{esc(option.model)}}${{esc(providerReadinessLabel(option))}}</option>`;
+    }}).join('');
+  }}
+  const parserOption = document.querySelector('#parser option[value="llm"]');
+  if (parserOption) parserOption.textContent = `LLM 语义解析: ${{llm.provider || '未配置 LLM provider'}}`;
+  syncLlmApiKeyControls();
+}}
+async function refreshRuntimeStatus() {{
+  if (!controlTokenRequired) return;
+  const token = window.sessionStorage.getItem('qf_control_token') || '';
+  if (!token) return;
+  const response = await fetch('/api/status', {{
+    headers: {{Authorization: `Bearer ${{token}}`}}
+  }});
+  if (!response.ok) return;
+  hydrateRuntimeStatus(await response.json());
 }}
 function syncLlmApiKeyControls() {{
   const option = currentProviderOption();
@@ -2277,6 +2689,18 @@ function numIfStable(value, periods, digits = 2) {{
 function pctIfStable(value, periods) {{
   return hasStableDispersion(periods) ? pct(value) : 'n/a';
 }}
+function metricPill(label, metric) {{
+  if (!metric) return '';
+  const status = metric.status || 'unknown';
+  const method = metric.method ? ` · ${{metric.method}}` : '';
+  const n = metric.observation_count !== undefined ? ` · N=${{metric.observation_count}}` : '';
+  const value = metric.value === undefined || metric.value === null ? 'n/a' : num(metric.value, 4);
+  return `<span class="pill">${{esc(label)}} ${{esc(value)}} · ${{esc(status)}}${{esc(method)}}${{esc(n)}}</span>`;
+}}
+function pctMetric(metric) {{
+  if (!metric || metric.value === undefined || metric.value === null) return 'n/a';
+  return pct(metric.value);
+}}
 function parserDefaultParameterMessage(parser) {{
   const source = (parser && parser.source) || '';
   if (source.toLowerCase() === 'llm') {{
@@ -2327,24 +2751,31 @@ function renderParsed(payload) {{
 function render(payload) {{
   const factor = payload.factor;
   const evaluation = payload.evaluation;
+  const inSampleBacktest = payload.in_sample_backtest || null;
   const backtest = payload.backtest;
   const effectiveHoldingDays = (payload.parameters && payload.parameters.holding_days) || backtest.holding_days || factor.horizon_days;
   const evaluationProfile = evaluation.simulation_profile || {{}};
+  const inSampleProfile = inSampleBacktest ? (inSampleBacktest.simulation_profile || {{}}) : {{}};
   const backtestProfile = backtest.simulation_profile || {{}};
   const profile = Object.keys(backtestProfile).length ? backtestProfile : evaluationProfile;
   const splitRows = (evaluation.split_metrics || []).map(metric =>
-    `<span class="pill">${{esc(metric.name)}} ICIR ${{num(metric.rank_icir, 2)}} · t ${{num(valueOr(metric.rank_ic_t_stat, 0), 2)}} · days ${{metric.ic_days}}</span>`
+    `<span class="pill">${{esc(metric.name)}} ICIR ${{num(metric.rank_icir, 2)}} · HAC t ${{num(metric.rank_ic_t_stat, 2)}} · days ${{metric.ic_days}}</span>`
   ).join(' ');
   const horizonRows = (evaluation.horizon_metrics || []).map(metric =>
-    `<span class="pill">${{metric.horizon_days}}日 IC ${{num(metric.rank_ic_mean)}} / ICIR ${{num(metric.rank_icir, 2)}} / t ${{num(valueOr(metric.rank_ic_t_stat, 0), 2)}}</span>`
+    `<span class="pill">${{metric.horizon_days}}日 IC ${{num(metric.rank_ic_mean)}} / ICIR ${{num(metric.rank_icir, 2)}} / HAC t ${{num(metric.rank_ic_t_stat, 2)}}</span>`
   ).join(' ');
   const groupRows = (backtest.group_returns || []).map(metric =>
     `<span class="pill">${{esc(metric.group)}} ${{pct(metric.mean_return)}}</span>`
   ).join(' ');
   const segmentRows = (backtest.segment_metrics || []).map(metric =>
-    `<span class="pill">${{esc(metric.name)}} net ${{pct(metric.net_annualized_return)}} · sharpe ${{numIfStable(valueOr(metric.net_long_short_sharpe, 0), metric.periods, 2)}}</span>`
+    `<span class="pill">${{esc(metric.name)}} net ann ${{pct(metric.net_annualized_return)}} · sharpe ${{num(metric.net_long_short_sharpe, 2)}}</span>`
   ).join(' ');
-  const warningRows = [...(evaluation.warnings || []), ...(backtest.warnings || [])].map(item =>
+  const warningRows = [
+    ...(evaluation.warning_codes || []),
+    ...(backtest.warning_codes || []),
+    ...(evaluation.warnings || []),
+    ...(backtest.warnings || [])
+  ].map(item =>
     `<span class="pill">${{esc(item)}}</span>`
   ).join(' ');
   const assumptionRows = (backtest.assumptions || []).map(item =>
@@ -2356,6 +2787,19 @@ function render(payload) {{
     `backtest ${{backtest.score_source || 'computed'}} · cached ${{backtest.score_cached_rows || 0}} · computed ${{backtest.score_computed_rows || 0}}`,
     backtest.factor_values_path ? `backtest path ${{backtest.factor_values_path}}` : ''
   ].filter(Boolean).map(item => `<span class="pill">${{esc(item)}}</span>`).join(' ');
+  const evaluationMetrics = evaluation.metrics || {{}};
+  const backtestMetrics = backtest.metrics || {{}};
+  const metricRows = [
+    metricPill('HAC t-stat', evaluationMetrics.rank_ic_t_stat),
+    metricPill('可报告毛年化收益', backtestMetrics.annualized_return),
+    metricPill('可报告净年化收益', backtestMetrics.net_annualized_return),
+    metricPill('净值最大回撤', backtestMetrics.max_drawdown),
+    metricPill('再平衡换手', backtestMetrics.rebalance_turnover_mean || backtestMetrics.rebalance_rate)
+  ].filter(Boolean).join(' ');
+  const coverage = evaluation.coverage_lineage || {{}};
+  const singlePeriodWarning = Number(backtest.periods || 0) === 1
+    ? `<div class="notice warn">外部样本外仅包含 1 个完整持有期。累计收益可计算；年化收益、波动率、Sharpe、再平衡率以及无日频净值支持的最大回撤不可报告。</div>`
+    : '';
   resultEl.innerHTML = `
     <div class="panel hero-panel">
       <div>
@@ -2371,26 +2815,61 @@ function render(payload) {{
         ${{esc((factor.universe_filters || []).join(' · ') || 'FULL')}}
       </div>
     </div>
-    <div class="grid">
-      <div class="tile">Rank IC<b>${{num(evaluation.rank_ic_mean)}}</b></div>
-      <div class="tile">ICIR<b>${{num(evaluation.rank_icir, 2)}}</b></div>
-      <div class="tile">IC t-stat<b>${{num(valueOr(evaluation.rank_ic_t_stat, 0), 2)}}</b></div>
-      <div class="tile">覆盖率<b>${{pct(evaluation.coverage)}}</b></div>
-      <div class="tile">IC Days<b>${{evaluation.ic_days}}</b></div>
-      <div class="tile">毛累计收益<b>${{pct(backtest.gross_cumulative_return ?? backtest.cumulative_return)}}</b></div>
-      <div class="tile">净累计收益<b>${{pct(valueOr(backtest.net_cumulative_return, 0))}}</b></div>
-      <div class="tile">毛年化收益<b>${{pct(backtest.gross_annualized_return ?? backtest.annualized_return)}}</b></div>
-      <div class="tile">净年化收益<b>${{pct(valueOr(backtest.net_annualized_return, 0))}}</b></div>
-      <div class="tile">年化波动<b>${{pctIfStable(backtest.annualized_volatility, backtest.periods)}}</b></div>
-      <div class="tile">最大回撤<b>${{pct(backtest.max_drawdown)}}</b></div>
-      <div class="tile">回测期数<b>${{backtest.periods}}</b></div>
-      <div class="tile">持有期<b>${{backtest.holding_days}}日</b></div>
-      <div class="tile">Decay<b>${{valueOr(profile.decay_days, 0)}}</b></div>
-      <div class="tile">Top Quantile<b>${{num(valueOr(profile.top_quantile, valueOr(backtest.top_quantile, 0)), 2)}}</b></div>
-      <div class="tile">Delay<b>${{valueOr(profile.execution_delay_days, 1)}}日</b></div>
-      <div class="tile">净多空Sharpe<b>${{numIfStable(valueOr(backtest.net_long_short_sharpe, valueOr(backtest.long_short_sharpe, 0)), backtest.periods, 2)}}</b></div>
-      <div class="tile">调仓率<b>${{pct(valueOr(backtest.rebalance_rate, 0))}}</b></div>
-      <div class="tile">换手率<b>${{pct(valueOr(backtest.turnover_rate, 0))}}</b></div>
+    <div class="panel">
+      <h3>样本内研究评价</h3>
+      <div class="grid">
+        <div class="tile">Rank IC<b>${{num(evaluation.rank_ic_mean)}}</b></div>
+        <div class="tile">ICIR<b>${{num(evaluation.rank_icir, 2)}}</b></div>
+        <div class="tile">HAC t-stat<b>${{num(evaluation.rank_ic_t_stat, 2)}}</b></div>
+        <div class="tile">IC Days<b>${{evaluation.ic_days}}</b></div>
+        <div class="tile">Joint Coverage<b>${{pct(valueOr(coverage.joint_coverage, evaluation.coverage))}}</b></div>
+        <div class="tile">Horizon / Delay<b>${{effectiveHoldingDays}}日 / ${{valueOr(evaluationProfile.execution_delay_days, profile.execution_delay_days)}}日</b></div>
+      </div>
+      <p class="meta">research_evaluation · ${{esc(profilePeriodText(evaluationProfile))}}</p>
+    </div>
+    ${{inSampleBacktest ? `
+    <div class="panel">
+      <h3>样本内组合回测</h3>
+      <div class="grid">
+        <div class="tile">毛累计收益<b>${{pct(inSampleBacktest.gross_cumulative_return ?? inSampleBacktest.cumulative_return)}}</b></div>
+        <div class="tile">净累计收益<b>${{pct(inSampleBacktest.net_cumulative_return)}}</b></div>
+        <div class="tile">完整持有期数<b>${{valueOr(inSampleBacktest.completed_periods, inSampleBacktest.periods)}}</b></div>
+        <div class="tile">Exposure Days<b>${{valueOr(inSampleBacktest.exposure_days, 0)}}</b></div>
+        <div class="tile">可报告净年化收益<b>${{pct(inSampleBacktest.net_annualized_return)}}</b></div>
+        <div class="tile">年化Sharpe<b>${{num(inSampleBacktest.net_long_short_sharpe ?? inSampleBacktest.long_short_sharpe, 2)}}</b></div>
+        <div class="tile">净值最大回撤<b>${{pct(inSampleBacktest.net_max_drawdown ?? inSampleBacktest.max_drawdown)}}</b></div>
+        <div class="tile">Rebalance Turnover<b>${{pct(inSampleBacktest.rebalance_turnover_mean ?? inSampleBacktest.turnover_rate)}}</b></div>
+      </div>
+      <p class="meta">${{esc(inSampleBacktest.sample_role || 'in_sample_backtest')}} · ${{esc(profilePeriodText(inSampleProfile))}}</p>
+    </div>` : ''}}
+    <div class="panel">
+      <h3>外部样本外组合评测</h3>
+      ${{singlePeriodWarning}}
+      <div class="grid">
+        <div class="tile">毛累计收益<b>${{pct(backtest.gross_cumulative_return ?? backtest.cumulative_return)}}</b></div>
+        <div class="tile">净累计收益<b>${{pct(backtest.net_cumulative_return)}}</b></div>
+        <div class="tile">完整持有期数<b>${{valueOr(backtest.completed_periods, backtest.periods)}}</b></div>
+        <div class="tile">Exposure Days<b>${{valueOr(backtest.exposure_days, 0)}}</b></div>
+        <div class="tile">可报告毛年化收益<b>${{pct(backtest.gross_annualized_return ?? backtest.annualized_return)}}</b></div>
+        <div class="tile">可报告净年化收益<b>${{pct(backtest.net_annualized_return)}}</b></div>
+        <div class="tile">年化波动率<b>${{pct(backtest.net_annualized_volatility ?? backtest.annualized_volatility)}}</b></div>
+        <div class="tile">年化Sharpe<b>${{num(backtest.net_long_short_sharpe ?? backtest.long_short_sharpe, 2)}}</b></div>
+        <div class="tile">净值最大回撤<b>${{pct(backtest.net_max_drawdown ?? backtest.max_drawdown)}}</b></div>
+        <div class="tile">Initial Build Turnover<b>${{pct(backtest.initial_build_turnover)}}</b></div>
+        <div class="tile">Rebalance Turnover<b>${{pct(backtest.rebalance_turnover_mean ?? backtest.turnover_rate)}}</b></div>
+        <div class="tile">Replacement Rate<b>${{pct(backtest.replacement_rate_mean ?? backtest.rebalance_rate)}}</b></div>
+        <div class="tile">持有期<b>${{backtest.holding_days}}日</b></div>
+        <div class="tile">Decay<b>${{valueOr(profile.decay_days, 0)}}</b></div>
+        <div class="tile">Top Quantile<b>${{num(valueOr(profile.top_quantile, valueOr(backtest.top_quantile, 0)), 2)}}</b></div>
+        <div class="tile">Delay<b>${{valueOr(profile.execution_delay_days, 1)}}日</b></div>
+      </div>
+      <p class="meta">external_oos_backtest · ${{esc(profilePeriodText(backtestProfile))}}</p>
+    </div>
+    <div class="panel">
+      <h3>样本充分性与诊断</h3>
+      <p>${{metricRows || '<span class="pill">暂无指标状态</span>'}}</p>
+      <p>${{warningRows || '<span class="pill">研究口径，不是生产交易口径</span>'}}</p>
+      <p>${{cacheRows || '<span class="pill">computed</span>'}}</p>
     </div>
     <div class="evidence-grid">
       <div class="panel">
@@ -2415,7 +2894,70 @@ function render(payload) {{
     <div class="panel">
       <h3>Artifacts</h3>
       <p class="meta">${{esc(evaluation.artifact_path)}}</p>
+      ${{inSampleBacktest ? `<p class="meta">${{esc(inSampleBacktest.artifact_path)}}</p>` : ''}}
       <p class="meta">${{esc(backtest.artifact_path)}}</p>
+    </div>`;
+}}
+function renderStaggered(payload) {{
+  const terminal = (payload.daily_nav || []).slice(-1)[0] || {{}};
+  const cohortRows = (payload.cohorts || []).map(cohort =>
+    `<span class="pill">${{esc(cohort.signal_date)}} · weight ${{pct(cohort.capital_weight)}} · net ${{pct(cohort.net_cumulative_return)}}</span>`
+  ).join(' ');
+  staggeredResultEl.innerHTML = `
+    <div class="panel">
+      <h3>首月逐日建仓稳健性回测</h3>
+      <div class="grid">
+        <div class="tile">Staggered 净累计收益<b>${{pct(payload.strategy_cumulative_return)}}</b></div>
+        <div class="tile">基准累计收益<b>${{pct(payload.benchmark_cumulative_return)}}</b></div>
+        <div class="tile">相对财富收益<b>${{pct(payload.relative_wealth_excess_return)}}</b></div>
+        <div class="tile">Cohorts<b>${{valueOr(payload.cohort_count, 0)}}</b></div>
+        <div class="tile">Terminal NAV<b>${{num(terminal.net_nav, 4)}}</b></div>
+        <div class="tile">Inactive Cash<b>${{pct(terminal.inactive_cash_weight)}}</b></div>
+      </div>
+      <p class="meta">${{esc(payload.sample_role || 'staggered_entry_backtest')}} · ${{esc(payload.formation_window_mode || 'first_month')}}</p>
+      <p>${{cohortRows || '<span class="pill">暂无 cohort 明细</span>'}}</p>
+      <p class="meta">${{esc(payload.artifact_path || '')}}</p>
+    </div>`;
+}}
+function comparisonRows(payload) {{
+  const chain = payload.iteration_chain || {{}};
+  return payload.comparison_rows || chain.comparison_rows || [];
+}}
+function renderComparisonTable(payload) {{
+  const rows = comparisonRows(payload);
+  const body = rows.map(row => {{
+    const gate = row.gate_passed === true ? 'pass' : (row.gate_passed === false ? 'fail' : 'n/a');
+    return `
+      <tr>
+        <td>${{esc(row.round || 1)}}</td>
+        <td>${{esc(row.role || '')}}</td>
+        <td><code>${{esc(row.factor_id || '')}}</code><br><span class="meta">${{esc(row.factor_status || '')}}</span></td>
+        <td><code>${{esc(row.formula || '')}}</code></td>
+        <td>${{num(row.selection_score, 4)}}<br><span class="meta">IC ${{num(row.selection_rank_ic, 4)}} / ICIR ${{num(row.selection_icir, 2)}}</span></td>
+        <td>${{pct(row.selection_net_cumulative_return)}}<br><span class="meta">ann ${{pct(row.selection_net_annualized_return)}} · periods ${{esc(row.selection_completed_periods ?? row.selection_backtest_periods ?? '')}}</span></td>
+        <td>${{pct(row.external_oos_net_cumulative_return)}}<br><span class="meta">ann ${{pct(row.external_oos_net_annualized_return)}} · periods ${{esc(row.external_oos_completed_periods ?? row.external_oos_periods ?? '')}}</span></td>
+        <td>${{esc(gate)}}<br><span class="meta">${{esc((row.gate_reasons || []).join('; '))}}</span></td>
+      </tr>`;
+  }}).join('');
+  return `
+    <div class="panel">
+      <h3>RD 因子迭代对比</h3>
+      <p class="meta">selection 样本用于 RD 排序和 gate；external OOS 只用于审计展示，不参与 winner 选择。</p>
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>轮次</th>
+            <th>角色</th>
+            <th>因子</th>
+            <th>公式</th>
+            <th>Selection</th>
+            <th>样本内回测</th>
+            <th>External OOS</th>
+            <th>Gate</th>
+          </tr>
+        </thead>
+        <tbody>${{body || '<tr><td colspan="8">暂无比较行</td></tr>'}}</tbody>
+      </table>
     </div>`;
 }}
 function renderResearch(payload) {{
@@ -2441,6 +2983,11 @@ function renderResearch(payload) {{
     : (payload.next_exploration_seed_gate_passed === false ? '未过 gate，仅用于探索' : '无下一轮探索 seed');
   const optimizationLabel = optimizationStatusText(payload);
   const optimizationScope = Number(payload.iteration_count || 1) > 1 ? ' (aggregate)' : '';
+  const chainError = payload.chain_error || chain.chain_error || '';
+  const failedRoundIndex = payload.failed_round_index || chain.failed_round_index || '';
+  const partialNotice = chainError
+    ? `<p class="meta err">RD stopped at round ${{esc(failedRoundIndex || '?')}}: ${{esc(chainError)}}</p>`
+    : '';
   const roundRows = rounds.map(item =>
     `<span class="pill">#${{item.round}} seed ${{esc(item.seed_factor_id)}} → ${{esc(item.selected_next_seed_factor_id || item.top_candidate_id || 'stop')}} · ${{esc(item.selection_reason || 'completed')}} · score ${{item.top_score === null || item.top_score === undefined ? 'n/a' : num(item.top_score, 4)}}</span>`
   ).join(' ');
@@ -2476,15 +3023,15 @@ function renderResearch(payload) {{
           <span class="pill">split ICIR ${{num(valueOr(candidate.split_weighted_icir, 0), 2)}}</span>
           <span class="pill">IC ${{num(evaluation.rank_ic_mean)}}</span>
           <span class="pill">ICIR ${{num(evaluation.rank_icir, 2)}}</span>
-          <span class="pill">IC t-stat ${{num(valueOr(evaluation.rank_ic_t_stat, 0), 2)}}</span>
+          <span class="pill">HAC t-stat ${{num(evaluation.rank_ic_t_stat, 2)}}</span>
           <span class="pill">decay ${{valueOr(profile.decay_days, 0)}}</span>
           <span class="pill">top ${{num(valueOr(profile.top_quantile, valueOr(backtest.top_quantile, 0)), 2)}}</span>
           <span class="pill">periods ${{esc(backtest.periods)}}</span>
-          <span class="pill">net LS Sharpe ${{numIfStable(valueOr(backtest.net_long_short_sharpe, valueOr(backtest.long_short_sharpe, 0)), backtest.periods, 2)}}</span>
+          <span class="pill">net LS Sharpe ${{num(backtest.net_long_short_sharpe ?? backtest.long_short_sharpe, 2)}}</span>
           <span class="pill">gross ${{pct(backtest.gross_annualized_return ?? backtest.annualized_return)}}</span>
-          <span class="pill">net ${{pct(valueOr(backtest.net_annualized_return, 0))}}</span>
-          <span class="pill">rebalance rate ${{pct(valueOr(backtest.rebalance_rate, 0))}}</span>
-          <span class="pill">turnover rate ${{pct(valueOr(backtest.turnover_rate, 0))}}</span>
+          <span class="pill">net ${{pct(backtest.net_annualized_return)}}</span>
+          <span class="pill">rebalance rate ${{pct(backtest.rebalance_rate)}}</span>
+          <span class="pill">turnover rate ${{pct(backtest.turnover_rate)}}</span>
           <span class="pill">factor cache ${{esc(cacheText)}}</span>
         </p>
         <p class="meta">${{esc((candidate.self_review && candidate.self_review.summary) || '')}}</p>
@@ -2502,12 +3049,14 @@ function renderResearch(payload) {{
       <p class="meta">iterations: ${{esc(payload.iteration_count || 1)}} / ${{esc(payload.requested_iterations || 1)}} · original seed ${{esc(payload.original_seed_factor_id || payload.seed_factor_id)}} · recommended factor ${{esc(recommendedFactor)}} (${{esc(recommendationLabel)}}) · last accepted ${{esc(lastAcceptedFactor)}} · last explored ${{esc(lastExploredFactor)}} · ${{esc(payload.stopped_reason || 'completed')}}</p>
       <p class="meta">next exploration seed: ${{esc(explorationSeed)}} · ${{esc(explorationReason)}} · ${{esc(explorationGate)}}</p>
       <p class="meta">optimization: ${{esc(optimizationLabel)}}${{optimizationScope}}</p>
+      ${{partialNotice}}
       <p class="meta">accepted: ${{esc(aggregateAccepted.join(', ') || 'none')}}</p>
       <p class="meta">report: ${{esc(payload.report_path || 'not generated')}}</p>
       <p class="meta">round reports: ${{reportRows || '<span class="pill">same as report</span>'}}</p>
       <p>${{roundRows || '<span class="pill">single round</span>'}}</p>
     </div>
-    ${{cards || '<div class="panel"><h3>无候选</h3></div>'}}`;
+    ${{cards || '<div class="panel"><h3>无候选</h3></div>'}}
+    ${{renderComparisonTable(payload)}}`;
 }}
 function rdPayload() {{
   return {{
@@ -2526,7 +3075,10 @@ function controlHeaders() {{
   let token = window.sessionStorage.getItem('qf_control_token') || '';
   if (!token) {{
     token = window.prompt('请输入本次 Web 控制令牌') || '';
-    if (token) window.sessionStorage.setItem('qf_control_token', token);
+    if (token) {{
+      window.sessionStorage.setItem('qf_control_token', token);
+      setTimeout(() => refreshRuntimeStatus().catch(() => {{}}), 0);
+    }}
   }}
   if (!token) throw new Error('需要 Web 控制令牌');
   headers.Authorization = `Bearer ${{token}}`;
@@ -2606,9 +3158,26 @@ async function submitValidation() {{
     jobId => activeIdeaJobId === jobId
   );
 }}
+async function submitStaggeredEntry() {{
+  const factorId = validatedFactorId || (parsedIdea && parsedIdea.factor && parsedIdea.factor.factor_id);
+  if (!factorId) throw new Error('请先完成验证并评测');
+  const job = await postJson('/api/jobs/staggered-entry', {{
+      factor_id: factorId,
+      parameters: validationParameters()
+  }});
+  activeIdeaJobId = job.job_id;
+  cancelButton.disabled = false;
+  return waitForJob(
+    job.job_id,
+    statusEl,
+    '已运行超过10秒，系统仍在执行首月逐日建仓稳健性回测',
+    jobId => activeIdeaJobId === jobId
+  );
+}}
 llmProviderSelect.addEventListener('change', syncLlmApiKeyControls);
 llmApiKeyMode.addEventListener('change', syncLlmApiKeyControls);
 syncLlmApiKeyControls();
+refreshRuntimeStatus().catch(() => {{}});
 button.addEventListener('click', async () => {{
   button.disabled = true;
   validateButton.disabled = true;
@@ -2617,8 +3186,11 @@ button.addEventListener('click', async () => {{
   resetIdeaResult('解析中', '因子解析完成后，公式和默认评测参数会在这里刷新。');
   statusEl.textContent = '解析中...';
   parsedIdea = null;
+  validatedFactorId = null;
   fillValidationInputs({{}});
   setValidationInputsEnabled(false);
+  setStaggeredEnabled(false);
+  resetStaggeredResult();
   const parserMode = document.getElementById('parser').value;
   try {{
     const payload = await submitParse(parserMode);
@@ -2673,8 +3245,10 @@ validateButton.addEventListener('click', async () => {{
       factor: payload.factor,
       parameters: payload.parameters || validationParameters()
     }};
+    validatedFactorId = payload.factor.factor_id;
     fillValidationInputs(parsedIdea.parameters);
     document.getElementById('rd-seed').value = payload.factor.factor_id;
+    setStaggeredEnabled(true);
     statusEl.innerHTML = '<span class="ok">验证完成</span>';
   }} catch (error) {{
     if (error.message === '运行已中断') {{
@@ -2688,6 +3262,38 @@ validateButton.addEventListener('click', async () => {{
     button.disabled = false;
     cancelButton.disabled = true;
     setValidationInputsEnabled(Boolean(parsedIdea));
+    setStaggeredEnabled(Boolean(validatedFactorId));
+  }}
+}});
+staggeredButton.addEventListener('click', async () => {{
+  staggeredButton.disabled = true;
+  validateButton.disabled = true;
+  button.disabled = true;
+  cancelButton.disabled = true;
+  clearGlobalError();
+  staggeredResultEl.innerHTML = `
+    <div class="panel">
+      <h3>首月逐日建仓稳健性回测运行中</h3>
+      <p class="meta">完成后会显示 cohort、等权组合 NAV 和 artifact。</p>
+    </div>`;
+  statusEl.textContent = '首月逐日建仓稳健性回测中...';
+  try {{
+    const payload = await submitStaggeredEntry();
+    renderStaggered(payload);
+    statusEl.innerHTML = '<span class="ok">首月逐日建仓稳健性回测完成</span>';
+  }} catch (error) {{
+    if (error.message === '运行已中断') {{
+      statusEl.innerHTML = '<span class="warn">运行已中断</span>';
+      return;
+    }}
+    errorEl.textContent = error.message;
+    statusEl.textContent = '稳健性回测失败';
+  }} finally {{
+    activeIdeaJobId = null;
+    button.disabled = false;
+    cancelButton.disabled = true;
+    setValidationInputsEnabled(Boolean(parsedIdea));
+    setStaggeredEnabled(Boolean(validatedFactorId));
   }}
 }});
 cancelButton.addEventListener('click', async () => {{

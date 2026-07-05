@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from quant_forge.core.contracts import FactorDefinition
 from quant_forge.factor_engine.signal_processing import prepare_factor_scores_result
@@ -521,6 +522,178 @@ def test_discover_factor_value_roots_finds_mounted_sources_without_factor_dirs(t
     assert canonical_root in roots
     assert source_root in roots
     assert canonical_root / "factor_id=FTR_LOCAL" not in roots
+
+
+def test_catalog_get_resolves_canonical_factor_not_first_walked(tmp_path: Path) -> None:
+    """CAT-1: get() resolves on the strict canonical key, not fuzzy intersection."""
+
+    factor_values_root = tmp_path / "factor_values"
+    # A distinct factor whose fuzzy alias set overlapped WQ_ALPHA_001 under the
+    # old logic (name canonicalizes toward alpha_001) but has a distinct key.
+    _write_precomputed_factor(
+        factor_values_root / "factor_id=GTJA_ALPHA_001",
+        factor_id="GTJA_ALPHA_001",
+        factor_name="alpha_001",
+        factor_store_key="factor_id=GTJA_ALPHA_001",
+        value=0.11,
+    )
+    _write_precomputed_factor(
+        factor_values_root / "factor_id=WQ_ALPHA_001",
+        factor_id="WQ_ALPHA_001",
+        factor_name="worldquant_alpha_001",
+        factor_store_key="factor_id=WQ_ALPHA_001",
+        value=0.99,
+    )
+
+    catalog = FactorCatalog(tmp_path / "factor_root", factor_values_root=factor_values_root)
+
+    # Strict, unambiguous ids resolve to exactly the requested factor rather than
+    # the first walked dir.
+    assert catalog.get("wq_alpha_001").factor_id == "WQ_ALPHA_001"
+    assert catalog.get("GTJA_ALPHA_001").factor_id == "GTJA_ALPHA_001"
+    # A genuinely ambiguous alias (GTJA's own name is "alpha_001", which also
+    # canonicalizes toward WQ_ALPHA_001) must raise rather than silently return
+    # the first walked factor.
+    with pytest.raises(ValueError):
+        catalog.get("alpha_001")
+
+
+def test_catalog_get_missing_id_raises_file_not_found(tmp_path: Path) -> None:
+    factor_values_root = _mounted_wq_factor_values(tmp_path)
+    catalog = FactorCatalog(tmp_path / "factor_root", factor_values_root=factor_values_root)
+    with pytest.raises(FileNotFoundError):
+        catalog.get("WQ_ALPHA_999")
+
+
+def test_catalog_reads_horizon_days_from_manifest_metadata(tmp_path: Path) -> None:
+    """CAT-3: mounted factor horizon comes from metadata, not hardcoded 5."""
+
+    factor_values_root = tmp_path / "factor_values"
+    _write_precomputed_factor_with_metadata(
+        factor_values_root / "factor_id=WQ_ALPHA_010",
+        factor_id="WQ_ALPHA_010",
+        factor_name="worldquant_alpha_010",
+        factor_store_key="factor_id=WQ_ALPHA_010",
+        value=0.1,
+        extra_metadata={"horizon_days": 10},
+    )
+
+    factor = FactorCatalog(
+        tmp_path / "factor_root", factor_values_root=factor_values_root
+    ).get("WQ_ALPHA_010")
+
+    assert factor.horizon_days == 10
+
+
+def test_catalog_horizon_falls_back_to_5_without_metadata(tmp_path: Path) -> None:
+    factor_values_root = _mounted_wq_factor_values(tmp_path)
+
+    factor = FactorCatalog(
+        tmp_path / "factor_root", factor_values_root=factor_values_root
+    ).get("WQ_ALPHA_003")
+
+    assert factor.horizon_days == 5
+
+
+def test_catalog_horizon_distrusts_metadata_when_factor_id_mismatches_dir(tmp_path: Path) -> None:
+    """CAT-3: metadata horizon is not trusted when its factor_id disagrees with the dir."""
+
+    factor_values_root = tmp_path / "factor_values"
+    _write_precomputed_factor_with_metadata(
+        factor_values_root / "factor_id=WQ_ALPHA_011",
+        factor_id="WQ_ALPHA_777",  # disagrees with the dir/id resolved from name
+        factor_name="worldquant_alpha_011",
+        factor_store_key="factor_id=WQ_ALPHA_011",
+        value=0.1,
+        extra_metadata={"horizon_days": 20},
+    )
+
+    # Metadata factor_id (WQ_ALPHA_777) disagrees with the directory-derived id
+    # (WQ_ALPHA_011); the factor resolves under the metadata id but its horizon
+    # metadata is distrusted and falls back to 5.
+    factor = FactorCatalog(
+        tmp_path / "factor_root", factor_values_root=factor_values_root
+    ).get("WQ_ALPHA_777")
+
+    assert factor.horizon_days == 5
+
+
+def test_catalog_horizon_coerces_and_rejects_invalid_metadata(tmp_path: Path) -> None:
+    factor_values_root = tmp_path / "factor_values"
+    _write_precomputed_factor_with_metadata(
+        factor_values_root / "factor_id=WQ_ALPHA_012",
+        factor_id="WQ_ALPHA_012",
+        factor_name="worldquant_alpha_012",
+        factor_store_key="factor_id=WQ_ALPHA_012",
+        value=0.1,
+        extra_metadata={"horizon_days": "8"},
+    )
+    _write_precomputed_factor_with_metadata(
+        factor_values_root / "factor_id=WQ_ALPHA_013",
+        factor_id="WQ_ALPHA_013",
+        factor_name="worldquant_alpha_013",
+        factor_store_key="factor_id=WQ_ALPHA_013",
+        value=0.1,
+        extra_metadata={"horizon_days": "not-a-number"},
+    )
+    catalog = FactorCatalog(tmp_path / "factor_root", factor_values_root=factor_values_root)
+
+    assert catalog.get("WQ_ALPHA_012").horizon_days == 8
+    assert catalog.get("WQ_ALPHA_013").horizon_days == 5
+
+
+def test_dedupe_raises_on_cross_category_duplicate_with_distinct_content(tmp_path: Path) -> None:
+    """CAT-2: same canonical id under both categories with differing content raises."""
+
+    factor_values_root = tmp_path / "factor_values"
+    _write_precomputed_factor(
+        factor_values_root / "原始因子" / "factor_id=WQ_ALPHA_020",
+        factor_id="WQ_ALPHA_020",
+        factor_name="worldquant_alpha_020",
+        factor_store_key="factor_id=WQ_ALPHA_020",
+        value=0.2,
+    )
+    _write_precomputed_factor(
+        factor_values_root / "合成因子" / "factor_id=WQ_ALPHA_020",
+        factor_id="WQ_ALPHA_020",
+        factor_name="synthetic_alpha_020",
+        factor_store_key="factor_id=WQ_ALPHA_020",
+        value=0.2,
+    )
+
+    with pytest.raises(ValueError):
+        discover_precomputed_factors(factor_values_root)
+
+
+def _write_precomputed_factor_with_metadata(
+    factor_dir: Path,
+    *,
+    factor_id: str,
+    factor_name: str,
+    factor_store_key: str,
+    value: float,
+    extra_metadata: dict,
+) -> None:
+    factor_dir.mkdir(parents=True)
+    metadata = {
+        "factor_id": factor_id,
+        "factor_name": factor_name,
+        "factor_store_key": factor_store_key,
+        "schema_version": "qf.canonical_factor_values.v1",
+    }
+    metadata.update(extra_metadata)
+    (factor_dir / "2025.metadata.json").write_text(
+        json.dumps(metadata),
+        encoding="utf-8",
+    )
+    pd.DataFrame(
+        {
+            "trade_date": ["2025-01-02"],
+            "instrument": ["AAA"],
+            "factor_id": [factor_id],
+            "factor_value": [value],
+        }
+    ).to_parquet(factor_dir / "2025.parquet", index=False)
 
 
 def _mounted_wq_factor_values(tmp_path: Path) -> Path:

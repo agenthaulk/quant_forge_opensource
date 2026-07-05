@@ -30,6 +30,29 @@ def test_prepare_factor_scores_applies_test_period_and_ewma_decay() -> None:
     assert list(scores["score"]) == [20.0, 25.0]
 
 
+def test_prepare_factor_scores_uses_pre_period_lookback_context() -> None:
+    dates = pd.bdate_range("2025-01-02", periods=90)
+    panel = pd.DataFrame(
+        {
+            "trade_date": [date for date in dates for _ in range(2)],
+            "instrument": ["AAA", "BBB"] * len(dates),
+            "close": [float(index + 1) for index in range(len(dates) * 2)],
+            "market_cap": [100.0, 200.0] * len(dates),
+            "is_st": [False] * len(dates) * 2,
+        }
+    )
+    profile = SimulationProfile(test_period_start=dates[59].date().isoformat())
+
+    result = prepare_factor_scores_result(panel, "ts_mean(close, 60)", profile=profile)
+
+    assert result.lookback_rows == 59
+    assert result.context_rows == len(panel)
+    assert result.computed_rows == len(result.scores)
+    assert result.scores["trade_date"].min() == dates[59]
+    first_visible = result.scores[result.scores["trade_date"] == dates[59]]
+    assert first_visible["score"].notna().all()
+
+
 def test_prepare_factor_scores_preserves_universe_filter_missing_after_decay() -> None:
     panel = pd.DataFrame(
         {
@@ -76,6 +99,36 @@ def test_execute_factor_formula_supports_time_series_operator_subset() -> None:
     assert list(nested["score"].iloc[2:]) == [1.0, 0.5, 1.0, 0.5]
     assert list(corr["score"].iloc[:2].isna()) == [True, True]
     assert corr["score"].iloc[2:].notna().all()
+
+
+def test_execute_factor_formula_ts_rank_matches_last_window_rank_pct() -> None:
+    panel = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(["2025-01-01", "2025-01-02", "2025-01-03", "2025-01-04"]),
+            "instrument": ["AAA", "AAA", "AAA", "AAA"],
+            "close": [1.0, 3.0, 2.0, 2.0],
+        }
+    )
+
+    result = execute_factor_formula(panel, "ts_rank(close, 3)")
+
+    assert list(result["score"].iloc[:2].isna()) == [True, True]
+    assert result["score"].iloc[2:].tolist() == pytest.approx([2 / 3, 0.5])
+
+
+def test_execute_factor_formula_decay_linear_weights_recent_values_more() -> None:
+    panel = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(["2025-01-01", "2025-01-02", "2025-01-03", "2025-01-04"]),
+            "instrument": ["AAA", "AAA", "AAA", "AAA"],
+            "close": [1.0, 2.0, 3.0, 6.0],
+        }
+    )
+
+    result = execute_factor_formula(panel, "decay_linear(close, 3)")
+
+    assert list(result["score"].iloc[:2].isna()) == [True, True]
+    assert result["score"].iloc[2:].tolist() == pytest.approx([14 / 6, 26 / 6])
 
 
 def test_prepare_factor_scores_executes_safe_alias_without_value_store() -> None:

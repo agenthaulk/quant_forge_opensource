@@ -209,7 +209,7 @@ def _add_config_options(parser: argparse.ArgumentParser) -> None:
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
-    config = load_config(args.config, args.workspace)
+    config = bootstrap_runtime_config(args.config, args.workspace)
     paths = create_demo_workspace(
         args.workspace,
         data_root=config.paths.data_root,
@@ -491,7 +491,7 @@ def _normalization_source_roots(args: argparse.Namespace) -> tuple[Path, ...]:
 def _cmd_web(args: argparse.Namespace) -> int:
     from quant_forge.apps.web.server import run_local_web
 
-    config = load_config(args.config, args.workspace)
+    config = bootstrap_runtime_config(args.config, args.workspace)
     rd_config = load_research_loop_config(args.rd_config, config.research, config.simulation)
     host = args.host or config.web.host
     port = args.port or config.web.port
@@ -505,7 +505,7 @@ def _doctor_payload(args: argparse.Namespace) -> dict[str, Any]:
     workspace = getattr(args, "workspace", None)
     rd_config_path = getattr(args, "rd_config", DEFAULT_RD_CONFIG_PATH)
     try:
-        config = load_config(config_path, workspace)
+        config = bootstrap_runtime_config(config_path, workspace)
         checks.append(_doctor_check("config", "ok", "runtime config loaded"))
     except Exception as exc:
         checks.append(_doctor_check("config", "error", str(exc)))

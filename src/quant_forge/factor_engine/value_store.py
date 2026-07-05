@@ -66,6 +66,7 @@ class FactorValueStore:
         formula: str,
         universe_filters: tuple[str, ...],
         cache_only: bool = False,
+        target_panel: pd.DataFrame | None = None,
     ) -> FactorScoreResult:
         from quant_forge.operator_registry.resolver import resolve_executable_formula
 
@@ -95,11 +96,17 @@ class FactorValueStore:
                     ignore_index=True,
                 )
             )
-        panel_keys = _score_keys(panel)
-        required_keys = _required_score_keys(panel, universe_filters)
-        cached_for_panel = _restrict_to_panel(cached, panel_keys)
+        result_panel = target_panel if target_panel is not None else panel
+        panel_keys = _score_keys(result_panel)
+        context_keys = _score_keys(panel)
+        required_keys = _required_score_keys(result_panel, universe_filters)
+        cached_for_panel = _restrict_to_panel(cached, context_keys)
         if cache_only:
-            combined = _apply_universe_filters(panel, cached_for_panel, universe_filters)
+            combined = _apply_universe_filters(
+                result_panel,
+                _restrict_to_panel(cached_for_panel, panel_keys),
+                universe_filters,
+            )
             combined = combined.sort_values(["trade_date", "instrument"]).reset_index(drop=True)
             cached_rows = int(len(combined))
             return FactorScoreResult(
@@ -141,7 +148,7 @@ class FactorValueStore:
             combined = _empty_scores()
         else:
             combined = _restrict_to_panel(combined, panel_keys)
-            combined = _apply_universe_filters(panel, combined, universe_filters)
+            combined = _apply_universe_filters(result_panel, combined, universe_filters)
             combined = combined.sort_values(["trade_date", "instrument"]).reset_index(drop=True)
 
         cached_rows = int(len(cached_complete))
@@ -339,7 +346,7 @@ def _plan_score_computation(
     normalized_missing = _score_keys(missing_keys)
     missing_rows = int(len(normalized_missing))
     ratio = _missing_ratio(missing_rows, required_rows)
-    context_dates = set(normalized_missing["trade_date"])
+    context_dates = pd.DatetimeIndex(normalized_missing["trade_date"].drop_duplicates())
     if lookback <= 0:
         context_panel = panel[pd.to_datetime(panel["trade_date"]).isin(context_dates)]
         mode = "date_block_incremental" if ratio >= 0.05 else "sparse_incremental"
@@ -366,7 +373,7 @@ def _plan_score_computation(
             context_rows=int(len(panel)),
         )
 
-    context_dates.update(_lookback_context_dates(normalized_panel, normalized_missing, lookback))
+    context_dates = context_dates.union(_lookback_context_dates(normalized_panel, normalized_missing, lookback))
     context_panel = panel[pd.to_datetime(panel["trade_date"]).isin(context_dates)]
     context_rows = int(len(context_panel))
     if context_rows >= int(len(panel) * 0.8):
@@ -406,7 +413,7 @@ def _lookback_context_dates(
     normalized_panel: pd.DataFrame,
     normalized_missing: pd.DataFrame,
     lookback: int,
-) -> set[pd.Timestamp]:
+) -> pd.DatetimeIndex:
     ordered = (
         normalized_panel[["trade_date", "instrument"]]
         .drop_duplicates()
@@ -420,8 +427,8 @@ def _lookback_context_dates(
         how="inner",
     )[["instrument", "_qf_position"]]
     if positions.empty:
-        return set()
-    dates: set[pd.Timestamp] = set()
+        return pd.DatetimeIndex([])
+    date_chunks: list[pd.Series] = []
     ordered_by_instrument = {
         instrument: rows.set_index("_qf_position")["trade_date"]
         for instrument, rows in ordered.groupby("instrument", sort=False)
@@ -435,8 +442,10 @@ def _lookback_context_dates(
             for position in group["_qf_position"].drop_duplicates()
         )
         for start, end in _merge_position_intervals(intervals):
-            dates.update(instrument_dates.loc[start:end])
-    return dates
+            date_chunks.append(instrument_dates.loc[start:end])
+    if not date_chunks:
+        return pd.DatetimeIndex([])
+    return pd.DatetimeIndex(pd.concat(date_chunks, ignore_index=True).drop_duplicates())
 
 
 def _merge_position_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -558,28 +567,23 @@ def _apply_universe_filters(
     if not universe_filters or scores.empty:
         return scores
     mask = execute_factor_formula(panel, "close", universe_filters)
-    allowed = set(
-        zip(
-            pd.to_datetime(mask.loc[mask["score"].notna(), "trade_date"]),
-            mask.loc[mask["score"].notna(), "instrument"].astype(str),
-            strict=True,
-        )
-    )
     result = scores.copy()
-    keys = zip(result["trade_date"], result["instrument"].astype(str), strict=True)
-    result.loc[[key not in allowed for key in keys], "score"] = pd.NA
+    result["trade_date"] = pd.to_datetime(result["trade_date"])
+    result["instrument"] = result["instrument"].astype(str)
+    allowed = _score_keys(mask.loc[mask["score"].notna(), ["trade_date", "instrument"]])
+    marked = result[["trade_date", "instrument"]].merge(
+        allowed.assign(_allowed=True),
+        on=["trade_date", "instrument"],
+        how="left",
+    )
+    result.loc[~marked["_allowed"].eq(True).to_numpy(), "score"] = pd.NA
     return result
 
 
 def _merge_score_updates(existing: pd.DataFrame, updates: pd.DataFrame) -> pd.DataFrame:
     if existing.empty:
         return _dedupe_scores(updates)
-    update_keys = set(zip(updates["trade_date"], updates["instrument"].astype(str), strict=True))
-    keep = [
-        key not in update_keys
-        for key in zip(existing["trade_date"], existing["instrument"].astype(str), strict=True)
-    ]
-    return _dedupe_scores(pd.concat([existing.loc[keep], updates], ignore_index=True))
+    return _dedupe_scores(pd.concat([existing, updates], ignore_index=True))
 
 
 def _dedupe_scores(scores: pd.DataFrame) -> pd.DataFrame:
@@ -668,6 +672,8 @@ def _unique_existing_dirs(paths: tuple[Path, ...]) -> tuple[Path, ...]:
 
 
 def _is_child_name(value: str) -> bool:
+    if value in {".", ".."}:
+        return False
     path = Path(value)
     return not path.is_absolute() and len(path.parts) == 1
 
@@ -715,7 +721,10 @@ def _worldquant_aliases(value: str) -> list[str]:
 
 def _safe_dir_name(value: str) -> str:
     normalized = re.sub(r"[^a-zA-Z0-9_.=-]+", "_", value.strip())
-    return normalized.strip("_") or "factor"
+    normalized = normalized.strip("_")
+    if normalized in {"", ".", ".."}:
+        return "factor"
+    return normalized
 
 
 def _factor_id_values(value: str) -> set[str]:

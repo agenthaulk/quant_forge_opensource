@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 from dataclasses import replace
 from pathlib import Path
 import threading
@@ -52,6 +53,9 @@ def test_web_workbench_rule_workflow_runs_end_to_end(tmp_path) -> None:
     assert result["factor"]["formula"] == "-rank(market_cap)"
     assert result["factor"]["universe_filters"] == ["is_st == false"]
     assert result["evaluation"]["observations"] > 0
+    assert result["in_sample_backtest"]["sample_role"] == "in_sample_backtest"
+    assert result["in_sample_backtest"]["periods"] > 0
+    assert result["backtest"]["sample_role"] == "external_oos_backtest"
     assert result["backtest"]["periods"] > 0
     assert "gross_annualized_return" in result["backtest"]
     assert "net_annualized_return" in result["backtest"]
@@ -243,10 +247,12 @@ def test_web_validation_workflow_uses_edited_parameters(monkeypatch, tmp_path) -
         factor_values_root,
         factor_values_overlay_root,
         factor_values_manifest_root,
+        sample_role="external_oos_backtest",
     ):
         captured["backtest_holding_days"] = holding_days
         captured["backtest_profile"] = simulation_profile
         captured["transaction_costs"] = transaction_costs
+        captured.setdefault("backtest_sample_roles", []).append(sample_role)
         return BacktestResult(
             factor_id=factor_id,
             periods=1,
@@ -305,6 +311,7 @@ def test_web_validation_workflow_uses_edited_parameters(monkeypatch, tmp_path) -
     costs = captured["transaction_costs"]
     assert captured["evaluation_horizon_days"] == 21
     assert captured["backtest_holding_days"] == 21
+    assert captured["backtest_sample_roles"] == ["in_sample_backtest", "external_oos_backtest"]
     assert isinstance(evaluation_profile, SimulationProfile)
     assert evaluation_profile.decay_days == 0
     assert evaluation_profile.top_quantile == 0.1
@@ -505,8 +512,10 @@ def test_web_run_idea_workflow_preserves_distinct_default_profiles(monkeypatch, 
         factor_values_root,
         factor_values_overlay_root,
         factor_values_manifest_root,
+        sample_role="external_oos_backtest",
     ):
         captured["backtest_profile"] = simulation_profile
+        captured.setdefault("backtest_sample_roles", []).append(sample_role)
         return BacktestResult(
             factor_id=factor_id,
             periods=1,
@@ -554,6 +563,7 @@ def test_web_run_idea_workflow_preserves_distinct_default_profiles(monkeypatch, 
     assert backtest_profile.decay_days == 3
     assert backtest_profile.test_period_start == "2026-01-01"
     assert result["parameters"]["holding_days"] == 9
+    assert captured["backtest_sample_roles"] == ["in_sample_backtest", "external_oos_backtest"]
     assert result["parameters"]["evaluation_start"] == "2025-01-01"
     assert result["parameters"]["backtest_start"] == "2026-01-01"
     assert result["backtest"]["holding_days"] == 9
@@ -577,6 +587,10 @@ def test_web_research_once_workflow_runs_end_to_end(tmp_path) -> None:
     assert result["candidates"][0]["factor"]["formula"] in {"rank(return_5d)", "-rank(volatility_5d)"}
     assert result["candidates"][0]["factor"]["status"] == "candidate"
     assert result["accepted_candidate_ids"]
+    assert result["comparison_rows"]
+    assert result["comparison_rows"][0]["role"] == "seed"
+    assert {row["role"] for row in result["comparison_rows"]} == {"seed", "candidate"}
+    assert result["iteration_chain"]["rounds"][0]["comparison_rows"]
     backtest = result["candidates"][0]["backtest"]
     assert "net_annualized_return" in backtest
     assert "rebalance_rate" in backtest
@@ -769,6 +783,53 @@ def test_web_research_workflow_marks_attempted_chain_without_acceptance(monkeypa
     ]
 
 
+def test_web_research_workflow_keeps_completed_rounds_when_later_round_fails(monkeypatch, tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+    calls: list[str] = []
+
+    def fake_run_research_once(
+        config,
+        rd_config,
+        seed_factor_id,
+        *,
+        objective,
+        max_candidates,
+        cancel_event=None,
+    ):
+        calls.append(seed_factor_id)
+        if len(calls) == 1:
+            return _fake_research_result(
+                seed_factor_id=seed_factor_id,
+                candidate_id="FTR_FIRST",
+                accepted=False,
+                report_path=tmp_path / f"{seed_factor_id}.md",
+            )
+        raise RuntimeError("LLM request timed out")
+
+    monkeypatch.setattr(web_server, "_run_research_once", fake_run_research_once)
+
+    result = run_research_once_workflow(
+        config,
+        "FTR_SEED",
+        max_candidates=1,
+        iterations=3,
+        rd_config=ResearchLoopConfig(),
+    )
+
+    assert calls == ["FTR_SEED", "FTR_FIRST"]
+    assert result["iteration_count"] == 1
+    assert result["requested_iterations"] == 3
+    assert result["failed_round_index"] == 2
+    assert result["partial_result"] is True
+    assert result["chain_error"] == "LLM request timed out"
+    assert result["stopped_reason"] == "iteration_failed"
+    assert result["iteration_chain"]["failed_round_index"] == 2
+    assert result["iteration_chain"]["chain_error"] == "LLM request timed out"
+    assert result["iteration_chain"]["rounds"][0]["top_candidate_id"] == "FTR_FIRST"
+    assert result["candidates"][0]["factor"]["factor_id"] == "FTR_FIRST"
+
+
 def test_web_research_workflow_marks_pure_no_optimization(monkeypatch, tmp_path) -> None:
     create_demo_workspace(tmp_path / "demo")
     config = QuantForgeConfig().resolve(tmp_path / "demo")
@@ -937,10 +998,12 @@ allowed_interval_days: [5]
     assert "/api/jobs/research-run-once" in html
     assert "/api/jobs/parse-idea" in html
     assert "/api/jobs/validate-idea" in html
+    assert "/api/jobs/staggered-entry" in html
     assert "/api/research/campaign" not in html
     assert "/api/research/schedule" in html
     assert "解析因子" in html
     assert "验证并评测" in html
+    assert "首月逐日建仓稳健性回测" in html
     assert "param-holding-days" in html
     assert "param-decay-days" in html
     assert "param-top-quantile" in html
@@ -998,8 +1061,8 @@ allowed_interval_days: [5]
     assert ">set<" not in html
     assert "毛年化收益" in html
     assert "净年化收益" in html
-    assert "IC t-stat" in html
-    assert "回测期数" in html
+    assert "HAC t-stat" in html
+    assert "完整持有期数" in html
     assert "numIfStable" in html
     assert "pctIfStable" in html
     assert "调仓率" in html
@@ -1007,6 +1070,10 @@ allowed_interval_days: [5]
     assert "风险提示" in html
     assert "口径说明" in html
     assert "研究口径，不是生产交易口径" in html
+    assert "RD 因子迭代对比" in html
+    assert "function comparisonRows" in html
+    assert "function renderComparisonTable" in html
+    assert "external_oos_net_cumulative_return" in html
 
 
 def test_web_html_contract_clears_stale_errors_before_new_submissions(tmp_path) -> None:
@@ -1212,6 +1279,40 @@ def test_web_job_research_run_once_endpoint_completes(tmp_path) -> None:
         assert completed["status"] == "completed"
         assert completed["result"]["seed_factor_id"] == "FTR_DEMO_SMALL_CAP"
         assert completed["result"]["candidates"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_web_job_staggered_entry_endpoint_completes(tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+    server = create_local_web_server(host="127.0.0.1", port=0, config=config)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        started = _post_json(
+            f"{base_url}/api/jobs/staggered-entry",
+            {
+                "factor_id": "FTR_DEMO_SMALL_CAP",
+                "parameters": {
+                    "holding_days": 21,
+                    "backtest": {"simulation": {"top_quantile": 0.3}},
+                },
+                "formation_trading_days": 5,
+            },
+        )
+        completed = _wait_for_job(base_url, started["job_id"])
+
+        assert completed["status"] == "completed"
+        assert completed["result"]["sample_role"] == "staggered_entry_backtest"
+        assert completed["result"]["factor_id"] == "FTR_DEMO_SMALL_CAP"
+        assert completed["result"]["cohort_count"] == 5
+        assert completed["result"]["daily_nav"]
+        assert completed["result"]["artifact_path"].endswith(".json")
     finally:
         server.shutdown()
         server.server_close()
@@ -1501,6 +1602,8 @@ def test_web_server_requires_control_token_for_docker_bind(monkeypatch, tmp_path
         assert str(tmp_path) not in html
         assert "QF_TEST_WEB_TOKEN" not in html
         assert "api_key_env" not in html
+        assert "refreshRuntimeStatus" in html
+        assert "runtime-llm" in html
         with pytest.raises(urllib.error.HTTPError) as status_exc:
             _get_json(f"{base_url}/api/status")
         assert status_exc.value.code == 401
@@ -1523,6 +1626,84 @@ def test_web_server_requires_control_token_for_docker_bind(monkeypatch, tmp_path
             headers={"Authorization": "Bearer secret-token"},
         )
         assert completed["status"] == "completed"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_web_control_token_check_accepts_correct_and_rejects_wrong(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("QF_TEST_WEB_TOKEN", "secret-token")
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig(
+        web=WebSettings(allow_docker_bind=True, control_token_env="QF_TEST_WEB_TOKEN")
+    ).resolve(tmp_path / "demo")
+    server = create_local_web_server(host="0.0.0.0", port=0, config=config)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        # Correct token is accepted (constant-time compare path exercised).
+        status = _get_json(
+            f"{base_url}/api/status", headers={"Authorization": "Bearer secret-token"}
+        )
+        assert status["paths"]["data_root"] == str(config.paths.data_root)
+
+        # A wrong token of the same length is rejected with 401.
+        with pytest.raises(urllib.error.HTTPError) as wrong_exc:
+            _get_json(
+                f"{base_url}/api/status",
+                headers={"Authorization": "Bearer wrong0token0"},
+            )
+        assert wrong_exc.value.code == 401
+
+        # A prefix of the real token is also rejected (no early accept).
+        with pytest.raises(urllib.error.HTTPError) as prefix_exc:
+            _get_json(
+                f"{base_url}/api/status", headers={"Authorization": "Bearer secret"}
+            )
+        assert prefix_exc.value.code == 401
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_web_rejects_oversized_request_body_with_413(tmp_path) -> None:
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+    server = create_local_web_server(host="127.0.0.1", port=0, config=config)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+
+    # Declare an oversized Content-Length but send only a tiny body: the server
+    # must reject on the declared length (before reading the body) with 413, so
+    # no oversized allocation happens. Use a raw socket because urllib would try
+    # to stream the full declared length.
+    declared = web_server.MAX_REQUEST_BODY_BYTES + 1
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+            request = (
+                "POST /api/parse-idea HTTP/1.1\r\n"
+                "Host: 127.0.0.1\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {declared}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{}"
+            )
+            sock.sendall(request.encode("ascii"))
+            sock.shutdown(socket.SHUT_WR)
+            response = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+        status_line = response.split(b"\r\n", 1)[0].decode("ascii", "replace")
+        assert "413" in status_line, status_line
     finally:
         server.shutdown()
         server.server_close()
@@ -1594,6 +1775,10 @@ def test_web_client_error_message_preserves_llm_runtime_detail() -> None:
 
     assert "DEEPSEEK_API_KEY" in message
     assert "Missing API key" in message
+
+    timeout_message = web_server._client_error_message(RuntimeError("LLM request timed out"), fallback="job failed")
+
+    assert timeout_message == "LLM request timed out"
 
 
 def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
@@ -1680,6 +1865,7 @@ def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
         factor_values_root,
         factor_values_overlay_root,
         factor_values_manifest_root,
+        sample_role="external_oos_backtest",
     ):
         assert holding_days == 11
         assert transaction_costs.commission_bps == 0.0
@@ -1690,6 +1876,7 @@ def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
         captured["top_quantile_basis_points"] = int(simulation_profile.top_quantile * 10000)
         captured["backtest_start"] = simulation_profile.test_period_start
         captured["backtest_end"] = simulation_profile.test_period_end
+        captured.setdefault("backtest_sample_roles", []).append(sample_role)
         return fake_run_factor_backtest(
             factor_id,
             factor_root=factor_root,
@@ -1714,6 +1901,7 @@ def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
     assert captured["evaluation_end"] == "2025-12-31"
     assert captured["backtest_start"] == "2026-01-01"
     assert captured["backtest_end"] == "2026-12-31"
+    assert captured["backtest_sample_roles"] == ["in_sample_backtest", "external_oos_backtest"]
     assert captured["top_quantile_basis_points"] == 3000
     assert result["factor"]["horizon_days"] == 11
     assert result["backtest"]["holding_days"] == 11
@@ -1745,7 +1933,7 @@ def test_web_research_once_uses_shared_llm_for_hypothesis_and_review(monkeypatch
     ).resolve(tmp_path / "demo")
     calls: list[str] = []
 
-    def fake_generate_chat_text(llm, messages, *, temperature=0.0, max_tokens=1200):
+    def fake_generate_chat_text(llm, messages, *, temperature=0.0, max_tokens=1200, retry_timeouts=True):
         text = messages[-1]["content"]
         calls.append(text)
         if "Generate up to" in text:
@@ -1839,7 +2027,9 @@ def test_rd_review_prompt_requests_chinese_report_language(tmp_path) -> None:
     assert "Write summary, strengths, risks, and next_hypotheses in Chinese" in messages[0]["content"]
 
 
-def test_web_research_llm_missing_formula_dsl_repairs_then_falls_back(monkeypatch, tmp_path) -> None:
+def test_web_research_llm_missing_formula_dsl_repairs_then_stops_without_fallback(
+    monkeypatch, tmp_path
+) -> None:
     create_demo_workspace(tmp_path / "demo")
     config = QuantForgeConfig(
         llm=LLMSettings(
@@ -1857,7 +2047,7 @@ def test_web_research_llm_missing_formula_dsl_repairs_then_falls_back(monkeypatc
 
     prompts: list[str] = []
 
-    def fake_generate_chat_text(llm, messages, *, temperature=0.0, max_tokens=1200):
+    def fake_generate_chat_text(llm, messages, *, temperature=0.0, max_tokens=1200, retry_timeouts=True):
         prompts.append("\n".join(message["content"] for message in messages))
         return LLMChatResult(
             content=json.dumps(
@@ -1894,14 +2084,14 @@ def test_web_research_llm_missing_formula_dsl_repairs_then_falls_back(monkeypatc
 
     assert len(prompts) == 3
     assert "formula_dsl is missing" in prompts[1]
-    assert result["candidates"]
-    assert result["candidates"][0]["factor"]["factor_id"] == "FTR_DEMO_SMALL_CAP"
-    assert result["candidates"][0]["hypothesis"]["parameter_search_fallback"] is True
+    assert result["candidates"] == []
     assert result["accepted_candidate_ids"] == []
     assert result["optimization_performed"] is False
     assert result["no_optimization_performed"] is True
+    assert result["optimization_status"] == "no_optimization_performed"
     assert result["blocked_plans"][0]["plan"]["status"] == "blocked_missing_formula"
     assert result["blocked_plans"][0]["error"] == "formula_dsl is missing"
+    assert result["blocked_plans"][0]["plan"]["metadata"]["parameter_search_fallback"] is False
 
 
 def test_web_research_llm_mode_requires_configured_provider_key(monkeypatch, tmp_path) -> None:
@@ -2267,6 +2457,39 @@ def test_web_research_cards_include_cache_paths_and_artifacts() -> None:
 
     assert "factor_values:" in html
     assert "artifacts:" in html
+
+
+def test_web_result_sections_separate_roles_and_diagnostics() -> None:
+    html = web_server._index_html(QuantForgeConfig())
+
+    assert "样本内研究评价" in html
+    assert "外部样本外组合评测" in html
+    assert "样本充分性与诊断" in html
+    assert "research_evaluation" in html
+    assert "external_oos_backtest" in html
+    assert "HAC t-stat" in html
+    assert "外部样本外仅包含 1 个完整持有期" in html
+
+
+def test_web_backtest_metric_labels_match_metric_units() -> None:
+    html = web_server._index_html(QuantForgeConfig())
+
+    assert "年化Sharpe" in html
+    assert "年化波动率" in html
+    assert "净值最大回撤" in html
+    assert "日频Sharpe" not in html
+    assert "日频波动率" not in html
+    assert "日频最大回撤" not in html
+
+
+def test_web_does_not_coerce_unavailable_metrics_to_zero() -> None:
+    html = web_server._index_html(QuantForgeConfig())
+
+    assert "valueOr(evaluation.rank_ic_t_stat, 0)" not in html
+    assert "valueOr(backtest.net_annualized_return, 0)" not in html
+    assert "valueOr(backtest.net_long_short_sharpe" not in html
+    assert "valueOr(backtest.rebalance_rate, 0)" not in html
+    assert "valueOr(backtest.turnover_rate, 0)" not in html
 
 
 def _fake_research_result(

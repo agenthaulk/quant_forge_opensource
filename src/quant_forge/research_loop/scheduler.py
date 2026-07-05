@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import logging
 import threading
 from typing import Any, Callable
 
 MAX_SCHEDULED_RD_ITERATIONS = 5
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -119,7 +122,10 @@ class ResearchLoopScheduler:
             error = None
         except Exception as exc:
             result = current.last_result
-            error = str(exc)
+            # Log full detail server-side; only a sanitized message is exposed
+            # on the token-gated status surface.
+            logger.exception("scheduled research run failed")
+            error = _scheduler_error_message(exc)
         with self._lock:
             self._status = ResearchScheduleStatus(
                 enabled=True,
@@ -130,6 +136,24 @@ class ResearchLoopScheduler:
                 last_error=error,
                 last_result=result,
             )
+
+
+def _scheduler_error_message(exc: Exception) -> str:
+    """Sanitize a scheduler exception before exposing it on status.
+
+    Mirrors the web POST path's allowlist (apps/web/server.py:_client_error_message)
+    without importing it (server.py imports this module, so importing back would
+    create a circular dependency). Full detail is logged server-side; only these
+    vetted messages are returned to the token-gated status surface.
+    """
+    if isinstance(exc, PermissionError):
+        return "unauthorized"
+    if isinstance(exc, ValueError):
+        return str(exc)
+    text = str(exc)
+    if "Missing API key" in text or "requires api_key_env" in text or text.startswith("LLM request "):
+        return text
+    return "scheduled research run failed"
 
 
 def _now() -> datetime:

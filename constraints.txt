@@ -1,0 +1,19 @@
+# Reproducible demo-path constraints for Quant Forge (OSS-3).
+#
+# pyproject.toml intentionally uses floor-only version pins so the library
+# stays installable in a wide range of environments. Those floors, however,
+# let a fresh `pip install` pull the newest majors (e.g. numpy 2.5 / pandas 3.0
+# / pyarrow 24), which are *above* the documented baseline and can shift
+# numerical output and API behavior.
+#
+# Use this file to reproduce the documented baseline (Python 3.12) exactly:
+#
+#     pip install -e . -c constraints.txt
+#
+# These are the highest patch releases within the documented baseline majors
+# (numpy 1.x, pandas 2.x). Bump deliberately, and re-run the full test suite
+# plus scripts/release_safety_scan.py when you do.
+numpy==1.26.4
+pandas==2.2.3
+pyarrow==16.1.0
+pyyaml==6.0.2

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from typing import Any
 
 from quant_forge.config import LLMSettings
@@ -28,8 +29,9 @@ CHINESE_RD_REPORT_PROMPT = "通过中文完成RD研究报告"
 class LLMHypothesisGenerator:
     """Generate bounded RD hypotheses with the configured shared LLM."""
 
-    def __init__(self, llm: LLMSettings) -> None:
+    def __init__(self, llm: LLMSettings, *, hypothesis_temperature: float = 0.0) -> None:
         self.llm = _require_non_rule_llm(llm, feature="RD LLM hypothesis generation")
+        self._temperature = hypothesis_temperature
         self._metadata = ResearchGenerationMetadata(
             source="llm_hypothesis",
             provider=self.llm.provider,
@@ -59,7 +61,7 @@ class LLMHypothesisGenerator:
         result = generate_chat_text(
             self.llm,
             _hypothesis_messages(seed, context=context, objective=objective, max_candidates=max_candidates),
-            temperature=0.2,
+            temperature=self._temperature,
             max_tokens=1200,
         )
         payload = extract_json_object(result.content)
@@ -140,6 +142,7 @@ class LLMResearchReviewGenerator:
             ),
             temperature=0.1,
             max_tokens=1200,
+            retry_timeouts=False,
         )
         payload = extract_json_object(result.content)
         fallback_summary = _fallback_review_summary(
@@ -252,6 +255,8 @@ def _repair_messages(
         "Use only listed fields, listed operators, numeric window arguments where required, and safe arithmetic. "
         "Preserve the selected research lane and economic mechanism whenever possible. "
         "If the exact formula cannot be repaired, choose the closest executable formula from the same lane. "
+        "If validation_error says the formula already exists, return a materially different executable formula. "
+        "If validation_error includes forbidden_formula_dsl, never return any listed formula_dsl. "
         "Do not change the research intent unless needed to make the formula executable. "
         "Do not request parameter-search fallback. If you cannot repair it, return an empty hypotheses list."
     )
@@ -449,6 +454,21 @@ def _hypotheses_from_payload(payload: dict[str, Any], *, max_candidates: int) ->
     raw = payload.get("hypotheses")
     if not isinstance(raw, list):
         raise RuntimeError("RD LLM response must include hypotheses list")
+    # Record (non-silently) any drift from the versioned RD hypothesis contract.
+    # We coerce-and-warn rather than raise so already-lenient payloads keep
+    # parsing, mirroring normalize_review_payload's behavior on the review path.
+    if str(payload.get("schema_version", "")).strip() != RD_LLM_SCHEMA_VERSION:
+        warnings.warn(
+            f"RD LLM hypothesis payload schema_version_missing_or_mismatched "
+            f"(expected {RD_LLM_SCHEMA_VERSION})",
+            stacklevel=2,
+        )
+    if str(payload.get("task_type", "")).strip() != "rd_research_hypotheses":
+        warnings.warn(
+            "RD LLM hypothesis payload task_type_missing_or_mismatched "
+            "(expected rd_research_hypotheses)",
+            stacklevel=2,
+        )
     parsed: list[ResearchHypothesis] = []
     provider_fallback_seen: list[bool] = []
     seen: set[str] = set()

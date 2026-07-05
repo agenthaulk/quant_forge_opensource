@@ -11,6 +11,7 @@ import pandas as pd
 
 from quant_forge.core.contracts import SimulationProfile
 from quant_forge.factor_engine.executor import execute_factor_formula
+from quant_forge.factor_engine.formula_parser import formula_lookback_rows
 from quant_forge.factor_engine.value_store import FactorScoreResult, FactorValueStore
 from quant_forge.factor_library.catalog import is_precomputed_formula
 
@@ -56,6 +57,8 @@ def prepare_factor_scores_result(
     _validate_profile(simulation_profile)
     working_panel = apply_test_period(panel, simulation_profile)
     cache_only = is_precomputed_formula(formula)
+    lookback_rows = 0 if cache_only else formula_lookback_rows(formula)
+    context_panel = _profile_context_panel(panel, simulation_profile, lookback_rows)
     read_root = factor_values_root or factor_values_overlay_root
     factor_values_write_path = None
     compute_mode = "computed_formula"
@@ -63,16 +66,17 @@ def prepare_factor_scores_result(
     missing_rows = 0
     required_rows = 0
     missing_ratio = 0.0
-    lookback_rows = 0
     context_rows = 0
     if read_root is not None and factor_id is not None:
+        target_panel = context_panel if simulation_profile.decay_days > 1 else working_panel
         score_result = FactorValueStore(read_root, write_root=factor_values_overlay_root).prepare_scores(
-            working_panel,
+            context_panel,
             factor_id=factor_id,
             factor_name=factor_name or factor_id,
             formula=formula,
             universe_filters=universe_filters,
             cache_only=cache_only,
+            target_panel=target_panel,
         )
         scores = score_result.scores
         source = score_result.source
@@ -92,17 +96,18 @@ def prepare_factor_scores_result(
     else:
         from quant_forge.operator_registry.resolver import resolve_executable_formula
 
-        scores = execute_factor_formula(working_panel, resolve_executable_formula(formula), universe_filters)
+        scores = execute_factor_formula(context_panel, resolve_executable_formula(formula), universe_filters)
         source = "computed_formula"
         cached_rows = 0
-        computed_rows = int(len(scores))
+        computed_rows = int(len(_restrict_scores_to_panel(scores, working_panel)))
         factor_values_path = None
         missing_rows = computed_rows
-        required_rows = computed_rows
-        missing_ratio = 1.0 if computed_rows else 0.0
-        context_rows = computed_rows
+        required_rows = int(len(working_panel))
+        missing_ratio = 1.0 if required_rows else 0.0
+        context_rows = int(len(context_panel))
     if simulation_profile.decay_days > 1:
         scores = _apply_ewma_decay(scores, simulation_profile.decay_days)
+    scores = _restrict_scores_to_panel(scores, working_panel)
     prepared = (
         scores[["trade_date", "instrument", "score"]]
         .sort_values(["trade_date", "instrument"])
@@ -132,6 +137,27 @@ def apply_test_period(panel: pd.DataFrame, profile: SimulationProfile) -> pd.Dat
     if profile.test_period_end:
         result = result[result["trade_date"] <= pd.Timestamp(profile.test_period_end)]
     return result
+
+
+def _profile_context_panel(panel: pd.DataFrame, profile: SimulationProfile, lookback_rows: int) -> pd.DataFrame:
+    result = panel.copy()
+    if profile.test_period_end:
+        result = result[result["trade_date"] <= pd.Timestamp(profile.test_period_end)]
+    if profile.test_period_start and lookback_rows <= 0:
+        result = result[result["trade_date"] >= pd.Timestamp(profile.test_period_start)]
+    return result
+
+
+def _restrict_scores_to_panel(scores: pd.DataFrame, panel: pd.DataFrame) -> pd.DataFrame:
+    if scores.empty or panel.empty:
+        return scores.iloc[0:0].copy()
+    keys = panel[["trade_date", "instrument"]].copy()
+    keys["trade_date"] = pd.to_datetime(keys["trade_date"])
+    keys["instrument"] = keys["instrument"].astype(str)
+    normalized = scores.copy()
+    normalized["trade_date"] = pd.to_datetime(normalized["trade_date"])
+    normalized["instrument"] = normalized["instrument"].astype(str)
+    return normalized.merge(keys.drop_duplicates(), on=["trade_date", "instrument"], how="inner")
 
 
 def require_minimum_display_trading_days(
