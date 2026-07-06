@@ -31,8 +31,10 @@ Studio's exec()-based codegen are recorded counterexamples).
 3. **LLM never sees audit-OOS evidence during selection.** The orchestrator
    filters context packets by sample_role before prompting (FP-6). External
    OOS appears only in post-selection audit sections and human reports.
-4. **Determinism defaults:** temperature 0.0 for hypothesis lanes; all
-   prompts and responses traced; request hashes make reruns idempotent.
+4. **Reproducibility mechanism:** trace-replay is the guarantee — all
+   prompts and responses traced, request hashes make reruns idempotent.
+   Temperature 0.0 on hypothesis lanes reduces variance but providers do
+   not guarantee bitwise determinism; never claim it.
 5. **LLM unavailability degrades, never blocks evidence:** parsing falls
    back to structured forms; RD falls back to local rule generators
    (existing pattern); evaluation/backtest paths have zero LLM dependency.
@@ -40,6 +42,23 @@ Studio's exec()-based codegen are recorded counterexamples).
    from NL is the restricted formula DSL through the hardened AST path.
    (Studio's in-process exec of agent code is explicitly rejected for the
    public repo.)
+
+## Phase C obligations (named requirements, not current facts)
+
+- **Validation witness (B4 F4):** the gate must issue a typed witness
+  (validated spec + registry/catalog provenance) and execution ports must
+  accept ONLY the witness — closing the advisory-gate gap and the
+  `precomputed:` resolver short-circuit path. Until then, no autonomous
+  spec→execution routing exists by policy.
+- **Prompt-injection threat model (B4 F12):** context packets interpolate
+  artifact-derived text (factor names, theses, objectives) into prompts;
+  the orchestrator lane must review data→LLM flows, and LLM narrative may
+  never be the sole carrier of a numeric claim — every number in narrative
+  must be checkable against typed evidence refs (UI renders the typed
+  value, not the prose).
+- **AgentTaskSpec.allowed_tools is a declared catalog contract**: it
+  constrains construction today; runtime enforcement arrives with
+  AgentToolPort, which must implement the catalog 1:1 (B5 #2 honesty gap).
 
 ## Human confirmation points (minimum set)
 

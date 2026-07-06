@@ -50,8 +50,11 @@ registry version, request hash (closes the mounted-store trust gap).
 
 ## 4. Anti-overfitting mechanics in the loop (FP-6 operationalized)
 
-- Context packets are filtered by `sample_role` — audit-OOS evidence is
-  structurally absent from selection prompts.
+- Context packets are filtered by `sample_role` — audit-OOS evidence must
+  be structurally absent from selection prompts. STATUS: contract-level
+  today (closed sample-role vocabulary, selection-only filter default);
+  the runtime filter is the orchestrator lane's acceptance test (a trace
+  test proving OOS absence from prompts), not an existing fact.
 - Dedup: formula fingerprint + result signature + candidate diversity
   (existing), plus value-correlation pruning against the active library
   (RD-Agent-adopted, value-corr not string-similarity).
