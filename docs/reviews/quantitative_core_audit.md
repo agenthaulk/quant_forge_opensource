@@ -16,6 +16,25 @@
   squash-merged to `main` as `7931522` (verified via reflog: `03e33c8` →
   ff-pull → `7931522`; the audited tree IS the base tree).
 
+## First principles
+
+Every finding, fix, and recommendation in this audit derives from one of
+these axioms — not from convention or reference-project imitation. Each
+register entry cites its axiom.
+
+| # | Axiom | Derived findings/fixes |
+| --- | --- | --- |
+| FP-1 | Information unavailable at decision time must not enter the decision | QUANT-1 embargo; A-P1-2 segment purge; A-P1-1 formation (exit-availability is future info); COR-5 order-independence |
+| FP-2 | Absence of evidence is not evidence of compliance | A-P1-3 INSUFFICIENT_OOS_EVIDENCE (both gates); A-P1-4 status rendering; metrics.v2 null-not-zero |
+| FP-3 | Realized P&L is conserved — a loss cannot vanish through re-normalization or exclusion | A-P1-1 lost-position realization + frozen-mark NAV |
+| FP-4 | Unobserved values are never fabricated; unknowns are surfaced, not guessed | A-P2-1/2 snapshot NaN + synthesized_columns; COR-8 unmarkable-day NaN |
+| FP-5 | One quantity, one definition, across every surface | A-P2-3 agent config parity; eval/backtest timing parity (contrast: Studio's shift(-1) eval vs t+2 backtest) |
+| FP-6 | A sample touched by selection is no longer out-of-sample | COR-2 audit-only external OOS; bounded/deduped RD rounds (contrast: RD-Agent's every-round test-set SOTA gate) |
+| FP-7 | Every statistic must carry its own validity (sample size, significance, status) | HAC/NW t-stats; 126-day reportability floor; MetricValue statuses; degenerate guards |
+
+Phase B design rule that follows: prefer making axiom-violating states
+*unrepresentable in the type/contract layer* over policing them with review.
+
 ## 0. Step A0 baseline status
 
 | Gate | Status (2026-07-05, this session) |
