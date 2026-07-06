@@ -18,16 +18,16 @@
 
 ## 0. Step A0 baseline status
 
-| Gate | Status |
+| Gate | Status (2026-07-05, this session) |
 | --- | --- |
-| Full `pytest` | **BLOCKED — not run this session** (Bash classifier outage). Last recorded at this exact tree: 394 passed (`docs/first_principles_review_20260703.md` §10, WORKING_STATE handoff log 2026-07-03). CI (`.github/workflows/ci.yml`) enforces pytest + release scan + `git diff --check` on push/PR for py3.11/3.12. |
-| CLI `--help` smoke | BLOCKED — same. Last recorded: ok. |
-| `release_safety_scan.py` | BLOCKED — same. Last recorded: green. |
-| `git diff --check` | BLOCKED — same. Last recorded: clean. |
+| Full `pytest` on unmodified BASE (`main`@7931522) | **397 passed** (105.7s) — the true Step A0 baseline |
+| Full `pytest` on Phase A branch after A-P1-2/A-P1-3 | **404 passed** (397 baseline + 7 new regressions, zero regressions) |
+| CLI `--help` smoke (worktree) | OK |
+| `release_safety_scan.py` (worktree) | PASSED (112 public files) |
+| `git diff --check` (worktree) | clean |
 
-Per protocol, **no large-scale code modification happens before the baseline
-is re-run in this worktree.** Documentation-only commits are exempt. The
-moment Bash recovers, Step A0 runs first and this table is updated.
+The classifier outage that blocked the first execution window resolved
+mid-session; all gates above were executed directly, not carried forward.
 
 ## 1. Step A1 — Review map
 
