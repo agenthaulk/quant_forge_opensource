@@ -166,7 +166,7 @@ def _validate_source_snapshot(data_root: Path, source_root: Path) -> DataValidat
             optional_columns=(f"source_snapshot_error={exc}",),
         )
     try:
-        _read_snapshot_files(source_root / "daily_basic", columns=SOURCE_DAILY_BASIC_COLUMNS)
+        daily_basic = _read_snapshot_files(source_root / "daily_basic", columns=SOURCE_DAILY_BASIC_COLUMNS)
     except Exception as exc:
         return DataValidationResult(
             data_root=data_root,
@@ -200,7 +200,30 @@ def _validate_source_snapshot(data_root: Path, source_root: Path) -> DataValidat
         start_date=dates.min().date().isoformat() if not dates.empty else "",
         end_date=dates.max().date().isoformat() if not dates.empty else "",
         optional_columns=("source_snapshot", "volume", "return_1d", "return_5d", "volatility_5d"),
+        synthesized_columns=_snapshot_synthesized_columns(price, daily_basic),
     )
+
+
+def _snapshot_synthesized_columns(price: pd.DataFrame, daily_basic: pd.DataFrame) -> tuple[str, ...]:
+    """Report panel columns the snapshot loader cannot fully back with source data.
+
+    ``is_st`` is always synthesized: the snapshot schema carries no ST flag, so
+    ``load_panel`` fills ``False`` for every row. ``market_cap`` is reported when
+    ``total_mv``/``circ_mv`` coverage is incomplete for the price rows, in which
+    case the loader leaves the affected rows as NaN instead of inventing a value.
+    """
+
+    if daily_basic.empty:
+        return ("is_st", "market_cap")
+    total_mv = pd.to_numeric(daily_basic["total_mv"], errors="coerce")
+    circ_mv = pd.to_numeric(daily_basic["circ_mv"], errors="coerce")
+    if total_mv.fillna(circ_mv).isna().any():
+        return ("is_st", "market_cap")
+    price_keys = pd.MultiIndex.from_frame(price[["trade_date", "ts_code"]].astype(str))
+    basic_keys = pd.MultiIndex.from_frame(daily_basic[["trade_date", "ts_code"]].astype(str))
+    if not price_keys.isin(basic_keys).all():
+        return ("is_st", "market_cap")
+    return ("is_st",)
 
 
 def _load_source_snapshot_panel(source_root: Path) -> pd.DataFrame:
@@ -221,18 +244,17 @@ def _load_source_snapshot_panel(source_root: Path) -> pd.DataFrame:
     panel["volume"] = pd.to_numeric(panel.get("volume", 0.0), errors="coerce").fillna(0.0)
     total_mv = pd.to_numeric(panel.get("total_mv"), errors="coerce") if "total_mv" in panel else pd.Series(index=panel.index)
     circ_mv = pd.to_numeric(panel.get("circ_mv"), errors="coerce") if "circ_mv" in panel else pd.Series(index=panel.index)
-    panel["market_cap"] = total_mv.fillna(circ_mv).fillna(1.0)
+    panel["market_cap"] = total_mv.fillna(circ_mv)
     panel["is_st"] = False
     panel = panel.dropna(subset=["trade_date", "instrument", "close"])
     panel = panel.sort_values(["instrument", "trade_date"]).reset_index(drop=True)
-    panel["return_1d"] = panel.groupby("instrument")["close"].pct_change().fillna(0.0)
-    panel["return_5d"] = panel.groupby("instrument")["close"].pct_change(5).fillna(0.0)
+    panel["return_1d"] = panel.groupby("instrument")["close"].pct_change()
+    panel["return_5d"] = panel.groupby("instrument")["close"].pct_change(5)
     panel["volatility_5d"] = (
         panel.groupby("instrument")["return_1d"]
         .rolling(5, min_periods=2)
         .std()
         .reset_index(level=0, drop=True)
-        .fillna(0.0)
     )
     return panel[
         [

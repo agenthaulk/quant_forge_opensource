@@ -73,6 +73,7 @@ class DataValidationResult:
     start_date: str = ""
     end_date: str = ""
     optional_columns: tuple[str, ...] = field(default_factory=tuple)
+    synthesized_columns: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
