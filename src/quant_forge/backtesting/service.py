@@ -42,6 +42,7 @@ DAILY_NAV_UNAVAILABLE = "DAILY_NAV_UNAVAILABLE"
 NO_REBALANCE_OBSERVATIONS = "NO_REBALANCE_OBSERVATIONS"
 PARTIAL_FINAL_PERIOD = "PARTIAL_FINAL_PERIOD"
 SEGMENT_BOUNDARY_PURGED = "SEGMENT_BOUNDARY_PURGED"
+POSITIONS_LOST_BEFORE_EXIT = "POSITIONS_LOST_BEFORE_EXIT"
 
 
 def run_factor_backtest(
@@ -125,6 +126,7 @@ def run_factor_backtest(
     start_signal_index = _resolve_start_signal_index(dates, first_signal_date)
     completed_periods = 0
     partial_periods = 0
+    lost_positions_total = 0
     for signal_index in range(start_signal_index, len(dates) - delay - 1, holding):
         signal_date = dates[signal_index]
         entry_date = dates[signal_index + delay]
@@ -160,6 +162,8 @@ def run_factor_backtest(
         period_group_returns = _group_returns(ordered, group_count)
         for group_name, group_return in period_group_returns.items():
             grouped_returns.setdefault(group_name, []).append(group_return)
+        lost_position_count = int(long_leg["position_lost"].sum() + short_leg["position_lost"].sum())
+        lost_positions_total += lost_position_count
         long_names = set(long_leg["instrument"].astype(str))
         short_names = set(short_leg["instrument"].astype(str))
         rebalance_rate: float | None = None
@@ -237,6 +241,7 @@ def run_factor_backtest(
                 "is_complete_period": is_complete_period,
                 "is_partial_final_period": not is_complete_period,
                 "trading_days_held": trading_days_held,
+                "lost_position_count": lost_position_count,
                 "eligible_universe_count": int(len(signal)),
                 "valid_score_count": int(len(signal)),
                 "long_count": int(len(long_leg)),
@@ -309,6 +314,13 @@ def run_factor_backtest(
         warning_code_items.append(NO_REBALANCE_OBSERVATIONS)
     if partial_periods:
         warning_code_items.append(PARTIAL_FINAL_PERIOD)
+    if lost_positions_total:
+        warning_code_items.append(POSITIONS_LOST_BEFORE_EXIT)
+        warnings = tuple(
+            dict.fromkeys(
+                (*warnings, "positions lost before scheduled exit realize at last available close")
+            )
+        )
     warning_codes = tuple(dict.fromkeys(warning_code_items))
     metrics = {
         "annualized_return": gross_summary["metrics"]["annualized_return"],
@@ -428,6 +440,7 @@ def run_factor_backtest(
             "periods": len(rows),
             "completed_periods": completed_periods,
             "partial_periods": partial_periods,
+            "lost_positions": lost_positions_total,
             "exposure_days": exposure_days,
             "calendar_days": _calendar_days(rows),
             "cumulative_return": gross_summary["cumulative_return"],
@@ -520,6 +533,7 @@ def run_factor_backtest(
         return_series_kind="scheduled_horizon_daily_mark_to_market",
         completed_periods=completed_periods,
         partial_periods=partial_periods,
+        lost_positions=lost_positions_total,
         exposure_days=exposure_days,
         calendar_days=_calendar_days(rows),
         reportable_annualization=gross_summary["reportable_annualization"],
@@ -653,10 +667,21 @@ def run_staggered_entry_backtest(
 
 def _with_period_return(close: pd.DataFrame, entry_date: pd.Timestamp, exit_date: pd.Timestamp) -> pd.DataFrame:
     entry = close[close["trade_date"] == entry_date][["instrument", "close"]].rename(columns={"close": "entry_close"})
-    exit_ = close[close["trade_date"] == exit_date][["instrument", "close"]].rename(columns={"close": "exit_close"})
-    result = entry.merge(exit_, on="instrument", how="inner")
+    window = close[(close["trade_date"] > entry_date) & (close["trade_date"] <= exit_date)]
+    last_marks = (
+        window.sort_values("trade_date")
+        .groupby("instrument", as_index=False)
+        .tail(1)[["instrument", "trade_date", "close"]]
+        .rename(columns={"trade_date": "last_mark_date", "close": "last_mark_close"})
+    )
+    result = entry.merge(last_marks, on="instrument", how="left")
+    # Requiring an exit-date quote here would condition formation on
+    # information unavailable at entry time (survivorship bias): a name that
+    # stops quoting mid-period realizes at its last available close instead.
+    result["exit_close"] = result["last_mark_close"].fillna(result["entry_close"])
     result["period_return"] = result["exit_close"] / result["entry_close"] - 1.0
-    return result[["instrument", "period_return"]]
+    result["position_lost"] = result["last_mark_date"].isna() | result["last_mark_date"].ne(exit_date)
+    return result[["instrument", "period_return", "position_lost"]]
 
 
 def _resolve_start_signal_index(dates: list[pd.Timestamp], first_signal_date: str | None) -> int:
@@ -847,18 +872,22 @@ def _leg_cumulative_returns(
     )
     leg_prices = leg_prices.merge(entry_prices, on="instrument", how="inner")
     leg_prices["instrument_return"] = leg_prices["close"] / leg_prices["entry_close"] - 1.0
+    marks = leg_prices.pivot_table(index="trade_date", columns="instrument", values="instrument_return", aggfunc="last")
+    marks = marks.reindex(pd.DatetimeIndex(dates))
+    fresh_counts = marks.notna().sum(axis=1).to_numpy()
+    # Carry each name's last observed mark forward: a name that stops quoting
+    # mid-period keeps its cumulated loss in the leg mark instead of silently
+    # dropping out of a present-subset mean (which re-normalizes the loss away).
+    filled = marks.ffill()
+    means = filled.mean(axis=1, skipna=True).to_numpy()
     result: list[float] = []
-    for item in dates:
-        day = leg_prices[leg_prices["trade_date"] == item]
-        if not day.empty:
-            # Present-subset mean: names missing that day are already excluded,
-            # so a partially-held leg reflects only the surviving names.
-            result.append(float(day["instrument_return"].mean()))
+    for mean, fresh in zip(means, fresh_counts, strict=True):
+        if fresh > 0 and not np.isnan(mean):
+            result.append(float(mean))
         else:
-            # Fully-empty day (every held name absent, e.g. delisting/halt): do
-            # NOT carry the prior day's leg return, which would hold NAV flat at
-            # a stale mark and understate max drawdown (COR-8). Emit NaN so the
-            # NAV/drawdown path can drop the unmarkable day.
+            # Fully-unmarkable day (no held name quoted at all): do NOT hold NAV
+            # flat at a stale mark; emit NaN so the NAV/drawdown path drops the
+            # day (COR-8).
             result.append(float("nan"))
     return result
 
@@ -1262,6 +1291,7 @@ def _assumptions() -> tuple[str, ...]:
         "non-overlapping holding periods",
         "close-to-close period returns",
         "transaction costs are configurable research assumptions",
+        "positions that stop quoting before exit realize at last available close",
         "rebalance_rate tracks component replacement per rebalance",
         "turnover_rate estimates true portfolio weight turnover",
     )

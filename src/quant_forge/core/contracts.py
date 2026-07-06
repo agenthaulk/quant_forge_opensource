@@ -308,6 +308,7 @@ class BacktestResult:
     return_series_kind: str = "non_overlapping_horizon_return"
     completed_periods: int = 0
     partial_periods: int = 0
+    lost_positions: int = 0
     exposure_days: int = 0
     calendar_days: int = 0
     reportable_annualization: MetricValue | None = None
