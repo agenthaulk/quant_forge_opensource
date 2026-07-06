@@ -1,15 +1,20 @@
 """AgentTaskSpec: bounded, typed tasks for the agent plane.
 
 LLM output is always a proposal in a typed schema; tasks carry explicit
-budgets and an allowlist of tools. The LLM-boundary rule "no exec() of
-generated code" is enforced structurally: a task whose tool allowlist names an
-exec/shell surface cannot be constructed at all.
+budgets and an allowlist of tools drawn from a declared catalog.
+``KNOWN_AGENT_TOOLS`` is that catalog — the exact tool names the Phase C
+AgentToolPort must implement 1:1. ``allowed_tools`` must be a non-empty
+subset of it, so a task naming any other surface (exec, shell, bash, or an
+arbitrary string) cannot be constructed at all.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
+
+from quant_forge.specs._normalize import set_tuple
+from quant_forge.specs._vocab import SAMPLE_ROLES
 
 AGENT_TASK_SCHEMA_VERSION = "qf.agent_task.v1"
 
@@ -27,8 +32,24 @@ _ALLOWED_TASK_TYPES: tuple[str, ...] = (
     "review_backtest",
     "assemble_governance_packet",
 )
-# No codegen execution surface may ever be handed to an agent (boundary rule 6).
-_FORBIDDEN_TOOLS: frozenset[str] = frozenset({"exec", "shell"})
+
+# The declared agent tool catalog. This is the complete surface the Phase C
+# AgentToolPort must implement 1:1; allowed_tools is validated as a subset,
+# so no execution surface outside this catalog is representable in a task.
+KNOWN_AGENT_TOOLS: frozenset[str] = frozenset(
+    {
+        "read_catalog",
+        "propose_factor",
+        "validate_spec",
+        "evaluate_factor",
+        "run_backtest",
+        "review_backtest",
+        "run_falsification",
+        "assemble_governance_packet",
+        "request_promotion",
+        "write_artifact_note",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -48,7 +69,7 @@ class AgentTaskSpec:
                 f"unsupported agent task schema_version: {self.schema_version} "
                 f"(expected {AGENT_TASK_SCHEMA_VERSION})"
             )
-        _set_tuple(self, "allowed_tools")
+        set_tuple(self, "allowed_tools")
         if not self.task_id.strip():
             raise ValueError("task_id is required")
         if self.task_type not in _ALLOWED_TASK_TYPES:
@@ -60,24 +81,13 @@ class AgentTaskSpec:
         if not self.allowed_tools:
             raise ValueError("allowed_tools must name at least one tool")
         for tool in self.allowed_tools:
-            if not tool.strip():
-                raise ValueError("allowed_tools entries must be non-empty")
-            if tool.strip().lower() in _FORBIDDEN_TOOLS:
+            if tool not in KNOWN_AGENT_TOOLS:
                 raise ValueError(
-                    f"forbidden tool in allowed_tools: {tool} (no codegen execution surface for agents)"
+                    f"unknown tool in allowed_tools: {tool!r} "
+                    "(not in the declared agent tool catalog KNOWN_AGENT_TOOLS)"
                 )
-        if not self.sample_role_filter.strip():
-            raise ValueError("sample_role_filter is required")
-
-
-def _set_tuple(instance: object, field_name: str) -> None:
-    value = getattr(instance, field_name)
-    if value is None:
-        normalized: tuple[str, ...] = ()
-    elif isinstance(value, tuple):
-        normalized = value
-    elif isinstance(value, list):
-        normalized = tuple(value)
-    else:
-        normalized = (value,)
-    object.__setattr__(instance, field_name, tuple(str(item) for item in normalized))
+        if self.sample_role_filter not in SAMPLE_ROLES:
+            raise ValueError(
+                f"invalid sample_role_filter: {self.sample_role_filter!r} "
+                f"(expected one of {sorted(SAMPLE_ROLES)})"
+            )

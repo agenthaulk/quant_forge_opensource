@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from quant_forge.core.contracts import FactorDefinition, SimulationProfile, TransactionCostModel
+from quant_forge.specs._normalize import coerce_component, set_tuple
 
 STRATEGY_SPEC_SCHEMA_VERSION = "qf.strategy_spec.v1"
 
@@ -46,8 +47,8 @@ class StrategySpec:
                 f"unsupported strategy spec schema_version: {self.schema_version} "
                 f"(expected {STRATEGY_SPEC_SCHEMA_VERSION})"
             )
-        _set_tuple(self, "ranking_factor_ids")
-        _set_tuple(self, "capabilities_required")
+        set_tuple(self, "ranking_factor_ids")
+        set_tuple(self, "capabilities_required")
         _validate_kernel_identifier(self.strategy_id, "strategy_id")
         if not self.name.strip():
             raise ValueError("strategy name is required")
@@ -97,22 +98,9 @@ class StrategySpec:
             name=str(data["name"]),
             ranking_factor_ids=tuple(str(item) for item in data.get("ranking_factor_ids", ())),
             holding_days=int(data.get("holding_days", 5)),
-            simulation=simulation if isinstance(simulation, SimulationProfile) else SimulationProfile(**dict(simulation)),
-            costs=costs if isinstance(costs, TransactionCostModel) else TransactionCostModel(**dict(costs)),
+            simulation=coerce_component(SimulationProfile, simulation, "simulation"),
+            costs=coerce_component(TransactionCostModel, costs, "costs"),
             benchmark=str(data.get("benchmark", "cash")),
             capabilities_required=tuple(str(item) for item in data.get("capabilities_required", ())),
             schema_version=schema_version,
         )
-
-
-def _set_tuple(instance: object, field_name: str) -> None:
-    value = getattr(instance, field_name)
-    if value is None:
-        normalized: tuple[str, ...] = ()
-    elif isinstance(value, tuple):
-        normalized = value
-    elif isinstance(value, list):
-        normalized = tuple(value)
-    else:
-        normalized = (value,)
-    object.__setattr__(instance, field_name, tuple(str(item) for item in normalized))

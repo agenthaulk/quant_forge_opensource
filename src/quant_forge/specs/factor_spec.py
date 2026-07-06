@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 from quant_forge.core.contracts import FactorDefinition, SimulationProfile, TransactionCostModel
+from quant_forge.specs._normalize import coerce_component, set_tuple
 
 FACTOR_SPEC_SCHEMA_VERSION = "qf.factor_spec.v1"
 
@@ -39,8 +40,8 @@ class FactorSpec:
             raise ValueError(
                 f"unsupported factor spec schema_version: {self.schema_version} (expected {FACTOR_SPEC_SCHEMA_VERSION})"
             )
-        _set_tuple(self, "universe_filters")
-        _set_tuple(self, "capabilities_required")
+        set_tuple(self, "universe_filters")
+        set_tuple(self, "capabilities_required")
         if not self.formula_dsl.strip():
             raise ValueError("formula_dsl is required")
         if self.expected_direction not in _ALLOWED_DIRECTIONS:
@@ -67,6 +68,18 @@ class FactorSpec:
             source="spec",
         )
 
+    def unsupported_capabilities(self, known: tuple[str, ...]) -> tuple[str, ...]:
+        """Capabilities this spec requires but the executing adapter lacks.
+
+        Mirrors `StrategySpec.unsupported_capabilities`: reserved-not-yet-
+        executable capabilities must never silently pass — callers MUST check
+        this before routing the spec to execution and fail closed when the
+        result is non-empty (FP-2).
+        """
+
+        known_set = {item.strip() for item in known}
+        return tuple(cap for cap in self.capabilities_required if cap not in known_set)
+
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["universe_filters"] = list(self.universe_filters)
@@ -91,22 +104,9 @@ class FactorSpec:
             expected_direction=str(data.get("expected_direction", "unknown")),  # type: ignore[arg-type]
             horizon_days=int(data.get("horizon_days", 5)),
             universe_filters=tuple(str(item) for item in data.get("universe_filters", ())),
-            simulation=simulation if isinstance(simulation, SimulationProfile) else SimulationProfile(**dict(simulation)),
-            costs=costs if isinstance(costs, TransactionCostModel) else TransactionCostModel(**dict(costs)),
+            simulation=coerce_component(SimulationProfile, simulation, "simulation"),
+            costs=coerce_component(TransactionCostModel, costs, "costs"),
             capabilities_required=tuple(str(item) for item in data.get("capabilities_required", ())),
             metadata=dict(data.get("metadata", {})),
             schema_version=schema_version,
         )
-
-
-def _set_tuple(instance: object, field_name: str) -> None:
-    value = getattr(instance, field_name)
-    if value is None:
-        normalized: tuple[str, ...] = ()
-    elif isinstance(value, tuple):
-        normalized = value
-    elif isinstance(value, list):
-        normalized = tuple(value)
-    else:
-        normalized = (value,)
-    object.__setattr__(instance, field_name, tuple(str(item) for item in normalized))
