@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from pathlib import Path
 
+from quant_forge.core.contracts import SampleSplitSpec, SimulationProfile, TransactionCostModel
 from quant_forge.factor_library.repository import parse_idea_to_definition
 from quant_forge.mcp import read_models
 from quant_forge.workbench.service import WorkbenchService
@@ -20,6 +21,10 @@ class AgentWorkspaceTools:
         factor_values_root: Path | None = None,
         factor_values_overlay_root: Path | None = None,
         factor_values_manifest_root: Path | None = None,
+        simulation_profile: SimulationProfile | None = None,
+        transaction_costs: TransactionCostModel | None = None,
+        sample_splits: tuple[SampleSplitSpec, ...] | None = None,
+        horizon_days_matrix: tuple[int, ...] | None = None,
     ) -> None:
         self.workbench = WorkbenchService(
             factor_root=factor_root,
@@ -28,6 +33,10 @@ class AgentWorkspaceTools:
             factor_values_root=factor_values_root,
             factor_values_overlay_root=factor_values_overlay_root,
             factor_values_manifest_root=factor_values_manifest_root,
+            simulation_profile=simulation_profile,
+            transaction_costs=transaction_costs,
+            sample_splits=sample_splits,
+            horizon_days_matrix=horizon_days_matrix,
         )
         self.factor_root = factor_root
         self.factor_values_root = factor_values_root

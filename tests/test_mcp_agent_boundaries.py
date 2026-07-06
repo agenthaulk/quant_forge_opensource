@@ -6,6 +6,7 @@ import pytest
 
 from quant_forge.agent_workspace import desktop_chrome_rd_prompt
 from quant_forge.agent_workspace.tools import AgentWorkspaceTools
+from quant_forge.core.contracts import SimulationProfile
 from quant_forge.data.local import create_demo_workspace
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.mcp.read_models import list_available_fields, list_available_operators
@@ -90,3 +91,21 @@ def test_agent_tools_can_write_factor_value_increments_to_overlay(tmp_path: Path
     assert result["factor_values_write_path"] == str(overlay_factor_dir)
     assert (overlay_factor_dir / "incremental" / "2024.parquet").exists()
     assert not (factor_values_root / "factor_id=FTR_DEMO_SMALL_CAP" / "incremental").exists()
+
+
+def test_agent_tools_pass_evaluation_configuration_through(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    tools = AgentWorkspaceTools(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        simulation_profile=SimulationProfile(execution_delay_days=2),
+        horizon_days_matrix=(1, 5),
+    )
+
+    result = tools.evaluate_factor("FTR_DEMO_SMALL_CAP")
+
+    # Agent-surface evaluations must honor the same evaluation-shaping
+    # configuration as CLI/Web instead of silently reverting to defaults.
+    assert result["simulation_profile"]["execution_delay_days"] == 2
+    assert {metric["horizon_days"] for metric in result["horizon_metrics"]} == {1, 5}
