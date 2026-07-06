@@ -747,7 +747,9 @@ def _aggregate_staggered_nav(
                 continue
             nav_row = by_date.get(date_label)
             if nav_row is not None:
-                state["last_net_nav"] = float(nav_row["net_nav"])
+                candidate_net_nav = float(nav_row["net_nav"])
+                if np.isfinite(candidate_net_nav):
+                    state["last_net_nav"] = candidate_net_nav
                 state["last_benchmark_nav"] = 1.0
             net_nav += weight * float(state["last_net_nav"])
             benchmark_nav += weight * float(state["last_benchmark_nav"])
@@ -785,13 +787,17 @@ def _daily_ledger_from_nav(daily_nav: list[dict[str, object]]) -> list[dict[str,
     previous_gross = 1.0
     previous_net = 1.0
     previous_benchmark = 1.0
-    for index, item in enumerate(daily_nav):
+    for item in daily_nav:
         gross_nav = float(item["gross_nav"])
         net_nav = float(item["net_nav"])
+        if not (np.isfinite(gross_nav) and np.isfinite(net_nav)):
+            # Unmarkable day (COR-8 NaN): emit no ledger row; the compounding
+            # state carries to the next markable day.
+            continue
         benchmark_nav = 1.0
-        gross_daily_return = gross_nav / previous_gross - 1.0 if index else gross_nav - 1.0
-        net_daily_return = net_nav / previous_net - 1.0 if index else net_nav - 1.0
-        benchmark_return = benchmark_nav / previous_benchmark - 1.0 if index else 0.0
+        gross_daily_return = gross_nav / previous_gross - 1.0 if rows else gross_nav - 1.0
+        net_daily_return = net_nav / previous_net - 1.0 if rows else net_nav - 1.0
+        benchmark_return = benchmark_nav / previous_benchmark - 1.0 if rows else 0.0
         active_return = net_daily_return - benchmark_return
         rows.append(
             {
@@ -818,6 +824,7 @@ def _daily_ledger_from_nav(daily_nav: list[dict[str, object]]) -> list[dict[str,
 
 def _active_risk_metrics(daily_ledger: list[dict[str, object]]) -> tuple[float | None, float | None]:
     active = np.array([float(row["daily_active_return"]) for row in daily_ledger[1:]], dtype=float)
+    active = active[np.isfinite(active)]
     if len(active) < 2:
         return None, None
     std = float(np.std(active, ddof=1))

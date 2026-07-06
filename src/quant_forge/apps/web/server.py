@@ -9,6 +9,7 @@ import hmac
 from html import escape
 import json
 import logging
+import math
 import os
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1538,6 +1539,7 @@ def _backtest_payload(backtest: BacktestResult) -> dict[str, Any]:
         "return_series_kind": backtest.return_series_kind,
         "completed_periods": backtest.completed_periods,
         "partial_periods": backtest.partial_periods,
+        "lost_positions": backtest.lost_positions,
         "exposure_days": backtest.exposure_days,
         "calendar_days": backtest.calendar_days,
         "reportable_annualization": _json_safe(backtest.reportable_annualization),
@@ -1756,7 +1758,9 @@ def _json_safe(value: Any) -> Any:
         return [_json_safe(item) for item in value]
     if isinstance(value, dict):
         return {str(key): _json_safe(item) for key, item in value.items() if str(key) != "raw_response"}
-    if value is None or isinstance(value, bool | int | float | str):
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if value is None or isinstance(value, bool | int | str):
         return value
     return str(value)
 

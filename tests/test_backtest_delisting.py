@@ -7,10 +7,21 @@ present-subset NAV mean, so delisting losses never realized.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
-from quant_forge.backtesting.service import _leg_cumulative_returns, _with_period_return
+from quant_forge.backtesting.service import (
+    POSITIONS_LOST_BEFORE_EXIT,
+    _aggregate_staggered_nav,
+    _daily_ledger_from_nav,
+    _leg_cumulative_returns,
+    _with_period_return,
+    run_factor_backtest,
+)
+from quant_forge.data.local import PANEL_FILE, create_demo_workspace
 
 
 def _close_frame(rows: list[tuple[str, str, float]]) -> pd.DataFrame:
@@ -83,3 +94,63 @@ def test_leg_nav_still_unmarkable_when_no_held_name_quotes() -> None:
     dates = [pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-03"), pd.Timestamp("2024-01-04")]
     returns = _leg_cumulative_returns(close, {"CCC"}, dates[0], dates)
     assert np.isnan(returns[2])
+
+
+def test_run_factor_backtest_reports_lost_positions_on_gapped_panel(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    panel_path = paths["data_root"] / PANEL_FILE
+    panel = pd.read_parquet(panel_path)
+    dates = sorted(panel["trade_date"].unique())
+    victim = panel.groupby("instrument")["market_cap"].mean().sort_values().index[0]
+    # Default schedule (delay=1, holding=5) enters/exits on indices ≡ 1 mod 5;
+    # keep the cutoff off that grid so the gap opens strictly mid-period.
+    cut_index = len(dates) * 2 // 3
+    if cut_index % 5 == 1:
+        cut_index += 1
+    cutoff = dates[cut_index]
+    gapped = panel[~((panel["instrument"] == victim) & (panel["trade_date"] > cutoff))]
+    gapped.to_parquet(panel_path, index=False)
+
+    result = run_factor_backtest(
+        "FTR_DEMO_SMALL_CAP",
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+    )
+
+    assert result.lost_positions >= 1
+    assert POSITIONS_LOST_BEFORE_EXIT in result.warning_codes
+
+    def _reject_constant(constant: str) -> None:
+        raise AssertionError(f"non-finite JSON constant {constant}")
+
+    payload = json.loads(result.artifact_path.read_text(encoding="utf-8"), parse_constant=_reject_constant)
+    assert payload["lost_positions"] == result.lost_positions
+
+
+def test_daily_ledger_skips_unmarkable_days() -> None:
+    daily_nav = [
+        {"date": "2024-01-02", "gross_nav": 1.01, "net_nav": 1.0, "period_index": 0},
+        {"date": "2024-01-03", "gross_nav": float("nan"), "net_nav": float("nan"), "period_index": 0},
+        {"date": "2024-01-04", "gross_nav": 1.02, "net_nav": 1.01, "period_index": 0},
+    ]
+    ledger = _daily_ledger_from_nav(daily_nav)
+    assert [row["trade_date"] for row in ledger] == ["2024-01-02", "2024-01-04"]
+    assert all(np.isfinite(float(row["daily_net_return"])) for row in ledger)
+
+
+def test_staggered_aggregate_ignores_non_finite_cohort_marks() -> None:
+    dates = [pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-03"), pd.Timestamp("2024-01-04")]
+    cohorts = [
+        {
+            "capital_weight": 1.0,
+            "daily_nav": [
+                {"date": "2024-01-02", "net_nav": 1.01},
+                {"date": "2024-01-03", "net_nav": float("nan")},
+                {"date": "2024-01-04", "net_nav": 1.03},
+            ],
+        }
+    ]
+    rows = _aggregate_staggered_nav(dates, cohorts)
+    assert [round(float(row["net_nav"]), 6) for row in rows] == [1.01, 1.01, 1.03]
+    assert all(np.isfinite(float(row["daily_net_return"])) for row in rows)
