@@ -22,7 +22,14 @@ from quant_forge.apps.web.server import (
     run_research_once_workflow,
 )
 from quant_forge.config import LLMProviderSettings, LLMSettings, PathSettings, QuantForgeConfig, WebSettings
-from quant_forge.core.contracts import BacktestResult, EvaluationResult, FactorDefinition, SimulationProfile
+from quant_forge.core.contracts import (
+    BacktestResult,
+    EvaluationResult,
+    FactorDefinition,
+    HorizonEvaluationMetric,
+    MetricValue,
+    SimulationProfile,
+)
 from quant_forge.data.local import create_demo_workspace
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.llm_client import LLMChatResult
@@ -2490,6 +2497,153 @@ def test_web_does_not_coerce_unavailable_metrics_to_zero() -> None:
     assert "valueOr(backtest.net_long_short_sharpe" not in html
     assert "valueOr(backtest.rebalance_rate, 0)" not in html
     assert "valueOr(backtest.turnover_rate, 0)" not in html
+
+
+def _insufficient_sample_evaluation(artifact_path: Path) -> EvaluationResult:
+    return EvaluationResult(
+        factor_id="demo_factor",
+        observations=3,
+        coverage=1.0,
+        rank_ic_mean=0.1,
+        rank_ic_std=0.0,
+        rank_icir=0.0,
+        ic_days=1,
+        artifact_path=artifact_path,
+        rank_ic_t_stat=0.0,
+        horizon_metrics=(
+            HorizonEvaluationMetric(
+                horizon_days=5,
+                observations=1,
+                coverage=1.0,
+                rank_ic_mean=0.1,
+                rank_ic_std=0.0,
+                rank_icir=0.0,
+                ic_days=1,
+                rank_ic_t_stat=0.0,
+                metrics={
+                    "rank_icir": MetricValue(
+                        value=None,
+                        unit="ratio",
+                        status="insufficient_sample",
+                        observation_count=1,
+                        minimum_required=2,
+                    ),
+                },
+            ),
+        ),
+        metrics={
+            "rank_ic_mean": MetricValue(
+                value=0.1,
+                unit="correlation",
+                status="available",
+                observation_count=1,
+            ),
+            "rank_icir": MetricValue(
+                value=None,
+                unit="ratio",
+                status="insufficient_sample",
+                observation_count=1,
+                minimum_required=2,
+            ),
+            "rank_ic_t_stat": MetricValue(
+                value=None,
+                unit="t_stat",
+                status="insufficient_sample",
+                observation_count=1,
+                minimum_required=2,
+            ),
+        },
+    )
+
+
+def test_web_evaluation_payload_reports_insufficient_metrics_as_null(tmp_path) -> None:
+    evaluation = _insufficient_sample_evaluation(tmp_path / "evaluation.json")
+
+    payload = web_server._evaluation_payload(evaluation)
+
+    assert payload["rank_icir"] is None
+    assert payload["rank_icir_status"] == "insufficient_sample"
+    assert payload["rank_ic_t_stat"] is None
+    assert payload["rank_ic_t_stat_status"] == "insufficient_sample"
+    assert payload["rank_ic_mean"] == pytest.approx(0.1)
+    assert payload["rank_ic_mean_status"] == "available"
+    assert payload["horizon_metrics"][0]["rank_icir"] is None
+    assert payload["horizon_metrics"][0]["rank_icir_status"] == "insufficient_sample"
+    encoded = json.loads(json.dumps(web_server._json_safe(payload)))
+    assert encoded["rank_icir"] is None
+    assert encoded["rank_icir_status"] == "insufficient_sample"
+
+
+def test_web_evaluation_payload_keeps_legacy_scalars_without_metric_map(tmp_path) -> None:
+    legacy = EvaluationResult(
+        factor_id="demo_factor",
+        observations=3,
+        coverage=1.0,
+        rank_ic_mean=0.1,
+        rank_ic_std=0.2,
+        rank_icir=0.5,
+        ic_days=10,
+        artifact_path=tmp_path / "evaluation.json",
+        rank_ic_t_stat=1.5,
+    )
+
+    payload = web_server._evaluation_payload(legacy)
+
+    assert payload["rank_icir"] == pytest.approx(0.5)
+    assert payload["rank_icir_status"] == "legacy"
+    assert payload["rank_ic_mean"] == pytest.approx(0.1)
+    assert payload["rank_ic_mean_status"] == "legacy"
+    assert payload["rank_ic_t_stat"] == pytest.approx(1.5)
+    assert payload["rank_ic_t_stat_status"] == "legacy"
+
+
+def test_web_validation_payload_reports_insufficient_metrics_as_null(tmp_path) -> None:
+    evaluation = _insufficient_sample_evaluation(tmp_path / "evaluation.json")
+    factor = FactorDefinition(factor_id="demo_factor", name="demo", formula="rank(market_cap)")
+    backtest = BacktestResult(
+        factor_id="demo_factor",
+        periods=1,
+        holding_days=5,
+        cumulative_return=0.01,
+        annualized_return=0.01,
+        annualized_volatility=0.0,
+        max_drawdown=0.0,
+        artifact_path=tmp_path / "backtest.json",
+    )
+
+    payload = web_server._validation_payload(
+        factor,
+        parser=None,
+        evaluation=evaluation,
+        in_sample_backtest=backtest,
+        backtest=backtest,
+        parameters={},
+    )
+
+    evaluation_payload = payload["evaluation"]
+    assert evaluation_payload["rank_icir"] is None
+    assert evaluation_payload["rank_icir_status"] == "insufficient_sample"
+    assert evaluation_payload["rank_ic_t_stat"] is None
+    assert evaluation_payload["rank_ic_t_stat_status"] == "insufficient_sample"
+    assert evaluation_payload["rank_ic_mean"] == pytest.approx(0.1)
+    assert evaluation_payload["rank_ic_mean_status"] == "available"
+    horizon_payload = evaluation_payload["horizon_metrics"][0]
+    assert horizon_payload["rank_icir"] is None
+    assert horizon_payload["rank_icir_status"] == "insufficient_sample"
+    assert horizon_payload["rank_ic_mean"] == pytest.approx(0.1)
+    assert horizon_payload["rank_ic_mean_status"] == "legacy"
+
+
+def test_web_html_renders_metric_status_instead_of_placeholder_zero() -> None:
+    html = web_server._index_html(QuantForgeConfig())
+
+    assert "function metricNum(" in html
+    assert "metricNum(evaluation.rank_ic_mean, evaluation.rank_ic_mean_status)" in html
+    assert "metricNum(evaluation.rank_icir, evaluation.rank_icir_status, 2)" in html
+    assert "metricNum(evaluation.rank_ic_t_stat, evaluation.rank_ic_t_stat_status, 2)" in html
+    assert "num(evaluation.rank_ic_mean)" not in html
+    assert "num(evaluation.rank_icir, 2)" not in html
+    assert "num(evaluation.rank_ic_t_stat, 2)" not in html
 
 
 def _fake_research_result(

@@ -780,11 +780,18 @@ def _validation_payload(
     backtest: BacktestResult,
     parameters: dict[str, Any],
 ) -> dict[str, Any]:
+    evaluation_payload = _apply_metric_display(_json_safe(evaluation))
+    for nested_metric in [
+        *(evaluation_payload.get("split_metrics") or []),
+        *(evaluation_payload.get("horizon_metrics") or []),
+    ]:
+        if isinstance(nested_metric, dict):
+            _apply_metric_display(nested_metric)
     return {
         "parser": _parser_payload_from_request(parser, factor),
         "factor": _json_safe(factor),
         "parameters": _json_safe(parameters),
-        "evaluation": _json_safe(evaluation),
+        "evaluation": evaluation_payload,
         "in_sample_backtest": _json_safe(in_sample_backtest),
         "backtest": _json_safe(backtest),
     }
@@ -1391,8 +1398,35 @@ def _research_candidate_payload(candidate: Any) -> dict[str, Any]:
     }
 
 
+_EVALUATION_DISPLAY_METRIC_KEYS = ("rank_ic_mean", "rank_icir", "rank_ic_t_stat")
+
+
+def _apply_metric_display(
+    payload: dict[str, Any], keys: tuple[str, ...] = _EVALUATION_DISPLAY_METRIC_KEYS
+) -> dict[str, Any]:
+    """Make legacy scalar metric keys honest against the qf.metrics.v2 map.
+
+    For each key that has a MetricValue entry in ``payload["metrics"]``, a
+    non-"available" status replaces the legacy placeholder scalar (for example
+    0.0) with None and records the status under ``<key>_status``; an
+    "available" status keeps the typed value. Payloads without the map (old
+    artifacts) keep the legacy scalar and are marked with status "legacy".
+    """
+
+    metrics = payload.get("metrics")
+    for key in keys:
+        metric = metrics.get(key) if isinstance(metrics, dict) else None
+        if isinstance(metric, dict) and metric.get("status"):
+            status = str(metric["status"])
+            payload[key] = metric.get("value") if status == "available" else None
+            payload[f"{key}_status"] = status
+        else:
+            payload[f"{key}_status"] = "legacy"
+    return payload
+
+
 def _evaluation_payload(evaluation: EvaluationResult) -> dict[str, Any]:
-    return {
+    return _apply_metric_display({
         "factor_id": evaluation.factor_id,
         "observations": evaluation.observations,
         "coverage": evaluation.coverage,
@@ -1430,11 +1464,11 @@ def _evaluation_payload(evaluation: EvaluationResult) -> dict[str, Any]:
         "metric_provenance": _json_safe(evaluation.metric_provenance),
         "warning_codes": list(evaluation.warning_codes),
         "metrics": _json_safe(evaluation.metrics),
-    }
+    })
 
 
 def _horizon_metric_payload(metric: Any) -> dict[str, Any]:
-    return {
+    return _apply_metric_display({
         "horizon_days": metric.horizon_days,
         "observations": metric.observations,
         "coverage": metric.coverage,
@@ -1454,7 +1488,7 @@ def _horizon_metric_payload(metric: Any) -> dict[str, Any]:
         "metric_provenance": _json_safe(metric.metric_provenance),
         "warning_codes": list(metric.warning_codes),
         "metrics": _json_safe(metric.metrics),
-    }
+    })
 
 
 def _backtest_payload(backtest: BacktestResult) -> dict[str, Any]:
@@ -2472,6 +2506,10 @@ function num(value, digits = 4) {{
   if (value === undefined || value === null || Number.isNaN(Number(value))) return 'n/a';
   return Number(value).toFixed(digits);
 }}
+function metricNum(value, status, digits = 4) {{
+  if (status && status !== 'available' && status !== 'legacy') return esc(status);
+  return num(value, digits);
+}}
 function esc(value) {{
   return String(value).replace(/[&<>"']/g, ch => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[ch]));
 }}
@@ -2759,10 +2797,10 @@ function render(payload) {{
   const backtestProfile = backtest.simulation_profile || {{}};
   const profile = Object.keys(backtestProfile).length ? backtestProfile : evaluationProfile;
   const splitRows = (evaluation.split_metrics || []).map(metric =>
-    `<span class="pill">${{esc(metric.name)}} ICIR ${{num(metric.rank_icir, 2)}} · HAC t ${{num(metric.rank_ic_t_stat, 2)}} · days ${{metric.ic_days}}</span>`
+    `<span class="pill">${{esc(metric.name)}} ICIR ${{metricNum(metric.rank_icir, metric.rank_icir_status, 2)}} · HAC t ${{metricNum(metric.rank_ic_t_stat, metric.rank_ic_t_stat_status, 2)}} · days ${{metric.ic_days}}</span>`
   ).join(' ');
   const horizonRows = (evaluation.horizon_metrics || []).map(metric =>
-    `<span class="pill">${{metric.horizon_days}}日 IC ${{num(metric.rank_ic_mean)}} / ICIR ${{num(metric.rank_icir, 2)}} / HAC t ${{num(metric.rank_ic_t_stat, 2)}}</span>`
+    `<span class="pill">${{metric.horizon_days}}日 IC ${{metricNum(metric.rank_ic_mean, metric.rank_ic_mean_status)}} / ICIR ${{metricNum(metric.rank_icir, metric.rank_icir_status, 2)}} / HAC t ${{metricNum(metric.rank_ic_t_stat, metric.rank_ic_t_stat_status, 2)}}</span>`
   ).join(' ');
   const groupRows = (backtest.group_returns || []).map(metric =>
     `<span class="pill">${{esc(metric.group)}} ${{pct(metric.mean_return)}}</span>`
@@ -2818,9 +2856,9 @@ function render(payload) {{
     <div class="panel">
       <h3>样本内研究评价</h3>
       <div class="grid">
-        <div class="tile">Rank IC<b>${{num(evaluation.rank_ic_mean)}}</b></div>
-        <div class="tile">ICIR<b>${{num(evaluation.rank_icir, 2)}}</b></div>
-        <div class="tile">HAC t-stat<b>${{num(evaluation.rank_ic_t_stat, 2)}}</b></div>
+        <div class="tile">Rank IC<b>${{metricNum(evaluation.rank_ic_mean, evaluation.rank_ic_mean_status)}}</b></div>
+        <div class="tile">ICIR<b>${{metricNum(evaluation.rank_icir, evaluation.rank_icir_status, 2)}}</b></div>
+        <div class="tile">HAC t-stat<b>${{metricNum(evaluation.rank_ic_t_stat, evaluation.rank_ic_t_stat_status, 2)}}</b></div>
         <div class="tile">IC Days<b>${{evaluation.ic_days}}</b></div>
         <div class="tile">Joint Coverage<b>${{pct(valueOr(coverage.joint_coverage, evaluation.coverage))}}</b></div>
         <div class="tile">Horizon / Delay<b>${{effectiveHoldingDays}}日 / ${{valueOr(evaluationProfile.execution_delay_days, profile.execution_delay_days)}}日</b></div>
@@ -3021,9 +3059,9 @@ function renderResearch(payload) {{
         <p>
           <span class="pill">score ${{num(candidate.score, 4)}}</span>
           <span class="pill">split ICIR ${{num(valueOr(candidate.split_weighted_icir, 0), 2)}}</span>
-          <span class="pill">IC ${{num(evaluation.rank_ic_mean)}}</span>
-          <span class="pill">ICIR ${{num(evaluation.rank_icir, 2)}}</span>
-          <span class="pill">HAC t-stat ${{num(evaluation.rank_ic_t_stat, 2)}}</span>
+          <span class="pill">IC ${{metricNum(evaluation.rank_ic_mean, evaluation.rank_ic_mean_status)}}</span>
+          <span class="pill">ICIR ${{metricNum(evaluation.rank_icir, evaluation.rank_icir_status, 2)}}</span>
+          <span class="pill">HAC t-stat ${{metricNum(evaluation.rank_ic_t_stat, evaluation.rank_ic_t_stat_status, 2)}}</span>
           <span class="pill">decay ${{valueOr(profile.decay_days, 0)}}</span>
           <span class="pill">top ${{num(valueOr(profile.top_quantile, valueOr(backtest.top_quantile, 0)), 2)}}</span>
           <span class="pill">periods ${{esc(backtest.periods)}}</span>
