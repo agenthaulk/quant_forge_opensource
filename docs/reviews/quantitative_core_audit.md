@@ -173,7 +173,69 @@ nondeterminism were all fixed and re-verified.
 Each lands as its own atomic commit with a failing-then-passing regression
 test, per protocol.
 
-## 5. Limitations (this session)
+## 5. Step A6/A7 — Cross-review record and Fable adjudication
+
+Reviews executed on the 11-commit branch (both read-only, independent):
+
+- **Opus recheck** (Claude Opus, adversarial mandate): verdict **ACCEPT**.
+  All six fixes confirmed correct from first principles; P&L conservation
+  verified to machine precision by probe; the signal-date purge boundary
+  argued correct (conservative superset; one boundary definition shared
+  with evaluation). Follow-ups raised: delay>0 embargo fixture, gapped-panel
+  end-to-end test, is_st compat-note overstatement, missing-evidence
+  residuals in retention/turnover/correlation clauses, staggered-NAV NaN
+  fragility, lost_positions web observability.
+- **Codex review** (GPT-5-family, reasoning effort xhigh, read-only):
+  verdict **FIX-FIRST** with four findings: (1) blocker — NaN NAV marks leak
+  into JSON/ledger/staggered aggregates; (2) major — snapshot path lacks
+  duplicate-key guards; (3) minor — lost_positions absent from web payload;
+  (4) minor — doc claimed −100% delisting while code realizes last mark/0%.
+
+**Fable adjudication** (evidence-based, no majority voting):
+
+| Conflict | Ruling | Rationale |
+| --- | --- | --- |
+| Codex #1 "blocker" vs Opus "pre-existing, non-blocking" | Both partially right → severity MAJOR, fixed in-phase (`4d31047`) | NaN semantics predate the branch (COR-8, BASE emits the same NaN), so it cannot block THESE commits; but A-P1-1 interacts with the NaN path and the serialization defect is real — fixing now is cheaper than a ticket |
+| Codex #2 snapshot dup keys | ACCEPTED, fixed (`cfaf324`) | DATA-1's sibling gap; exact dups deduped (unambiguous), conflicting dups fail closed per FP-4 |
+| Codex #3 / Opus observability | ACCEPTED, fixed (`4d31047`) | lost_positions now in web payload |
+| Codex #4 / Opus doc errors | ACCEPTED, fixed (`1cb2ee5`) | −100% claim and is_st claim corrected to match implemented, FP-4-consistent semantics |
+| Opus test gaps | ACCEPTED, fixed (`1cb2ee5`) | delay>0 boundary fixture + gapped-panel e2e added |
+| Opus: extend evidence-blocking to retention/turnover/corr clauses; unify the two gates' evidence definitions; `_backtest_metrics` omits segment_metrics; demo-panel warmup fillna | **DEFERRED (recorded)** | Gate-semantics changes deserve their own test-first pass; none is a P1 (all fail toward strictness or affect demo data only). Queued as Phase A follow-ups below |
+
+**Deferred follow-up register (not blocking acceptance):**
+1. F-1: retention/turnover/correlation clauses treat missing evidence as
+   pass (candidate_gate.py + service.py) — same FP-2 class, lower stakes.
+2. F-2: unify candidate_gate vs apply_gate "sufficient OOS evidence"
+   definitions (any-one-non-null vs per-segment-None-blocks).
+3. F-3: `_backtest_metrics` (research_loop/service.py) omits
+   segment_metrics — structured gate would fail closed surprisingly if OOS
+   clauses were configured externally.
+4. F-4: `_build_demo_panel` warmup fillna(0.0) (demo-only fabrication).
+5. F-5: `missing_oos_evidence_blocks` not yet parseable from rd.yaml;
+   ResearchGate has no warn-mode equivalent.
+6. F-6: purged-period counts not persisted (only warning codes).
+
+## 6. Step A8 — Acceptance status
+
+| Protocol condition | Status |
+| --- | --- |
+| P0 fixed or blocked-with-reason | ✓ none open (none found on BASE) |
+| Confirmed P1s fixed or deferral recorded | ✓ A-P1-1/2/3/4 fixed with fail-on-BASE evidence |
+| Key PIT tests pass | ✓ embargo (eval+backtest), delisting, ordering, boundary fixtures |
+| Eval/backtest definitions consistent | ✓ one boundary definition; period return == NAV at exit by construction |
+| IS/OOS boundaries provable | ✓ embargo default-on both sides; purge tests pin the edges |
+| Golden dataset tests | Spec written (`docs/testing/golden_dataset_spec.md`); GD-2/GD-3 realized as regression tests; full GD suite queued with F-register |
+| Unit+integration tests green | ✓ 426 passed (BASE baseline 397) |
+| Phase A docs complete | ✓ 6 documents under docs/reviews, docs/testing, docs/migration |
+| Worktree clean, all changes on Phase A branch | ✓ 14 atomic commits on `fable/phase-a-quant-core-audit` |
+| No merge/push/delete without user approval | ✓ nothing merged or pushed |
+
+**Fable decision: Phase A ACCEPTED.** Proceed to Phase B: the quant core is
+stable enough to be an architecture base (no open P0/P1; both adversarial
+reviews' blocking items remediated in-phase; residuals are recorded
+strictness gaps, none affecting the correctness of stored evidence).
+
+## 7. Limitations (this session)
 
 - **Platform outage:** the tool-safety classifier (`glm-5.1[1m]`) is down;
   `Bash` and `Agent` (subagent spawn) calls fail; `WebFetch`'s internal model
