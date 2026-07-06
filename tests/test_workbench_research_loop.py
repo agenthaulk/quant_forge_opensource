@@ -12,16 +12,22 @@ from quant_forge.core.contracts import (
     BacktestResult,
     BacktestSegmentMetric,
     EvaluationResult,
+    FactorDefinition,
+    MetricValue,
     SimulationProfile,
     TransactionCostModel,
 )
+from quant_forge.research_loop.reporting import render_research_report
 from quant_forge.research_loop.scheduler import ResearchLoopScheduler, ResearchScheduleRequest
 from quant_forge.research_loop.service import (
+    ResearchCandidateResult,
     ResearchDeduplicationConfig,
     ResearchGate,
+    ResearchLoopResult,
     ResearchLoopService,
     ResearchHypothesis,
     ResearchObjectiveWeights,
+    ResearchSelfReview,
     ResearchTrialSimulationOverlay,
     apply_gate,
 )
@@ -570,3 +576,98 @@ def test_research_loop_scheduler_passes_value_error_through() -> None:
 
     assert status.run_count == 1
     assert status.last_error == "bad seed"
+
+
+def test_research_report_renders_metric_status_instead_of_placeholder_zero(tmp_path: Path) -> None:
+    factor = FactorDefinition(
+        factor_id="FTR_STATUS_DEMO",
+        name="status demo",
+        formula="rank(return_5d)",
+        status="candidate",
+        source="research_loop",
+    )
+    evaluation = EvaluationResult(
+        factor_id=factor.factor_id,
+        observations=3,
+        coverage=1.0,
+        rank_ic_mean=0.1,
+        rank_ic_std=0.0,
+        rank_icir=0.0,
+        ic_days=1,
+        artifact_path=tmp_path / "evaluation.json",
+        rank_ic_t_stat=0.0,
+        metrics={
+            "rank_ic_mean": MetricValue(
+                value=0.1,
+                unit="correlation",
+                status="available",
+                observation_count=1,
+            ),
+            "rank_icir": MetricValue(
+                value=None,
+                unit="ratio",
+                status="insufficient_sample",
+                observation_count=1,
+                minimum_required=2,
+            ),
+            "rank_ic_t_stat": MetricValue(
+                value=None,
+                unit="t_stat",
+                status="insufficient_sample",
+                observation_count=1,
+                minimum_required=2,
+            ),
+        },
+    )
+    backtest = BacktestResult(
+        factor_id=factor.factor_id,
+        periods=1,
+        holding_days=5,
+        cumulative_return=0.01,
+        annualized_return=0.01,
+        annualized_volatility=0.0,
+        max_drawdown=0.0,
+        artifact_path=tmp_path / "backtest.json",
+    )
+    candidate = ResearchCandidateResult(
+        hypothesis=ResearchHypothesis(
+            text="status demo",
+            rationale="insufficient-sample metrics must not render as numbers",
+            formula_dsl=factor.formula,
+        ),
+        factor=factor,
+        evaluation=evaluation,
+        backtest=backtest,
+        split_weighted_icir=1.0,
+        score=1.0,
+        gate_passed=True,
+        gate_reasons=(),
+        self_review=ResearchSelfReview(
+            source="local_self_review",
+            summary="status demo",
+            strengths=(),
+            risks=(),
+            next_hypotheses=(),
+        ),
+    )
+    result = ResearchLoopResult(
+        rd_stage="research",
+        seed_factor_id=factor.factor_id,
+        objective="balanced",
+        objective_weights=ResearchObjectiveWeights(),
+        gate=ResearchGate(),
+        candidates=(candidate,),
+        accepted_candidate_ids=(factor.factor_id,),
+        report_path=tmp_path / "report.md",
+        optimization_performed=True,
+        no_optimization_performed=False,
+    )
+
+    report = render_research_report(result)
+
+    assert "- Rank ICIR: insufficient_sample" in report
+    assert "- Rank IC t-stat: insufficient_sample" in report
+    assert "- Rank IC: 0.1000" in report
+    assert "- Rank ICIR: 0.0000" not in report
+    assert "- Rank IC t-stat: 0.0000" not in report
+    assert "| insufficient_sample | insufficient_sample " in report
