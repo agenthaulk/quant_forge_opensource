@@ -54,6 +54,33 @@ def test_boundary_crossing_periods_are_purged_from_earlier_segment() -> None:
     assert SEGMENT_BOUNDARY_PURGED not in oos_metric.warning_codes
 
 
+def test_purge_boundary_is_signal_date_not_entry_date() -> None:
+    # Entry dates lag signals by one day. The 2024-01-15 period exits ON the
+    # next segment's first SIGNAL date (2024-01-22); a revert to an
+    # entry-date boundary (2024-01-23) would keep it in IS.
+    def row(signal: str, entry: str, exit_date: str) -> dict[str, object]:
+        return {
+            "signal_date": signal,
+            "entry_date": entry,
+            "exit_date": exit_date,
+            "gross_period_return": 0.02,
+            "net_period_return": 0.015,
+        }
+
+    rows = [
+        row("2024-01-01", "2024-01-02", "2024-01-09"),
+        row("2024-01-08", "2024-01-09", "2024-01-16"),
+        row("2024-01-15", "2024-01-16", "2024-01-22"),
+        row("2024-01-22", "2024-01-23", "2024-01-30"),
+        row("2024-01-29", "2024-01-30", "2024-02-06"),
+        row("2024-02-05", "2024-02-06", "2024-02-13"),
+    ]
+    metrics = _segment_metrics(rows, 5, SPLITS)
+    assert metrics[0].periods == 2
+    assert SEGMENT_BOUNDARY_PURGED in metrics[0].warning_codes
+    assert metrics[1].periods == 3
+
+
 def test_fully_realized_periods_keep_previous_attribution() -> None:
     rows = [
         _period_row("2024-01-01", "2024-01-08"),
