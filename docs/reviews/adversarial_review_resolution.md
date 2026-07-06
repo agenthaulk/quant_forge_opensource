@@ -57,6 +57,28 @@ inspection-only) → `docs/reviews/phase_b_codex_review.md`. Both verdicts:
   demo-data power policy; INSUFFICIENT verdicts must stay blocking-grade
   evidence (FP-2), with sample floors set so demo runs can pass them.
 
+## Step B8 acceptance record
+
+All B7 revisions landed (`0bad5f5` docs half, `d094053` code half).
+Post-revision state: contracts file 61 tests; full suite 487 passed
+(Phase A acceptance baseline 426 → B3 453 → B7 487); release scan green
+(133 public files); CLI smoke ok; `git diff --check` clean; tree clean.
+
+Protocol B8 checklist: target architecture final (✓ docs committed with
+review-driven revisions); beginner/expert flows defined (✓); deterministic
+core vs agent boundary explicit incl. Phase C obligations (✓); minimal
+vertical prototype runs with tested interfaces (✓ specs package, 61
+tests); Opus review done (✓ REVISE-FIRST → revisions landed); Codex review
+done (✓ REVISE-FIRST → adopted/adjudicated); all major conflicts ruled by
+Fable with evidence (✓ this document); migration path documented (✓);
+Phase C task graph ready (✓ implementation_plan.md). Nothing merged or
+pushed; branch deletion prohibited without user approval.
+
+**Fable decision: Phase B ACCEPTED.** Phase C may start from this branch's
+final SHA per the lane plan; recommended first wave: experiment-registry +
+data-plane + server-decomposition (M1), with the F-register follow-ups
+running in parallel.
+
 ## Residual risks accepted knowingly
 
 - Validation-witness pattern (gate token consumed by execution ports) is a
