@@ -41,6 +41,7 @@ INSUFFICIENT_SHARPE_OBSERVATIONS = "INSUFFICIENT_SHARPE_OBSERVATIONS"
 DAILY_NAV_UNAVAILABLE = "DAILY_NAV_UNAVAILABLE"
 NO_REBALANCE_OBSERVATIONS = "NO_REBALANCE_OBSERVATIONS"
 PARTIAL_FINAL_PERIOD = "PARTIAL_FINAL_PERIOD"
+SEGMENT_BOUNDARY_PURGED = "SEGMENT_BOUNDARY_PURGED"
 
 
 def run_factor_backtest(
@@ -1110,9 +1111,9 @@ def _segment_metrics(
     *,
     sample_role: str = EXTERNAL_OOS_ROLE,
 ) -> tuple[BacktestSegmentMetric, ...]:
-    split_rows = _split_rows_by_signal_date(rows, split_specs)
+    split_rows, purged_counts = _split_rows_with_purge_counts(rows, split_specs)
     metrics: list[BacktestSegmentMetric] = []
-    for spec, segment in zip(split_specs, split_rows, strict=True):
+    for spec, segment, purged_count in zip(split_specs, split_rows, purged_counts, strict=True):
         gross_returns = np.array([float(row["gross_period_return"]) for row in segment], dtype=float)
         net_returns = np.array([float(row["net_period_return"]) for row in segment], dtype=float)
         gross = _return_summary(gross_returns, holding_days, sample_role=sample_role)
@@ -1132,6 +1133,7 @@ def _segment_metrics(
                 net_long_short_sharpe=net["long_short_sharpe"],
                 net_max_drawdown=net["max_drawdown"],
                 sample_role=sample_role,
+                warning_codes=(SEGMENT_BOUNDARY_PURGED,) if purged_count else (),
             )
         )
     return tuple(metrics)
@@ -1141,12 +1143,49 @@ def _split_rows_by_signal_date(
     rows: list[dict[str, object]],
     split_specs: tuple[SampleSplitSpec, ...],
 ) -> tuple[tuple[dict[str, object], ...], ...]:
+    segments, _ = _split_rows_with_purge_counts(rows, split_specs)
+    return segments
+
+
+def _split_rows_with_purge_counts(
+    rows: list[dict[str, object]],
+    split_specs: tuple[SampleSplitSpec, ...],
+) -> tuple[tuple[tuple[dict[str, object], ...], ...], tuple[int, ...]]:
     if not rows:
-        return tuple(tuple() for _ in split_specs)
+        return tuple(tuple() for _ in split_specs), tuple(0 for _ in split_specs)
     dates = sorted({pd.Timestamp(str(row["signal_date"])) for row in rows})
     date_chunks = _split_dates(dates, split_specs)
     chunk_sets = [{date.date().isoformat() for date in chunk} for chunk in date_chunks]
-    return tuple(tuple(row for row in rows if str(row["signal_date"]) in chunk) for chunk in chunk_sets)
+    boundaries = _next_segment_start_dates(date_chunks)
+    segments: list[tuple[dict[str, object], ...]] = []
+    purged_counts: list[int] = []
+    for chunk, boundary in zip(chunk_sets, boundaries, strict=True):
+        segment_rows = [row for row in rows if str(row["signal_date"]) in chunk]
+        if boundary is None:
+            kept = segment_rows
+        else:
+            # A period attributed to this segment must be fully realized before
+            # the next segment's first signal date; otherwise its return uses
+            # prices from the later segment's window (backtest mirror of the
+            # evaluation-side purge/embargo).
+            kept = [row for row in segment_rows if pd.Timestamp(str(row["exit_date"])) < boundary]
+        purged_counts.append(len(segment_rows) - len(kept))
+        segments.append(tuple(kept))
+    return tuple(segments), tuple(purged_counts)
+
+
+def _next_segment_start_dates(
+    date_chunks: tuple[tuple[pd.Timestamp, ...], ...],
+) -> list[pd.Timestamp | None]:
+    boundaries: list[pd.Timestamp | None] = []
+    for index in range(len(date_chunks)):
+        boundary: pd.Timestamp | None = None
+        for later in date_chunks[index + 1 :]:
+            if later:
+                boundary = later[0]
+                break
+        boundaries.append(boundary)
+    return boundaries
 
 
 def _split_dates(

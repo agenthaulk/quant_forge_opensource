@@ -53,7 +53,9 @@ def test_backtest_uses_next_day_execution(tmp_path: Path) -> None:
     assert "turnover_rate estimates true portfolio weight turnover" in payload["assumptions"]
     assert "short annualization window" not in "; ".join(payload["warnings"])
     assert {metric["name"] for metric in payload["segment_metrics"]} == {"IS", "OOS1", "OOS2"}
-    assert sum(metric["periods"] for metric in payload["segment_metrics"]) == payload["periods"]
+    # Boundary-crossing periods are purged from earlier segments (A-P1-2), so
+    # segment attribution can undercount but never double-count.
+    assert sum(metric["periods"] for metric in payload["segment_metrics"]) <= payload["periods"]
     segments = payload["segment_metrics"]
     assert segments[0]["end_date"] < segments[1]["start_date"]
     assert segments[1]["end_date"] < segments[2]["start_date"]
