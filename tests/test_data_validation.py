@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from quant_forge.data.local import (
     PANEL_FILE,
@@ -187,3 +188,58 @@ def test_snapshot_derived_warmup_rows_stay_nan_and_drop_under_nan_policy(tmp_pat
 
     assert usable_dates == set(dates[5:])
     assert len(usable) == len(dates[5:]) * len(instruments)
+
+
+def test_snapshot_conflicting_duplicate_keys_are_rejected(tmp_path: Path) -> None:
+    price = pd.DataFrame(
+        {
+            "ts_code": ["AAA", "AAA", "AAA"],
+            "trade_date": ["20250102", "20250102", "20250103"],
+            "close": [10.0, 12.0, 11.0],
+            "vol": [100.0, 100.0, 110.0],
+        }
+    )
+    daily_basic = pd.DataFrame(
+        {
+            "ts_code": ["AAA", "AAA"],
+            "trade_date": ["20250102", "20250103"],
+            "total_mv": [1000.0, 1100.0],
+            "circ_mv": [900.0, 990.0],
+        }
+    )
+    _write_snapshot(tmp_path / "lakehouse", price=price, daily_basic=daily_basic)
+
+    provider = LocalPanelDataProvider(tmp_path / "lakehouse")
+    result = provider.validate()
+
+    assert result.ok is False
+    assert "duplicate_price_keys" in result.missing_columns
+    with pytest.raises(ValueError, match="conflicting duplicate"):
+        provider.load_panel()
+
+
+def test_snapshot_exact_duplicate_rows_are_deduplicated(tmp_path: Path) -> None:
+    price = pd.DataFrame(
+        {
+            "ts_code": ["AAA", "AAA", "AAA"],
+            "trade_date": ["20250102", "20250102", "20250103"],
+            "close": [10.0, 10.0, 11.0],
+            "vol": [100.0, 100.0, 110.0],
+        }
+    )
+    daily_basic = pd.DataFrame(
+        {
+            "ts_code": ["AAA", "AAA"],
+            "trade_date": ["20250102", "20250103"],
+            "total_mv": [1000.0, 1100.0],
+            "circ_mv": [900.0, 990.0],
+        }
+    )
+    _write_snapshot(tmp_path / "lakehouse", price=price, daily_basic=daily_basic)
+
+    provider = LocalPanelDataProvider(tmp_path / "lakehouse")
+    result = provider.validate()
+    panel = provider.load_panel()
+
+    assert result.ok is True
+    assert len(panel) == 2

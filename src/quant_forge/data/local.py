@@ -188,6 +188,23 @@ def _validate_source_snapshot(data_root: Path, source_root: Path) -> DataValidat
             missing_columns=("price",),
             panel_path=source_root,
         )
+    price = price.drop_duplicates()
+    daily_basic = daily_basic.drop_duplicates()
+    duplicate_problems = tuple(
+        f"duplicate_{label}_keys"
+        for label, frame in (("price", price), ("daily_basic", daily_basic))
+        if not frame.empty and bool(frame.duplicated(subset=["trade_date", "ts_code"], keep=False).any())
+    )
+    if duplicate_problems:
+        return DataValidationResult(
+            data_root=data_root,
+            ok=False,
+            rows=len(price),
+            instruments=int(price["ts_code"].nunique()),
+            date_count=int(price["trade_date"].nunique()),
+            missing_columns=duplicate_problems,
+            panel_path=source_root,
+        )
     dates = pd.to_datetime(price["trade_date"].astype(str), errors="coerce")
     return DataValidationResult(
         data_root=data_root,
@@ -226,6 +243,17 @@ def _snapshot_synthesized_columns(price: pd.DataFrame, daily_basic: pd.DataFrame
     return ("is_st",)
 
 
+def _reject_conflicting_snapshot_keys(frame: pd.DataFrame, label: str) -> None:
+    if frame.empty:
+        return
+    # Exact duplicate rows were already dropped; anything still duplicated on
+    # the key carries conflicting values, and picking one would fabricate data.
+    if bool(frame.duplicated(subset=["trade_date", "ts_code"], keep=False).any()):
+        raise ValueError(
+            f"source snapshot {label} files contain conflicting duplicate (trade_date, ts_code) rows"
+        )
+
+
 def _load_source_snapshot_panel(source_root: Path) -> pd.DataFrame:
     price = _read_snapshot_files(source_root / "price", columns=SOURCE_PRICE_COLUMNS)
     daily_basic = _read_snapshot_files(
@@ -234,6 +262,10 @@ def _load_source_snapshot_panel(source_root: Path) -> pd.DataFrame:
     )
     if price.empty:
         raise ValueError(f"source snapshot has no price rows: {source_root}")
+    price = price.drop_duplicates()
+    daily_basic = daily_basic.drop_duplicates()
+    _reject_conflicting_snapshot_keys(price, "price")
+    _reject_conflicting_snapshot_keys(daily_basic, "daily_basic")
     panel = price.rename(columns={"ts_code": "instrument", "vol": "volume"}).copy()
     if not daily_basic.empty:
         fundamentals = daily_basic.rename(columns={"ts_code": "instrument"})
