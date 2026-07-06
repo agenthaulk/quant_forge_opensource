@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+from quant_forge.core.contracts import BacktestResult, BacktestSegmentMetric, EvaluationResult
 from quant_forge.research_loop.candidate_gate import (
     INSUFFICIENT_OOS_EVIDENCE,
     CandidateGateConfig,
     evaluate_candidate,
 )
 from quant_forge.research_loop.contracts import FactorExperimentPlan, FactorExperimentResult
+from quant_forge.research_loop.service import ResearchGate, apply_gate
 
 
 def _ready_result(backtest_metrics: dict[str, object] | None = None) -> FactorExperimentResult:
@@ -104,3 +108,81 @@ def test_present_oos_evidence_keeps_existing_semantics() -> None:
         CandidateGateConfig(max_oos_net_return_decay=0.9),
     )
     assert not _marker_reasons(decay_ok.blocking_reasons)
+
+
+def _evaluation_stub() -> EvaluationResult:
+    return EvaluationResult(
+        factor_id="f",
+        observations=1000,
+        coverage=0.9,
+        rank_ic_mean=0.05,
+        rank_ic_std=0.1,
+        rank_icir=0.5,
+        ic_days=100,
+        artifact_path=Path("eval.json"),
+    )
+
+
+def _backtest_stub(segment_metrics: tuple[BacktestSegmentMetric, ...] = ()) -> BacktestResult:
+    return BacktestResult(
+        factor_id="f",
+        periods=10,
+        holding_days=5,
+        cumulative_return=0.1,
+        annualized_return=0.2,
+        annualized_volatility=0.1,
+        max_drawdown=-0.05,
+        artifact_path=Path("bt.json"),
+        segment_metrics=segment_metrics,
+    )
+
+
+def _segment(name: str, net_annualized_return: float | None, periods: int = 5) -> BacktestSegmentMetric:
+    return BacktestSegmentMetric(
+        name=name,
+        start_date="2024-01-01",
+        end_date="2024-06-30",
+        periods=periods,
+        gross_cumulative_return=0.1,
+        gross_annualized_return=0.2,
+        gross_long_short_sharpe=1.0,
+        gross_max_drawdown=-0.05,
+        net_cumulative_return=0.08,
+        net_annualized_return=net_annualized_return,
+        net_long_short_sharpe=0.9,
+        net_max_drawdown=-0.06,
+    )
+
+
+def test_apply_gate_blocks_when_oos_segments_missing() -> None:
+    passed, reasons = apply_gate(
+        _evaluation_stub(),
+        _backtest_stub(),
+        1.0,
+        ResearchGate(min_oos_net_annualized_return=0.0),
+    )
+    assert not passed
+    assert any(reason.startswith(INSUFFICIENT_OOS_EVIDENCE) for reason in reasons)
+
+
+def test_apply_gate_blocks_decay_clause_without_evidence() -> None:
+    passed, reasons = apply_gate(
+        _evaluation_stub(),
+        _backtest_stub(),
+        1.0,
+        ResearchGate(max_oos_net_return_decay=0.5),
+    )
+    assert not passed
+    assert any(reason.startswith(INSUFFICIENT_OOS_EVIDENCE) for reason in reasons)
+
+
+def test_apply_gate_with_present_evidence_keeps_existing_semantics() -> None:
+    segments = (_segment("IS", 0.25), _segment("OOS1", 0.2))
+    passed, reasons = apply_gate(
+        _evaluation_stub(),
+        _backtest_stub(segments),
+        1.0,
+        ResearchGate(min_oos_net_annualized_return=0.0, max_oos_net_return_decay=0.5),
+    )
+    assert passed
+    assert not any(reason.startswith(INSUFFICIENT_OOS_EVIDENCE) for reason in reasons)
