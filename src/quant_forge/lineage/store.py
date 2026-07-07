@@ -24,7 +24,7 @@ from quant_forge.factor_library.classification import FACTOR_CATEGORY_DIRS
 
 LINEAGE_SCHEMA_VERSION = "qf.lineage.v1"
 RUN_INDEX_SCHEMA_VERSION = "qf.run_index.v1"
-RUN_KINDS = ("evaluate", "backtest", "bench", "rd")
+RUN_KINDS = ("evaluate", "backtest", "bench", "rd", "falsification")
 DATA_WINDOW_STATUSES = ("available", "unavailable")
 METRIC_HIGHLIGHT_STATUSES = (
     "available",

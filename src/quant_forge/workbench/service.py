@@ -6,6 +6,8 @@ from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pandas as pd
+
 from quant_forge.backtesting.service import run_factor_backtest
 from quant_forge.core.contracts import (
     BacktestResult,
@@ -15,7 +17,10 @@ from quant_forge.core.contracts import (
     SimulationProfile,
     TransactionCostModel,
 )
-from quant_forge.evaluation.service import evaluate_factor
+from quant_forge.evaluation.falsification import FalsificationReport
+from quant_forge.evaluation.falsification import run_falsification as run_falsification_diagnostics
+from quant_forge.evaluation.service import evaluate_factor, falsification_frame
+from quant_forge.factor_engine.signal_processing import simulation_profile_suffix
 from quant_forge.factor_library.catalog import FactorCatalog
 from quant_forge.factor_library.repository import FactorRepository, parse_idea_to_definition
 from quant_forge.lineage.store import (
@@ -27,6 +32,7 @@ from quant_forge.lineage.store import (
     metric_highlight,
     new_run_id,
 )
+from quant_forge.utils import write_json
 
 EVALUATION_HIGHLIGHT_METRICS = ("rank_ic_mean", "rank_icir", "rank_ic_t_stat")
 BACKTEST_HIGHLIGHT_METRICS = (
@@ -36,6 +42,7 @@ BACKTEST_HIGHLIGHT_METRICS = (
     "net_max_drawdown",
     "rebalance_turnover_mean",
 )
+FALSIFICATION_HIGHLIGHT_METRICS = ("placebo_percentile", "ic_half_life_days", "block_sign_consistency")
 
 
 def evaluation_data_window(result: EvaluationResult) -> dict[str, str | None]:
@@ -61,7 +68,20 @@ def backtest_data_window(result: BacktestResult) -> dict[str, str | None]:
     return {"start_date": None, "end_date": None, "status": "unavailable"}
 
 
-def result_warnings_count(result: EvaluationResult | BacktestResult) -> int:
+def falsification_data_window(frame: pd.DataFrame) -> dict[str, str | None]:
+    """Observed window of labeled (forward-return-bearing) dates; else unavailable."""
+
+    labeled_dates = pd.to_datetime(frame.dropna(subset=["forward_return"])["trade_date"])
+    if len(labeled_dates):
+        return {
+            "start_date": labeled_dates.min().date().isoformat(),
+            "end_date": labeled_dates.max().date().isoformat(),
+            "status": "available",
+        }
+    return {"start_date": None, "end_date": None, "status": "unavailable"}
+
+
+def result_warnings_count(result: EvaluationResult | BacktestResult | FalsificationReport) -> int:
     """Distinct warning messages plus distinct warning codes."""
 
     return len(set(result.warnings)) + len(set(result.warning_codes))
@@ -195,6 +215,77 @@ class WorkbenchService:
             warnings_count=result_warnings_count(result),
         )
         return result
+
+    def run_falsification(
+        self,
+        factor_id: str,
+        *,
+        seed: int,
+        horizon_days: int | None = None,
+    ) -> FalsificationReport:
+        """Run advisory falsification diagnostics on the evaluation IC input.
+
+        The score/label frame is built exactly as :meth:`evaluate` builds its
+        IC input (same execution-delay/horizon alignment), the report is
+        written as a JSON artifact with status-carrying MetricValues, and the
+        run is indexed with a factor-definition -> falsification lineage edge.
+        Advisory only: nothing here feeds a promotion gate.
+        """
+
+        profile = self.simulation_profile
+        factor = FactorCatalog(
+            self.factor_root,
+            factor_values_root=self.factor_values_root,
+            factor_values_manifest_root=self.factor_values_manifest_root,
+        ).get(factor_id)
+        horizon = horizon_days or factor.horizon_days
+        frame = falsification_frame(
+            factor_id,
+            factor_root=self.factor_root,
+            data_root=self.data_root,
+            horizon_days=horizon,
+            simulation_profile=profile,
+            factor_values_root=self.factor_values_root,
+            factor_values_overlay_root=self.factor_values_overlay_root,
+            factor_values_manifest_root=self.factor_values_manifest_root,
+        )
+        report = run_falsification_diagnostics(frame, seed=seed)
+        artifact_path = (
+            self.artifact_root.expanduser()
+            / "falsification"
+            / f"{factor_id}{simulation_profile_suffix(profile)}.json"
+        )
+        write_json(
+            artifact_path,
+            {
+                "factor_id": factor_id,
+                "formula": factor.formula,
+                "horizon_days": horizon,
+                "execution_delay_days": profile.execution_delay_days,
+                "simulation_profile": asdict(profile),
+                **asdict(report),
+            },
+        )
+        self._record_run(
+            kind="falsification",
+            factor_id=factor_id,
+            artifact_type="falsification",
+            artifact_path=artifact_path,
+            generated_by="workbench.run_falsification",
+            request={
+                "kind": "falsification",
+                "factor_id": factor_id,
+                "seed": seed,
+                "horizon_days": horizon,
+                "simulation_profile": asdict(profile),
+            },
+            metric_highlights={
+                name: metric_highlight(getattr(report, name)) for name in FALSIFICATION_HIGHLIGHT_METRICS
+            },
+            data_window=falsification_data_window(frame),
+            warnings_count=result_warnings_count(report),
+        )
+        return report
 
     def _record_run(
         self,

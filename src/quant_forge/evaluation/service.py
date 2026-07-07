@@ -186,6 +186,59 @@ def evaluate_factor(
     )
 
 
+def falsification_frame(
+    factor_id: str,
+    *,
+    factor_root: Path,
+    data_root: Path,
+    horizon_days: int | None = None,
+    simulation_profile: SimulationProfile | None = None,
+    factor_values_root: Path | None = None,
+    factor_values_overlay_root: Path | None = None,
+    factor_values_manifest_root: Path | None = None,
+) -> pd.DataFrame:
+    """Joined ``[trade_date, instrument, score, forward_return]`` IC input frame.
+
+    Built exactly the way :func:`evaluate_factor` prepares its primary-horizon
+    IC input: the same score preparation and the same per-instrument
+    ``shift(-execution_delay)`` / ``shift(-(execution_delay + horizon))``
+    forward-return alignment (FP-5: one quantity, one definition, across every
+    surface). Rows whose score or forward return is unobservable keep ``NaN``
+    (FP-4); consumers such as
+    :func:`quant_forge.evaluation.falsification.run_falsification` apply their
+    own sample floors.
+    """
+
+    profile = simulation_profile or SimulationProfile()
+    factor = FactorCatalog(
+        factor_root,
+        factor_values_root=factor_values_root,
+        factor_values_manifest_root=factor_values_manifest_root,
+    ).get(factor_id)
+    horizon = horizon_days or factor.horizon_days
+    if horizon < 1:
+        raise ValueError("horizon_days must be positive")
+    panel = LocalPanelDataProvider(data_root).load_panel()
+    working_panel = apply_test_period(panel, profile)
+    require_minimum_display_trading_days(working_panel)
+    scores = prepare_factor_scores_result(
+        panel,
+        factor.formula,
+        factor.universe_filters,
+        profile=profile,
+        factor_id=factor.factor_id,
+        factor_name=factor.name,
+        factor_values_root=factor_values_root,
+        factor_values_overlay_root=factor_values_overlay_root,
+    ).scores
+    labeled = _with_forward_return(
+        working_panel,
+        horizon,
+        execution_delay_days=profile.execution_delay_days,
+    ).merge(scores, on=["trade_date", "instrument"], how="left")
+    return labeled[["trade_date", "instrument", "score", "forward_return"]].reset_index(drop=True)
+
+
 def _with_forward_return(panel: pd.DataFrame, horizon_days: int, *, execution_delay_days: int) -> pd.DataFrame:
     if execution_delay_days < 1:
         raise ValueError("execution_delay_days must be at least 1")
