@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -22,8 +23,20 @@ def write_yaml(path: Path, payload: dict[str, Any]) -> None:
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
-    text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+    # Non-finite floats (unmarkable NAV days etc.) must serialize as null:
+    # json.dumps would otherwise emit bare NaN/Infinity, which is not JSON.
+    text = json.dumps(_finite_json(payload), ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
     _atomic_write(path, text + "\n")
+
+
+def _finite_json(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _finite_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite_json(item) for item in value]
+    return value
 
 
 def write_text(path: Path, text: str) -> None:

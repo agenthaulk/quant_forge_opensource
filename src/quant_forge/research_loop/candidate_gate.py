@@ -8,6 +8,9 @@ from typing import Any
 from quant_forge.research_loop.contracts import FactorExperimentResult, GateDecision
 
 
+INSUFFICIENT_OOS_EVIDENCE = "INSUFFICIENT_OOS_EVIDENCE"
+
+
 @dataclass(frozen=True)
 class CandidateGateConfig:
     min_score: float = 0.0
@@ -25,6 +28,7 @@ class CandidateGateConfig:
     min_oos_net_annualized_return: float | None = None
     min_net_return_retention: float | None = None
     max_oos_net_return_decay: float | None = None
+    missing_oos_evidence_blocks: bool = True
     turnover_blocks_candidate: bool = True
     auto_candidate: bool = False
 
@@ -57,19 +61,21 @@ def evaluate_candidate(result: FactorExperimentResult, config: CandidateGateConf
         if corr > gate.max_abs_corr_with_active:
             blocking.append(f"active factor correlation too high: {corr:.6g}")
     if gate.min_oos_net_annualized_return is not None:
-        for segment in _segments(metrics):
-            name = str(segment.get("name") or "")
-            if not name.upper().startswith("OOS"):
-                continue
-            value = _optional_number(segment.get("net_annualized_return"))
-            if value is not None and value < gate.min_oos_net_annualized_return:
+        oos_returns = _oos_segment_returns(metrics)
+        for name, value in oos_returns:
+            if value < gate.min_oos_net_annualized_return:
                 blocking.append(f"{name} net_annualized_return below threshold: {value:.6g}")
+        if not oos_returns:
+            _flag_missing_oos_evidence(blocking, warnings, gate, "min_oos_net_annualized_return")
     if gate.min_net_return_retention is not None:
         retention = _net_return_retention(metrics)
         if retention < gate.min_net_return_retention:
             blocking.append(f"net_return_retention below threshold: {retention:.6g}")
-    if gate.max_oos_net_return_decay is not None and _oos_net_decay(metrics, gate.max_oos_net_return_decay):
-        blocking.append(f"OOS net return decay exceeds {gate.max_oos_net_return_decay:.6g}")
+    if gate.max_oos_net_return_decay is not None:
+        if _oos_net_decay(metrics, gate.max_oos_net_return_decay):
+            blocking.append(f"OOS net return decay exceeds {gate.max_oos_net_return_decay:.6g}")
+        elif not _oos_decay_evidence(metrics):
+            _flag_missing_oos_evidence(blocking, warnings, gate, "max_oos_net_return_decay")
 
     turnover_reasons = _turnover_reasons(metrics, gate)
     if gate.turnover_blocks_candidate:
@@ -145,6 +151,44 @@ def _transition_reason(result: FactorExperimentResult, metrics: dict[str, Any]) 
 def _segments(metrics: dict[str, Any]) -> list[dict[str, Any]]:
     raw = metrics.get("segment_metrics") or metrics.get("segments") or ()
     return [dict(item) for item in raw if isinstance(item, dict)]
+
+
+def _oos_segment_returns(metrics: dict[str, Any]) -> list[tuple[str, float]]:
+    values: list[tuple[str, float]] = []
+    for segment in _segments(metrics):
+        name = str(segment.get("name") or "")
+        if not name.upper().startswith("OOS"):
+            continue
+        value = _optional_number(segment.get("net_annualized_return"))
+        if value is not None:
+            values.append((name, value))
+    return values
+
+
+def _oos_decay_evidence(metrics: dict[str, Any]) -> bool:
+    by_name = {str(item.get("name") or "").upper(): item for item in _segments(metrics)}
+    is_segment = by_name.get("IS")
+    if not is_segment:
+        return False
+    if _optional_number(is_segment.get("net_annualized_return")) is None:
+        return False
+    return bool(_oos_segment_returns(metrics))
+
+
+def _flag_missing_oos_evidence(
+    blocking: list[str],
+    warnings: list[str],
+    gate: CandidateGateConfig,
+    clause: str,
+) -> None:
+    reason = (
+        f"{INSUFFICIENT_OOS_EVIDENCE}: {clause} is configured but no OOS "
+        "net_annualized_return evidence is available"
+    )
+    if gate.missing_oos_evidence_blocks:
+        blocking.append(reason)
+    else:
+        warnings.append(reason)
 
 
 def _net_return_retention(metrics: dict[str, Any]) -> float:

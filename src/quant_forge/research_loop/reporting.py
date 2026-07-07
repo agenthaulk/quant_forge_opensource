@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from quant_forge.research_loop.service import ResearchCandidateResult, ResearchLoopResult
 from quant_forge.utils import write_text
@@ -141,9 +142,9 @@ def _candidate_summary(candidate: ResearchCandidateResult) -> list[str]:
         f"- Result Signature: `{candidate.result_signature or '-'}`",
         f"- Score: {_fmt(candidate.score)}",
         f"- Weighted Split ICIR: {_fmt(candidate.split_weighted_icir)}",
-        f"- Rank IC: {_fmt(candidate.evaluation.rank_ic_mean)}",
-        f"- Rank ICIR: {_fmt(candidate.evaluation.rank_icir)}",
-        f"- Rank IC t-stat: {_fmt(candidate.evaluation.rank_ic_t_stat)}",
+        f"- Rank IC: {_fmt_metric(candidate.evaluation, 'rank_ic_mean')}",
+        f"- Rank ICIR: {_fmt_metric(candidate.evaluation, 'rank_icir')}",
+        f"- Rank IC t-stat: {_fmt_metric(candidate.evaluation, 'rank_ic_t_stat')}",
         f"- Gross Annualized Return: {_pct(candidate.backtest.annualized_return)}",
         f"- Net Annualized Return: {_pct(candidate.backtest.net_annualized_return)}",
         f"- Net Long-Short Sharpe: {_fmt(candidate.backtest.net_long_short_sharpe)}",
@@ -206,8 +207,8 @@ def _candidate_row(candidate: ResearchCandidateResult) -> str:
     return (
         f"| `{candidate.factor.factor_id}` | {_profile_label(candidate)} | {candidate.factor.status} "
         f"| {_fmt(candidate.score)} "
-        f"| {_fmt(candidate.split_weighted_icir)} | {_fmt(candidate.evaluation.rank_ic_mean)} "
-        f"| {_fmt(candidate.evaluation.rank_icir)} | {_fmt(candidate.evaluation.rank_ic_t_stat)} "
+        f"| {_fmt(candidate.split_weighted_icir)} | {_fmt_metric(candidate.evaluation, 'rank_ic_mean')} "
+        f"| {_fmt_metric(candidate.evaluation, 'rank_icir')} | {_fmt_metric(candidate.evaluation, 'rank_ic_t_stat')} "
         f"| {_pct(candidate.backtest.annualized_return)} "
         f"| {_pct(candidate.backtest.net_annualized_return)} | {_fmt(candidate.backtest.net_long_short_sharpe)} "
         f"| {_pct(candidate.backtest.rebalance_rate)} "
@@ -247,8 +248,8 @@ def _candidate_detail(candidate: ResearchCandidateResult) -> list[str]:
     for metric in candidate.evaluation.split_metrics:
         lines.append(
             f"| {metric.name} | {metric.start_date} to {metric.end_date} | {metric.ic_days} "
-            f"| {_pct(metric.coverage)} | {_fmt(metric.rank_ic_mean)} | {_fmt(metric.rank_icir)} "
-            f"| {_fmt(metric.rank_ic_t_stat)} "
+            f"| {_pct(metric.coverage)} | {_fmt_metric(metric, 'rank_ic_mean')} | {_fmt_metric(metric, 'rank_icir')} "
+            f"| {_fmt_metric(metric, 'rank_ic_t_stat')} "
             f"| {_fmt(metric.score_weight)} |"
         )
     lines.extend(
@@ -263,8 +264,8 @@ def _candidate_detail(candidate: ResearchCandidateResult) -> list[str]:
     for metric in candidate.evaluation.horizon_metrics:
         lines.append(
             f"| {metric.horizon_days} | {metric.observations} | {_pct(metric.coverage)} "
-            f"| {_fmt(metric.rank_ic_mean)} | {_fmt(metric.rank_icir)} "
-            f"| {_fmt(metric.rank_ic_t_stat)} | {metric.ic_days} |"
+            f"| {_fmt_metric(metric, 'rank_ic_mean')} | {_fmt_metric(metric, 'rank_icir')} "
+            f"| {_fmt_metric(metric, 'rank_ic_t_stat')} | {metric.ic_days} |"
         )
     lines.extend(
         [
@@ -322,7 +323,7 @@ def _conclusion_lines(candidate: ResearchCandidateResult | None) -> list[str]:
             f"- Best current candidate: `{candidate.factor.factor_id}`.",
             f"- Suggested next queue: {decision}.",
             f"- Primary evidence: score {_fmt(candidate.score)}, weighted split ICIR "
-            f"{_fmt(candidate.split_weighted_icir)}, Rank IC {_fmt(candidate.evaluation.rank_ic_mean)}.",
+            f"{_fmt(candidate.split_weighted_icir)}, Rank IC {_fmt_metric(candidate.evaluation, 'rank_ic_mean')}.",
             "- Next research step: review the self-review hypotheses before starting another iteration.",
             "",
         ]
@@ -353,6 +354,25 @@ def _artifact_label(path: Path | str) -> str:
 
 def _profile_label_from_profile(profile) -> str:
     return f"top={_fmt(profile.top_quantile)}, decay={profile.decay_days}, delay={profile.execution_delay_days}"
+
+
+def _fmt_metric(record: Any, key: str) -> str:
+    """Format one evaluation metric honestly against the qf.metrics.v2 map.
+
+    A MetricValue entry with a non-"available" status renders the status
+    marker (for example "insufficient_sample") instead of a placeholder
+    scalar such as 0.0; an "available" status renders its typed value.
+    Records without a map entry (old artifacts) fall back to the legacy
+    scalar attribute of the same name.
+    """
+
+    metrics = getattr(record, "metrics", None) or {}
+    metric = metrics.get(key) if isinstance(metrics, dict) else None
+    if metric is None:
+        return _fmt(getattr(record, key, None))
+    if metric.status != "available":
+        return metric.status
+    return _fmt(metric.value)
 
 
 def _fmt(value: float | None) -> str:

@@ -73,6 +73,7 @@ class DataValidationResult:
     start_date: str = ""
     end_date: str = ""
     optional_columns: tuple[str, ...] = field(default_factory=tuple)
+    synthesized_columns: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -308,6 +309,7 @@ class BacktestResult:
     return_series_kind: str = "non_overlapping_horizon_return"
     completed_periods: int = 0
     partial_periods: int = 0
+    lost_positions: int = 0
     exposure_days: int = 0
     calendar_days: int = 0
     reportable_annualization: MetricValue | None = None

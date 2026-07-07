@@ -29,6 +29,7 @@ from quant_forge.evaluation.service import evaluate_factor
 from quant_forge.factor_engine.formula_parser import SUPPORTED_OPERATORS, inspect_formula
 from quant_forge.factor_library.catalog import FactorCatalog, is_precomputed_formula
 from quant_forge.factor_library.repository import FactorRepository, parse_idea_to_definition
+from quant_forge.research_loop.candidate_gate import INSUFFICIENT_OOS_EVIDENCE
 from quant_forge.research_loop.candidate_gate import evaluate_candidate as evaluate_structured_candidate
 from quant_forge.research_loop.context_builder import ResearchContextBuilder
 from quant_forge.research_loop.contracts import (
@@ -1610,7 +1611,13 @@ def apply_gate(
     if score < gate.min_score:
         reasons.append(f"score {score:.6f} < {gate.min_score:.6f}")
     if gate.min_oos_net_annualized_return is not None:
-        for metric in _oos_segments(oos):
+        oos_segments = _oos_segments(oos)
+        if not oos_segments:
+            reasons.append(
+                f"{INSUFFICIENT_OOS_EVIDENCE}: min_oos_net_annualized_return is configured "
+                "but the backtest reports no OOS segments"
+            )
+        for metric in oos_segments:
             if metric.net_annualized_return is None:
                 reasons.append(f"{metric.name} net_annualized_return unavailable")
             elif metric.net_annualized_return < gate.min_oos_net_annualized_return:
@@ -1629,8 +1636,14 @@ def apply_gate(
         retention = _net_return_retention(oos)
         if retention < gate.min_net_return_retention:
             reasons.append(f"net_return_retention {retention:.6f} < {gate.min_net_return_retention:.6f}")
-    if gate.max_oos_net_return_decay is not None and _oos_net_decay(oos, gate.max_oos_net_return_decay):
-        reasons.append(f"OOS net return decay exceeds {gate.max_oos_net_return_decay:.6f}")
+    if gate.max_oos_net_return_decay is not None:
+        if _oos_net_decay(oos, gate.max_oos_net_return_decay):
+            reasons.append(f"OOS net return decay exceeds {gate.max_oos_net_return_decay:.6f}")
+        elif not _oos_decay_evidence_available(oos):
+            reasons.append(
+                f"{INSUFFICIENT_OOS_EVIDENCE}: max_oos_net_return_decay is configured "
+                "but IS/OOS net_annualized_return evidence is missing"
+            )
     if not reasons:
         reasons.append("passed smoke research gate")
     return len(reasons) == 1 and reasons[0] == "passed smoke research gate", tuple(reasons)
@@ -2419,6 +2432,17 @@ def _net_return_retention(backtest: BacktestResult) -> float:
     if backtest.annualized_return <= 0:
         return 1.0 if backtest.net_annualized_return >= backtest.annualized_return else 0.0
     return float(backtest.net_annualized_return / backtest.annualized_return)
+
+
+def _oos_decay_evidence_available(backtest: BacktestResult) -> bool:
+    split_by_name = {metric.name.upper(): metric for metric in backtest.segment_metrics}
+    is_metric = split_by_name.get("IS")
+    if is_metric is None or is_metric.net_annualized_return is None:
+        return False
+    return any(
+        name.startswith("OOS") and metric.net_annualized_return is not None
+        for name, metric in split_by_name.items()
+    )
 
 
 def _oos_net_decay(backtest: BacktestResult, max_decay: float = 0.5) -> bool:
