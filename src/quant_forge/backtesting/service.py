@@ -41,6 +41,7 @@ INSUFFICIENT_SHARPE_OBSERVATIONS = "INSUFFICIENT_SHARPE_OBSERVATIONS"
 DAILY_NAV_UNAVAILABLE = "DAILY_NAV_UNAVAILABLE"
 NO_REBALANCE_OBSERVATIONS = "NO_REBALANCE_OBSERVATIONS"
 PARTIAL_FINAL_PERIOD = "PARTIAL_FINAL_PERIOD"
+FINAL_PARTIAL_PERIOD_EXCLUDED = "FINAL_PARTIAL_PERIOD_EXCLUDED"
 SEGMENT_BOUNDARY_PURGED = "SEGMENT_BOUNDARY_PURGED"
 POSITIONS_LOST_BEFORE_EXIT = "POSITIONS_LOST_BEFORE_EXIT"
 
@@ -62,8 +63,17 @@ def run_factor_backtest(
     factor_values_manifest_root: Path | None = None,
     sample_role: str = EXTERNAL_OOS_ROLE,
     first_signal_date: str | None = None,
-    include_partial_final_period: bool = True,
+    include_partial_final_period: bool = False,
 ) -> BacktestResult:
+    """Run the next-day execution factor backtest.
+
+    By default the final incomplete holding period is excluded from the
+    schedule (owner decision D3) and the result carries the
+    ``FINAL_PARTIAL_PERIOD_EXCLUDED`` warning code so the exclusion is never
+    silent. Pass ``include_partial_final_period=True`` to mark the tail period
+    to market instead (flagged via ``PARTIAL_FINAL_PERIOD``).
+    """
+
     profile = simulation_profile or SimulationProfile()
     costs = transaction_costs or TransactionCostModel()
     if top_quantile is not None:
@@ -126,6 +136,7 @@ def run_factor_backtest(
     start_signal_index = _resolve_start_signal_index(dates, first_signal_date)
     completed_periods = 0
     partial_periods = 0
+    excluded_final_partial_period = False
     lost_positions_total = 0
     for signal_index in range(start_signal_index, len(dates) - delay - 1, holding):
         signal_date = dates[signal_index]
@@ -137,6 +148,11 @@ def run_factor_backtest(
         elif include_partial_final_period:
             actual_exit_index = len(dates) - 1
         else:
+            # Owner decision D3: the default drops the scheduled tail period
+            # whose exit falls beyond the data window instead of marking it to
+            # market. The exclusion is surfaced via FINAL_PARTIAL_PERIOD_EXCLUDED
+            # so it is never silent (FP-2).
+            excluded_final_partial_period = True
             break
         if actual_exit_index <= signal_index + delay:
             break
@@ -314,6 +330,18 @@ def run_factor_backtest(
         warning_code_items.append(NO_REBALANCE_OBSERVATIONS)
     if partial_periods:
         warning_code_items.append(PARTIAL_FINAL_PERIOD)
+    if excluded_final_partial_period:
+        warning_code_items.append(FINAL_PARTIAL_PERIOD_EXCLUDED)
+        warnings = tuple(
+            dict.fromkeys(
+                (
+                    *warnings,
+                    "final incomplete holding period excluded from the schedule "
+                    "(owner decision D3); pass include_partial_final_period=True "
+                    "to include it marked to market at the window end",
+                )
+            )
+        )
     if lost_positions_total:
         warning_code_items.append(POSITIONS_LOST_BEFORE_EXIT)
         warnings = tuple(
@@ -385,7 +413,9 @@ def run_factor_backtest(
         "execution_delay_days": delay,
         "execution_price": "close",
         "first_entry_policy": "first_signal_inside_window_then_next_day_entry",
-        "final_period_policy": "mark_to_market_partial_final",
+        "final_period_policy": (
+            "mark_to_market_partial_final" if include_partial_final_period else "exclude_partial_final"
+        ),
         "portfolio_mode": "long_short",
         "top_quantile": top_quantile,
         "benchmark": benchmark,
@@ -634,6 +664,7 @@ def run_staggered_entry_backtest(
                 "daily_nav": list(cohort_result.daily_nav),
                 "completed_periods": cohort_result.completed_periods,
                 "partial_periods": cohort_result.partial_periods,
+                "warning_codes": list(cohort_result.warning_codes),
             }
         )
     aggregate_nav = _aggregate_staggered_nav(dates, cohorts)
@@ -657,7 +688,10 @@ def run_staggered_entry_backtest(
         "relative_wealth_excess_return": terminal_nav / benchmark_terminal - 1.0 if benchmark_terminal else None,
         "daily_nav": aggregate_nav,
         "cohorts": cohorts,
-        "warning_codes": [],
+        # Aggregate-level codes are the distinct union of cohort codes so a
+        # cohort-level exclusion (e.g. FINAL_PARTIAL_PERIOD_EXCLUDED under D3)
+        # is never silent at the staggered surface (FP-2).
+        "warning_codes": sorted({str(code) for cohort in cohorts for code in cohort["warning_codes"]}),
     }
     artifact_path = artifact_root.expanduser() / "staggered_backtests" / f"{factor_id}{simulation_profile_suffix(profile)}.json"
     write_json(artifact_path, result)

@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 import pytest
 from quant_forge.backtesting.service import (
+    FINAL_PARTIAL_PERIOD_EXCLUDED,
+    PARTIAL_FINAL_PERIOD,
     _daily_nav_for_period,
     _leg_cumulative_returns,
     _max_drawdown,
@@ -15,7 +17,7 @@ from quant_forge.backtesting.service import (
     run_staggered_entry_backtest,
 )
 from quant_forge.core.contracts import FactorDefinition, SampleSplitSpec, SimulationProfile, TransactionCostModel
-from quant_forge.data.local import create_demo_workspace
+from quant_forge.data.local import PANEL_FILE, create_demo_workspace
 from quant_forge.factor_library.repository import FactorRepository
 
 
@@ -331,7 +333,9 @@ def test_backtest_sample_role_is_metadata_not_math(tmp_path: Path) -> None:
     assert external.metrics["net_annualized_return"].sample_role == "external_oos_backtest"
 
 
-def test_backtest_marks_partial_final_period_to_window_end(tmp_path: Path) -> None:
+def test_backtest_default_excludes_partial_final_period_and_warns(tmp_path: Path) -> None:
+    # Owner decision D3: the default schedule stops at the last complete holding
+    # period. The dropped tail must be surfaced, never silent (FP-2).
     paths = create_demo_workspace(tmp_path / "demo")
     result = run_factor_backtest(
         "FTR_DEMO_SMALL_CAP",
@@ -343,12 +347,94 @@ def test_backtest_marks_partial_final_period_to_window_end(tmp_path: Path) -> No
     payload = json.loads(result.artifact_path.read_text(encoding="utf-8"))
 
     assert payload["completed_periods"] == 1
+    assert payload["partial_periods"] == 0
+    assert payload["periods"] == 1
+    assert all(row["is_complete_period"] for row in payload["period_returns"])
+    assert payload["daily_nav"][-1]["date"] < "2024-08-12"
+    assert FINAL_PARTIAL_PERIOD_EXCLUDED in result.warning_codes
+    assert FINAL_PARTIAL_PERIOD_EXCLUDED in payload["warning_codes"]
+    assert PARTIAL_FINAL_PERIOD not in result.warning_codes
+    assert "include_partial_final_period=True" in "; ".join(result.warnings)
+    assert payload["request"]["final_period_policy"] == "exclude_partial_final"
+    assert payload["net_cumulative_return"] == pytest.approx(payload["daily_nav"][-1]["net_nav"] - 1.0)
+
+
+def test_backtest_opt_in_marks_partial_final_period_to_window_end(tmp_path: Path) -> None:
+    # Explicit opt-in (include_partial_final_period=True) preserves the legacy
+    # mark-to-market tail behavior and the legacy PARTIAL_FINAL_PERIOD flag.
+    paths = create_demo_workspace(tmp_path / "demo")
+    result = run_factor_backtest(
+        "FTR_DEMO_SMALL_CAP",
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        holding_days=80,
+        include_partial_final_period=True,
+    )
+    payload = json.loads(result.artifact_path.read_text(encoding="utf-8"))
+
+    assert payload["completed_periods"] == 1
     assert payload["partial_periods"] == 1
     assert payload["periods"] == 2
     assert payload["period_returns"][-1]["is_partial_final_period"] is True
     assert payload["period_returns"][-1]["is_complete_period"] is False
     assert payload["daily_nav"][-1]["date"] == "2024-08-12"
+    assert PARTIAL_FINAL_PERIOD in result.warning_codes
+    assert FINAL_PARTIAL_PERIOD_EXCLUDED not in result.warning_codes
+    assert payload["request"]["final_period_policy"] == "mark_to_market_partial_final"
     assert payload["net_cumulative_return"] == pytest.approx(payload["daily_nav"][-1]["net_nav"] - 1.0)
+
+
+def test_default_exclusion_preserves_complete_periods_segments_and_lost_positions(tmp_path: Path) -> None:
+    # D3 + FP-3: dropping the scheduled tail must not touch any realized complete
+    # period — including mid-period delisting losses — nor corrupt segment math.
+    paths = create_demo_workspace(tmp_path / "demo")
+    panel_path = paths["data_root"] / PANEL_FILE
+    panel = pd.read_parquet(panel_path)
+    dates = sorted(panel["trade_date"].unique())
+    victim = panel.groupby("instrument")["market_cap"].mean().sort_values().index[0]
+    # Default schedule (delay=1, holding=5) enters/exits on indices ≡ 1 mod 5;
+    # keep the cutoff off that grid so the gap opens strictly mid-period, well
+    # before the final scheduled tail.
+    cut_index = len(dates) * 2 // 3
+    if cut_index % 5 == 1:
+        cut_index += 1
+    cutoff = dates[cut_index]
+    gapped = panel[~((panel["instrument"] == victim) & (panel["trade_date"] > cutoff))]
+    gapped.to_parquet(panel_path, index=False)
+
+    excluded = run_factor_backtest(
+        "FTR_DEMO_SMALL_CAP",
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"] / "excluded",
+    )
+    included = run_factor_backtest(
+        "FTR_DEMO_SMALL_CAP",
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"] / "included",
+        include_partial_final_period=True,
+    )
+
+    assert included.partial_periods == 1
+    assert excluded.partial_periods == 0
+    assert excluded.completed_periods == included.completed_periods
+    assert excluded.periods == included.periods - 1
+    # The delisting loss lives in a complete mid-window period; exclusion of the
+    # tail cannot make it vanish (FP-3 conservation).
+    assert excluded.lost_positions == included.lost_positions
+    assert excluded.lost_positions >= 1
+
+    excluded_payload = json.loads(excluded.artifact_path.read_text(encoding="utf-8"))
+    included_payload = json.loads(included.artifact_path.read_text(encoding="utf-8"))
+    complete_rows = [row for row in included_payload["period_returns"] if row["is_complete_period"]]
+    assert excluded_payload["period_returns"] == complete_rows
+    segments = excluded_payload["segment_metrics"]
+    assert {metric["name"] for metric in segments} == {"IS", "OOS1", "OOS2"}
+    assert sum(metric["periods"] for metric in segments) <= excluded_payload["periods"]
+    assert segments[0]["end_date"] < segments[1]["start_date"]
+    assert segments[1]["end_date"] < segments[2]["start_date"]
 
 
 def test_backtest_uses_pre_period_lookback_for_2026_h21_schedule(tmp_path: Path) -> None:
@@ -426,6 +512,8 @@ def test_backtest_default_cash_benchmark_and_excess_reconcile(tmp_path: Path) ->
 
 def test_backtest_artifact_recomputes_from_daily_ledger_and_schedule(tmp_path: Path) -> None:
     paths = create_demo_workspace(tmp_path / "demo")
+    # Opt in to the mark-to-market tail so the recompute covers a mixed
+    # complete + partial schedule (the D3 default would drop the tail).
     result = run_factor_backtest(
         "FTR_DEMO_SMALL_CAP",
         factor_root=paths["factor_root"],
@@ -433,6 +521,7 @@ def test_backtest_artifact_recomputes_from_daily_ledger_and_schedule(tmp_path: P
         artifact_root=paths["artifact_root"],
         holding_days=80,
         transaction_costs=TransactionCostModel(commission_bps=10.0, slippage_bps=5.0),
+        include_partial_final_period=True,
     )
     payload = json.loads(result.artifact_path.read_text(encoding="utf-8"))
     ledger = payload["daily_ledger"]
@@ -645,3 +734,29 @@ def test_staggered_entry_artifact_recomputes_equal_sleeve_nav(tmp_path: Path) ->
         assert row["capital_weight_sum"] == pytest.approx(1.0)
     assert payload["strategy_cumulative_return"] == pytest.approx(payload["daily_nav"][-1]["net_nav"] - 1.0)
     assert payload["relative_wealth_excess_return"] == pytest.approx(payload["daily_nav"][-1]["relative_nav"] - 1.0)
+
+
+def test_staggered_entry_backtest_surfaces_cohort_warning_codes(tmp_path: Path) -> None:
+    # F2/D3: cohorts drop scheduled tail periods by default; the staggered
+    # aggregate must carry the distinct union of cohort warning codes instead
+    # of a hardcoded empty list, and each cohort row must expose its own codes.
+    paths = create_demo_workspace(tmp_path / "demo")
+    result = run_staggered_entry_backtest(
+        "FTR_DEMO_SMALL_CAP",
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        holding_days=21,
+        formation_trading_days=5,
+    )
+
+    per_cohort = [cohort["warning_codes"] for cohort in result["cohorts"]]
+    assert all(isinstance(codes, list) for codes in per_cohort)
+    assert any(FINAL_PARTIAL_PERIOD_EXCLUDED in codes for codes in per_cohort)
+    assert FINAL_PARTIAL_PERIOD_EXCLUDED in result["warning_codes"]
+    assert result["warning_codes"] == sorted(set(result["warning_codes"]))
+    assert set(result["warning_codes"]) == {code for codes in per_cohort for code in codes}
+
+    payload = json.loads(Path(result["artifact_path"]).read_text(encoding="utf-8"))
+    assert payload["warning_codes"] == result["warning_codes"]
+    assert [cohort["warning_codes"] for cohort in payload["cohorts"]] == per_cohort
