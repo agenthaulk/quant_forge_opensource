@@ -45,7 +45,11 @@ class ResearchContextBuilder:
         effective = tuple(
             _factor_summary(factor) for factor in factors if factor.status in {"candidate", "active"}
         )[:20]
-        recent = self.trace_store.read_recent_entries(limit=20) if self.trace_store is not None else []
+        recent = (
+            self.trace_store.read_recent_entries(limit=20, phases={"experiment_result", "plan_blocked"})
+            if self.trace_store is not None
+            else []
+        )
         terminal = tuple(item for item in recent if _is_terminal_trace(item))
         successes = tuple(item for item in terminal if _trace_passed(item))
         failures = tuple(item for item in terminal if not _trace_passed(item))

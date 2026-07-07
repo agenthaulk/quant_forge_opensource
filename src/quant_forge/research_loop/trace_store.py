@@ -74,14 +74,23 @@ class ResearchTraceStore:
             return rows
         return rows[-max(limit, 0) :]
 
-    def read_recent_entries(self, *, limit: int = 20) -> list[dict[str, Any]]:
+    def read_recent_entries(
+        self, *, limit: int = 20, phases: set[str] | frozenset[str] | None = None
+    ) -> list[dict[str, Any]]:
         if not self.runs_root.exists():
             return []
         rows: list[dict[str, Any]] = []
         for path in sorted(self.runs_root.glob("*/trace.jsonl"), key=lambda item: item.stat().st_mtime):
             for line in path.read_text(encoding="utf-8").splitlines():
-                if line.strip():
-                    rows.append(_jsonable(json.loads(line)))
+                if not line.strip():
+                    continue
+                entry = _jsonable(json.loads(line))
+                # Phase filtering happens BEFORE the limit so interleaved
+                # non-experiment rows (strategy_decision, round_summary) do not
+                # shrink a reader's effective window of real experiment rows.
+                if phases is not None and str(entry.get("phase") or "") not in phases:
+                    continue
+                rows.append(entry)
         return rows[-max(limit, 0) :]
 
     def _write_json(self, path: Path, payload: Any) -> Path:

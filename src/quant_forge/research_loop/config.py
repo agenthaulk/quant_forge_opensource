@@ -156,6 +156,7 @@ class ResearchLoopConfig:
     transaction_costs: TransactionCostModel = field(default_factory=TransactionCostModel)
     llm: ResearchLLMConfig = field(default_factory=ResearchLLMConfig)
     deduplication: ResearchDeduplicationConfig = field(default_factory=ResearchDeduplicationConfig)
+    strategy_selector_enabled: bool = True
 
     def __post_init__(self) -> None:
         if self.default_max_candidates < 1 or self.default_max_candidates > 10:
@@ -284,6 +285,9 @@ def load_research_loop_config(
         transaction_costs=_load_transaction_costs(loaded.get("transaction_costs"), base.transaction_costs),
         llm=_load_rd_llm_config(loaded.get("llm"), base.llm),
         deduplication=_load_deduplication(loaded.get("deduplication"), base.deduplication),
+        strategy_selector_enabled=bool(
+            loaded.get("strategy_selector_enabled", base.strategy_selector_enabled)
+        ),
     )
 
 

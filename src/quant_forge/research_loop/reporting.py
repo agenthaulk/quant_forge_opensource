@@ -53,6 +53,9 @@ def render_research_report(result: ResearchLoopResult, *, generated_at: datetime
         "",
     ]
     lines.extend(_deduplication_lines(result))
+    if result.strategy_trail:
+        lines.extend(["## Strategy Trail", ""])
+        lines.extend(_strategy_trail_lines(result))
     lines.extend(["## Successive Halving Trace", ""])
     lines.extend(_search_trace_lines(result))
     lines.extend(["## SOTA / Best Candidate", ""])
@@ -167,6 +170,27 @@ def _deduplication_lines(result: ResearchLoopResult) -> list[str]:
         f"- Result Signature Duplicates: {int(summary.get('result_duplicates') or 0)}",
         "",
     ]
+
+
+def _strategy_trail_lines(result: ResearchLoopResult) -> list[str]:
+    """Compact per-round strategy decisions; omitted when the selector is off."""
+
+    lines = [
+        "| Round | Strategy | Reason |",
+        "| ---: | --- | --- |",
+    ]
+    for entry in result.strategy_trail:
+        round_index = entry.get("round_index")
+        round_label = (
+            str(round_index)
+            if isinstance(round_index, int) and not isinstance(round_index, bool)
+            else "-"
+        )
+        strategy = str(entry.get("strategy") or "-")
+        reason = str(entry.get("reason") or "-").replace("|", "\\|")
+        lines.append(f"| {round_label} | {strategy} | {reason} |")
+    lines.append("")
+    return lines
 
 
 def _search_trace_lines(result: ResearchLoopResult) -> list[str]:

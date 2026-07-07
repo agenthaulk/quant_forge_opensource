@@ -8,7 +8,7 @@ import re
 from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
-from math import ceil
+from math import ceil, isfinite
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
@@ -29,6 +29,12 @@ from quant_forge.evaluation.service import evaluate_factor
 from quant_forge.factor_engine.formula_parser import SUPPORTED_OPERATORS, inspect_formula
 from quant_forge.factor_library.catalog import FactorCatalog, is_precomputed_formula
 from quant_forge.factor_library.repository import FactorRepository, parse_idea_to_definition
+from quant_forge.lineage.store import (
+    RunIndex,
+    canonical_fingerprint,
+    metric_highlight,
+    relative_artifact_path,
+)
 from quant_forge.research_loop.candidate_gate import INSUFFICIENT_OOS_EVIDENCE
 from quant_forge.research_loop.candidate_gate import evaluate_candidate as evaluate_structured_candidate
 from quant_forge.research_loop.context_builder import ResearchContextBuilder
@@ -42,13 +48,29 @@ from quant_forge.research_loop.contracts import (
 from quant_forge.research_loop.experiment_planner import ExperimentPlanner
 from quant_forge.research_loop.feedback_builder import build_feedback
 from quant_forge.research_loop.operator_drafts import write_operator_draft_artifacts
+from quant_forge.research_loop.strategy_selector import (
+    StrategyContext,
+    StrategyDecision,
+    select_strategy,
+)
 from quant_forge.research_loop.trace_store import ResearchTraceStore, utc_timestamp
+from quant_forge.workbench.service import evaluation_data_window
 
 
 DEFAULT_QUICK_HORIZON_DAYS = (5, 21)
 DEFAULT_QUICK_SAMPLE_SPLITS = (SampleSplitSpec(name="IS", fraction=1.0, score_weight=1.0),)
 DEFAULT_LLM_FORMULA_REPAIR_ATTEMPTS = 2
 RD_RESEARCH_STAGE = "research"
+RD_RUN_INDEX_KIND = "rd"
+RD_RUN_HIGHLIGHT_METRICS = ("rank_ic_mean", "rank_icir", "rank_ic_t_stat")
+# Bounded evidence window the strategy selector reads from the trace store.
+# Decoupled from deduplication.recent_trace_limit so disabling result-signature
+# dedup does not silently blind the selector.
+STRATEGY_CONTEXT_TRACE_LIMIT = 200
+_STRATEGY_TRAIL_LIMIT = 10
+_STRATEGY_MECHANISM_LIMIT = 10
+_STRATEGY_FINGERPRINT_LIMIT = 20
+_DUPLICATE_PLAN_STATUSES = frozenset({"blocked_duplicate_formula", "blocked_candidate_diversity"})
 
 
 @dataclass(frozen=True)
@@ -358,6 +380,10 @@ class ResearchLoopResult:
     deduplication: dict[str, object] = field(default_factory=dict)
     optimization_performed: bool = False
     no_optimization_performed: bool = False
+    # Strategy selector observability: the current round's decision (None when
+    # the selector is disabled) and the bounded per-round decision trail.
+    strategy_decision: dict[str, object] | None = None
+    strategy_trail: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -435,6 +461,7 @@ class ResearchLoopService:
         experiment_planner: ExperimentPlanner | None = None,
         deduplication: ResearchDeduplicationConfig | None = None,
         llm_formula_repair_attempts: int = DEFAULT_LLM_FORMULA_REPAIR_ATTEMPTS,
+        strategy_selector_enabled: bool = True,
         cancel_event: Any | None = None,
     ) -> None:
         self.factor_root = factor_root
@@ -494,6 +521,7 @@ class ResearchLoopService:
         if not 0 <= llm_formula_repair_attempts <= 3:
             raise ValueError("llm_formula_repair_attempts must be between 0 and 3")
         self.llm_formula_repair_attempts = llm_formula_repair_attempts
+        self.strategy_selector_enabled = strategy_selector_enabled
         self.cancel_event = cancel_event
         self._active_run_id: str | None = None
         self._cancel_written = False
@@ -537,6 +565,54 @@ class ResearchLoopService:
             factor_values_manifest_root=self.factor_values_manifest_root,
             trace_store=self.trace_store,
         ).build(objective=objective, seed_factor_ids=(seed_factor_id,))
+        # Strategy selection happens BEFORE candidate generation and reads only
+        # evidence already persisted by prior rounds (trace/dedup/gate state);
+        # it never peeks at this round's evaluation data (FP-6).
+        strategy_round_index: int | None = None
+        strategy_decision_payload: dict[str, Any] | None = None
+        strategy_trail: tuple[dict[str, Any], ...] = ()
+        if self.strategy_selector_enabled:
+            # F3: the selector's evidence is scoped to THIS seed's run chain
+            # (run ids embed the seed id). Rounds of other seeds must never
+            # leak gate reasons, round summaries, duplicate counts, or
+            # fingerprints into this run's context; same-seed history is the
+            # legitimate "prior rounds" evidence (and the fingerprint dedup
+            # memory) the selector was designed to consume.
+            recent_strategy_entries = [
+                entry
+                for entry in self.trace_store.read_recent_entries(limit=STRATEGY_CONTEXT_TRACE_LIMIT)
+                if _entry_belongs_to_seed_run_chain(entry, seed_factor_id=seed_factor_id, current_run_id=run_id)
+            ]
+            strategy_context = _strategy_context_from_trace_entries(recent_strategy_entries)
+            strategy_decision = select_strategy(strategy_context)
+            strategy_round_index = strategy_context.round_index
+            strategy_decision_payload = strategy_decision.to_dict()
+            strategy_trail = (
+                *_strategy_trail_from_trace_entries(recent_strategy_entries),
+                {
+                    "round_index": strategy_context.round_index,
+                    "strategy": strategy_decision.strategy,
+                    "reason": strategy_decision.reason,
+                },
+            )
+            self.trace_store.append_trace(
+                {
+                    "run_id": run_id,
+                    "lane_id": "strategy_selector",
+                    "phase": "strategy_decision",
+                    "timestamp": utc_timestamp(),
+                    "schema_version": "qf.research_loop.trace.v1",
+                    "strategy_context": strategy_context.to_dict(),
+                    "strategy_decision": strategy_decision_payload,
+                }
+            )
+            context = replace(
+                context,
+                next_focus_hints=(
+                    *context.next_focus_hints,
+                    *_strategy_prompt_hints(strategy_decision),
+                ),
+            )
         self.trace_store.write_context(run_id, context)
         self._raise_if_cancelled()
         planned = hypotheses or _generate_hypotheses(
@@ -557,27 +633,26 @@ class ResearchLoopService:
             )
         else:
             generation = _hypothesis_generator_metadata(self.hypothesis_generator)
-        self.trace_store.write_config_snapshot(
-            run_id,
-            {
-                "objective": objective,
-                "max_candidates": max_candidates,
-                "generation": _generation_snapshot(generation),
-                "llm_formula_repair_attempts": self.llm_formula_repair_attempts,
-                "parameter_search_enabled": self.parameter_search_enabled,
-                "parameter_search_method": self.parameter_search_method,
-                "simulation_profile": asdict(self.simulation_profile),
-                "evaluation_profile": asdict(self.evaluation_simulation_profile),
-                "backtest_profile": asdict(self.backtest_simulation_profile),
-                "trial_simulation_overlays": [
-                    _trial_simulation_overlay_snapshot(overlay) for overlay in self.trial_simulation_overlays
-                ],
-                "effective_trial_configs": [
-                    _effective_trial_config_snapshot(config) for config in self.effective_trial_configs
-                ],
-                "deduplication": _deduplication_snapshot(self.deduplication),
-            },
-        )
+        config_snapshot: dict[str, Any] = {
+            "objective": objective,
+            "max_candidates": max_candidates,
+            "generation": _generation_snapshot(generation),
+            "llm_formula_repair_attempts": self.llm_formula_repair_attempts,
+            "parameter_search_enabled": self.parameter_search_enabled,
+            "parameter_search_method": self.parameter_search_method,
+            "simulation_profile": asdict(self.simulation_profile),
+            "evaluation_profile": asdict(self.evaluation_simulation_profile),
+            "backtest_profile": asdict(self.backtest_simulation_profile),
+            "trial_simulation_overlays": [
+                _trial_simulation_overlay_snapshot(overlay) for overlay in self.trial_simulation_overlays
+            ],
+            "effective_trial_configs": [
+                _effective_trial_config_snapshot(config) for config in self.effective_trial_configs
+            ],
+            "deduplication": _deduplication_snapshot(self.deduplication),
+            "strategy_selector_enabled": self.strategy_selector_enabled,
+        }
+        self.trace_store.write_config_snapshot(run_id, config_snapshot)
         seed_assessment = self._assess_factor(
             seed,
             role="seed",
@@ -794,6 +869,27 @@ class ResearchLoopService:
             )
         )
         optimization_performed = _optimization_performed(results, seed, self.evaluation_simulation_profile)
+        # Persist compact per-round evidence so the NEXT round's strategy
+        # selector can consume duplicate rate and score deltas from the trace
+        # (run history), not from in-memory state that dies with this call.
+        self.trace_store.append_trace(
+            {
+                "run_id": run_id,
+                "lane_id": "run_history",
+                "phase": "round_summary",
+                "timestamp": utc_timestamp(),
+                "schema_version": "qf.research_loop.trace.v1",
+                "round_summary": _round_summary_payload(
+                    seed_factor_id=seed_factor_id,
+                    round_index=strategy_round_index,
+                    planned_count=len(planned[:max_candidates]),
+                    results=results,
+                    seed_score=seed_assessment.selection_score,
+                    dedup_summary=dedup_summary,
+                    accepted_candidate_ids=accepted,
+                ),
+            }
+        )
         result = ResearchLoopResult(
             rd_stage=RD_RESEARCH_STAGE,
             seed_factor_id=seed_factor_id,
@@ -818,6 +914,8 @@ class ResearchLoopService:
             deduplication=dedup_summary,
             optimization_performed=optimization_performed,
             no_optimization_performed=not optimization_performed,
+            strategy_decision=strategy_decision_payload,
+            strategy_trail=strategy_trail,
         )
         from quant_forge.research_loop.reporting import write_research_report
 
@@ -841,6 +939,13 @@ class ResearchLoopService:
                 "no_optimization_performed": result.no_optimization_performed,
                 "report_path": result.report_path,
             },
+        )
+        self._append_rd_run_index_row(
+            run_id=run_id,
+            seed_factor_id=seed_factor_id,
+            result=result,
+            seed_assessment=seed_assessment,
+            config_snapshot=config_snapshot,
         )
         self._created_factor_ids.clear()
         self._promoted_factor_snapshots.clear()
@@ -1471,6 +1576,51 @@ class ResearchLoopService:
             parent_seed_factor_id=parent_seed_factor_id,
         )
 
+    def _append_rd_run_index_row(
+        self,
+        *,
+        run_id: str,
+        seed_factor_id: str,
+        result: ResearchLoopResult,
+        seed_assessment: FactorAssessmentBundle,
+        config_snapshot: dict[str, Any],
+    ) -> None:
+        """Append one honest run-history row (kind "rd") at run completion.
+
+        Artifact paths are stored relative to ``artifact_root`` (or dropped
+        when outside it); metric highlights keep their MetricValue statuses so
+        an unavailable metric is never rendered as a number (FP-2/FP-4).
+        """
+        created_at = datetime.now(UTC)
+        best = result.candidates[0] if result.candidates else None
+        highlight_source = (best.evaluation if best is not None else seed_assessment.evaluation).metrics
+        highlights = {
+            name: metric_highlight(highlight_source[name])
+            for name in RD_RUN_HIGHLIGHT_METRICS
+            if name in highlight_source
+        }
+        artifact_paths_rel = [
+            path_rel
+            for path_rel in (
+                relative_artifact_path(self.artifact_root, result.report_path),
+                relative_artifact_path(self.artifact_root, result.trace_root),
+            )
+            if path_rel
+        ]
+        RunIndex(self.artifact_root).append_run(
+            run_id=run_id,
+            kind=RD_RUN_INDEX_KIND,
+            factor_ids=tuple(dict.fromkeys((seed_factor_id, *result.accepted_candidate_ids))),
+            created_at=created_at.isoformat(),
+            data_window=evaluation_data_window(seed_assessment.evaluation),
+            config_fingerprint=canonical_fingerprint(
+                {"kind": RD_RUN_INDEX_KIND, "seed_factor_id": seed_factor_id, "config": config_snapshot}
+            ),
+            metric_highlights=highlights,
+            artifact_paths_rel=artifact_paths_rel,
+            warnings_count=_rd_warnings_count(seed_assessment, result.candidates),
+        )
+
 
 def objective_weights_for(objective: str) -> ResearchObjectiveWeights:
     normalized = objective.strip().lower()
@@ -1883,7 +2033,7 @@ def _recent_result_signature_index(
     limit: int,
 ) -> dict[str, str]:
     index: dict[str, str] = {}
-    for entry in trace_store.read_recent_entries(limit=limit):
+    for entry in trace_store.read_recent_entries(limit=limit, phases={"experiment_result"}):
         if str(entry.get("phase") or "") != "experiment_result":
             continue
         signature = _result_signature_from_trace_entry(entry, precision=precision)
@@ -2292,6 +2442,12 @@ def _structured_result_from_candidate(
         universe_filters=candidate.factor.universe_filters,
         expected_direction="positive",
     )
+    backtest_metrics = _backtest_metrics(selection_backtest)
+    # Additive trace evidence for the next round's strategy selector: worst
+    # OOS-vs-IS net-return decay from the same backtest the gate audited
+    # (external OOS when configured, else the selection backtest). None, never
+    # a fabricated number, when segment evidence is missing (FP-2/FP-4).
+    backtest_metrics["oos_net_return_decay"] = _oos_net_return_decay_value(candidate.backtest)
     decision = evaluate_structured_candidate(
         StructuredFactorExperimentResult(
             plan=experiment_plan,
@@ -2299,7 +2455,7 @@ def _structured_result_from_candidate(
             evaluation_status="completed",
             evaluation_metrics=_evaluation_metrics(candidate.evaluation),
             backtest_status="completed",
-            backtest_metrics=_backtest_metrics(selection_backtest),
+            backtest_metrics=backtest_metrics,
             artifact_refs=_artifact_refs(candidate),
         )
     )
@@ -2326,7 +2482,7 @@ def _structured_result_from_candidate(
         evaluation_status="completed",
         evaluation_metrics=_evaluation_metrics(candidate.evaluation),
         backtest_status="completed",
-        backtest_metrics=_backtest_metrics(selection_backtest),
+        backtest_metrics=backtest_metrics,
         artifact_refs=_artifact_refs(candidate),
         gate_decision=decision,
     )
@@ -2460,3 +2616,273 @@ def _oos_net_decay(backtest: BacktestResult, max_decay: float = 0.5) -> bool:
             if ratio < max_decay:
                 return True
     return False
+
+
+def _oos_net_return_decay_value(backtest: BacktestResult) -> float | None:
+    """Worst OOS-vs-IS net-return decay, ``1 - min(OOS/IS)``, from segments.
+
+    Returns None — never a fabricated number (FP-2/FP-4) — when the IS
+    baseline or every OOS segment lacks ``net_annualized_return`` evidence,
+    or when the IS baseline is non-positive so the ratio is undefined. At the
+    selector's 0.5 threshold this matches the gate helper ``_oos_net_decay``:
+    ``ratio < 0.5`` if and only if ``1 - ratio > 0.5``.
+    """
+
+    split_by_name = {metric.name.upper(): metric for metric in backtest.segment_metrics}
+    is_metric = split_by_name.get("IS")
+    if is_metric is None or is_metric.periods == 0 or is_metric.net_annualized_return is None:
+        return None
+    if is_metric.net_annualized_return <= 0:
+        return None
+    ratios = [
+        metric.net_annualized_return / is_metric.net_annualized_return
+        for name, metric in split_by_name.items()
+        if name.startswith("OOS") and metric.periods > 0 and metric.net_annualized_return is not None
+    ]
+    if not ratios:
+        return None
+    decay = 1.0 - min(ratios)
+    return float(decay) if isfinite(decay) else None
+
+
+def _finite_float_or_none(value: Any) -> float | None:
+    """A finite float, or None for missing/non-numeric/NaN/inf evidence."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if isfinite(number) else None
+
+
+_RUN_ID_SUFFIX_RE = re.compile(r"\d{8}T\d{12}Z_[0-9a-f]{8}")
+
+
+def _entry_belongs_to_seed_run_chain(
+    entry: dict[str, Any],
+    *,
+    seed_factor_id: str,
+    current_run_id: str,
+) -> bool:
+    """True when a trace entry belongs to the current run or a prior run of
+    the SAME seed factor id.
+
+    Run ids are structural (``rd_<safe_seed>_<UTC timestamp>_<hex8>``, see
+    :func:`_research_run_id`), so the seed chain is recognized without reading
+    entry payloads. The timestamp/uuid suffix match prevents one seed id that
+    is a prefix of another (``FTR_A`` vs ``FTR_A_X``) from matching the wrong
+    chain.
+    """
+
+    run_id = str(entry.get("run_id") or "")
+    if not run_id:
+        return False
+    if run_id == current_run_id:
+        return True
+    prefix = f"rd_{_safe_id(seed_factor_id)}_"
+    if not run_id.startswith(prefix):
+        return False
+    return _RUN_ID_SUFFIX_RE.fullmatch(run_id[len(prefix) :]) is not None
+
+
+def _strategy_context_from_trace_entries(entries: list[dict[str, Any]]) -> StrategyContext:
+    """Build the selector's evidence snapshot from persisted trace state only.
+
+    ``entries`` must already be scoped to the current seed's run chain (F3:
+    no cross-seed contamination; ``round_index`` counts prior rounds of this
+    seed, and ``recent_fingerprints`` aggregate only across runs of the same
+    seed). Every input is derived from prior rounds' recorded evidence
+    (duplicate counters via round summaries or plan statuses, OOS decay via
+    the segment decay value traced with each result, gate reasons from the
+    last gate decision). Missing evidence stays None/empty — never a
+    fabricated value.
+    """
+
+    run_ids: set[str] = set()
+    candidate_count = 0
+    blocked_plan_count = 0
+    failed_plan_count = 0
+    duplicate_plan_count = 0
+    last_round_summary: dict[str, Any] | None = None
+    last_result_entry: dict[str, Any] | None = None
+    mechanisms: list[str] = []
+    fingerprints: list[str] = []
+    for entry in entries:
+        run_id = str(entry.get("run_id") or "")
+        if run_id:
+            run_ids.add(run_id)
+        phase = str(entry.get("phase") or "")
+        if phase == "experiment_failed":
+            failed_plan_count += 1
+        elif phase == "plan_blocked":
+            blocked_plan_count += 1
+            plan = entry.get("experiment_plan")
+            if isinstance(plan, dict):
+                if str(plan.get("status") or "") in _DUPLICATE_PLAN_STATUSES:
+                    duplicate_plan_count += 1
+                metadata = plan.get("metadata")
+                if isinstance(metadata, dict):
+                    fingerprint = str(metadata.get("formula_fingerprint") or "")
+                    if fingerprint:
+                        fingerprints.append(fingerprint)
+        elif phase == "experiment_result":
+            candidate_count += 1
+            last_result_entry = entry
+            decision = entry.get("gate_decision")
+            formula = str(entry.get("formula_dsl") or "")
+            if isinstance(decision, dict) and bool(decision.get("accepted")) and formula:
+                mechanisms.append(formula)
+            refs = entry.get("artifact_refs")
+            if isinstance(refs, dict):
+                fingerprint = str(refs.get("formula_fingerprint") or "")
+                if fingerprint:
+                    fingerprints.append(fingerprint)
+        elif phase == "round_summary":
+            summary = entry.get("round_summary")
+            if isinstance(summary, dict):
+                last_round_summary = summary
+
+    duplicate_rate = None
+    best_objective_score = None
+    best_score_delta_vs_seed = None
+    if last_round_summary is not None:
+        duplicate_rate = _finite_float_or_none(last_round_summary.get("duplicate_rate"))
+        best_objective_score = _finite_float_or_none(last_round_summary.get("best_score"))
+        best_score_delta_vs_seed = _finite_float_or_none(last_round_summary.get("best_score_delta_vs_seed"))
+    if duplicate_rate is None:
+        # F8: the denominator is every ATTEMPTED plan (ready plans that ran to
+        # a result or failed, plus blocked plans) — not the count of planner
+        # calls, which repair retries inflate and which would dilute the rate.
+        attempted_plan_count = candidate_count + failed_plan_count + blocked_plan_count
+        duplicate_rate = (
+            min(1.0, duplicate_plan_count / attempted_plan_count) if attempted_plan_count > 0 else 0.0
+        )
+    duplicate_rate = min(1.0, max(0.0, duplicate_rate))
+
+    gate_blocking_reasons: tuple[str, ...] = ()
+    oos_net_return_decay = None
+    if last_result_entry is not None:
+        decision = last_result_entry.get("gate_decision")
+        if isinstance(decision, dict):
+            gate_blocking_reasons = tuple(
+                str(reason) for reason in (decision.get("blocking_reasons") or ())
+            )
+        backtest_summary = last_result_entry.get("backtest_summary")
+        if isinstance(backtest_summary, dict):
+            oos_net_return_decay = _finite_float_or_none(backtest_summary.get("oos_net_return_decay"))
+    turnover_breach = any(reason.startswith("turnover_rate") for reason in gate_blocking_reasons)
+
+    return StrategyContext(
+        round_index=len(run_ids),
+        candidate_count=candidate_count,
+        best_objective_score=best_objective_score,
+        best_score_delta_vs_seed=best_score_delta_vs_seed,
+        duplicate_rate=duplicate_rate,
+        oos_net_return_decay=oos_net_return_decay,
+        gate_blocking_reasons=gate_blocking_reasons,
+        turnover_breach=turnover_breach,
+        successful_mechanisms=tuple(dict.fromkeys(mechanisms))[:_STRATEGY_MECHANISM_LIMIT],
+        recent_fingerprints=tuple(dict.fromkeys(fingerprints))[-_STRATEGY_FINGERPRINT_LIMIT:],
+    )
+
+
+def _strategy_trail_from_trace_entries(entries: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    trail: list[dict[str, Any]] = []
+    for entry in entries:
+        if str(entry.get("phase") or "") != "strategy_decision":
+            continue
+        decision = entry.get("strategy_decision")
+        if not isinstance(decision, dict):
+            continue
+        strategy_context = entry.get("strategy_context")
+        round_index = strategy_context.get("round_index") if isinstance(strategy_context, dict) else None
+        trail.append(
+            {
+                "round_index": round_index if isinstance(round_index, int) and not isinstance(round_index, bool) else None,
+                "strategy": str(decision.get("strategy") or ""),
+                "reason": str(decision.get("reason") or ""),
+            }
+        )
+    return tuple(trail[-(_STRATEGY_TRAIL_LIMIT - 1):])
+
+
+def _strategy_prompt_hints(decision: StrategyDecision) -> tuple[str, ...]:
+    """Additional structured hints for the existing prompt-context channel.
+
+    These append to ``ResearchContext.next_focus_hints`` only; the prompt
+    structure itself is not changed.
+    """
+
+    hints = [f"strategy_selector: strategy={decision.strategy}; reason={decision.reason}"]
+    if decision.allowed_formula_transformations:
+        hints.append(
+            "strategy_selector: allowed_formula_transformations="
+            + ", ".join(decision.allowed_formula_transformations)
+        )
+    if decision.forbidden_patterns:
+        hints.append(
+            "strategy_selector: forbidden_formula_fingerprints="
+            + ", ".join(decision.forbidden_patterns[:_STRATEGY_TRAIL_LIMIT])
+        )
+    return tuple(hints)
+
+
+def _round_summary_payload(
+    *,
+    seed_factor_id: str,
+    round_index: int | None,
+    planned_count: int,
+    results: list[ResearchCandidateResult],
+    seed_score: float,
+    dedup_summary: dict[str, object],
+    accepted_candidate_ids: tuple[str, ...],
+) -> dict[str, Any]:
+    best_score = _finite_float_or_none(results[0].score) if results else None
+    seed_score_value = _finite_float_or_none(seed_score)
+    delta = (
+        _finite_float_or_none(best_score - seed_score_value)
+        if best_score is not None and seed_score_value is not None
+        else None
+    )
+    duplicate_count = (
+        int(dedup_summary.get("formula_skipped") or 0)
+        + int(dedup_summary.get("diversity_skipped") or 0)
+        + int(dedup_summary.get("result_duplicates") or 0)
+    )
+    duplicate_rate = min(1.0, duplicate_count / planned_count) if planned_count > 0 else 0.0
+    return {
+        "seed_factor_id": seed_factor_id,
+        "round_index": round_index,
+        "planned_count": planned_count,
+        "candidate_count": len(results),
+        "duplicate_count": duplicate_count,
+        "duplicate_rate": duplicate_rate,
+        "seed_score": seed_score_value,
+        "best_score": best_score,
+        "best_score_delta_vs_seed": delta,
+        "accepted_candidate_ids": list(accepted_candidate_ids),
+    }
+
+
+def _rd_warnings_count(
+    seed_assessment: FactorAssessmentBundle,
+    candidates: tuple[ResearchCandidateResult, ...],
+) -> int:
+    """Distinct warning messages plus distinct warning codes across the run."""
+
+    sources: list[Any] = [
+        seed_assessment.evaluation,
+        seed_assessment.selection_backtest,
+        seed_assessment.external_oos_backtest,
+    ]
+    for candidate in candidates:
+        sources.extend((candidate.evaluation, candidate.backtest))
+        if candidate.selection_backtest is not None:
+            sources.append(candidate.selection_backtest)
+        if candidate.external_oos_backtest is not None:
+            sources.append(candidate.external_oos_backtest)
+    messages: set[str] = set()
+    codes: set[str] = set()
+    for source in sources:
+        messages.update(str(item) for item in getattr(source, "warnings", ()) or ())
+        codes.update(str(item) for item in getattr(source, "warning_codes", ()) or ())
+    return len(messages) + len(codes)
