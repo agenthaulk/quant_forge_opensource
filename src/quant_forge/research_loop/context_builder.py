@@ -7,7 +7,10 @@ from pathlib import Path
 from quant_forge.factor_library.catalog import FactorCatalog, is_precomputed_formula
 from quant_forge.mcp.read_models import list_available_fields, list_available_operators
 from quant_forge.research_loop.contracts import ResearchContext
+from quant_forge.research_loop.memory import ResearchMemoryStore
 from quant_forge.research_loop.trace_store import ResearchTraceStore
+
+_MEMORY_CONTEXT_LIMIT = 5
 
 
 class ResearchContextBuilder:
@@ -19,6 +22,7 @@ class ResearchContextBuilder:
         factor_values_root: Path | None = None,
         factor_values_manifest_root: Path | None = None,
         trace_store: ResearchTraceStore | None = None,
+        memory_store: ResearchMemoryStore | None = None,
         market: str = "cn_a",
     ) -> None:
         self.factor_root = factor_root
@@ -26,6 +30,7 @@ class ResearchContextBuilder:
         self.factor_values_root = factor_values_root
         self.factor_values_manifest_root = factor_values_manifest_root
         self.trace_store = trace_store
+        self.memory_store = memory_store
         self.market = market
 
     def build(
@@ -53,6 +58,8 @@ class ResearchContextBuilder:
         terminal = tuple(item for item in recent if _is_terminal_trace(item))
         successes = tuple(item for item in terminal if _trace_passed(item))
         failures = tuple(item for item in terminal if not _trace_passed(item))
+        memory_failures = self._memory_items("failure")
+        memory_findings = self._memory_items("finding")
         field_catalog = tuple(dict(field) for field in list_available_fields())
         operator_catalog = tuple(dict(operator) for operator in list_available_operators())
         return ResearchContext(
@@ -68,10 +75,27 @@ class ResearchContextBuilder:
             available_filters=("is_st == false",),
             seed_factor_summary=seeds,
             effective_ideas=effective,
-            recent_successes=successes[-5:],
-            recent_failures=failures[-5:],
+            recent_successes=successes[-5:] + memory_findings,
+            recent_failures=failures[-5:] + memory_failures,
             next_focus_hints=_next_focus_hints(failures),
             prompt_context=_prompt_context(seeds, effective, failures),
+        )
+
+    def _memory_items(self, kind: str) -> tuple[dict[str, object], ...]:
+        """Durable memory rows as context items: redacted statements only,
+        marked with ``{"source": "research_memory"}`` so prompt assembly can
+        distinguish them from same-run trace entries."""
+
+        if self.memory_store is None:
+            return ()
+        return tuple(
+            {
+                "source": "research_memory",
+                "kind": str(row.get("kind") or kind),
+                "statement": str(row.get("statement") or ""),
+                "observation_count": int(row.get("observation_count") or 0),
+            }
+            for row in self.memory_store.read_recent(kind, _MEMORY_CONTEXT_LIMIT)
         )
 
 
