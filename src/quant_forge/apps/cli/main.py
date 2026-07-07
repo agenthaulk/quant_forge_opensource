@@ -48,6 +48,12 @@ from quant_forge.research_loop.config import (
     load_research_loop_config,
     weights_for_objective,
 )
+from quant_forge.research_loop.goals import (
+    GOAL_AUDIT_RESULTS,
+    GoalCompletionError,
+    GoalCriterion,
+    ResearchGoalStore,
+)
 from quant_forge.research_loop.llm import LLMHypothesisGenerator, LLMResearchReviewGenerator
 from quant_forge.research_loop.service import ResearchLoopService
 from quant_forge.utils import write_json, write_text
@@ -238,6 +244,64 @@ def build_parser() -> argparse.ArgumentParser:
     runs_search.add_argument("--artifact-root", type=Path)
     runs_search.add_argument("--limit", type=int, default=20)
     runs_search.set_defaults(handler=_cmd_runs_search)
+
+    # ------------------------------------------------------------------
+    # Research goal commands (Lane G). Keep this block self-contained so it
+    # does not collide with the runs/bench commands registered above.
+    # ------------------------------------------------------------------
+    goal = subcommands.add_parser("goal", help="immutable research goal artifact commands")
+    goal_subcommands = goal.add_subparsers(dest="goal_command", required=True)
+    goal_create = goal_subcommands.add_parser("create", help="create an immutable research goal artifact")
+    goal_create.add_argument("--objective", required=True, help="what this research goal is trying to achieve")
+    goal_create.add_argument(
+        "--criteria",
+        action="append",
+        required=True,
+        metavar="TEXT",
+        help="required completion criterion (repeatable; ids are assigned c1..cN in order)",
+    )
+    goal_create.add_argument(
+        "--optional-criteria",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="non-required criterion (repeatable; ids continue the c1..cN sequence)",
+    )
+    goal_create.add_argument("--seed", required=True, dest="seed_factor_id", help="seed factor id")
+    _add_config_options(goal_create)
+    goal_create.add_argument("--artifact-root", type=Path)
+    goal_create.add_argument("--rd-config", type=Path, default=DEFAULT_RD_CONFIG_PATH)
+    goal_create.set_defaults(handler=_cmd_goal_create)
+    goal_list = goal_subcommands.add_parser("list", help="list research goals with effective status")
+    _add_config_options(goal_list)
+    goal_list.add_argument("--artifact-root", type=Path)
+    goal_list.set_defaults(handler=_cmd_goal_list)
+    goal_show = goal_subcommands.add_parser("show", help="show one goal with its audit log")
+    goal_show.add_argument("goal_id")
+    _add_config_options(goal_show)
+    goal_show.add_argument("--artifact-root", type=Path)
+    goal_show.set_defaults(handler=_cmd_goal_show)
+    goal_audit = goal_subcommands.add_parser("audit", help="append one criterion audit row")
+    goal_audit.add_argument("goal_id")
+    goal_audit.add_argument("--criterion", required=True, help="criterion id, for example c1")
+    goal_audit.add_argument("--result", required=True, choices=list(GOAL_AUDIT_RESULTS))
+    goal_audit.add_argument(
+        "--evidence",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="evidence path relative to artifact_root (repeatable; existence is validated)",
+    )
+    goal_audit.add_argument("--notes", default="")
+    _add_config_options(goal_audit)
+    goal_audit.add_argument("--artifact-root", type=Path)
+    goal_audit.set_defaults(handler=_cmd_goal_audit)
+    goal_complete = goal_subcommands.add_parser("complete", help="complete a goal via the audited completion rule")
+    goal_complete.add_argument("goal_id")
+    _add_config_options(goal_complete)
+    goal_complete.add_argument("--artifact-root", type=Path)
+    goal_complete.set_defaults(handler=_cmd_goal_complete)
+    # -------------------------- end Lane G ----------------------------
 
     web = subcommands.add_parser("web", help="run local web adapter")
     web.add_argument("--config", type=Path)
@@ -758,6 +822,106 @@ def _format_metric_text(entry: dict[str, Any]) -> str:
     if value is None:
         return f"null ({status})"
     return f"{float(value):.4f} ({status})"
+
+
+# ---------------------------------------------------------------------------
+# Research goal handlers (Lane G): immutable goal artifacts + audit log.
+# ---------------------------------------------------------------------------
+
+
+def _cmd_goal_create(args: argparse.Namespace) -> int:
+    config = _config(args)
+    rd_config = load_research_loop_config(args.rd_config, config.research, config.simulation)
+    store = ResearchGoalStore(_runtime_paths_from_config(args, config).artifact_root)
+    goal = store.create_goal(
+        objective=args.objective,
+        criteria=_goal_criteria(args),
+        seed_factor_id=args.seed_factor_id,
+        runtime_config_hash=_goal_runtime_config_hash(rd_config),
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    _print_json(store.describe(goal.goal_id))
+    return 0
+
+
+def _cmd_goal_list(args: argparse.Namespace) -> int:
+    _print_json(ResearchGoalStore(_runtime_paths(args).artifact_root).list_goals())
+    return 0
+
+
+def _cmd_goal_show(args: argparse.Namespace) -> int:
+    store = ResearchGoalStore(_runtime_paths(args).artifact_root)
+    try:
+        payload = store.describe(args.goal_id)
+    except FileNotFoundError:
+        print(f"goal not found: {args.goal_id}")
+        return 2
+    _print_json(payload)
+    return 0
+
+
+def _cmd_goal_audit(args: argparse.Namespace) -> int:
+    store = ResearchGoalStore(_runtime_paths(args).artifact_root)
+    row = store.append_audit(
+        args.goal_id,
+        criterion_id=args.criterion,
+        result=args.result,
+        evidence_refs=_goal_evidence_refs(args, store.artifact_root),
+        notes=args.notes,
+        recorded_at=datetime.now(timezone.utc).isoformat(),
+    )
+    _print_json(row)
+    return 0
+
+
+def _cmd_goal_complete(args: argparse.Namespace) -> int:
+    store = ResearchGoalStore(_runtime_paths(args).artifact_root)
+    try:
+        row = store.complete_goal(args.goal_id, recorded_at=datetime.now(timezone.utc).isoformat())
+    except GoalCompletionError as exc:
+        print(f"goal completion blocked: {exc}")
+        return 2
+    _print_json(row)
+    return 0
+
+
+def _goal_criteria(args: argparse.Namespace) -> tuple[GoalCriterion, ...]:
+    entries = [(text, True) for text in args.criteria or []]
+    entries.extend((text, False) for text in getattr(args, "optional_criteria", None) or [])
+    return tuple(
+        GoalCriterion(criterion_id=f"c{index}", text=text, required=required)
+        for index, (text, required) in enumerate(entries, start=1)
+    )
+
+
+def _goal_runtime_config_hash(rd_config: ResearchLoopConfig) -> str:
+    return canonical_fingerprint(
+        {
+            "backtest_profile": asdict(rd_config.backtest_profile),
+            "evaluation_profile": asdict(rd_config.evaluation_profile),
+            "horizon_days_matrix": list(rd_config.horizon_days_matrix),
+            "objective": rd_config.objective,
+            "sample_splits": [asdict(split) for split in rd_config.sample_splits],
+            "transaction_costs": asdict(rd_config.transaction_costs),
+        }
+    )
+
+
+def _goal_evidence_refs(args: argparse.Namespace, artifact_root: Path) -> tuple[str, ...]:
+    refs: list[str] = []
+    for raw in getattr(args, "evidence", None) or []:
+        candidate = Path(raw)
+        if candidate.is_absolute() or raw.startswith("~"):
+            rel = relative_artifact_path(artifact_root, candidate)
+            if rel is None:
+                raise ValueError(f"evidence path is outside artifact_root: {raw}")
+            refs.append(rel)
+        else:
+            refs.append(raw)
+    return tuple(refs)
+
+
+# ------------------------------ end Lane G ---------------------------------
 
 
 def _cmd_research_run_once(args: argparse.Namespace) -> int:
