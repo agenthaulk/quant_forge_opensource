@@ -97,6 +97,7 @@ class _IdeaValidationSettings:
     backtest_profile: SimulationProfile
     transaction_costs: TransactionCostModel
     parameters: dict[str, Any]
+    include_partial_final_period: bool = False
 
 
 class _WebJobManager:
@@ -367,6 +368,7 @@ def _validate_factor_workflow(
             factor_values_overlay_root=config.paths.factor_values_overlay_root,
             factor_values_manifest_root=config.paths.factor_values_manifest_root,
             sample_role="in_sample_backtest",
+            include_partial_final_period=settings.include_partial_final_period,
         )
         _raise_if_cancelled(cancel_event)
         backtest = run_factor_backtest(
@@ -382,6 +384,7 @@ def _validate_factor_workflow(
             factor_values_overlay_root=config.paths.factor_values_overlay_root,
             factor_values_manifest_root=config.paths.factor_values_manifest_root,
             sample_role="external_oos_backtest",
+            include_partial_final_period=settings.include_partial_final_period,
         )
         _raise_if_cancelled(cancel_event)
     except Exception:
@@ -834,6 +837,7 @@ def _default_validation_parameters(factor: FactorDefinition, rd_config: Research
         "commission_bps": costs.commission_bps,
         "slippage_bps": costs.slippage_bps,
         "short_borrow_bps_annual": costs.short_borrow_bps_annual,
+        "include_partial_final_period": False,
         "evaluation": _simulation_profile_payload(evaluation_profile),
         "backtest": _simulation_profile_payload(backtest_profile),
         "transaction_costs": _transaction_costs_payload(costs),
@@ -850,6 +854,10 @@ def _idea_validation_settings(
     if not isinstance(raw, dict):
         raise ValueError("validation parameters must be a JSON object")
     holding_days = _positive_int_parameter(raw.get("holding_days", defaults["holding_days"]), "holding_days")
+    include_partial_final_period = _bool_parameter(
+        raw.get("include_partial_final_period", defaults["include_partial_final_period"]),
+        "include_partial_final_period",
+    )
     evaluation_overrides = _test_period_override("evaluation", raw)
     evaluation_overrides.update(_role_profile_overrides("evaluation", raw))
     backtest_overrides = _flat_backtest_profile_overrides(raw)
@@ -871,6 +879,7 @@ def _idea_validation_settings(
         evaluation_profile=evaluation_profile,
         backtest_profile=backtest_profile,
         transaction_costs=transaction_costs,
+        include_partial_final_period=include_partial_final_period,
         parameters={
             "holding_days": holding_days,
             "execution_delay_days": backtest_profile.execution_delay_days,
@@ -883,6 +892,7 @@ def _idea_validation_settings(
             "commission_bps": transaction_costs.commission_bps,
             "slippage_bps": transaction_costs.slippage_bps,
             "short_borrow_bps_annual": transaction_costs.short_borrow_bps_annual,
+            "include_partial_final_period": include_partial_final_period,
             "evaluation": _simulation_profile_payload(evaluation_profile),
             "backtest": _simulation_profile_payload(backtest_profile),
             "transaction_costs": _transaction_costs_payload(transaction_costs),
@@ -1007,6 +1017,12 @@ def _optional_date_parameter(value: Any, name: str) -> str | None:
     except ValueError as exc:
         raise ValueError(f"{name} must use YYYY-MM-DD") from exc
     return text
+
+
+def _bool_parameter(value: Any, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{name} must be a boolean")
 
 
 def _positive_int_parameter(value: Any, name: str) -> int:
@@ -1144,6 +1160,7 @@ def _run_research_once(
         transaction_costs=rd_config.transaction_costs,
         deduplication=rd_config.deduplication,
         llm_formula_repair_attempts=rd_config.llm.max_formula_repair_attempts,
+        strategy_selector_enabled=rd_config.strategy_selector_enabled,
         hypothesis_generator=hypothesis_generator,
         review_generator=review_generator,
         cancel_event=cancel_event,

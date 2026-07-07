@@ -255,6 +255,7 @@ def test_web_validation_workflow_uses_edited_parameters(monkeypatch, tmp_path) -
         factor_values_overlay_root,
         factor_values_manifest_root,
         sample_role="external_oos_backtest",
+        include_partial_final_period=False,
     ):
         captured["backtest_holding_days"] = holding_days
         captured["backtest_profile"] = simulation_profile
@@ -520,6 +521,7 @@ def test_web_run_idea_workflow_preserves_distinct_default_profiles(monkeypatch, 
         factor_values_overlay_root,
         factor_values_manifest_root,
         sample_role="external_oos_backtest",
+        include_partial_final_period=False,
     ):
         captured["backtest_profile"] = simulation_profile
         captured.setdefault("backtest_sample_roles", []).append(sample_role)
@@ -1873,6 +1875,7 @@ def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
         factor_values_overlay_root,
         factor_values_manifest_root,
         sample_role="external_oos_backtest",
+        include_partial_final_period=False,
     ):
         assert holding_days == 11
         assert transaction_costs.commission_bps == 0.0

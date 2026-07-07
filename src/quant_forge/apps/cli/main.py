@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict, is_dataclass, replace
+from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from quant_forge.backtesting.service import run_factor_backtest
 from quant_forge.config import (
     PathSettings,
     QuantForgeConfig,
@@ -17,7 +17,6 @@ from quant_forge.config import (
     validate_llm_runtime,
 )
 from quant_forge.data.local import create_demo_workspace, validate_data_root
-from quant_forge.evaluation.service import evaluate_factor
 from quant_forge.factor_library.catalog import (
     FactorCatalog,
     discover_factor_value_roots,
@@ -31,10 +30,33 @@ from quant_forge.factor_library.repository import (
     normalize_factor_root_layout,
     parse_idea_to_definition,
 )
+from quant_forge.lineage.store import (
+    LineageStore,
+    RunIndex,
+    artifact_id_for,
+    canonical_fingerprint,
+    metric_highlight,
+    new_run_id,
+    redact_free_text,
+    relative_artifact_path,
+)
+from quant_forge.core.contracts import SimulationProfile
 from quant_forge.llm_factor_parser import parse_factor_idea
-from quant_forge.research_loop.config import DEFAULT_RD_CONFIG_PATH, load_research_loop_config, weights_for_objective
+from quant_forge.research_loop.config import (
+    DEFAULT_RD_CONFIG_PATH,
+    ResearchLoopConfig,
+    load_research_loop_config,
+    weights_for_objective,
+)
 from quant_forge.research_loop.llm import LLMHypothesisGenerator, LLMResearchReviewGenerator
 from quant_forge.research_loop.service import ResearchLoopService
+from quant_forge.utils import write_json, write_text
+from quant_forge.workbench.service import (
+    EVALUATION_HIGHLIGHT_METRICS,
+    WorkbenchService,
+    evaluation_data_window,
+    result_warnings_count,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -131,6 +153,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_options(recommend)
     recommend.add_argument("--factor-root", type=Path)
     recommend.set_defaults(handler=_cmd_factor_recommend)
+    bench = factor_subcommands.add_parser(
+        "bench",
+        help="evaluate several factors serially through one shared config and write a bench artifact",
+    )
+    bench.add_argument("--factor-ids", help="comma-separated factor ids to benchmark")
+    bench.add_argument("--status", choices=["draft", "candidate", "active"], help="also benchmark factors with this status")
+    _add_runtime_roots(bench)
+    bench.add_argument("--rd-config", type=Path, default=DEFAULT_RD_CONFIG_PATH)
+    bench.set_defaults(handler=_cmd_factor_bench)
 
     idea = subcommands.add_parser("idea-to-factor", help="parse an idea into a draft factor")
     idea.add_argument("--text", required=True)
@@ -166,6 +197,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_runtime_roots(backtest)
     backtest.add_argument("--top-quantile", type=float)
     backtest.add_argument("--holding-days", type=int)
+    backtest.add_argument(
+        "--include-partial-final-period",
+        action="store_true",
+        help="include the final incomplete holding period marked to market (D3 opt-in)",
+    )
     backtest.add_argument("--rd-config", type=Path, default=DEFAULT_RD_CONFIG_PATH)
     backtest.set_defaults(handler=_cmd_run_backtest)
 
@@ -182,6 +218,26 @@ def build_parser() -> argparse.ArgumentParser:
     run_once.add_argument("--max-candidates", type=int)
     run_once.add_argument("--rd-config", type=Path, default=DEFAULT_RD_CONFIG_PATH)
     run_once.set_defaults(handler=_cmd_research_run_once)
+
+    runs = subcommands.add_parser("runs", help="read-only research run history commands")
+    runs_subcommands = runs.add_subparsers(dest="runs_command", required=True)
+    runs_list = runs_subcommands.add_parser("list", help="list recorded runs, newest first")
+    _add_config_options(runs_list)
+    runs_list.add_argument("--artifact-root", type=Path)
+    runs_list.add_argument("--limit", type=int, default=20)
+    runs_list.set_defaults(handler=_cmd_runs_list)
+    runs_show = runs_subcommands.add_parser("show", help="show one recorded run in detail")
+    runs_show.add_argument("run_id")
+    _add_config_options(runs_show)
+    runs_show.add_argument("--artifact-root", type=Path)
+    runs_show.set_defaults(handler=_cmd_runs_show)
+    runs_search = runs_subcommands.add_parser("search", help="search runs by factor id and kind")
+    runs_search.add_argument("--factor", required=True, help="factor id to search for")
+    runs_search.add_argument("--kind", choices=["evaluate", "backtest", "bench"])
+    _add_config_options(runs_search)
+    runs_search.add_argument("--artifact-root", type=Path)
+    runs_search.add_argument("--limit", type=int, default=20)
+    runs_search.set_defaults(handler=_cmd_runs_search)
 
     web = subcommands.add_parser("web", help="run local web adapter")
     web.add_argument("--config", type=Path)
@@ -346,19 +402,8 @@ def _cmd_eval_factor(args: argparse.Namespace) -> int:
     config = _config(args)
     rd_config = load_research_loop_config(args.rd_config, config.research, config.simulation)
     paths = _runtime_paths(args)
-    result = evaluate_factor(
-        args.factor_id,
-        factor_root=paths.factor_root,
-        data_root=paths.data_root,
-        artifact_root=paths.artifact_root,
-        horizon_days=args.horizon_days,
-        horizon_days_matrix=rd_config.horizon_days_matrix,
-        sample_splits=rd_config.sample_splits,
-        simulation_profile=rd_config.evaluation_profile,
-        factor_values_root=paths.factor_values_root,
-        factor_values_overlay_root=paths.factor_values_overlay_root,
-        factor_values_manifest_root=paths.factor_values_manifest_root,
-    )
+    workbench = _workbench(paths, rd_config, profile=rd_config.evaluation_profile)
+    result = workbench.evaluate(args.factor_id, horizon_days=args.horizon_days)
     _print_dataclass(result)
     return 0
 
@@ -367,24 +412,352 @@ def _cmd_run_backtest(args: argparse.Namespace) -> int:
     config = _config(args)
     rd_config = load_research_loop_config(args.rd_config, config.research, config.simulation)
     paths = _runtime_paths(args)
-    profile = rd_config.backtest_profile
-    if args.top_quantile is not None:
-        profile = replace(profile, top_quantile=args.top_quantile)
-    result = run_factor_backtest(
+    workbench = _workbench(paths, rd_config, profile=rd_config.backtest_profile)
+    result = workbench.run_backtest(
         args.factor_id,
-        factor_root=paths.factor_root,
-        data_root=paths.data_root,
-        artifact_root=paths.artifact_root,
-        simulation_profile=profile,
+        top_quantile=args.top_quantile,
         holding_days=args.holding_days,
-        transaction_costs=rd_config.transaction_costs,
-        sample_splits=rd_config.sample_splits,
-        factor_values_root=paths.factor_values_root,
-        factor_values_overlay_root=paths.factor_values_overlay_root,
-        factor_values_manifest_root=paths.factor_values_manifest_root,
+        include_partial_final_period=args.include_partial_final_period,
     )
     _print_dataclass(result)
     return 0
+
+
+def _workbench(paths: PathSettings, rd_config: ResearchLoopConfig, *, profile: SimulationProfile) -> WorkbenchService:
+    return WorkbenchService(
+        factor_root=paths.factor_root,
+        data_root=paths.data_root,
+        artifact_root=paths.artifact_root,
+        factor_values_root=paths.factor_values_root,
+        factor_values_overlay_root=paths.factor_values_overlay_root,
+        factor_values_manifest_root=paths.factor_values_manifest_root,
+        simulation_profile=profile,
+        transaction_costs=rd_config.transaction_costs,
+        sample_splits=rd_config.sample_splits,
+        horizon_days_matrix=rd_config.horizon_days_matrix,
+    )
+
+
+def _cmd_factor_bench(args: argparse.Namespace) -> int:
+    config = _config(args)
+    rd_config = load_research_loop_config(args.rd_config, config.research, config.simulation)
+    paths = _runtime_paths(args)
+    workbench = _workbench(paths, rd_config, profile=rd_config.evaluation_profile)
+    factor_ids = _bench_factor_ids(args, workbench)
+    if not factor_ids:
+        print("no factors selected: pass --factor-ids and/or --status")
+        return 2
+
+    created_at = datetime.now(timezone.utc)
+    created_at_iso = created_at.isoformat()
+    shared_config = {
+        "kind": "bench",
+        "factor_ids": list(factor_ids),
+        "horizon_days_matrix": list(rd_config.horizon_days_matrix),
+        "sample_splits": [asdict(split) for split in rd_config.sample_splits],
+        "simulation_profile": asdict(rd_config.evaluation_profile),
+    }
+    fingerprint = canonical_fingerprint(shared_config)
+    run_id = new_run_id("bench", created_at, fingerprint)
+    artifact_root = paths.artifact_root.expanduser()
+
+    factor_rows: list[dict[str, Any]] = []
+    evaluation_artifact_ids: list[str] = []
+    window_starts: list[str] = []
+    window_ends: list[str] = []
+    warnings_total = 0
+    for factor_id in factor_ids:
+        try:
+            result = workbench.evaluate(factor_id)
+        except Exception as exc:  # per-factor isolation: one bad factor must not sink the bench
+            factor_rows.append(
+                {
+                    "factor_id": factor_id,
+                    "status": "error",
+                    "error": redact_free_text(str(exc)),
+                    "metrics": {},
+                    "warnings_count": None,
+                    "artifact_path_rel": None,
+                }
+            )
+            continue
+        window = evaluation_data_window(result)
+        if window["status"] == "available":
+            window_starts.append(str(window["start_date"]))
+            window_ends.append(str(window["end_date"]))
+        warnings_count = result_warnings_count(result)
+        warnings_total += warnings_count
+        evaluation_artifact_ids.append(artifact_id_for(path=result.artifact_path))
+        factor_rows.append(
+            {
+                "factor_id": factor_id,
+                "status": "evaluated",
+                "metrics": {
+                    name: metric_highlight(result.metrics[name])
+                    for name in EVALUATION_HIGHLIGHT_METRICS
+                    if name in result.metrics
+                },
+                "warnings_count": warnings_count,
+                "artifact_path_rel": relative_artifact_path(artifact_root, result.artifact_path),
+            }
+        )
+
+    summary = _bench_summary(factor_rows)
+    bench_payload = {
+        "schema_version": "qf.bench.v1",
+        "run_id": run_id,
+        "created_at": created_at_iso,
+        "config_fingerprint": fingerprint,
+        "shared_config": shared_config,
+        "factors": factor_rows,
+        "summary": summary,
+    }
+    json_rel = f"bench/{run_id}.json"
+    markdown_rel = f"bench/{run_id}.md"
+    json_path = artifact_root / json_rel
+    markdown_path = artifact_root / markdown_rel
+    write_json(json_path, bench_payload)
+    write_text(markdown_path, _render_bench_markdown(run_id, created_at_iso, factor_rows, summary))
+
+    store = LineageStore(artifact_root)
+    bench_record = store.record_artifact(
+        artifact_type="bench_report",
+        path=json_path,
+        created_at=created_at_iso,
+        generated_by="cli.factor_bench",
+        parents=tuple(evaluation_artifact_ids),
+    )
+    store.record_artifact(
+        artifact_type="bench_report_markdown",
+        path=markdown_path,
+        created_at=created_at_iso,
+        generated_by="cli.factor_bench",
+        parents=(bench_record.artifact_id,),
+    )
+    data_window: dict[str, Any] = (
+        {"start_date": min(window_starts), "end_date": max(window_ends), "status": "available"}
+        if window_starts and window_ends
+        else {"start_date": None, "end_date": None, "status": "unavailable"}
+    )
+    RunIndex(artifact_root).append_run(
+        run_id=run_id,
+        kind="bench",
+        factor_ids=factor_ids,
+        created_at=created_at_iso,
+        data_window=data_window,
+        config_fingerprint=fingerprint,
+        metric_highlights=_bench_run_highlights(factor_rows),
+        artifact_paths_rel=(json_rel, markdown_rel),
+        warnings_count=warnings_total + summary["error_factor_count"],
+    )
+
+    print(f"bench run_id: {run_id}")
+    print(f"bench artifact (json): {json_rel}")
+    print(f"bench artifact (markdown): {markdown_rel}")
+    _print_bench_table(factor_rows)
+    print(
+        "summary: "
+        f"evaluated={summary['evaluated_factor_count']} "
+        f"errors={summary['error_factor_count']} "
+        f"metrics_available={summary['available_metric_count']} "
+        f"metrics_insufficient={summary['insufficient_metric_count']} "
+        f"metrics_other_status={summary['other_status_metric_count']}"
+    )
+    return 0 if summary["error_factor_count"] == 0 else 2
+
+
+def _bench_factor_ids(args: argparse.Namespace, workbench: WorkbenchService) -> list[str]:
+    selected: list[str] = []
+    if getattr(args, "factor_ids", None):
+        selected.extend(item.strip() for item in str(args.factor_ids).split(",") if item.strip())
+    if getattr(args, "status", None):
+        selected.extend(
+            factor.factor_id for factor in workbench.list_factors() if factor.status == args.status
+        )
+    return list(dict.fromkeys(selected))
+
+
+def _bench_summary(factor_rows: list[dict[str, Any]]) -> dict[str, int]:
+    available = insufficient = other = 0
+    for row in factor_rows:
+        for entry in (row.get("metrics") or {}).values():
+            status = entry.get("status")
+            if status == "available":
+                available += 1
+            elif status == "insufficient_sample":
+                insufficient += 1
+            else:
+                other += 1
+    return {
+        "evaluated_factor_count": sum(1 for row in factor_rows if row["status"] == "evaluated"),
+        "error_factor_count": sum(1 for row in factor_rows if row["status"] == "error"),
+        "available_metric_count": available,
+        "insufficient_metric_count": insufficient,
+        "other_status_metric_count": other,
+    }
+
+
+def _bench_run_highlights(factor_rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    highlights: dict[str, dict[str, Any]] = {}
+    for row in factor_rows:
+        for name in ("rank_ic_mean", "rank_icir"):
+            entry = (row.get("metrics") or {}).get(name)
+            if entry is not None:
+                highlights[f"{row['factor_id']}:{name}"] = entry
+    return highlights
+
+
+def _render_bench_markdown(
+    run_id: str,
+    created_at_iso: str,
+    factor_rows: list[dict[str, Any]],
+    summary: dict[str, int],
+) -> str:
+    lines = [
+        f"# Factor Bench {run_id}",
+        "",
+        f"- created_at: {created_at_iso}",
+        f"- factors evaluated: {summary['evaluated_factor_count']}",
+        f"- factors errored: {summary['error_factor_count']}",
+        f"- metric statuses: available={summary['available_metric_count']}, "
+        f"insufficient_sample={summary['insufficient_metric_count']}, "
+        f"other={summary['other_status_metric_count']}",
+        "",
+        "| factor_id | status | " + " | ".join(EVALUATION_HIGHLIGHT_METRICS) + " | warnings |",
+        "| --- | --- | " + " | ".join("---" for _ in EVALUATION_HIGHLIGHT_METRICS) + " | --- |",
+    ]
+    for row in factor_rows:
+        if row["status"] == "error":
+            cells = ["error: " + str(row.get("error") or "")] + ["-" for _ in EVALUATION_HIGHLIGHT_METRICS] + ["-"]
+        else:
+            cells = ["evaluated"]
+            for name in EVALUATION_HIGHLIGHT_METRICS:
+                entry = (row.get("metrics") or {}).get(name)
+                cells.append(_format_metric_text(entry) if entry else "not_recorded")
+            cells.append(str(row.get("warnings_count")))
+        lines.append("| " + row["factor_id"] + " | " + " | ".join(cells) + " |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _print_bench_table(factor_rows: list[dict[str, Any]]) -> None:
+    headers = ["factor_id", "status", *EVALUATION_HIGHLIGHT_METRICS, "warnings"]
+    table: list[list[str]] = []
+    for row in factor_rows:
+        if row["status"] == "error":
+            table.append([row["factor_id"], "error: " + str(row.get("error") or ""), *["-"] * len(EVALUATION_HIGHLIGHT_METRICS), "-"])
+            continue
+        cells = [row["factor_id"], "evaluated"]
+        for name in EVALUATION_HIGHLIGHT_METRICS:
+            entry = (row.get("metrics") or {}).get(name)
+            cells.append(_format_metric_text(entry) if entry else "not_recorded")
+        cells.append(str(row.get("warnings_count")))
+        table.append(cells)
+    _print_text_table(headers, table)
+
+
+def _cmd_runs_list(args: argparse.Namespace) -> int:
+    rows = RunIndex(_runtime_paths(args).artifact_root).read_rows()
+    rows = _newest_first(rows, args.limit)
+    if not rows:
+        print("no runs recorded")
+        return 0
+    _print_runs_table(rows)
+    return 0
+
+
+def _cmd_runs_show(args: argparse.Namespace) -> int:
+    row = RunIndex(_runtime_paths(args).artifact_root).find(args.run_id)
+    if row is None:
+        print(f"run not found: {args.run_id}")
+        return 2
+    print(f"run_id: {row.get('run_id')}")
+    print(f"schema_version: {row.get('schema_version')}")
+    print(f"kind: {row.get('kind')}")
+    print(f"factor_ids: {', '.join(row.get('factor_ids') or [])}")
+    print(f"created_at: {row.get('created_at')}")
+    print(f"data_window: {_format_window(row.get('data_window') or {})}")
+    print(f"config_fingerprint: {row.get('config_fingerprint')}")
+    print(f"warnings_count: {row.get('warnings_count')}")
+    print("metric_highlights:")
+    highlights = row.get("metric_highlights") or {}
+    if not highlights:
+        print("  (none recorded)")
+    for name in sorted(highlights):
+        print(f"  - {name}: {_format_metric_text(highlights[name])}")
+    print("artifact_paths_rel:")
+    paths_rel = row.get("artifact_paths_rel") or []
+    if not paths_rel:
+        print("  (none recorded)")
+    for path_rel in paths_rel:
+        print(f"  - {path_rel}")
+    return 0
+
+
+def _cmd_runs_search(args: argparse.Namespace) -> int:
+    index = RunIndex(_runtime_paths(args).artifact_root)
+    rows = index.search(factor_id=args.factor, kind=args.kind)
+    rows = _newest_first(rows, args.limit)
+    if not rows:
+        print("no runs matched")
+        return 0
+    _print_runs_table(rows)
+    return 0
+
+
+def _newest_first(rows: list[dict[str, Any]], limit: int | None) -> list[dict[str, Any]]:
+    ordered = list(reversed(rows))
+    if limit is not None and limit >= 0:
+        ordered = ordered[:limit]
+    return ordered
+
+
+def _print_runs_table(rows: list[dict[str, Any]]) -> None:
+    headers = ["run_id", "kind", "factor_ids", "created_at", "data_window", "warnings", "metric_highlights"]
+    table = [
+        [
+            str(row.get("run_id", "")),
+            str(row.get("kind", "")),
+            ",".join(row.get("factor_ids") or []),
+            str(row.get("created_at", "")),
+            _format_window(row.get("data_window") or {}),
+            str(row.get("warnings_count", "")),
+            _format_highlights(row.get("metric_highlights") or {}),
+        ]
+        for row in rows
+    ]
+    _print_text_table(headers, table)
+
+
+def _print_text_table(headers: list[str], rows: list[list[str]]) -> None:
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for column, cell in enumerate(row):
+            widths[column] = max(widths[column], len(cell))
+    line = "  ".join(header.ljust(widths[column]) for column, header in enumerate(headers))
+    print(line)
+    print("  ".join("-" * width for width in widths))
+    for row in rows:
+        print("  ".join(cell.ljust(widths[column]) for column, cell in enumerate(row)))
+
+
+def _format_window(window: dict[str, Any]) -> str:
+    status = str(window.get("status") or "unavailable")
+    if status == "available":
+        return f"{window.get('start_date')} .. {window.get('end_date')} ({status})"
+    return f"({status})"
+
+
+def _format_highlights(highlights: dict[str, Any]) -> str:
+    return "; ".join(f"{name}={_format_metric_text(highlights[name])}" for name in sorted(highlights))
+
+
+def _format_metric_text(entry: dict[str, Any]) -> str:
+    value = entry.get("value")
+    status = str(entry.get("status") or "")
+    if value is None:
+        return f"null ({status})"
+    return f"{float(value):.4f} ({status})"
 
 
 def _cmd_research_run_once(args: argparse.Namespace) -> int:
@@ -419,6 +792,7 @@ def _cmd_research_run_once(args: argparse.Namespace) -> int:
         factor_values_overlay_root=paths.factor_values_overlay_root,
         factor_values_manifest_root=paths.factor_values_manifest_root,
         llm_formula_repair_attempts=rd_config.llm.max_formula_repair_attempts,
+        strategy_selector_enabled=rd_config.strategy_selector_enabled,
         hypothesis_generator=hypothesis_generator,
         review_generator=review_generator,
     )
