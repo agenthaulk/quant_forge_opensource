@@ -54,12 +54,27 @@ Branch: `fable/phase-c-research-platform-wave1` (base = Phase B tip
   C5 major: lineage dedup read-then-append races under concurrent CLIs
   (fix: advisory flock around read+append, no-lock fallback documented);
   C6 minor: `qf runs search --kind` argparse lacks rd/falsification.
-- Remaining: Opus wave-2 verification agent (a4fac...) returns → merge its
-  accepted findings into this fix list → serial fix agent → gate →
-  hardening commit(s) → update WAVE1_REVIEW_RESOLUTION (add wave-2/CP3
-  section) → mark DONE.
-- Verify on resume: check whether a commit after `7aede17` mentions
-  "CP3"/"hardening"; if absent, the fix list above is still open. Codex log:
+- Opus wave-2 verification RETURNED: fix-first ×2 major (O1 vacuous
+  goal completion when all criteria optional; O2 research memory inert —
+  service.py:561 builds the context builder without memory_store, nothing
+  records observations, and llm.py prompt assembly ignores the fed fields)
+  + O3/O4/O5 promotion-count honesty, O6 transition-table bypass, O7=C6,
+  O9 naive timestamps + unredacted fields, O10 CLI errors/symlink
+  containment, O8 assembly duplication (DEFERRED to CP7, parity test added
+  now). Core invariants verified sound (no rule auto-activation,
+  append-only, evidence gating, frame parity 1e-12).
+- **CP3 serial fix agent IN FLIGHT**: combined work order C1-C6 + O1-O6 +
+  O9/O10 + parity-guard test. Agent id acfe6e83818b9163e; final report at
+  /private/tmp/claude-501/-Users-haulk-Desktop-openclaw-space-projects-quant-forge-opensource/3f0a63cb-ab5d-4799-a321-4cbbb6f57526/tasks/acfe6e83818b9163e.output
+  (last JSON line = its report). It does NOT commit.
+- Remaining after it returns: verify (full suite ~588+, scan, CLI, diff) →
+  hardening commits (split: backtesting C3; lineage C4/C5; selector C1/C2;
+  memory/goals O-items; CLI C6) → append CP3 adjudication to
+  WAVE1_REVIEW_RESOLUTION.md → mark CP3 DONE here.
+- Verify on resume: `git status --porcelain` in the worktree — uncommitted
+  changes across research_loop/backtesting/lineage/cli = fix agent output
+  awaiting adjudication (or mid-flight; check compileall + focused tests).
+  A commit after `525dc1c` mentioning "CP3" = already landed. Codex log:
   ~/.claude/plugins/data/codex-inline/state/fable-phase-c-wave1-*/jobs/task-mrafznd5-ls7oz2.log
 
 ## CP4 — Server decomposition + Web research panels — ⬜ TODO
