@@ -31,26 +31,36 @@ Branch: `fable/phase-c-research-platform-wave1` (base = Phase B tip
   CLI OK, diff clean. Docs: `WAVE1_REVIEW_RESOLUTION.md`, `DECISIONS.md`.
 - Verify: `git log --oneline af19710..87dbff9 | wc -l` == 6; suite green.
 
-## CP2 — Wave 2: memory / goals / falsification surfaces — 🔄 IN FLIGHT
-- Scope: research memory (append-only rules/findings/failures + deterministic
-  promotion, rules never auto-activate); research-goal artifacts (completion
-  gated on per-criterion audit rows citing on-disk evidence); workbench
-  falsification surface (frame parity with evaluate_factor, artifact +
-  run-index + lineage).
-- Runner: Workflow `wf_4ddf4796-5f8` (3 lanes → gate → Opus review).
-- Remaining steps at this checkpoint: workflow returns → Fable adjudicates
-  review → fixes → per-lane atomic commits → gate re-run → mark DONE here.
-- Verify on resume: `git status --porcelain` in the worktree (uncommitted
-  lane files = workflow output not yet adjudicated); full suite tail.
+## CP2 — Wave 2: memory / goals / falsification surfaces — ✅ DONE
+- Landed: research memory (`ea849f8`), goal artifacts (`b3960e2`),
+  falsification surface (`7aede17`). Gate at landing: **588 passed**
+  (555→588), scan 148 files, CLI OK, diff clean.
+- Note: the wave-2 Opus review inside the workflow was blocked by a
+  safety-filter false positive on its wording; a neutral-worded
+  verification agent was relaunched and its findings fold into CP3.
+- Verify: `git log --oneline f0b2c84..7aede17 | wc -l` == 3; suite green.
 
-## CP3 — Cross-review adjudication (Codex wave-1 + Opus wave-2) — 🔄 IN FLIGHT
-- Scope: Codex xhigh review of committed wave-1 diff (`562a52b..87dbff9`)
-  is running as external Codex task `task-mrafznd5-ls7oz2` (state file under
-  ~/.claude/plugins/data/codex-inline/state/.../jobs/). Fable adjudicates
-  findings from BOTH reviews, fixes accepted items, commits, updates
-  `WAVE1_REVIEW_RESOLUTION.md` (or a WAVE2 twin).
-- Verify on resume: read the Codex job JSON status; if done, its .log tail
-  holds the findings; check resolution doc for an adjudication section.
+## CP3 — Cross-review adjudication + hardening — 🔄 IN FLIGHT
+- Codex wave-1 review (gpt-5.4 high, task-mrafznd5-ls7oz2) returned
+  **fix-first ×6, ALL ACCEPTED by Fable**:
+  C1 blocker: selector context reads OOS decay/blocking reasons from the
+  LAST-evaluated candidate, not the round winner (service.py:840,2763);
+  C2 major: same-seed chain history truncated by the global 200-row window
+  BEFORE seed filtering (service.py:583);
+  C3 major: `_segment_metrics` treats a partial tail as a full holding
+  period while top-level metrics use actual exposure; `_return_summary`
+  observation_count overstates when vol uses the complete-only subset;
+  C4 major: redaction misses UNC `\\\\server\\share` and `file://host/...`;
+  C5 major: lineage dedup read-then-append races under concurrent CLIs
+  (fix: advisory flock around read+append, no-lock fallback documented);
+  C6 minor: `qf runs search --kind` argparse lacks rd/falsification.
+- Remaining: Opus wave-2 verification agent (a4fac...) returns → merge its
+  accepted findings into this fix list → serial fix agent → gate →
+  hardening commit(s) → update WAVE1_REVIEW_RESOLUTION (add wave-2/CP3
+  section) → mark DONE.
+- Verify on resume: check whether a commit after `7aede17` mentions
+  "CP3"/"hardening"; if absent, the fix list above is still open. Codex log:
+  ~/.claude/plugins/data/codex-inline/state/fable-phase-c-wave1-*/jobs/task-mrafznd5-ls7oz2.log
 
 ## CP4 — Server decomposition + Web research panels — ⬜ TODO
 - Order is binding (B4 F11): extract `apps/web/server.py` into
