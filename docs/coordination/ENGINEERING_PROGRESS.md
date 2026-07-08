@@ -120,28 +120,65 @@ pytest -q` + `python3 scripts/release_safety_scan.py` + CLI `--help` +
 - Verify: `git log --oneline d682f20 8dc2731 fe0fcdc 1f66648 d392e52`
   exist; suite green.
 
-## CP5 — Data plane — ⬜ TODO
-- DataCatalogPort backed by the actually-loaded catalog (replaces the static
-  7-field dict); operator/factor research metadata tags (OUR schema — see
-  memo corrections in WAVE1_REVIEW_RESOLUTION.md); field expansion path;
-  ValidationGate wired to real capabilities. (Owner decision D2.)
+## CP5 — Data plane — ✅ DONE
+- Landed in `8f95f0a` (D1 lane): DataCatalogPort backed by the loaded
+  PANEL_FIELD_CATALOG (mcp/read_models.py advertises real fields, payload
+  byte-compatible); research metadata tags (factor_library/research_tags.py,
+  OUR schema per WAVE1 memo correction #1; D7/D7a-ready plain data);
+  documented+tested field expansion path; ValidationGate consults the real
+  catalog. (Owner decision D2.) Codex xhigh review majors fixed in-commit.
+- Verify: `git log --oneline 8f95f0a` exists; `tests/test_data_catalog_*.py`
+  present; suite green.
 
-## CP6 — Interactive platform frontend (D6) — ⬜ TODO
-- Open-source Studio-style UI over the QF_OS kernel (research workbench,
-  run timeline, goal/criteria view, bench tables). Commercial boundary:
-  agent orchestration depth + portfolio rebalancing stay out (capability
-  tags mark the line). Will be split into its own sub-phases when opened.
+## CP6 — Interactive platform frontend (D6/D8) — 🔶 CP6-1 DONE
+- Framework review = decision D8 (`a574674`, CP6_FRONTEND_PLAN.md): static
+  ES-module app on the stdlib server, no build step / npm / external
+  resources; sub-phases CP6-1 skeleton → CP6-2 Lab → CP6-3 Data+Registry
+  → CP6-4 Docs+Extensions. Design references Studio + an Opus design pass
+  from CP6-2 on (D-clause `633945c`).
+- **CP6-1 ✅ DONE** (`82fc631`): html.py inline JS (1759→674) extracted to
+  static/{app,api,metric,views/*}.js served by a containment-checked
+  static handler; metric.js is the single MetricValue renderer (FP-4
+  null-not-zero preserved verbatim); pyproject ships static/*.js. Codex
+  xhigh review (fresh thread, after the first job hung) + Fable spot-check:
+  all clean. Gate: combined barrier **748 passed**, scan 172, CLI, diff.
+- CP6-2/3/4 ⬜ TODO (CP6-3 depends on CP5 = done; each runs as a Workflow
+  wave with an Opus design pass then Codex review). Commercial boundary
+  (agent orchestration depth + portfolio rebalancing) stays out; D7/D7a
+  Extensions registry is the cuttable CP6-4 sub-item.
 - Optional cuttable sub-item per decision D7: declarative-only Extensions
   registry (manifest schema + 5 MVP contribution points + read-only
   browse panel; executable contributions rejected unconditionally; data.*
   points feed the CP5 DataCatalogPort, no parallel catalog). Defers to a
   post-CP8 enhancement wave if CP6 runs tight.
 
-## CP7 — Residual register — ⬜ TODO
-- Phase A F-1..F-6 (gate evidence extension to retention/turnover/corr,
-  gate-definition unification, `_backtest_metrics` segments, demo fillna,
-  rd.yaml knob for missing_oos_evidence_blocks, purge-count persistence);
-  `_atomic_write` concurrent-writer safety; prompt-injection review item.
+## CP7 — Residual register — ✅ DONE
+- Mechanical residuals (D2 lane): `f89bc72` _atomic_write concurrent-writer
+  safety, `b6e0b48` F-6 purge-count persistence (MetricValue into
+  artifacts + report), `dbe8381` O8 single IC-assembly path (1e-9 parity
+  guard untouched). Codex-reviewed, 1 major + 1 minor fixed pre-landing.
+- Gate-cluster residuals (D1 lane, in `8f95f0a`): F-1 retention/turnover/
+  correlation evidence fail-closed; F-2 single gate-definition authority;
+  F-3 _backtest_metrics segment_metrics; F-4 demo fillna removed; F-5
+  rd.yaml missing_oos_evidence_blocks knob. Codex xhigh review majors
+  fixed in-commit.
+- Untrusted-input handling review (the "prompt-injection review item"):
+  read-only dataflow analysis landed as docs/reviews/
+  untrusted_text_dataflow_review.md (`e274012`); findings F1-F6, proposals
+  P1-P5 accepted.
+- CP7-H hardening batch (`7b10667`): P1 read-time statement/hint template
+  gates (whole-statement match to the exact service templates), P2
+  family-reduced memory statements, P3 provider error-body cap, P4 factor
+  free-text caps + web-path slug + draft-only status, P5 DSL window/
+  formula-length caps + horizon bound, F6 tz-aware lineage timestamps.
+  Codex xhigh review found 2 gaps (prefix-only auth; wq_min/wq_max window
+  skip) — both fixed by an Opus lane. Test fixtures use benign structural
+  markers, not free-form payloads. (Note: this untrusted-input thread
+  tripped Fable 5's dual-use safeguard; the batch was completed on Opus
+  4.8 per standing owner protocol, then the model returns to Fable.)
+- Gate: combined barrier **748 passed**, scan 172, CLI, diff-check.
+- Verify: `git log --oneline f89bc72 b6e0b48 dbe8381 e274012 7b10667`
+  exist; suite green.
 
 ## CP8 — Integration acceptance + merge prep — ⬜ TODO
 - Full-chain integration test (Docker/web/RD per docs/integration_workflow.md
