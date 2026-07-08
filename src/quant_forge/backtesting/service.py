@@ -1040,7 +1040,10 @@ def _return_summary(
                 value=annualized_volatility,
                 unit="return_volatility",
                 status="available" if annualized_volatility is not None else "insufficient_sample",
-                observation_count=periods,
+                # COR-6 honesty: when volatility_returns is the complete-only
+                # subset, the observation count must describe that subset, not
+                # the full period count including the excluded partial tail.
+                observation_count=len(vol_returns),
                 minimum_required=2,
                 method="period_return_std_scaled",
                 source_series="non_overlapping_period_returns",
@@ -1051,7 +1054,7 @@ def _return_summary(
                 value=long_short_sharpe,
                 unit="ratio",
                 status="available" if long_short_sharpe is not None else "insufficient_sample",
-                observation_count=periods,
+                observation_count=len(vol_returns),
                 minimum_required=2,
                 method="period_return_mean_over_std_scaled",
                 source_series="non_overlapping_period_returns",
@@ -1186,8 +1189,34 @@ def _segment_metrics(
     for spec, segment, purged_count in zip(split_specs, split_rows, purged_counts, strict=True):
         gross_returns = np.array([float(row["gross_period_return"]) for row in segment], dtype=float)
         net_returns = np.array([float(row["net_period_return"]) for row in segment], dtype=float)
-        gross = _return_summary(gross_returns, holding_days, sample_role=sample_role)
-        net = _return_summary(net_returns, holding_days, sample_role=sample_role)
+        # Mirror the top-level COR-6 handling inside each segment: a partial
+        # tail row (included via the D3 opt-in) must not be scaled as a full
+        # holding period by segment vol/Sharpe, and segment annualization uses
+        # the segment's ACTUAL exposure (sum of trading_days_held), not
+        # periods * holding_days.
+        complete_gross_returns = np.array(
+            [float(row["gross_period_return"]) for row in segment if bool(row.get("is_complete_period", True))],
+            dtype=float,
+        )
+        complete_net_returns = np.array(
+            [float(row["net_period_return"]) for row in segment if bool(row.get("is_complete_period", True))],
+            dtype=float,
+        )
+        segment_exposure_days = int(sum(int(row.get("trading_days_held", holding_days)) for row in segment))
+        gross = _return_summary(
+            gross_returns,
+            holding_days,
+            exposure_days=segment_exposure_days,
+            sample_role=sample_role,
+            volatility_returns=complete_gross_returns,
+        )
+        net = _return_summary(
+            net_returns,
+            holding_days,
+            exposure_days=segment_exposure_days,
+            sample_role=sample_role,
+            volatility_returns=complete_net_returns,
+        )
         metrics.append(
             BacktestSegmentMetric(
                 name=spec.name,

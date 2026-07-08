@@ -760,3 +760,83 @@ def test_staggered_entry_backtest_surfaces_cohort_warning_codes(tmp_path: Path) 
     payload = json.loads(Path(result["artifact_path"]).read_text(encoding="utf-8"))
     assert payload["warning_codes"] == result["warning_codes"]
     assert [cohort["warning_codes"] for cohort in payload["cohorts"]] == per_cohort
+
+
+def test_segment_metrics_exclude_partial_tail_from_vol_sharpe_and_use_actual_exposure() -> None:
+    # C3(a): segment vol/Sharpe mirror the top-level COR-6 rule (complete
+    # periods only) and segment annualization uses the segment's ACTUAL
+    # exposure (sum of trading_days_held), not periods * holding_days.
+    from quant_forge.backtesting.service import _segment_metrics
+
+    holding = 21
+    complete_net = [0.02, -0.01, 0.03, 0.005, 0.015, -0.02]
+    partial_net = 0.004
+    rows = []
+    start = pd.Timestamp("2024-01-01")
+    for index, net in enumerate(complete_net):
+        signal = start + pd.Timedelta(days=index * 30)
+        rows.append(
+            {
+                "signal_date": signal.date().isoformat(),
+                "entry_date": signal.date().isoformat(),
+                "exit_date": (signal + pd.Timedelta(days=29)).date().isoformat(),
+                "gross_period_return": net + 0.001,
+                "net_period_return": net,
+                "is_complete_period": True,
+                "trading_days_held": holding,
+            }
+        )
+    tail_signal = start + pd.Timedelta(days=len(complete_net) * 30)
+    rows.append(
+        {
+            "signal_date": tail_signal.date().isoformat(),
+            "entry_date": tail_signal.date().isoformat(),
+            "exit_date": (tail_signal + pd.Timedelta(days=6)).date().isoformat(),
+            "gross_period_return": partial_net + 0.001,
+            "net_period_return": partial_net,
+            "is_complete_period": False,
+            "trading_days_held": 5,
+        }
+    )
+    splits = (SampleSplitSpec(name="IS", fraction=1.0, score_weight=1.0),)
+
+    metric = _segment_metrics(rows, holding, splits)[0]
+
+    complete = np.array(complete_net, dtype=float)
+    expected_sharpe = float(np.mean(complete) / np.std(complete, ddof=1) * np.sqrt(252 / holding))
+    assert metric.net_long_short_sharpe == pytest.approx(expected_sharpe)
+    naive_all = np.append(complete, partial_net)
+    naive_sharpe = float(np.mean(naive_all) / np.std(naive_all, ddof=1) * np.sqrt(252 / holding))
+    assert metric.net_long_short_sharpe != pytest.approx(naive_sharpe)
+
+    # Actual exposure: 6 complete * 21 + 5 partial trading days = 131 >= 126,
+    # so the annualized return is reportable and scales by 252/131 — not by
+    # the old periods * holding_days = 147.
+    exposure = len(complete_net) * holding + 5
+    terminal = float(np.prod(1.0 + naive_all))
+    expected_annualized = terminal ** (252 / exposure) - 1.0
+    assert metric.net_annualized_return == pytest.approx(expected_annualized)
+    old_denominator = terminal ** (252 / (len(rows) * holding)) - 1.0
+    assert metric.net_annualized_return != pytest.approx(old_denominator)
+
+
+def test_mixed_run_vol_sharpe_observation_counts_use_complete_subset(tmp_path: Path) -> None:
+    # C3(b): with the D3 opt-in tail included, vol/Sharpe MetricValues must
+    # report the complete-only observation count, not the full period count.
+    paths = create_demo_workspace(tmp_path / "demo")
+    result = run_factor_backtest(
+        "FTR_DEMO_SMALL_CAP",
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        holding_days=21,
+        include_partial_final_period=True,
+    )
+
+    assert result.partial_periods == 1
+    assert result.periods == result.completed_periods + 1
+    for name in ("annualized_volatility", "long_short_sharpe"):
+        metric = result.metrics[name]
+        assert metric.observation_count == result.completed_periods
+    # Metrics that legitimately cover every period keep the full count.
+    assert result.metrics["annualized_return"].observation_count == result.exposure_days
