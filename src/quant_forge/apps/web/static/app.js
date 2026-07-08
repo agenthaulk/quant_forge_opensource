@@ -25,6 +25,7 @@ import {
 import { renderResearch, resetRdResult } from './views/research.js';
 import { refreshHistoryPanel } from './views/history.js';
 import { refreshBenchPanel } from './views/bench.js';
+import { activateTab, initLabTabs, setStep, setTabDot } from './views/lab.js';
 
 const pageConfig = JSON.parse(document.getElementById('qf-page-config').textContent || '{}');
 const controlTokenRequired = Boolean(pageConfig.controlTokenRequired);
@@ -291,17 +292,63 @@ async function submitStaggeredEntry() {
     jobId => activeIdeaJobId === jobId
   );
 }
-onControlTokenStored(() => refreshRuntimeStatus().catch(() => {}));
+// Token-gated panel refreshes skip silently until a control token is
+// stored, so each panel remembers whether it has rendered real data yet.
+// The tracked wrapper de-duplicates in-flight refreshes; the underlying
+// view refreshers resolve true/false and never reject.
+function trackedPanelRefresh(refreshPanel) {
+  let loaded = false;
+  let inFlight = null;
+  return {
+    hasLoaded: () => loaded,
+    refresh() {
+      if (!inFlight) {
+        inFlight = refreshPanel().then(rendered => {
+          inFlight = null;
+          if (rendered) loaded = true;
+          return rendered;
+        });
+      }
+      return inFlight;
+    }
+  };
+}
+const historyPanel = trackedPanelRefresh(refreshHistoryPanel);
+const benchPanel = trackedPanelRefresh(refreshBenchPanel);
+const lazyPanelsByTab = {
+  'lab-tab-history': historyPanel,
+  'lab-tab-bench': benchPanel
+};
+initLabTabs({
+  // Lazy refresh on tab activation: a history / bench panel that has not
+  // rendered real data yet (e.g. the startup refresh skipped because the
+  // control token was missing) retries when its tab becomes active. The
+  // refresh never switches tabs; it only fills the already-active panel.
+  onActivate: tabId => {
+    const panel = lazyPanelsByTab[tabId];
+    if (panel && !panel.hasLoaded()) panel.refresh();
+  }
+});
+onControlTokenStored(() => {
+  refreshRuntimeStatus().catch(() => {});
+  historyPanel.refresh();
+  benchPanel.refresh();
+});
 llmProviderSelect.addEventListener('change', syncLlmApiKeyControls);
 llmApiKeyMode.addEventListener('change', syncLlmApiKeyControls);
 syncLlmApiKeyControls();
 refreshRuntimeStatus().catch(() => {});
-refreshHistoryPanel();
-refreshBenchPanel();
+historyPanel.refresh();
+benchPanel.refresh();
 button.addEventListener('click', async () => {
   button.disabled = true;
   validateButton.disabled = true;
   cancelButton.disabled = true;
+  activateTab('lab-tab-factor');
+  setTabDot('lab-tab-factor', 'running');
+  setStep('parse', 'active');
+  setStep('validate', 'pending');
+  setStep('report', 'pending');
   clearGlobalError();
   resetIdeaResult('解析中', '因子解析完成后，公式和默认评测参数会在这里刷新。');
   statusEl.textContent = '解析中...';
@@ -318,9 +365,13 @@ button.addEventListener('click', async () => {
     fillValidationInputs(payload.parameters);
     setValidationInputsEnabled(true);
     renderParsed(payload);
+    setStep('parse', 'done');
+    setTabDot('lab-tab-factor', 'done');
     statusEl.innerHTML = '<span class="ok">解析完成，等待确认参数</span>';
   } catch (error) {
     if (error.message === '运行已中断') {
+      setStep('parse', 'pending');
+      setTabDot('lab-tab-factor', 'clear');
       statusEl.innerHTML = '<span class="warn">运行已中断</span>';
       return;
     }
@@ -333,15 +384,21 @@ button.addEventListener('click', async () => {
           fillValidationInputs(payload.parameters);
           setValidationInputsEnabled(true);
           renderParsed(payload);
+          setStep('parse', 'done');
+          setTabDot('lab-tab-factor', 'done');
           statusEl.innerHTML = '<span class="ok">已使用本地规则解析，等待确认参数</span>';
           return;
         } catch (fallbackError) {
+          setStep('parse', 'pending');
+          setTabDot('lab-tab-factor', 'error');
           errorEl.textContent = fallbackError.message;
           statusEl.textContent = '运行失败';
           return;
         }
       }
     }
+    setStep('parse', 'pending');
+    setTabDot('lab-tab-factor', 'error');
     errorEl.textContent = error.message;
     statusEl.textContent = '运行失败';
   } finally {
@@ -354,6 +411,9 @@ validateButton.addEventListener('click', async () => {
   validateButton.disabled = true;
   button.disabled = true;
   cancelButton.disabled = true;
+  activateTab('lab-tab-factor');
+  setTabDot('lab-tab-factor', 'running');
+  setStep('validate', 'active');
   clearGlobalError();
   resetIdeaResult('验证与评测中', '评测完成后，IC、回测收益和 artifact 路径会在这里刷新。');
   statusEl.textContent = '验证与评测中...';
@@ -369,12 +429,19 @@ validateButton.addEventListener('click', async () => {
     fillValidationInputs(parsedIdea.parameters);
     document.getElementById('rd-seed').value = payload.factor.factor_id;
     setStaggeredEnabled(true);
+    setStep('validate', 'done');
+    setStep('report', 'done');
+    setTabDot('lab-tab-factor', 'done');
     statusEl.innerHTML = '<span class="ok">验证完成</span>';
   } catch (error) {
     if (error.message === '运行已中断') {
+      setStep('validate', 'pending');
+      setTabDot('lab-tab-factor', 'clear');
       statusEl.innerHTML = '<span class="warn">运行已中断</span>';
       return;
     }
+    setStep('validate', 'pending');
+    setTabDot('lab-tab-factor', 'error');
     errorEl.textContent = error.message;
     statusEl.textContent = '验证失败';
   } finally {
@@ -390,18 +457,25 @@ staggeredButton.addEventListener('click', async () => {
   validateButton.disabled = true;
   button.disabled = true;
   cancelButton.disabled = true;
+  activateTab('lab-tab-factor');
+  setTabDot('lab-tab-factor', 'running');
   clearGlobalError();
   renderStaggeredRunning();
   statusEl.textContent = '首月逐日建仓稳健性回测中...';
   try {
     const payload = await submitStaggeredEntry();
     renderStaggered(payload);
+    setTabDot('lab-tab-factor', 'done');
+    const staggeredSection = document.getElementById('report-staggered');
+    if (staggeredSection) staggeredSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
     statusEl.innerHTML = '<span class="ok">首月逐日建仓稳健性回测完成</span>';
   } catch (error) {
     if (error.message === '运行已中断') {
+      setTabDot('lab-tab-factor', 'clear');
       statusEl.innerHTML = '<span class="warn">运行已中断</span>';
       return;
     }
+    setTabDot('lab-tab-factor', 'error');
     errorEl.textContent = error.message;
     statusEl.textContent = '稳健性回测失败';
   } finally {
@@ -429,6 +503,9 @@ cancelButton.addEventListener('click', async () => {
 rdRun.addEventListener('click', async () => {
   rdRun.disabled = true;
   rdCancel.disabled = true;
+  activateTab('lab-tab-rd');
+  setTabDot('lab-tab-rd', 'running');
+  setStep('rd', 'active');
   clearGlobalError();
   resetRdResult('RD 运行中', 'RD 候选、gate、report path 和分段证据会在本次运行完成后刷新。');
   rdStatusEl.textContent = 'RD 运行中...';
@@ -443,13 +520,19 @@ rdRun.addEventListener('click', async () => {
       jobId => activeRdJobId === jobId
     );
     renderResearch(payload);
+    setStep('rd', 'done');
+    setTabDot('lab-tab-rd', 'done');
     clearGlobalError();
     rdStatusEl.innerHTML = '<span class="ok">RD 完成</span>';
   } catch (error) {
     if (error.message === '运行已中断') {
+      setStep('rd', 'pending');
+      setTabDot('lab-tab-rd', 'clear');
       resetRdResult('RD 已中断', '本次 RD 已取消，未产生新的候选结果。');
       rdStatusEl.textContent = 'RD 已中断';
     } else {
+      setStep('rd', 'pending');
+      setTabDot('lab-tab-rd', 'error');
       rdStatusEl.textContent = error.message;
     }
   } finally {
@@ -474,6 +557,7 @@ rdCancel.addEventListener('click', async () => {
 });
 rdStart.addEventListener('click', async () => {
   rdStart.disabled = true;
+  activateTab('lab-tab-rd');
   clearGlobalError();
   resetRdResult('调度启动中', '调度开启后，最近一次 RD 结果会在这里刷新。');
   rdStatusEl.textContent = '调度启动中...';
@@ -483,7 +567,10 @@ rdStart.addEventListener('click', async () => {
     payload.interval_days = Number(document.getElementById('rd-interval').value);
     const status = await postJson('/api/research/schedule', payload);
     rdStatusEl.innerHTML = '<span class="ok">调度已开启</span>';
-    if (status.last_result) renderResearch(status.last_result);
+    if (status.last_result) {
+      renderResearch(status.last_result);
+      setStep('rd', 'done');
+    }
   } catch (error) {
     rdStatusEl.textContent = error.message;
   } finally {

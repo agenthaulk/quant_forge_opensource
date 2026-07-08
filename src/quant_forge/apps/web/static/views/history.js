@@ -51,11 +51,16 @@ export function renderHistory(payload) {
     </div>`;
 }
 
+// Resolves true only after a successful render (never rejects), so app.js
+// can retry token-gated panels lazily until the first load succeeds.
 export async function refreshHistoryPanel() {
   try {
     const payload = await fetchPanelJson('/api/research/history');
-    if (payload) renderHistory(payload);
+    if (!payload) return false;
+    renderHistory(payload);
+    return true;
   } catch (error) {
     historyResultEl.innerHTML = `<div class="panel"><h3>研究历史</h3><p class="meta err">${esc(error.message)}</p></div>`;
+    return false;
   }
 }

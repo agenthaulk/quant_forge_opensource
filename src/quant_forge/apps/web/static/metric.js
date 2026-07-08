@@ -57,3 +57,17 @@ export function metricStatusSuffix(entry) {
   const n = entry.observation_count === undefined || entry.observation_count === null ? '' : ` · N=${entry.observation_count}`;
   return `${esc(status)}${n}`;
 }
+/* CP6-2 additive helpers (existing exports above keep byte-identical
+ * output). Same FP-4 discipline: null is never coerced to 0, and any
+ * status other than available/legacy renders its label, not a scalar. */
+export function statusBadgeHtml(status) {
+  if (status !== 'legacy') return '';
+  return '<span class="status-badge status-badge--legacy">legacy</span>';
+}
+export function metricCellHtml(entry, digits = 4) {
+  if (!entry) return '<span class="metric-missing">not_recorded</span>';
+  const status = entry.status || 'unknown';
+  if (status === 'available') return num(entry.value, digits);
+  if (status === 'legacy') return `${num(entry.value, digits)} ${statusBadgeHtml(status)}`;
+  return `<span class="metric-blocked">${esc(status)}</span>`;
+}

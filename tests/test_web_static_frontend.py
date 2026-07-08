@@ -35,8 +35,9 @@ JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 HTML_CONTENT_TYPE = "text/html; charset=utf-8"
 JS_CONTENT_TYPE = "text/javascript; charset=utf-8"
 
-# The complete CP6-1 module set. A new module must be added here so the
-# no-external-resources and single-renderer sweeps keep covering everything.
+# The complete CP6-1 module set (+ CP6-2 Lab chrome). A new module must be
+# added here so the no-external-resources and single-renderer sweeps keep
+# covering everything.
 EXPECTED_STATIC_MODULES = (
     "api.js",
     "app.js",
@@ -44,7 +45,9 @@ EXPECTED_STATIC_MODULES = (
     "views/bench.js",
     "views/factor.js",
     "views/history.js",
+    "views/lab.js",
     "views/research.js",
+    "views/spark.js",
 )
 
 # One definition site for every MetricValue rendering helper (metric.js).
@@ -58,6 +61,8 @@ METRIC_RENDERER_DEFINITIONS = (
     "function pctMetric(",
     "function metricValueText(",
     "function metricStatusSuffix(",
+    "function statusBadgeHtml(",
+    "function metricCellHtml(",
 )
 
 
@@ -147,6 +152,28 @@ def test_index_page_keeps_all_panel_sections_and_controls(web_app) -> None:
         "等待运行",
         "暂无研究历史",
         "暂无 bench 结果",
+    ):
+        assert marker in html, marker
+    # CP6-2 Lab chrome: stepper, tablist, tab panels (mount ids re-hosted).
+    for marker in (
+        'class="lab-stepper"',
+        'data-step="idea"',
+        'data-step="parse"',
+        'data-step="validate"',
+        'data-step="report"',
+        'data-step="rd"',
+        'role="tablist"',
+        'id="lab-tab-factor"',
+        'id="lab-tab-rd"',
+        'id="lab-tab-history"',
+        'id="lab-tab-bench"',
+        'id="lab-panel-factor"',
+        'id="lab-panel-rd"',
+        'id="lab-panel-history"',
+        'id="lab-panel-bench"',
+        '因子工作台',
+        'RD 循环',
+        '研究流程',
     ):
         assert marker in html, marker
     # Control rail forms and runtime strip.

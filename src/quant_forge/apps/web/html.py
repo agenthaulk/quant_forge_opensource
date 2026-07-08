@@ -154,10 +154,10 @@ def _index_html(
   <title>Quant Forge</title>
   <style>
     :root {{
-      color-scheme: light;
+      color-scheme: light dark;
       --ink: #17211d;
       --muted: #65736e;
-      --faint: #87948e;
+      --faint: #6b7873;
       --line: #d9e0dc;
       --line-strong: #b7c4be;
       --surface: #fbfcfa;
@@ -165,10 +165,18 @@ def _index_html(
       --wash: #f2f6f1;
       --accent: #134b3c;
       --accent-2: #1f6f63;
+      --accent-ink: #ffffff;
       --blue: #265f8f;
       --bad: #9b2f31;
-      --warn: #a36213;
+      --warn: #985b10;
       --mono: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+      --surface-translucent: rgba(251, 252, 250, .92);
+      --ok-wash: #e8f2ec;
+      --ok-line: #bcd8c8;
+      --warn-wash: #f8f0dd;
+      --warn-line: #e3cf9a;
+      --bad-wash: #f9ecec;
+      --bad-line: #e5bcbc;
     }}
     * {{ box-sizing: border-box; }}
     html {{ min-width: 320px; }}
@@ -257,7 +265,7 @@ def _index_html(
       border-radius: 6px;
       padding: 13px 16px;
       background: var(--accent);
-      color: #fff;
+      color: var(--accent-ink);
       font-weight: 800;
       cursor: pointer;
       transition: transform .12s ease, background .12s ease;
@@ -517,6 +525,89 @@ def _index_html(
       font-size: 13px;
       letter-spacing: .08em;
     }}
+    .lab-stepper ol {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 14px; padding: 0; list-style: none; }}
+    .lab-stepper .step {{ display: inline-flex; align-items: center; gap: 6px;
+      padding: 5px 10px; border: 1px solid var(--line); border-radius: 999px;
+      background: var(--panel); color: var(--muted); font-size: 12px; font-weight: 800; }}
+    .lab-stepper .step-index {{ display: inline-grid; place-items: center; width: 16px; height: 16px;
+      border-radius: 50%; background: var(--wash); font-family: var(--mono); font-size: 10px; }}
+    .lab-stepper .step.is-done   {{ border-color: var(--accent-2); color: var(--accent-2); }}
+    .lab-stepper .step.is-done .step-index {{ background: var(--ok-wash); }}
+    .lab-stepper .step.is-active {{ border-color: var(--accent); background: var(--accent); color: var(--accent-ink); }}
+    .lab-stepper .step.is-active .step-index {{ background: rgba(255,255,255,.2); }}
+    .lab-stepper .step-link {{ width: auto; margin: 0; padding: 0; border: 0;
+      background: transparent; color: inherit; font: inherit; cursor: pointer; }}
+    .lab-stepper .step-link:disabled {{ opacity: 1; cursor: default; }}
+    .lab-stepper .step-link:not(:disabled):hover {{ text-decoration: underline; }}
+    .lab-stepper .step-link:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .lab-tabs {{ position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 8px;
+      margin: 0 -4px 18px; padding: 8px 4px; background: var(--surface-translucent);
+      backdrop-filter: blur(6px); border-bottom: 1px solid var(--line); }}
+    .lab-tab {{ width: auto; margin: 0; padding: 9px 14px; border: 1px solid var(--line);
+      border-radius: 8px; background: var(--panel); color: var(--ink);
+      font-size: 13px; font-weight: 800; cursor: pointer; }}
+    .lab-tab:hover {{ background: var(--wash); }}
+    .lab-tab[aria-selected="true"] {{ background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }}
+    .lab-tab[aria-selected="true"]:hover {{ background: var(--accent); }}
+    .lab-tab:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .lab-tab-dot {{ width: 7px; height: 7px; margin-left: 6px; border-radius: 50%;
+      display: inline-block; vertical-align: 1px; box-shadow: 0 0 0 1px var(--panel); }}
+    /* Author display beats the UA [hidden] rule; visibility keeps the dot's
+       layout slot so tab widths stay stable when a status appears. */
+    .lab-tab-dot[hidden] {{ visibility: hidden; }}
+    .lab-tab-dot.is-running {{ background: var(--warn); }}
+    .lab-tab-dot.is-done    {{ background: var(--accent-2); }}
+    .lab-tab-dot.is-error   {{ background: var(--bad); }}
+    .lab-tabpanel {{ min-width: 0; }}
+    .lab-tabpanel:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 4px; }}
+    .anchor-nav {{ display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }}
+    .anchor-nav a {{ padding: 4px 9px; border: 1px solid var(--line); border-radius: 6px;
+      background: var(--panel); color: var(--muted); font-size: 11px; font-weight: 800;
+      text-decoration: none; }}
+    .anchor-nav a:hover {{ color: var(--accent); border-color: var(--accent-2); }}
+    .anchor-nav a:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .report-section {{ scroll-margin-top: 72px; }}
+    .eyebrow {{ margin: 0 0 5px; color: var(--accent); font-size: 11px; font-weight: 800;
+      letter-spacing: .1em; text-transform: uppercase; }}
+    .sparkline-row {{ margin: 0 0 10px; }}
+    .sparkline {{ display: block; max-width: 100%; color: var(--accent-2); }}
+    .status-pill {{ display: inline-block; padding: 3px 9px; border: 1px solid var(--line);
+      border-radius: 999px; font-size: 10px; font-weight: 800; }}
+    .status-pill--ok      {{ background: var(--ok-wash);   border-color: var(--ok-line);   color: var(--accent-2); }}
+    .status-pill--fail    {{ background: var(--bad-wash);  border-color: var(--bad-line);  color: var(--bad); }}
+    .status-pill--running {{ background: var(--warn-wash); border-color: var(--warn-line); color: var(--warn); }}
+    .status-pill--neutral {{ color: var(--muted); }}
+    .status-badge--legacy {{ background: var(--warn-wash); border: 1px solid var(--warn-line);
+      color: var(--warn); border-radius: 5px; padding: 1px 5px; font-size: 10px; font-weight: 800; }}
+    .metric-blocked {{ color: var(--muted); font-weight: 400; }}
+    .metric-missing {{ color: var(--faint); }}
+    .notice {{ border: 1px solid var(--line); border-left: 4px solid var(--muted);
+      border-radius: 8px; padding: 10px 12px; margin: 0 0 10px; font-size: 13px; }}
+    .notice.warn {{ border-left-color: var(--warn); background: var(--warn-wash); color: var(--ink); }}
+    .notice.err  {{ border-left-color: var(--bad);  background: var(--bad-wash);  color: var(--ink); }}
+    @media (prefers-color-scheme: dark) {{
+      :root {{
+        --ink: #e6ece8; --muted: #9fb0a8; --faint: #7d8d86;
+        --line: #2e3a34; --line-strong: #46554d;
+        --surface: #121815; --panel: #1a221e; --wash: #202a25;
+        --surface-translucent: rgba(18, 24, 21, .92);
+        --accent: #4ea27f; --accent-2: #63b391; --accent-ink: #121815; --blue: #6da3cf;
+        --bad: #d98b83; --warn: #d3a34f;
+        --ok-wash:  #1b2f26; --ok-line:  #2f4f3f;
+        --warn-wash: #332a17; --warn-line: #54451f;
+        --bad-wash: #33201e; --bad-line: #543230;
+      }}
+      body {{ background: var(--surface); }}
+      .control-rail {{ background: var(--surface-translucent); }}
+      textarea, select, input, button.secondary, button.danger {{ background: var(--panel); }}
+      button:hover {{ background: var(--accent-2); }}
+      button.danger:hover {{ background: var(--bad-wash); }}
+      code {{ background: var(--wash); }}
+      .brand-mark, .pill, .runtime-strip {{ background: var(--panel); }}
+      .empty-state {{ background: var(--surface-translucent); }}
+      .lab-tab:hover {{ background: var(--wash); }}
+      .lab-tab[aria-selected="true"]:hover {{ background: var(--accent); }}
+    }}
     @media (max-width: 900px) {{
       .app-shell {{ grid-template-columns: 1fr; }}
       .control-rail {{
@@ -526,6 +617,9 @@ def _index_html(
         border-bottom: 1px solid var(--line);
       }}
       .workbench {{ padding: 18px; }}
+      /* The sticky tab strip wraps to two rows at narrow widths; anchor
+         jumps need the taller clearance so sections never tuck under it. */
+      .report-section {{ scroll-margin-top: 120px; }}
       .grid {{ grid-template-columns: repeat(2, minmax(140px, 1fr)); }}
       .evidence-grid {{ grid-template-columns: 1fr; }}
       .hero-panel {{ grid-template-columns: 1fr; }}
@@ -624,48 +718,71 @@ def _index_html(
     </div>
   </aside>
   <section class="workbench">
-    <div class="section-title">
-      <h2>Factor Tape</h2>
-      <p>解析、评价、回测集中展示</p>
+    <nav class="lab-stepper" aria-label="研究流程">
+      <ol>
+        <li class="step is-active" data-step="idea"><span class="step-index">1</span>想法</li>
+        <li class="step is-pending" data-step="parse"><span class="step-index">2</span>解析</li>
+        <li class="step is-pending" data-step="validate"><span class="step-index">3</span>验证</li>
+        <li class="step is-pending" data-step="report"><span class="step-index">4</span><button type="button" class="step-link" data-step-action="report" disabled>因子报告</button></li>
+        <li class="step is-pending" data-step="rd"><span class="step-index">5</span><button type="button" class="step-link" data-step-action="rd">RD 循环</button></li>
+      </ol>
+    </nav>
+    <div class="lab-tabs" role="tablist" aria-label="Lab 工作台">
+      <button class="lab-tab" role="tab" id="lab-tab-factor" aria-controls="lab-panel-factor" aria-selected="true">因子工作台 <span class="lab-tab-dot" hidden></span></button>
+      <button class="lab-tab" role="tab" id="lab-tab-rd" aria-controls="lab-panel-rd" aria-selected="false" tabindex="-1">RD 循环 <span class="lab-tab-dot" hidden></span></button>
+      <button class="lab-tab" role="tab" id="lab-tab-history" aria-controls="lab-panel-history" aria-selected="false" tabindex="-1">研究历史 <span class="lab-tab-dot" hidden></span></button>
+      <button class="lab-tab" role="tab" id="lab-tab-bench" aria-controls="lab-panel-bench" aria-selected="false" tabindex="-1">Benchmark <span class="lab-tab-dot" hidden></span></button>
     </div>
     <div id="error" class="err"></div>
-    <div id="result">
-      <div class="panel empty-state">
-        <h3>等待输入</h3>
-        <p class="meta">输入因子观点后运行，公式、IC、回测收益、缓存路径会在这里展开。</p>
+    <section class="lab-tabpanel" role="tabpanel" id="lab-panel-factor" aria-labelledby="lab-tab-factor" tabindex="0">
+      <div class="section-title">
+        <h2>Factor Tape</h2>
+        <p>解析、评价、回测集中展示</p>
       </div>
-    </div>
-    <div id="staggered-result"></div>
-    <div class="section-title">
-      <h2>RD Loop</h2>
-      <p>候选因子与研究证据</p>
-    </div>
-    <div id="rd-result">
-      <div class="panel empty-state">
-        <h3>等待运行</h3>
-        <p class="meta">RD 候选、gate、report path 和分段证据会展示在这里。</p>
+      <div id="result">
+        <div class="panel empty-state">
+          <h3>等待输入</h3>
+          <p class="meta">输入因子观点后运行，公式、IC、回测收益、缓存路径会在这里展开。</p>
+        </div>
       </div>
-    </div>
-    <div class="section-title">
-      <h2>研究历史</h2>
-      <p>run index 最近运行记录</p>
-    </div>
-    <div id="history-result">
-      <div class="panel empty-state">
-        <h3>暂无研究历史</h3>
-        <p class="meta">评价、回测、bench、RD 运行记录到 run index 后会展示在这里。</p>
+      <div id="staggered-result"></div>
+    </section>
+    <section class="lab-tabpanel" role="tabpanel" id="lab-panel-rd" aria-labelledby="lab-tab-rd" tabindex="0" hidden>
+      <div class="section-title">
+        <h2>RD Loop</h2>
+        <p>候选因子与研究证据</p>
       </div>
-    </div>
-    <div class="section-title">
-      <h2>Benchmark</h2>
-      <p>qf factor bench 多因子横向对比</p>
-    </div>
-    <div id="bench-result">
-      <div class="panel empty-state">
-        <h3>暂无 bench 结果</h3>
-        <p class="meta">运行 qf factor bench 后，多因子指标状态表会展示在这里。</p>
+      <div id="rd-result">
+        <div class="panel empty-state">
+          <h3>等待运行</h3>
+          <p class="meta">RD 候选、gate、report path 和分段证据会展示在这里。</p>
+        </div>
       </div>
-    </div>
+    </section>
+    <section class="lab-tabpanel" role="tabpanel" id="lab-panel-history" aria-labelledby="lab-tab-history" tabindex="0" hidden>
+      <div class="section-title">
+        <h2>研究历史</h2>
+        <p>run index 最近运行记录</p>
+      </div>
+      <div id="history-result">
+        <div class="panel empty-state">
+          <h3>暂无研究历史</h3>
+          <p class="meta">评价、回测、bench、RD 运行记录到 run index 后会展示在这里。</p>
+        </div>
+      </div>
+    </section>
+    <section class="lab-tabpanel" role="tabpanel" id="lab-panel-bench" aria-labelledby="lab-tab-bench" tabindex="0" hidden>
+      <div class="section-title">
+        <h2>Benchmark</h2>
+        <p>qf factor bench 多因子横向对比</p>
+      </div>
+      <div id="bench-result">
+        <div class="panel empty-state">
+          <h3>暂无 bench 结果</h3>
+          <p class="meta">运行 qf factor bench 后，多因子指标状态表会展示在这里。</p>
+        </div>
+      </div>
+    </section>
   </section>
 </main>
 <script type="application/json" id="qf-page-config">{page_config_json}</script>

@@ -1,7 +1,10 @@
 /* Benchmark panel over GET /api/bench (qf factor bench artifacts).
- * Rendering moved 1:1 from the former inline script. */
+ * Rendering moved 1:1 from the former inline script; the CP6-2 design pass
+ * adopts the shared metricCellHtml status classes for metric cells and the
+ * status-pill convention for factor error rows (text label always present —
+ * color is never the sole signal). */
 
-import { esc, metricStatusSuffix, metricValueText } from '../metric.js';
+import { esc, metricCellHtml, metricStatusSuffix } from '../metric.js';
 import { fetchPanelJson } from '../api.js';
 
 const benchResultEl = document.getElementById('bench-result');
@@ -29,12 +32,12 @@ export function renderBench(payload) {
   const head = metricNames.map(name => `<th>${esc(name)}</th>`).join('');
   const body = factors.map(row => {
     const statusCell = row.status === 'error'
-      ? `<span class="err">error</span><br><span class="meta">${esc(row.error || '')}</span>`
+      ? `<span class="status-pill status-pill--fail">error</span><br><span class="meta">${esc(row.error || '')}</span>`
       : `${esc(row.status || '')}<br><span class="meta">warnings ${esc(row.warnings_count ?? 'n/a')}</span>`;
     const cells = metricNames.map(name => {
       const entry = (row.metrics || {})[name];
-      if (!entry) return '<td><span class="meta">not_recorded</span></td>';
-      return `<td>${metricValueText(entry)}<br><span class="meta">${metricStatusSuffix(entry)}</span></td>`;
+      const suffix = entry ? `<br><span class="meta">${metricStatusSuffix(entry)}</span>` : '';
+      return `<td>${metricCellHtml(entry)}${suffix}</td>`;
     }).join('');
     return `
       <tr>
@@ -61,11 +64,16 @@ export function renderBench(payload) {
     </div>`;
 }
 
+// Resolves true only after a successful render (never rejects), so app.js
+// can retry token-gated panels lazily until the first load succeeds.
 export async function refreshBenchPanel() {
   try {
     const payload = await fetchPanelJson('/api/bench');
-    if (payload) renderBench(payload);
+    if (!payload) return false;
+    renderBench(payload);
+    return true;
   } catch (error) {
     benchResultEl.innerHTML = `<div class="panel"><h3>Benchmark</h3><p class="meta err">${esc(error.message)}</p></div>`;
+    return false;
   }
 }
