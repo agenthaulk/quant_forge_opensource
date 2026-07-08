@@ -40,7 +40,7 @@ Branch: `fable/phase-c-research-platform-wave1` (base = Phase B tip
   verification agent was relaunched and its findings fold into CP3.
 - Verify: `git log --oneline f0b2c84..7aede17 | wc -l` == 3; suite green.
 
-## CP3 — Cross-review adjudication + hardening — 🔄 IN FLIGHT
+## CP3 — Cross-review adjudication + hardening — ✅ DONE
 - Codex wave-1 review (gpt-5.4 high, task-mrafznd5-ls7oz2) returned
   **fix-first ×6, ALL ACCEPTED by Fable**:
   C1 blocker: selector context reads OOS decay/blocking reasons from the
@@ -63,19 +63,17 @@ Branch: `fable/phase-c-research-platform-wave1` (base = Phase B tip
   containment, O8 assembly duplication (DEFERRED to CP7, parity test added
   now). Core invariants verified sound (no rule auto-activation,
   append-only, evidence gating, frame parity 1e-12).
-- **CP3 serial fix agent IN FLIGHT**: combined work order C1-C6 + O1-O6 +
-  O9/O10 + parity-guard test. Agent id acfe6e83818b9163e; final report at
-  /private/tmp/claude-501/-Users-haulk-Desktop-openclaw-space-projects-quant-forge-opensource/3f0a63cb-ab5d-4799-a321-4cbbb6f57526/tasks/acfe6e83818b9163e.output
-  (last JSON line = its report). It does NOT commit.
-- Remaining after it returns: verify (full suite ~588+, scan, CLI, diff) →
-  hardening commits (split: backtesting C3; lineage C4/C5; selector C1/C2;
-  memory/goals O-items; CLI C6) → append CP3 adjudication to
-  WAVE1_REVIEW_RESOLUTION.md → mark CP3 DONE here.
-- Verify on resume: `git status --porcelain` in the worktree — uncommitted
-  changes across research_loop/backtesting/lineage/cli = fix agent output
-  awaiting adjudication (or mid-flight; check compileall + focused tests).
-  A commit after `525dc1c` mentioning "CP3" = already landed. Codex log:
-  ~/.claude/plugins/data/codex-inline/state/fable-phase-c-wave1-*/jobs/task-mrafznd5-ls7oz2.log
+- Resolution: serial fix agent completed all 17 file edits, then was
+  interrupted by a session limit at its final full-suite step; Fable
+  re-verified from scratch (compileall, per-item marker audit, full suite,
+  scan, CLI, diff-check) and landed the commits — no work assumed done
+  without on-tree evidence.
+- Commits: `627bc34` (backtest C3), `445d4c7` (lineage C4/C5),
+  `4d4a4a3` (rd/CLI C1/C2/C6 + O1-O6/O9/O10 + parity guard). O8 deferred
+  to CP7 with an IC-series parity test (1e-9) guarding the seam.
+- Gate: **613 passed** (588→613, +25 tests), scan 148 files, CLI OK,
+  diff clean. Adjudication table: WAVE1_REVIEW_RESOLUTION.md §CP3.
+- Verify: `git log --oneline 627bc34 445d4c7 4d4a4a3` exist; suite green.
 
 ## CP4 — Server decomposition + Web research panels — ⬜ TODO
 - Order is binding (B4 F11): extract `apps/web/server.py` into
