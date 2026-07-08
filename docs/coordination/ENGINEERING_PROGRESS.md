@@ -130,7 +130,7 @@ pytest -q` + `python3 scripts/release_safety_scan.py` + CLI `--help` +
 - Verify: `git log --oneline 8f95f0a` exists; `tests/test_data_catalog_*.py`
   present; suite green.
 
-## CP6 — Interactive platform frontend (D6/D8) — 🔶 CP6-1/2/3 DONE
+## CP6 — Interactive platform frontend (D6/D8) — ✅ ALL DONE (CP6-1..4)
 - Framework review = decision D8 (`a574674`, CP6_FRONTEND_PLAN.md): static
   ES-module app on the stdlib server, no build step / npm / external
   resources; sub-phases CP6-1 skeleton → CP6-2 Lab → CP6-3 Data+Registry
@@ -170,9 +170,19 @@ pytest -q` + `python3 scripts/release_safety_scan.py` + CLI `--help` +
   fetchPanelJson errors lack HTTP status so 404/400 render unified;
   history.js/bench.js duplicate status label for non-available metrics
   (pre-existing CP4-2 quirk, fixed only in registry view).
-- CP6-4 ⬜ TODO (Docs view + declarative-only Extensions registry per
-  D7/D7a — proceeding, not cut; schedule permits). Commercial boundary
-  (agent orchestration depth + portfolio rebalancing) stays out.
+- **CP6-4 ✅ DONE** (`02fb31e`): Docs view + declarative Extensions
+  registry (D7/D7a executed in full, not cut). Stdlib markdown renderer
+  (escape-first, tag whitelist, external URLs never anchors);
+  /api/docs{,/relpath} with the doc-name rule defined once server-side
+  and mirrored by the frontend hash routers; extensions manifest
+  schema + validation (executable contribution types rejected
+  unconditionally, no dynamic loading, case-insensitive external-URL
+  rejection) + reference manifest + browse panel. Codex xhigh review
+  (fresh thread after a hung first launch — orphaned-job countermeasure
+  applied): 1 major + 3 minors, resolved by narrowing the doc-name
+  contract to a single server-side rule. Gate: **880 passed**, scan
+  190, CLI, diff clean. Lab strip: eight tabs (工作台/RD/历史/Bench/
+  数据/注册表/文档/扩展).
 - Optional cuttable sub-item per decision D7: declarative-only Extensions
   registry (manifest schema + 5 MVP contribution points + read-only
   browse panel; executable contributions rejected unconditionally; data.*
