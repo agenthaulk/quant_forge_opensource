@@ -240,3 +240,49 @@ def test_ic_series_parity_under_non_default_profile(tmp_path: Path) -> None:
     for entry, (date_label, derived_ic) in zip(evaluation.ic_series, derived, strict=True):
         assert entry["date"] == date_label
         assert abs(float(entry["ic"]) - derived_ic) <= 1e-9
+
+
+# ---------------------------------------------------------------------------
+# O8 dedup guard: one assembly path (FP-5) behind both IC-input surfaces
+# ---------------------------------------------------------------------------
+
+
+def test_falsification_and_evaluation_share_one_labeled_join(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O8 (CP7): both surfaces must flow through the single module-level
+    labeled-join helper. Fails on the pre-dedup code, where
+    ``falsification_frame`` built its own private score/forward-return join.
+    """
+
+    import quant_forge.evaluation.service as evaluation_service
+    from quant_forge.evaluation.service import evaluate_factor
+
+    _, paths = _workbench(tmp_path)
+    original = evaluation_service._labeled_ic_frame  # AttributeError pre-dedup
+    calls: list[dict[str, object]] = []
+
+    def spy(panel, scores, *, horizon_days, execution_delay_days):
+        calls.append({"horizon_days": horizon_days, "execution_delay_days": execution_delay_days})
+        return original(panel, scores, horizon_days=horizon_days, execution_delay_days=execution_delay_days)
+
+    monkeypatch.setattr(evaluation_service, "_labeled_ic_frame", spy)
+
+    frame = falsification_frame(
+        FACTOR_ID,
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+    )
+    assert list(frame.columns) == ["trade_date", "instrument", "score", "forward_return"]
+    assert calls == [{"horizon_days": FACTOR_HORIZON_DAYS, "execution_delay_days": EXECUTION_DELAY_DAYS}]
+
+    calls.clear()
+    evaluate_factor(
+        FACTOR_ID,
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+    )
+    # One labeled join per evaluated horizon, all through the same definition.
+    assert {call["horizon_days"] for call in calls} >= {FACTOR_HORIZON_DAYS}
+    assert all(call["execution_delay_days"] == EXECUTION_DELAY_DAYS for call in calls)

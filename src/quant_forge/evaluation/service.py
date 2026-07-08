@@ -57,27 +57,15 @@ def evaluate_factor(
     factor_values_overlay_root: Path | None = None,
     factor_values_manifest_root: Path | None = None,
 ) -> EvaluationResult:
-    profile = simulation_profile or SimulationProfile()
-    factor = FactorCatalog(
-        factor_root,
-        factor_values_root=factor_values_root,
-        factor_values_manifest_root=factor_values_manifest_root,
-    ).get(factor_id)
-    horizon = horizon_days or factor.horizon_days
-    if horizon < 1:
-        raise ValueError("horizon_days must be positive")
-    panel = LocalPanelDataProvider(data_root).load_panel()
-    working_panel = apply_test_period(panel, profile)
-    require_minimum_display_trading_days(working_panel)
-    score_result = prepare_factor_scores_result(
-        panel,
-        factor.formula,
-        factor.universe_filters,
-        profile=profile,
-        factor_id=factor.factor_id,
-        factor_name=factor.name,
+    factor, profile, horizon, working_panel, score_result = _prepare_ic_inputs(
+        factor_id,
+        factor_root=factor_root,
+        data_root=data_root,
+        horizon_days=horizon_days,
+        simulation_profile=simulation_profile,
         factor_values_root=factor_values_root,
         factor_values_overlay_root=factor_values_overlay_root,
+        factor_values_manifest_root=factor_values_manifest_root,
     )
     scores = score_result.scores
     split_specs = _validate_sample_splits(sample_splits or DEFAULT_SAMPLE_SPLITS)
@@ -199,14 +187,51 @@ def falsification_frame(
 ) -> pd.DataFrame:
     """Joined ``[trade_date, instrument, score, forward_return]`` IC input frame.
 
-    Built exactly the way :func:`evaluate_factor` prepares its primary-horizon
-    IC input: the same score preparation and the same per-instrument
-    ``shift(-execution_delay)`` / ``shift(-(execution_delay + horizon))``
-    forward-return alignment (FP-5: one quantity, one definition, across every
-    surface). Rows whose score or forward return is unobservable keep ``NaN``
-    (FP-4); consumers such as
+    Built through the SAME assembly path :func:`evaluate_factor` uses for its
+    IC input (``_prepare_ic_inputs`` + ``_labeled_ic_frame``): identical score
+    preparation and identical per-instrument ``shift(-execution_delay)`` /
+    ``shift(-(execution_delay + horizon))`` forward-return alignment (FP-5:
+    one quantity, one definition, across every surface — O8 dedup). Rows
+    whose score or forward return is unobservable keep ``NaN`` (FP-4);
+    consumers such as
     :func:`quant_forge.evaluation.falsification.run_falsification` apply their
     own sample floors.
+    """
+
+    _, profile, horizon, working_panel, score_result = _prepare_ic_inputs(
+        factor_id,
+        factor_root=factor_root,
+        data_root=data_root,
+        horizon_days=horizon_days,
+        simulation_profile=simulation_profile,
+        factor_values_root=factor_values_root,
+        factor_values_overlay_root=factor_values_overlay_root,
+        factor_values_manifest_root=factor_values_manifest_root,
+    )
+    labeled = _labeled_ic_frame(
+        working_panel,
+        score_result.scores,
+        horizon_days=horizon,
+        execution_delay_days=profile.execution_delay_days,
+    )
+    return labeled[["trade_date", "instrument", "score", "forward_return"]].reset_index(drop=True)
+
+
+def _prepare_ic_inputs(
+    factor_id: str,
+    *,
+    factor_root: Path,
+    data_root: Path,
+    horizon_days: int | None,
+    simulation_profile: SimulationProfile | None,
+    factor_values_root: Path | None,
+    factor_values_overlay_root: Path | None,
+    factor_values_manifest_root: Path | None,
+):
+    """Single IC-input assembly path shared by ``evaluate_factor`` and
+    ``falsification_frame`` (FP-5: one definition; O8 dedup).
+
+    Returns ``(factor, profile, primary_horizon, working_panel, score_result)``.
     """
 
     profile = simulation_profile or SimulationProfile()
@@ -221,7 +246,7 @@ def falsification_frame(
     panel = LocalPanelDataProvider(data_root).load_panel()
     working_panel = apply_test_period(panel, profile)
     require_minimum_display_trading_days(working_panel)
-    scores = prepare_factor_scores_result(
+    score_result = prepare_factor_scores_result(
         panel,
         factor.formula,
         factor.universe_filters,
@@ -230,13 +255,24 @@ def falsification_frame(
         factor_name=factor.name,
         factor_values_root=factor_values_root,
         factor_values_overlay_root=factor_values_overlay_root,
-    ).scores
-    labeled = _with_forward_return(
-        working_panel,
-        horizon,
-        execution_delay_days=profile.execution_delay_days,
+    )
+    return factor, profile, horizon, working_panel, score_result
+
+
+def _labeled_ic_frame(
+    panel: pd.DataFrame,
+    scores: pd.DataFrame,
+    *,
+    horizon_days: int,
+    execution_delay_days: int,
+) -> pd.DataFrame:
+    """One labeled score/forward-return join for every IC surface (FP-5)."""
+
+    return _with_forward_return(
+        panel,
+        horizon_days,
+        execution_delay_days=execution_delay_days,
     ).merge(scores, on=["trade_date", "instrument"], how="left")
-    return labeled[["trade_date", "instrument", "score", "forward_return"]].reset_index(drop=True)
 
 
 def _with_forward_return(panel: pd.DataFrame, horizon_days: int, *, execution_delay_days: int) -> pd.DataFrame:
@@ -261,11 +297,12 @@ def _evaluate_horizon(
 ) -> HorizonEvaluationMetric:
     if horizon_days < 1:
         raise ValueError("horizon_days_matrix values must be positive")
-    labeled = _with_forward_return(
+    labeled = _labeled_ic_frame(
         panel,
-        horizon_days,
+        scores,
+        horizon_days=horizon_days,
         execution_delay_days=execution_delay_days,
-    ).merge(scores, on=["trade_date", "instrument"], how="left")
+    )
     overall = _ic_summary(labeled, horizon_days=horizon_days, execution_delay_days=execution_delay_days)
     dates = list(labeled.dropna(subset=["forward_return"])["trade_date"].drop_duplicates().sort_values())
     # Purge/embargo: drop the tail of each non-final split whose forward-return
