@@ -1,0 +1,11 @@
+{
+  "id": "qf.reference.docs-pack",
+  "name": "Reference Docs Pack",
+  "version": "0.1.0",
+  "kind": "docs-extension",
+  "description": "Reference declarative extension: registers the repository docs set as a docs.pack contribution.",
+  "permissions": {"network_access": false, "secret_access": false, "data_scopes": []},
+  "contributes": [
+    {"id": "repo_docs", "point": "docs.pack", "config": {"docs_root": "docs"}}
+  ]
+}

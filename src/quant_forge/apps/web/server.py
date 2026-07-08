@@ -75,6 +75,8 @@ from quant_forge.apps.web.jobs import (
 )
 
 from quant_forge.apps.web.api import (
+    DOCS_ROOT as DOCS_ROOT,
+    EXTENSIONS_ROOT as EXTENSIONS_ROOT,
     MAX_RD_ITERATIONS as MAX_RD_ITERATIONS,
     RESEARCH_HISTORY_DEFAULT_LIMIT as RESEARCH_HISTORY_DEFAULT_LIMIT,
     RESEARCH_HISTORY_MAX_LIMIT as RESEARCH_HISTORY_MAX_LIMIT,
@@ -95,8 +97,12 @@ from quant_forge.apps.web.api import (
     _data_status_payload as _data_status_payload,
     _default_seed_factor_id as _default_seed_factor_id,
     _default_validation_parameters as _default_validation_parameters,
+    _docs_document_payload as _docs_document_payload,
+    _docs_list_payload as _docs_list_payload,
+    _docs_relpath_from_path as _docs_relpath_from_path,
     _evaluation_payload as _evaluation_payload,
     _existing_factor as _existing_factor,
+    _extensions_payload as _extensions_payload,
     _factor_from_request as _factor_from_request,
     _factor_from_validation_payload as _factor_from_validation_payload,
     _factor_research_tags_by_id as _factor_research_tags_by_id,
@@ -168,6 +174,11 @@ from quant_forge.apps.web.api import (
     run_idea_workflow as run_idea_workflow,
     run_research_once_workflow as run_research_once_workflow,
     run_staggered_entry_workflow as run_staggered_entry_workflow,
+)
+
+from quant_forge.apps.web.markdown import (
+    extract_markdown_title as extract_markdown_title,
+    render_markdown_html as render_markdown_html,
 )
 
 from quant_forge.apps.web.html import (

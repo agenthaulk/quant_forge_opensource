@@ -70,9 +70,10 @@ def _get(base_url: str, path: str) -> tuple[int, str, bytes]:
 
 def test_index_page_hosts_mounts_inside_lab_tab_panels(web_config) -> None:
     html = web_server._index_html(web_config)
-    # Tablist wiring: six tabs (CP6-2 four + CP6-3 data/registry appended so
-    # existing tab indices stay stable), factor selected, panels labelled by
-    # tabs. The tablist spans non-Lab views since CP6-3, hence the label.
+    # Tablist wiring: eight tabs (CP6-2 four + CP6-3 data/registry + CP6-4
+    # docs/extensions appended so existing tab indices stay stable), factor
+    # selected, panels labelled by tabs. The tablist spans non-Lab views
+    # since CP6-3, hence the label.
     assert 'role="tablist"' in html
     assert 'aria-label="工作台视图"' in html
     for tab, panel in (
@@ -82,14 +83,16 @@ def test_index_page_hosts_mounts_inside_lab_tab_panels(web_config) -> None:
         ("lab-tab-bench", "lab-panel-bench"),
         ("lab-tab-data", "lab-panel-data"),
         ("lab-tab-registry", "lab-panel-registry"),
+        ("lab-tab-docs", "lab-panel-docs"),
+        ("lab-tab-extensions", "lab-panel-extensions"),
     ):
         assert f'id="{tab}" aria-controls="{panel}"' in html
         assert f'id="{panel}" aria-labelledby="{tab}"' in html
-    assert html.count('role="tab"') == 6
-    assert html.count('role="tabpanel"') == 6
+    assert html.count('role="tab"') == 8
+    assert html.count('role="tabpanel"') == 8
     tablist = html[html.index('role="tablist"') : html.index('id="error"')]
     assert tablist.count('aria-selected="true"') == 1
-    assert tablist.count('aria-selected="false"') == 5
+    assert tablist.count('aria-selected="false"') == 7
     # Non-default panels start hidden; the default factor panel does not.
     for panel in (
         "lab-panel-rd",
@@ -97,6 +100,8 @@ def test_index_page_hosts_mounts_inside_lab_tab_panels(web_config) -> None:
         "lab-panel-bench",
         "lab-panel-data",
         "lab-panel-registry",
+        "lab-panel-docs",
+        "lab-panel-extensions",
     ):
         start = html.index(f'id="{panel}"')
         assert "hidden" in html[start : html.index(">", start)], panel

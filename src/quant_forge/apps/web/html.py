@@ -612,6 +612,54 @@ def _index_html(
     .registry-runs-toolbar select {{ width: auto; padding: 6px 10px; font-size: 12px; }}
     .nowrap {{ white-space: nowrap; }}
     .table-scroll {{ overflow-x: auto; }}
+    /* CP6-4 Docs + Extensions: token-referencing declarations only. */
+    .docs-layout {{ display: grid; grid-template-columns: minmax(240px, 320px) minmax(0, 1fr); gap: 14px; align-items: start; }}
+    .docs-nav {{ display: grid; gap: 8px; align-content: start; }}
+    .docs-nav-section {{ margin: 8px 0 0; color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }}
+    .docs-row {{ width: 100%; margin: 0; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--ink); font-size: 13px; font-weight: 400; text-align: left; cursor: pointer; }}
+    .docs-row:hover {{ background: var(--wash); }}
+    .docs-row[aria-current="true"] {{ border-color: var(--accent); box-shadow: inset 2px 0 0 var(--accent); }}
+    .docs-row:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .docs-row .meta {{ display: block; margin-top: 2px; font-family: var(--mono); font-size: 11px; overflow-wrap: anywhere; }}
+    .docs-detail {{ min-width: 0; }}
+    /* overflow-wrap inherits: one declaration keeps long unbroken tokens
+       (relpaths, inline code) from overflowing the panel at narrow widths.
+       break-word (not anywhere) so table columns keep word-based min
+       widths; fenced blocks keep white-space: pre and scroll. */
+    .docs-article {{ font-size: 14px; line-height: 1.65; overflow-wrap: break-word; }}
+    .docs-article h1 {{ font-size: 22px; margin: 0 0 12px; }}
+    .docs-article h2 {{ font-size: 17px; margin: 22px 0 8px; }}
+    .docs-article h3 {{ font-size: 14px; margin: 18px 0 6px; color: var(--ink); text-transform: none; letter-spacing: 0; }}
+    .docs-article h4, .docs-article h5, .docs-article h6 {{ font-size: 13px; margin: 14px 0 6px; }}
+    .docs-article p {{ margin: 0 0 12px; }}
+    .docs-article ul, .docs-article ol {{ margin: 0 0 12px; padding-left: 22px; }}
+    .docs-article li {{ margin: 3px 0; }}
+    .docs-article pre {{ margin: 0 0 14px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--wash); font-family: var(--mono); font-size: 12px; line-height: 1.55; overflow-x: auto; }}
+    .docs-article pre code {{ border: 0; padding: 0; background: none; }}
+    .docs-article blockquote {{ margin: 0 0 12px; padding: 8px 12px; border-left: 3px solid var(--line-strong); border-radius: 0 6px 6px 0; background: var(--wash); color: var(--muted); }}
+    .docs-article hr {{ margin: 18px 0; border: 0; border-top: 1px solid var(--line); }}
+    .docs-article .docs-table {{ width: 100%; border-collapse: collapse; font-size: 12px; margin: 0 0 14px; }}
+    .docs-article .docs-table th, .docs-article .docs-table td {{ border-bottom: 1px solid var(--line); padding: 7px 6px; text-align: left; vertical-align: top; }}
+    .docs-article .docs-table th {{ color: var(--muted); font-weight: 800; }}
+    .docs-link {{ color: var(--accent); }}
+    .docs-link:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .docs-external-url {{ color: var(--muted); font-family: var(--mono); font-size: .92em; overflow-wrap: anywhere; }}
+    .docs-image-alt {{ color: var(--faint); font-style: italic; }}
+    .ext-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }}
+    .ext-card {{ margin-bottom: 0; }}
+    .ext-card[aria-current="true"] {{ border-color: var(--accent); box-shadow: inset 2px 0 0 var(--accent); }}
+    .ext-card-head {{ display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; align-items: baseline; }}
+    .ext-card-head .ext-version {{ color: var(--muted); font-family: var(--mono); font-size: 11px; }}
+    .ext-contribs {{ margin-top: 8px; }}
+    .ext-points {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }}
+    .ext-point {{ display: inline-flex; gap: 6px; align-items: center; }}
+    /* On the tinted notice washes --muted lands under 4.5:1 in the light
+       theme (4.31 on --bad-wash); secondary text inside notices keeps its
+       hierarchy through size instead of color. */
+    .notice .meta {{ color: var(--ink); font-size: 12px; }}
+    /* Deep-link scrollIntoView targets need the same sticky-strip
+       clearance as .report-section anchors. */
+    .docs-detail, .ext-card {{ scroll-margin-top: 72px; }}
     @media (prefers-color-scheme: dark) {{
       :root {{
         --ink: #e6ece8; --muted: #9fb0a8; --faint: #7d8d86;
@@ -644,17 +692,21 @@ def _index_html(
         border-bottom: 1px solid var(--line);
       }}
       .workbench {{ padding: 18px; }}
-      /* The sticky tab strip wraps to two rows at narrow widths; anchor
-         jumps need the taller clearance so sections never tuck under it. */
-      .report-section {{ scroll-margin-top: 120px; }}
+      /* The sticky tab strip wraps to up to three rows at narrow widths;
+         anchor jumps need the taller clearance so sections never tuck
+         under it. */
+      .report-section {{ scroll-margin-top: 156px; }}
+      .docs-detail, .ext-card {{ scroll-margin-top: 156px; }}
       .grid {{ grid-template-columns: repeat(2, minmax(140px, 1fr)); }}
       .evidence-grid {{ grid-template-columns: 1fr; }}
       .registry-layout {{ grid-template-columns: 1fr; }}
+      .docs-layout {{ grid-template-columns: 1fr; }}
       /* Below the collapse point the dense tables keep a readable minimum
          width and scroll sideways inside .table-scroll instead of
          crushing cell content into vertical letter stacks. */
       .data-fields-table {{ min-width: 640px; }}
       .registry-runs-table {{ min-width: 520px; }}
+      .docs-article .docs-table {{ min-width: 480px; }}
       .hero-panel {{ grid-template-columns: 1fr; }}
       .formula-badge {{ justify-self: start; text-align: left; }}
     }}
@@ -767,6 +819,8 @@ def _index_html(
       <button class="lab-tab" role="tab" id="lab-tab-bench" aria-controls="lab-panel-bench" aria-selected="false" tabindex="-1">Benchmark <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-data" aria-controls="lab-panel-data" aria-selected="false" tabindex="-1">数据 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-registry" aria-controls="lab-panel-registry" aria-selected="false" tabindex="-1">注册表 <span class="lab-tab-dot" hidden></span></button>
+      <button class="lab-tab" role="tab" id="lab-tab-docs" aria-controls="lab-panel-docs" aria-selected="false" tabindex="-1">文档 <span class="lab-tab-dot" hidden></span></button>
+      <button class="lab-tab" role="tab" id="lab-tab-extensions" aria-controls="lab-panel-extensions" aria-selected="false" tabindex="-1">扩展 <span class="lab-tab-dot" hidden></span></button>
     </div>
     <div id="error" class="err"></div>
     <section class="lab-tabpanel" role="tabpanel" id="lab-panel-factor" aria-labelledby="lab-tab-factor" tabindex="0">
@@ -839,6 +893,30 @@ def _index_html(
         <div class="panel empty-state">
           <h3>等待加载</h3>
           <p class="meta">因子目录加载后，定义详情与关联运行记录会展示在这里。</p>
+        </div>
+      </div>
+    </section>
+    <section class="lab-tabpanel" role="tabpanel" id="lab-panel-docs" aria-labelledby="lab-tab-docs" tabindex="0" hidden>
+      <div class="section-title">
+        <h2>文档</h2>
+        <p>仓库 docs/ 只读渲染</p>
+      </div>
+      <div id="docs-result">
+        <div class="panel empty-state">
+          <h3>等待加载</h3>
+          <p class="meta">打开本页签后，文档目录与渲染内容会展示在这里。</p>
+        </div>
+      </div>
+    </section>
+    <section class="lab-tabpanel" role="tabpanel" id="lab-panel-extensions" aria-labelledby="lab-tab-extensions" tabindex="0" hidden>
+      <div class="section-title">
+        <h2>扩展</h2>
+        <p>声明式扩展注册表（只读）</p>
+      </div>
+      <div id="extensions-result">
+        <div class="panel empty-state">
+          <h3>等待加载</h3>
+          <p class="meta">扩展清单加载后，manifest 校验状态与贡献点会展示在这里。</p>
         </div>
       </div>
     </section>

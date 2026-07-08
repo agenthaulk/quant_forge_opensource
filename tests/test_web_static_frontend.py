@@ -36,14 +36,17 @@ HTML_CONTENT_TYPE = "text/html; charset=utf-8"
 JS_CONTENT_TYPE = "text/javascript; charset=utf-8"
 
 # The complete CP6-1 module set (+ CP6-2 Lab chrome + CP6-3 data/registry
-# views). A new module must be added here so the no-external-resources and
-# single-renderer sweeps keep covering everything.
+# views + CP6-4 docs/extensions views). A new module must be added here so
+# the no-external-resources and single-renderer sweeps keep covering
+# everything.
 EXPECTED_STATIC_MODULES = (
     "api.js",
     "app.js",
     "metric.js",
     "views/bench.js",
     "views/data.js",
+    "views/docs.js",
+    "views/extensions.js",
     "views/factor.js",
     "views/history.js",
     "views/lab.js",

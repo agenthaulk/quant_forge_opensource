@@ -13,13 +13,14 @@ from datetime import date, datetime
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import threading
 from typing import Any
 from urllib.parse import parse_qs, unquote
 
 from quant_forge.apps.web.jobs import _IdeaValidationSettings, _WebJobCancelled, _client_error_message
+from quant_forge.apps.web.markdown import extract_markdown_title, render_markdown_html
 from quant_forge.backtesting.service import run_staggered_entry_backtest
 from quant_forge.config import QuantForgeConfig, simulation_profile_from_mapping, validate_llm_runtime
 from quant_forge.core.contracts import (
@@ -30,6 +31,7 @@ from quant_forge.core.contracts import (
     TransactionCostModel,
 )
 from quant_forge.data.local import catalog_field_availability, data_field_catalog, validate_data_root
+from quant_forge.extensions.registry import contribution_points_payload, scan_extensions
 from quant_forge.factor_library.catalog import FactorCatalog
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.lineage.store import RUN_KINDS, RunIndex, redact_free_text
@@ -54,6 +56,12 @@ MAX_RD_ITERATIONS = 5
 
 RESEARCH_HISTORY_DEFAULT_LIMIT = 50
 RESEARCH_HISTORY_MAX_LIMIT = 200
+
+# Repo-checkout layout: parents[4] of this file is the repository root.
+# Both roots may be absent (e.g. an installed package); the payload
+# builders degrade to available=false instead of erroring.
+DOCS_ROOT = Path(__file__).resolve().parents[4] / "docs"
+EXTENSIONS_ROOT = Path(__file__).resolve().parents[4] / "extensions"
 
 
 _WEB_PATH_KEYS = {
@@ -1851,5 +1859,193 @@ def _registry_factor_detail_payload(
         "count": len(ordered),
         "limit": parsed_limit,
         "total": len(rows),
+    }
+    return _server._web_public_json(_redact_web_text(payload))
+
+
+# ---------------------------------------------------------------------------
+# CP6-4 read-only Docs view + Extensions registry payload builders (GET-only).
+#
+# Same endpoint discipline as CP6-3: builders live here, are re-exported
+# through the quant_forge.apps.web.server facade, and routing invokes them as
+# _server.<fn> so monkeypatches keep taking effect. DOCS_ROOT/EXTENSIONS_ROOT
+# are read through the server namespace at call time for the same reason.
+# ---------------------------------------------------------------------------
+
+# Single definition of the doc-name rule: every '/'-separated relpath segment
+# must match this pattern (no leading dot; conservative charset). The frontend
+# hash router (views/lab.js, views/docs.js #docs-doc-<relpath>) mirrors this
+# charset, so any name the server can serve deep-links cleanly. Conservative
+# by design: names outside [A-Za-z0-9_.-] (spaces, '=', '&', ...) never enter
+# payloads, keeping filename-derived identifiers redaction-neutral.
+_DOCS_RELPATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+
+
+def _is_public_doc_relpath(relpath: str) -> bool:
+    """True when every segment of ``relpath`` matches the doc-name rule.
+
+    Shared by list (skip non-matching files) and detail (404 non-matching
+    requests) so the index and the document endpoint can never disagree.
+    """
+
+    return all(
+        _DOCS_RELPATH_SEGMENT_RE.fullmatch(segment) for segment in relpath.split("/")
+    )
+
+
+def _docs_relpath_from_path(path: str) -> str:
+    # Decode exactly one percent-encoding layer, then validate (static-asset
+    # discipline): a double-encoded traversal stays literal and fails below.
+    relpath = unquote(path[len("/api/docs/"):])
+    if not relpath or "\x00" in relpath or "\\" in relpath:
+        raise KeyError(f"unknown doc: {path}")
+    if relpath.startswith("/"):
+        raise KeyError(f"unknown doc: {path}")
+    if not _is_public_doc_relpath(relpath):
+        # Blocks "..", ".", ".hidden", "//", trailing "/", and every name
+        # outside the conservative charset above.
+        raise KeyError(f"unknown doc: {path}")
+    if not relpath.endswith(".md"):  # case-sensitive by contract
+        raise KeyError(f"unknown doc: {path}")
+    return relpath
+
+
+def _docs_section_label(relpath: str) -> str:
+    return relpath.split("/", 1)[0] if "/" in relpath else "root"
+
+
+def _docs_list_payload(config: QuantForgeConfig) -> dict[str, Any]:
+    """Document index over DOCS_ROOT, grouped by first path segment.
+
+    ``config`` is unused; the uniform builder signature keeps the routing
+    dispatch and monkeypatch seam identical across GET builders.
+    """
+
+    del config  # uniform builder signature
+    from quant_forge.apps.web import server as _server
+
+    root = Path(_server.DOCS_ROOT)
+    if not root.is_dir():
+        payload: dict[str, Any] = {"available": False, "count": 0, "sections": []}
+        return _server._web_public_json(_redact_web_text(payload))
+    resolved_root = root.resolve()
+    by_section: dict[str, list[dict[str, str]]] = {}
+    count = 0
+    for path in sorted(root.rglob("*.md")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        relpath = relative.as_posix()
+        # Same doc-name rule as the detail endpoint (dot segments, spaces,
+        # '=', '&', ... are skipped) so list and detail can never disagree.
+        if not _is_public_doc_relpath(relpath):
+            continue
+        if not path.resolve(strict=False).is_relative_to(resolved_root):
+            continue
+        section = _docs_section_label(relpath)
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            title = path.stem
+        else:
+            title = extract_markdown_title(text) or path.stem
+        by_section.setdefault(section, []).append(
+            {"relpath": relpath, "section": section, "title": title}
+        )
+        count += 1
+    ordered_labels = sorted(
+        (label for label in by_section if label != "root"),
+        key=lambda label: (label.casefold(), label),
+    )
+    if "root" in by_section:
+        ordered_labels.insert(0, "root")
+    sections = [
+        {
+            "section": label,
+            "docs": sorted(
+                by_section[label],
+                key=lambda doc: (doc["relpath"].casefold(), doc["relpath"]),
+            ),
+        }
+        for label in ordered_labels
+    ]
+    payload = {"available": True, "count": count, "sections": sections}
+    return _server._web_public_json(_redact_web_text(payload))
+
+
+def _docs_document_payload(config: QuantForgeConfig, relpath: str) -> dict[str, Any]:
+    """One repo document rendered to whitelisted HTML (contained read)."""
+
+    del config  # uniform builder signature
+    from quant_forge.apps.web import server as _server
+
+    root = Path(_server.DOCS_ROOT).resolve()
+    candidate = (root / relpath).resolve(strict=False)
+    if (
+        candidate == root
+        or not candidate.is_relative_to(root)
+        or candidate.suffix != ".md"
+        or not candidate.is_file()
+    ):
+        raise KeyError(f"unknown doc: {relpath}")
+    # Authorize-then-open guard (same pattern as _read_bench_artifact):
+    # O_NOFOLLOW fails the open if the final component was swapped for a
+    # symlink after the containment check above; any OSError maps to 404.
+    try:
+        fd = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        raise KeyError(f"unknown doc: {relpath}") from None
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
+            source = handle.read()
+    except OSError:
+        raise KeyError(f"unknown doc: {relpath}") from None
+    # Redaction ordering (binding): redact the RAW source BEFORE rendering,
+    # then render, then wrap in _web_public_json only -- never pass the
+    # finished payload through _redact_web_text. The "html" field is
+    # post-escape; a second redaction pass could rewrite an escaped fragment
+    # into text containing raw "<"/">" (e.g. "KEY=&lt;redacted&gt;"
+    # re-matches the env-secret rule and would inject literal <redacted>
+    # markup). Redacting the source keeps one definition of the quantity
+    # (lineage.store.redact_free_text) and the escape step neutralizes the
+    # redaction tokens.
+    redacted = redact_free_text(source)
+    title = extract_markdown_title(redacted) or PurePosixPath(relpath).stem
+    payload = {
+        "relpath": relpath,
+        "section": _docs_section_label(relpath),
+        "title": title,
+        "html": render_markdown_html(redacted, current_relpath=relpath),
+    }
+    return _server._web_public_json(payload)
+
+
+def _extensions_payload(config: QuantForgeConfig) -> dict[str, Any]:
+    """Declarative extensions registry listing (D7/D7a; read-only)."""
+
+    del config  # uniform builder signature
+    from quant_forge.apps.web import server as _server
+
+    points = contribution_points_payload()
+    root = Path(_server.EXTENSIONS_ROOT)
+    if not root.is_dir():
+        payload: dict[str, Any] = {
+            "available": False,
+            "points": points,
+            "extensions": [],
+            "count": 0,
+            "valid_count": 0,
+            "rejected_count": 0,
+        }
+        return _server._web_public_json(_redact_web_text(payload))
+    rows = scan_extensions(root)
+    valid_count = sum(1 for row in rows if row["status"] == "valid")
+    payload = {
+        "available": True,
+        "points": points,
+        "extensions": rows,
+        "count": len(rows),
+        "valid_count": valid_count,
+        "rejected_count": len(rows) - valid_count,
     }
     return _server._web_public_json(_redact_web_text(payload))

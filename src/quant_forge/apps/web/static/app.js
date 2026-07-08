@@ -27,6 +27,8 @@ import { refreshHistoryPanel } from './views/history.js';
 import { refreshBenchPanel } from './views/bench.js';
 import { refreshDataPanel } from './views/data.js';
 import { refreshRegistryPanel } from './views/registry.js';
+import { refreshDocsPanel } from './views/docs.js';
+import { refreshExtensionsPanel } from './views/extensions.js';
 import { activateTab, initLabTabs, setStep, setTabDot } from './views/lab.js';
 
 const pageConfig = JSON.parse(document.getElementById('qf-page-config').textContent || '{}');
@@ -319,11 +321,15 @@ const historyPanel = trackedPanelRefresh(refreshHistoryPanel);
 const benchPanel = trackedPanelRefresh(refreshBenchPanel);
 const dataPanel = trackedPanelRefresh(refreshDataPanel);
 const registryPanel = trackedPanelRefresh(refreshRegistryPanel);
+const docsPanel = trackedPanelRefresh(refreshDocsPanel);
+const extensionsPanel = trackedPanelRefresh(refreshExtensionsPanel);
 const lazyPanelsByTab = {
   'lab-tab-history': historyPanel,
   'lab-tab-bench': benchPanel,
   'lab-tab-data': dataPanel,
-  'lab-tab-registry': registryPanel
+  'lab-tab-registry': registryPanel,
+  'lab-tab-docs': docsPanel,
+  'lab-tab-extensions': extensionsPanel
 };
 initLabTabs({
   // Lazy refresh on tab activation: a history / bench panel that has not
@@ -341,6 +347,8 @@ onControlTokenStored(() => {
   benchPanel.refresh();
   dataPanel.refresh();
   registryPanel.refresh();
+  docsPanel.refresh();
+  extensionsPanel.refresh();
 });
 llmProviderSelect.addEventListener('change', syncLlmApiKeyControls);
 llmApiKeyMode.addEventListener('change', syncLlmApiKeyControls);
@@ -350,6 +358,8 @@ historyPanel.refresh();
 benchPanel.refresh();
 dataPanel.refresh();
 registryPanel.refresh();
+docsPanel.refresh();
+extensionsPanel.refresh();
 button.addEventListener('click', async () => {
   button.disabled = true;
   validateButton.disabled = true;

@@ -4,7 +4,8 @@
  * Pure client-side state over the existing panels — no fetch calls, no new
  * endpoints. The tab panels only host per-view mounts (#result,
  * #staggered-result, #rd-result, #history-result, #bench-result,
- * #data-result, #registry-result); hidden panels use the `hidden` attribute
+ * #data-result, #registry-result, #docs-result, #extensions-result);
+ * hidden panels use the `hidden` attribute
  * so the existing render functions keep writing into their mounts while a
  * panel is inactive. Tab activation only notifies the optional `onActivate`
  * callback wired by app.js — all panel data loading stays out of this
@@ -19,7 +20,7 @@
 
 const TAB_IDS = [
   'lab-tab-factor', 'lab-tab-rd', 'lab-tab-history', 'lab-tab-bench',
-  'lab-tab-data', 'lab-tab-registry'
+  'lab-tab-data', 'lab-tab-registry', 'lab-tab-docs', 'lab-tab-extensions'
 ];
 const STEP_IDS = ['idea', 'parse', 'validate', 'report', 'rd'];
 const REPORT_SECTION_IDS = [
@@ -38,6 +39,15 @@ const REPORT_SECTION_IDS = [
 // prefix is known here; which factor the anchor selects is applied by the
 // registry view module (this module stays fetch-free and selection-free).
 const REGISTRY_FACTOR_HASH = /^registry-factor-[A-Za-z][A-Za-z0-9_=-]*$/;
+// Docs relpath charset — mirrors the server-side single definition
+// (_DOCS_RELPATH_SEGMENT_RE in apps/web/api.py, segments joined by '/') so
+// a #docs-doc-<relpath> anchor can activate the owning tab; which document
+// the anchor selects is applied by the docs view module.
+const DOCS_DOC_HASH = /^docs-doc-[A-Za-z0-9_][A-Za-z0-9_/.-]*$/;
+// Extension id charset (extensions/manifest.py) — same discipline for
+// #extensions-manifest-<id> anchors; card targeting lives in the
+// extensions view module.
+const EXTENSIONS_MANIFEST_HASH = /^extensions-manifest-[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
 const DOT_STATE_LABELS = { running: '运行中', done: '已完成', error: '出错' };
 
 let onTabActivate = null;
@@ -131,6 +141,16 @@ function applyHash(hash) {
     // Mirrors the #report-* rule: activate the owning tab, keep the anchor
     // in the URL for reload / back / copy-link.
     activateTab('lab-tab-registry', { updateHash: false });
+    return;
+  }
+  if (DOCS_DOC_HASH.test(target)) {
+    // Same registry discipline: this module only activates the owning tab;
+    // the docs view applies which document the anchor selects.
+    activateTab('lab-tab-docs', { updateHash: false });
+    return;
+  }
+  if (EXTENSIONS_MANIFEST_HASH.test(target)) {
+    activateTab('lab-tab-extensions', { updateHash: false });
   }
   // Unknown hashes are ignored; the server-rendered default tab stays.
 }

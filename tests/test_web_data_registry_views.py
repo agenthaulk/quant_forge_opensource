@@ -18,9 +18,10 @@ String-contract pins over the served page and static modules:
   ``data-factor-id`` (never DOM ids minted from factor ids), the URL hash
   syncs through ``replaceState``, the kind filter mirrors ``RUN_KINDS``,
   and metric cells render only via ``metric.js`` helpers;
-- ``views/lab.js`` gains only tab ids and one hash-prefix rule (fetch-free
-  purity intact); ``app.js`` wires both panels through the token-gated
-  tracked lazy refresh.
+- ``views/lab.js`` gains only tab ids and hash-prefix rules (fetch-free
+  purity intact; CP6-4 appends the docs/extensions ids and prefixes);
+  ``app.js`` wires both panels through the token-gated tracked lazy
+  refresh.
 """
 
 from __future__ import annotations
@@ -76,8 +77,8 @@ def test_index_page_hosts_data_and_registry_tabs_and_panels(web_config) -> None:
     assert html.index('id="lab-panel-data"') < html.index('id="data-result"')
     assert html.index('id="data-result"') < html.index('id="lab-panel-registry"')
     assert html.index('id="lab-panel-registry"') < html.index('id="registry-result"')
-    assert html.count('role="tab"') == 6
-    assert html.count('role="tabpanel"') == 6
+    assert html.count('role="tab"') == 8
+    assert html.count('role="tabpanel"') == 8
 
 
 def test_index_page_ships_cp63_css_with_theme_tokens_only(web_config) -> None:
@@ -322,24 +323,36 @@ def test_new_modules_never_format_or_zero_fill_metrics() -> None:
 
 def test_lab_module_adds_only_tab_ids_and_registry_hash_prefix() -> None:
     lab_js = _static_module_text("views/lab.js")
-    # Appended, not inserted: the CP6-2 id order stays byte-identical.
+    # Appended, not inserted: the CP6-2/CP6-3 id order stays byte-identical;
+    # CP6-4 appends the docs/extensions ids after the registry id.
     assert "'lab-tab-factor', 'lab-tab-rd', 'lab-tab-history', 'lab-tab-bench'," in lab_js
-    assert "'lab-tab-data', 'lab-tab-registry'" in lab_js
-    # The hash rule pins the FactorDefinition id charset client-side and
-    # keeps the anchor in the URL (same discipline as #report-* links).
+    assert "'lab-tab-data', 'lab-tab-registry', 'lab-tab-docs', 'lab-tab-extensions'" in lab_js
+    # The hash rules pin each entity charset client-side and keep the
+    # anchor in the URL (same discipline as #report-* links). lab.js only
+    # activates the owning tab; the view modules own selection.
     assert "const REGISTRY_FACTOR_HASH = /^registry-factor-[A-Za-z][A-Za-z0-9_=-]*$/;" in lab_js
     assert "activateTab('lab-tab-registry', { updateHash: false });" in lab_js
     assert "[A-Za-z][A-Za-z0-9_=-]*" in inspect.getsource(core_contracts)
+    assert "const DOCS_DOC_HASH = /^docs-doc-[A-Za-z0-9_][A-Za-z0-9_/.-]*$/;" in lab_js
+    assert "activateTab('lab-tab-docs', { updateHash: false });" in lab_js
+    assert (
+        "const EXTENSIONS_MANIFEST_HASH = /^extensions-manifest-[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;"
+        in lab_js
+    )
+    assert "activateTab('lab-tab-extensions', { updateHash: false });" in lab_js
     # Purity intact: no fetch, no endpoints, no panel refreshers, and no
-    # selection logic (the registry view owns which factor the anchor
-    # selects).
+    # selection logic (each view owns what its anchor selects).
     assert "fetch(" not in lab_js
     assert "/api/" not in lab_js
     assert "refreshDataPanel" not in lab_js
     assert "refreshRegistryPanel" not in lab_js
+    assert "refreshDocsPanel" not in lab_js
+    assert "refreshExtensionsPanel" not in lab_js
     assert "data-factor-id" not in lab_js
-    # The research-flow stepper is untouched: data/registry are views, not
-    # research-flow steps.
+    assert "data-relpath" not in lab_js
+    assert "data-extension-id" not in lab_js
+    # The research-flow stepper is untouched: data/registry/docs/extensions
+    # are views, not research-flow steps.
     assert "const STEP_IDS = ['idea', 'parse', 'validate', 'report', 'rd'];" in lab_js
 
 

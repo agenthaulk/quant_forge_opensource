@@ -22,6 +22,7 @@ from urllib.parse import unquote, urlparse
 from quant_forge.apps.web.api import (
     _active_llm,
     _control_token_for_bind,
+    _docs_relpath_from_path,
     _factor_from_validation_payload,
     _int_parameter,
     _job_id_from_cancel_path,
@@ -173,6 +174,15 @@ def create_local_web_server(
                         self._json({"error": str(exc)}, status=400)
                     else:
                         self._json(payload)
+                elif path == "/api/docs":
+                    self._require_control_token()
+                    self._json(_server._docs_list_payload(config))
+                elif path.startswith("/api/docs/"):
+                    self._require_control_token()
+                    self._json(_server._docs_document_payload(config, _docs_relpath_from_path(path)))
+                elif path == "/api/extensions":
+                    self._require_control_token()
+                    self._json(_server._extensions_payload(config))
                 elif path == "/api/status":
                     self._require_control_token()
                     active_llm = _active_llm(config)
