@@ -27,6 +27,7 @@ from quant_forge.apps.web.api import (
     _optional_parser_payload,
     _optional_str,
     _paths_payload,
+    _query_parameter,
     _rd_status_payload,
 )
 from quant_forge.apps.web.html import _index_html
@@ -75,13 +76,39 @@ def create_local_web_server(
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            path = urlparse(self.path).path
+            parsed_url = urlparse(self.path)
+            path = parsed_url.path
             try:
                 if path == "/health":
                     self._json({"ok": True})
                 elif path == "/catalog":
                     self._require_control_token()
                     self._json({"fields": list_available_fields(), "operators": list_available_operators()})
+                elif path == "/api/research/history":
+                    self._require_control_token()
+                    # ValueError (limit validation) is reflected for the new
+                    # read-only endpoints only; pre-existing GET routes keep
+                    # the generic "request failed" mapping below unchanged.
+                    try:
+                        payload = _server._research_history_payload(
+                            config,
+                            limit=_query_parameter(parsed_url.query, "limit"),
+                        )
+                    except ValueError as exc:
+                        self._json({"error": str(exc)}, status=400)
+                    else:
+                        self._json(payload)
+                elif path == "/api/bench":
+                    self._require_control_token()
+                    try:
+                        payload = _server._bench_runs_payload(
+                            config,
+                            limit=_query_parameter(parsed_url.query, "limit"),
+                        )
+                    except ValueError as exc:
+                        self._json({"error": str(exc)}, status=400)
+                    else:
+                        self._json(payload)
                 elif path == "/api/status":
                     self._require_control_token()
                     active_llm = _active_llm(config)

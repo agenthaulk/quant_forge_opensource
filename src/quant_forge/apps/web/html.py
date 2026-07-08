@@ -622,6 +622,26 @@ def _index_html(
         <p class="meta">RD 候选、gate、report path 和分段证据会展示在这里。</p>
       </div>
     </div>
+    <div class="section-title">
+      <h2>研究历史</h2>
+      <p>run index 最近运行记录</p>
+    </div>
+    <div id="history-result">
+      <div class="panel empty-state">
+        <h3>暂无研究历史</h3>
+        <p class="meta">评价、回测、bench、RD 运行记录到 run index 后会展示在这里。</p>
+      </div>
+    </div>
+    <div class="section-title">
+      <h2>Benchmark</h2>
+      <p>qf factor bench 多因子横向对比</p>
+    </div>
+    <div id="bench-result">
+      <div class="panel empty-state">
+        <h3>暂无 bench 结果</h3>
+        <p class="meta">运行 qf factor bench 后，多因子指标状态表会展示在这里。</p>
+      </div>
+    </div>
   </section>
 </main>
 <script>
@@ -657,6 +677,8 @@ const rdStop = document.getElementById('rd-stop');
 const rdCancel = document.getElementById('rd-cancel');
 const rdStatusEl = document.getElementById('rd-status');
 const rdResultEl = document.getElementById('rd-result');
+const historyResultEl = document.getElementById('history-result');
+const benchResultEl = document.getElementById('bench-result');
 let activeIdeaJobId = null;
 let activeRdJobId = null;
 let parsedIdea = null;
@@ -1308,6 +1330,146 @@ async function getJob(jobId) {{
 async function cancelJob(jobId) {{
   return postJson(`/api/jobs/${{encodeURIComponent(jobId)}}/cancel`, {{}});
 }}
+function storedControlHeaders() {{
+  if (!controlTokenRequired) return {{}};
+  const token = window.sessionStorage.getItem('qf_control_token') || '';
+  if (!token) return null;
+  return {{Authorization: `Bearer ${{token}}`}};
+}}
+async function fetchPanelJson(url) {{
+  const headers = storedControlHeaders();
+  if (headers === null) return null;
+  const response = await fetch(url, {{headers}});
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error || 'request failed');
+  return body;
+}}
+function metricValueText(entry, digits = 4) {{
+  if (!entry) return 'not_recorded';
+  const status = entry.status || 'unknown';
+  if (status === 'available') return num(entry.value, digits);
+  return esc(status);
+}}
+function metricStatusSuffix(entry) {{
+  if (!entry) return '';
+  const status = entry.status || 'unknown';
+  const n = entry.observation_count === undefined || entry.observation_count === null ? '' : ` · N=${{entry.observation_count}}`;
+  return `${{esc(status)}}${{n}}`;
+}}
+function renderHistory(payload) {{
+  const rows = (payload && payload.runs) || [];
+  if (!rows.length) {{
+    historyResultEl.innerHTML = `
+      <div class="panel empty-state">
+        <h3>暂无研究历史</h3>
+        <p class="meta">评价、回测、bench、RD 运行记录到 run index 后会展示在这里。</p>
+      </div>`;
+    return;
+  }}
+  const body = rows.map(row => {{
+    const dataWindow = row.data_window || {{}};
+    const windowText = dataWindow.status === 'available'
+      ? `${{dataWindow.start_date}} .. ${{dataWindow.end_date}}`
+      : (dataWindow.status || 'unavailable');
+    const highlights = Object.entries(row.metric_highlights || {{}}).map(([name, entry]) =>
+      `<span class="pill">${{esc(name)}} ${{metricValueText(entry)}} · ${{metricStatusSuffix(entry)}}</span>`
+    ).join(' ');
+    return `
+      <tr>
+        <td>${{esc(row.kind || '')}}<br><span class="meta">${{esc(row.run_id || '')}}</span></td>
+        <td>${{esc(row.created_at || '')}}</td>
+        <td><code>${{esc((row.factor_ids || []).join(', '))}}</code></td>
+        <td>${{esc(windowText)}}<br><span class="meta">warnings ${{esc(row.warnings_count ?? 'n/a')}}</span></td>
+        <td>${{highlights || '<span class="pill">无指标摘要</span>'}}</td>
+      </tr>`;
+  }}).join('');
+  historyResultEl.innerHTML = `
+    <div class="panel">
+      <h3>研究历史 · 最近 ${{rows.length}} 条</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>类型 / run_id</th>
+            <th>时间</th>
+            <th>因子</th>
+            <th>数据窗口 / 状态</th>
+            <th>指标摘要</th>
+          </tr>
+        </thead>
+        <tbody>${{body}}</tbody>
+      </table>
+    </div>`;
+}}
+function renderBench(payload) {{
+  const latest = payload && payload.latest;
+  if (!latest) {{
+    benchResultEl.innerHTML = `
+      <div class="panel empty-state">
+        <h3>暂无 bench 结果</h3>
+        <p class="meta">运行 qf factor bench 后，多因子指标状态表会展示在这里。</p>
+      </div>`;
+    return;
+  }}
+  if (!latest.available) {{
+    benchResultEl.innerHTML = `
+      <div class="panel">
+        <h3>Benchmark · ${{esc(latest.run_id || '')}}</h3>
+        <p class="meta">${{esc(latest.reason || 'bench artifact 不可用')}}</p>
+      </div>`;
+    return;
+  }}
+  const factors = latest.factors || [];
+  const metricNames = Array.from(new Set(factors.flatMap(row => Object.keys(row.metrics || {{}}))));
+  const head = metricNames.map(name => `<th>${{esc(name)}}</th>`).join('');
+  const body = factors.map(row => {{
+    const statusCell = row.status === 'error'
+      ? `<span class="err">error</span><br><span class="meta">${{esc(row.error || '')}}</span>`
+      : `${{esc(row.status || '')}}<br><span class="meta">warnings ${{esc(row.warnings_count ?? 'n/a')}}</span>`;
+    const cells = metricNames.map(name => {{
+      const entry = (row.metrics || {{}})[name];
+      if (!entry) return '<td><span class="meta">not_recorded</span></td>';
+      return `<td>${{metricValueText(entry)}}<br><span class="meta">${{metricStatusSuffix(entry)}}</span></td>`;
+    }}).join('');
+    return `
+      <tr>
+        <td><code>${{esc(row.factor_id || '')}}</code></td>
+        <td>${{statusCell}}</td>
+        ${{cells}}
+      </tr>`;
+  }}).join('');
+  const summary = latest.summary || {{}};
+  benchResultEl.innerHTML = `
+    <div class="panel">
+      <h3>Benchmark · ${{esc(latest.run_id || '')}}</h3>
+      <p class="meta">${{esc(latest.created_at || '')}} · evaluated ${{esc(summary.evaluated_factor_count ?? 'n/a')}} · errors ${{esc(summary.error_factor_count ?? 'n/a')}} · 指标不可用时展示状态标签，不显示为 0。</p>
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>因子</th>
+            <th>状态</th>
+            ${{head}}
+          </tr>
+        </thead>
+        <tbody>${{body || '<tr><td colspan="2">暂无因子行</td></tr>'}}</tbody>
+      </table>
+    </div>`;
+}}
+async function refreshHistoryPanel() {{
+  try {{
+    const payload = await fetchPanelJson('/api/research/history');
+    if (payload) renderHistory(payload);
+  }} catch (error) {{
+    historyResultEl.innerHTML = `<div class="panel"><h3>研究历史</h3><p class="meta err">${{esc(error.message)}}</p></div>`;
+  }}
+}}
+async function refreshBenchPanel() {{
+  try {{
+    const payload = await fetchPanelJson('/api/bench');
+    if (payload) renderBench(payload);
+  }} catch (error) {{
+    benchResultEl.innerHTML = `<div class="panel"><h3>Benchmark</h3><p class="meta err">${{esc(error.message)}}</p></div>`;
+  }}
+}}
 async function waitForJob(jobId, statusEl, slowText, isActive) {{
   const slowTimer = setTimeout(() => {{
     if (isActive(jobId)) {{
@@ -1381,6 +1543,8 @@ llmProviderSelect.addEventListener('change', syncLlmApiKeyControls);
 llmApiKeyMode.addEventListener('change', syncLlmApiKeyControls);
 syncLlmApiKeyControls();
 refreshRuntimeStatus().catch(() => {{}});
+refreshHistoryPanel();
+refreshBenchPanel();
 button.addEventListener('click', async () => {{
   button.disabled = true;
   validateButton.disabled = true;

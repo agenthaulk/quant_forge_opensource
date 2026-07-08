@@ -10,12 +10,14 @@ from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
+import json
 import math
 import os
 from pathlib import Path
 import re
 import threading
 from typing import Any
+from urllib.parse import parse_qs
 
 from quant_forge.apps.web.jobs import _IdeaValidationSettings, _WebJobCancelled, _client_error_message
 from quant_forge.backtesting.service import run_staggered_entry_backtest
@@ -29,6 +31,7 @@ from quant_forge.core.contracts import (
 )
 from quant_forge.factor_library.catalog import FactorCatalog
 from quant_forge.factor_library.repository import FactorRepository
+from quant_forge.lineage.store import RunIndex, redact_free_text
 from quant_forge.llm_factor_parser import ParsedFactor
 from quant_forge.research_loop.config import (
     ResearchLoopConfig,
@@ -41,9 +44,14 @@ from quant_forge.research_loop.service import ResearchLoopResult, ResearchLoopSe
 
 MAX_RD_ITERATIONS = 5
 
+RESEARCH_HISTORY_DEFAULT_LIMIT = 50
+RESEARCH_HISTORY_MAX_LIMIT = 200
+
 
 _WEB_PATH_KEYS = {
     "artifact_path",
+    "artifact_path_rel",
+    "artifact_paths_rel",
     "evaluation_artifact_path",
     "selection_backtest_artifact_path",
     "external_oos_artifact_path",
@@ -1389,3 +1397,227 @@ def _catalog_factor_ids(config: QuantForgeConfig) -> list[str]:
     except Exception:
         return []
     return [factor.factor_id for factor in factors]
+
+
+def _query_parameter(query: str, name: str) -> str | None:
+    values = parse_qs(query).get(name)
+    if not values:
+        return None
+    return values[-1]
+
+
+def _run_history_limit(value: Any) -> int:
+    if value in {None, ""}:
+        return RESEARCH_HISTORY_DEFAULT_LIMIT
+    limit = _positive_int_parameter(value, "limit")
+    if limit > RESEARCH_HISTORY_MAX_LIMIT:
+        raise ValueError(f"limit must be between 1 and {RESEARCH_HISTORY_MAX_LIMIT}")
+    return limit
+
+
+def _redact_web_text(value: Any) -> Any:
+    """Recursively redact absolute-path/secret-like fragments in free text.
+
+    The run index validates its own writes, but the web adapter must not trust
+    historical rows (legacy or hand-edited indexes may carry absolute paths in
+    free-text fields). Every string that reaches a web payload goes through the
+    lineage redactor first -- one definition per quantity:
+    :func:`quant_forge.lineage.store.redact_free_text`.
+    """
+
+    if isinstance(value, str):
+        return redact_free_text(value)
+    if isinstance(value, dict):
+        return {redact_free_text(str(key)): _redact_web_text(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_redact_web_text(item) for item in value]
+    return value
+
+
+def _run_record_payload(row: dict[str, Any]) -> dict[str, Any]:
+    """Project one run-index row into the web history record shape.
+
+    Metric highlights keep the qf.metrics.v2 convention: ``value`` may be null
+    with an explanatory ``status``; null is never coerced to a number.
+    """
+
+    highlights_raw = row.get("metric_highlights")
+    highlights: dict[str, dict[str, Any]] = {}
+    if isinstance(highlights_raw, dict):
+        for name, entry in highlights_raw.items():
+            source = entry if isinstance(entry, dict) else {}
+            highlights[str(name)] = {
+                "value": source.get("value"),
+                "unit": source.get("unit"),
+                "status": source.get("status"),
+                "observation_count": source.get("observation_count"),
+            }
+    window_raw = row.get("data_window")
+    window = window_raw if isinstance(window_raw, dict) else {}
+    return {
+        "run_id": row.get("run_id"),
+        "kind": row.get("kind"),
+        "created_at": row.get("created_at"),
+        "factor_ids": [str(item) for item in (row.get("factor_ids") or [])],
+        "data_window": {
+            "start_date": window.get("start_date"),
+            "end_date": window.get("end_date"),
+            "status": window.get("status"),
+        },
+        "config_fingerprint": row.get("config_fingerprint"),
+        "metric_highlights": highlights,
+        "artifact_paths_rel": [str(item) for item in (row.get("artifact_paths_rel") or [])],
+        "warnings_count": row.get("warnings_count"),
+    }
+
+
+def _research_history_payload(config: QuantForgeConfig, *, limit: Any = None) -> dict[str, Any]:
+    """Read-only run history for the web UI, most recent first.
+
+    Reuses the lineage run index read API (the same one ``qf runs`` uses);
+    newest-first is defined as reversed append order, matching
+    ``qf runs list``. Path-like values pass through ``_web_public_json`` /
+    ``_WEB_PATH_KEYS`` and free text through the lineage redactor.
+    """
+
+    from quant_forge.apps.web import server as _server
+
+    parsed_limit = _run_history_limit(limit)
+    rows = RunIndex(config.paths.artifact_root).read_rows()
+    ordered = list(reversed(rows))[:parsed_limit]
+    payload = {
+        "runs": [_run_record_payload(row) for row in ordered],
+        "count": len(ordered),
+        "limit": parsed_limit,
+        "total": len(rows),
+    }
+    return _server._web_public_json(_redact_web_text(payload))
+
+
+def _bench_runs_payload(config: QuantForgeConfig, *, limit: Any = None) -> dict[str, Any]:
+    """Bench run history plus the latest qf.bench.v1 report, most recent first.
+
+    Uses the run index (kind="bench") written by ``qf factor bench`` and loads
+    the latest bench JSON artifact from ``artifact_root``. Degrades to an empty
+    list with ``latest: null`` when no bench run exists.
+    """
+
+    from quant_forge.apps.web import server as _server
+
+    parsed_limit = _run_history_limit(limit)
+    rows = RunIndex(config.paths.artifact_root).search(kind="bench")
+    ordered = list(reversed(rows))[:parsed_limit]
+    payload = {
+        "runs": [_run_record_payload(row) for row in ordered],
+        "count": len(ordered),
+        "limit": parsed_limit,
+        "total": len(rows),
+        "latest": _bench_report_payload(config, ordered[0]) if ordered else None,
+    }
+    return _server._web_public_json(_redact_web_text(payload))
+
+
+def _bench_report_payload(config: QuantForgeConfig, row: dict[str, Any]) -> dict[str, Any]:
+    """Project one qf.bench.v1 artifact referenced by a bench run-index row.
+
+    Metric cells keep the full MetricValue convention ``{value, unit, status,
+    observation_count}``: a null value with an explanatory status must reach
+    the browser as ``{"value": null, "status": ...}``, never as 0 and never as
+    a bare scalar.
+    """
+
+    base: dict[str, Any] = {
+        "run_id": row.get("run_id"),
+        "created_at": row.get("created_at"),
+        "available": False,
+        "factors": [],
+        "summary": {},
+    }
+    report = _read_bench_artifact(config, row)
+    if report is None:
+        base["reason"] = "bench artifact not available under artifact_root or not a matching qf.bench.v1 report"
+        return base
+    factors: list[dict[str, Any]] = []
+    for factor_row in report.get("factors") or []:
+        if not isinstance(factor_row, dict):
+            continue
+        metrics_raw = factor_row.get("metrics")
+        metrics: dict[str, dict[str, Any]] = {}
+        if isinstance(metrics_raw, dict):
+            for name, entry in metrics_raw.items():
+                source = entry if isinstance(entry, dict) else {}
+                metrics[str(name)] = {
+                    "value": source.get("value"),
+                    "unit": source.get("unit"),
+                    "status": source.get("status"),
+                    "observation_count": source.get("observation_count"),
+                }
+        factors.append(
+            {
+                "factor_id": factor_row.get("factor_id"),
+                "status": factor_row.get("status"),
+                "error": factor_row.get("error"),
+                "metrics": metrics,
+                "warnings_count": factor_row.get("warnings_count"),
+                "artifact_path_rel": factor_row.get("artifact_path_rel"),
+            }
+        )
+    base.update(
+        {
+            "available": True,
+            "schema_version": report.get("schema_version"),
+            "factors": factors,
+            "summary": report.get("summary") if isinstance(report.get("summary"), dict) else {},
+        }
+    )
+    return base
+
+
+def _read_bench_artifact(config: QuantForgeConfig, row: dict[str, Any]) -> dict[str, Any] | None:
+    """Load the JSON bench artifact for one run-index row, containment-checked.
+
+    Only relative references that resolve inside ``artifact_root`` are
+    followed (FP-4: an unknown location yields None, never a guess), and only
+    payloads that identify themselves as the referenced bench report are
+    accepted: ``schema_version`` must be ``qf.bench.v1`` and the artifact's
+    ``run_id`` (which the writer ``cli.factor_bench`` always emits) must match
+    the run-index row, so a crafted row cannot surface unrelated artifact JSON
+    through the bench panel.
+    """
+
+    artifact_root = Path(config.paths.artifact_root).expanduser().resolve(strict=False)
+    for path_rel in row.get("artifact_paths_rel") or []:
+        text = str(path_rel)
+        if not text.endswith(".json"):
+            continue
+        candidate = Path(text)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            continue
+        resolved = (artifact_root / candidate).resolve(strict=False)
+        if not resolved.is_relative_to(artifact_root):
+            continue
+        if not resolved.is_file():
+            continue
+        # Authorize-then-open guard: O_NOFOLLOW makes the open fail (ELOOP ->
+        # OSError) if the final component was swapped for a symlink after the
+        # resolve()-based containment check above. The residual race on
+        # intermediate directories is accepted under the local-only
+        # single-user threat model, consistent with the CLI evidence-path
+        # containment precedent.
+        try:
+            fd = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(loaded, dict):
+            return None
+        if loaded.get("schema_version") != "qf.bench.v1":
+            return None
+        if loaded.get("run_id") != row.get("run_id"):
+            return None
+        return loaded
+    return None
