@@ -81,7 +81,7 @@ pytest -q` + `python3 scripts/release_safety_scan.py` + CLI `--help` +
   diff clean. Adjudication table: WAVE1_REVIEW_RESOLUTION.md §CP3.
 - Verify: `git log --oneline 627bc34 445d4c7 4d4a4a3` exist; suite green.
 
-## CP4 — Server decomposition + Web research panels — 🔶 STEP 1 DONE
+## CP4 — Server decomposition + Web research panels — ✅ DONE
 - Step 1 (extraction) ✅ DONE. Order was binding (B4 F11): characterization
   tests FIRST (`d682f20`, 23 tests, verified green against the pre-split
   server via stash), then pure-move extraction (`8dc2731`): server.py
@@ -101,11 +101,24 @@ pytest -q` + `python3 scripts/release_safety_scan.py` + CLI `--help` +
   resolved via module globals); adjudicated no-impact — the only existing
   patch of that name is a whole-function replacement, not a delegating
   wrapper.
-- Step 2 ⬜ TODO: strengthen deep-seam behavioral assertions in
-  tests/test_web_server_routes.py, then Web "Research History" (run index
-  reader) + "Benchmark" panels. Acceptance: panels render MetricValue
-  statuses, never bare scalars.
-- Verify: `git log --oneline d682f20 8dc2731 fe0fcdc` exist; suite green.
+- Step 2 ✅ DONE (`1f66648` seam/error-mapping tests — verified green
+  against pre-CP4-2 sources via stash, 30 passed; `d392e52` panels):
+  GET /api/research/history (lineage RunIndex.read_rows, FP-5 no parallel
+  parser) + GET /api/bench (kind=bench + qf.bench.v1 loader) + 研究历史 /
+  Benchmark panels. MetricValue {value,unit,status,observation_count}
+  end-to-end, null-not-zero (JS strict null checks). Codex (GPT-5.5)
+  review of the step-2 diff: 3 majors ALL ACCEPTED and fixed in place —
+  F1 bench artifact validates schema_version+run_id vs the referencing
+  row; F2 O_NOFOLLOW fd open closes the final-component symlink race
+  (residual intermediate-dir race documented, local-only threat model);
+  F3 ValueError→400 reflection scoped to the two new endpoints,
+  pre-existing GET error mapping restored byte-identical to HEAD.
+  Clean per Codex: MetricValue honesty, seam late-binding (10 new
+  X-as-X re-exports), test quality, param validation.
+- Gate: **655 passed** (613→636→655), scan 154 files, compileall, CLI,
+  diff-check OK — Fable independent re-runs at each step.
+- Verify: `git log --oneline d682f20 8dc2731 fe0fcdc 1f66648 d392e52`
+  exist; suite green.
 
 ## CP5 — Data plane — ⬜ TODO
 - DataCatalogPort backed by the actually-loaded catalog (replaces the static
