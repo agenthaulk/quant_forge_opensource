@@ -2,21 +2,25 @@
  * stepper state, hash routing, and per-tab status dots.
  *
  * Pure client-side state over the existing panels — no fetch calls, no new
- * endpoints. The tab panels only re-parent the existing mounts (#result,
- * #staggered-result, #rd-result, #history-result, #bench-result); hidden
- * panels use the `hidden` attribute so the existing render functions keep
- * writing into their mounts while a panel is inactive. Tab activation only
- * notifies the optional `onActivate` callback wired by app.js — all panel
- * data loading stays out of this module.
+ * endpoints. The tab panels only host per-view mounts (#result,
+ * #staggered-result, #rd-result, #history-result, #bench-result,
+ * #data-result, #registry-result); hidden panels use the `hidden` attribute
+ * so the existing render functions keep writing into their mounts while a
+ * panel is inactive. Tab activation only notifies the optional `onActivate`
+ * callback wired by app.js — all panel data loading stays out of this
+ * module.
  *
  * Known flow-step gaps (documented, intentionally not wired to new
- * endpoints): there is no factor-catalog listing, no per-factor report
- * fetch, no job re-attach after reload, and no research-history artifact
- * detail endpoint. Those surfaces stay on their existing panels until the
- * Registry sub-phase (CP6-3) specs the missing GET routes.
+ * endpoints): there is no job re-attach after reload and no
+ * research-history artifact detail endpoint. The factor-catalog listing and
+ * per-factor evidence chain live in the CP6-3 registry view over their
+ * GET-only endpoints.
  */
 
-const TAB_IDS = ['lab-tab-factor', 'lab-tab-rd', 'lab-tab-history', 'lab-tab-bench'];
+const TAB_IDS = [
+  'lab-tab-factor', 'lab-tab-rd', 'lab-tab-history', 'lab-tab-bench',
+  'lab-tab-data', 'lab-tab-registry'
+];
 const STEP_IDS = ['idea', 'parse', 'validate', 'report', 'rd'];
 const REPORT_SECTION_IDS = [
   'report-hero',
@@ -29,6 +33,11 @@ const REPORT_SECTION_IDS = [
   'report-artifacts',
   'report-staggered'
 ];
+// FactorDefinition id charset (core/contracts.py) pinned client-side so a
+// #registry-factor-<id> anchor can activate the owning tab. Only the hash
+// prefix is known here; which factor the anchor selects is applied by the
+// registry view module (this module stays fetch-free and selection-free).
+const REGISTRY_FACTOR_HASH = /^registry-factor-[A-Za-z][A-Za-z0-9_=-]*$/;
 const DOT_STATE_LABELS = { running: '运行中', done: '已完成', error: '出错' };
 
 let onTabActivate = null;
@@ -116,6 +125,12 @@ function applyHash(hash) {
   if (REPORT_SECTION_IDS.includes(target)) {
     activateTab('lab-tab-factor', { updateHash: false });
     scrollToReportSection(target);
+    return;
+  }
+  if (REGISTRY_FACTOR_HASH.test(target)) {
+    // Mirrors the #report-* rule: activate the owning tab, keep the anchor
+    // in the URL for reload / back / copy-link.
+    activateTab('lab-tab-registry', { updateHash: false });
   }
   // Unknown hashes are ignored; the server-rendered default tab stays.
 }

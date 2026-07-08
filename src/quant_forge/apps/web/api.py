@@ -17,7 +17,7 @@ from pathlib import Path
 import re
 import threading
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, unquote
 
 from quant_forge.apps.web.jobs import _IdeaValidationSettings, _WebJobCancelled, _client_error_message
 from quant_forge.backtesting.service import run_staggered_entry_backtest
@@ -29,9 +29,11 @@ from quant_forge.core.contracts import (
     SimulationProfile,
     TransactionCostModel,
 )
+from quant_forge.data.local import catalog_field_availability, data_field_catalog, validate_data_root
 from quant_forge.factor_library.catalog import FactorCatalog
 from quant_forge.factor_library.repository import FactorRepository
-from quant_forge.lineage.store import RunIndex, redact_free_text
+from quant_forge.lineage.store import RUN_KINDS, RunIndex, redact_free_text
+from quant_forge.mcp.read_models import list_factor_research_tags
 from quant_forge.llm_factor_parser import (
     FACTOR_DESCRIPTION_MAX_CHARS,
     UNIVERSE_FILTER_MAX_CHARS,
@@ -1634,3 +1636,220 @@ def _read_bench_artifact(config: QuantForgeConfig, row: dict[str, Any]) -> dict[
             return None
         return loaded
     return None
+
+
+# ---------------------------------------------------------------------------
+# CP6-3 read-only Data console + Registry payload builders (GET-only).
+#
+# Endpoint discipline copies CP4-2: builders live here, are re-exported
+# through the quant_forge.apps.web.server facade, and routing invokes them as
+# _server.<fn> so monkeypatches on the server namespace keep taking effect.
+# Every payload passes through _web_public_json(_redact_web_text(...)).
+# ---------------------------------------------------------------------------
+
+
+# Mirrors the FactorDefinition factor_id rule (core/contracts.py); the web
+# route validates path-supplied ids against it before any catalog lookup.
+_REGISTRY_FACTOR_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9_=-]*")
+
+
+def _registry_factor_id_from_path(path: str) -> str:
+    parts = path.strip("/").split("/")
+    if len(parts) != 4 or parts[:3] != ["api", "registry", "factors"] or not parts[3]:
+        raise KeyError(f"unknown registry path: {path}")
+    # Decode exactly one percent-encoding layer before validation, mirroring
+    # the static-asset handler (routing.py): the client sends the id segment
+    # through encodeURIComponent, so a contract-legal id containing '='
+    # arrives as '%3D'. The id regex stays the single validation gate after
+    # decoding; decoded values outside the id rule (a '/', a control
+    # character, a second encoding layer) fail it and map to 404 as before.
+    return unquote(parts[3])
+
+
+def _run_kind_parameter(value: Any) -> str | None:
+    if value in {None, ""}:
+        return None
+    kind = str(value).strip()
+    if kind not in RUN_KINDS:
+        raise ValueError(f"kind must be one of: {', '.join(RUN_KINDS)}")
+    return kind
+
+
+def _data_catalog_payload(config: QuantForgeConfig) -> dict[str, Any]:
+    """Declared panel fields with role and research tags (Data console).
+
+    Wraps the one authoritative catalog accessor ``data_field_catalog()``
+    (FP-5) instead of extending ``GET /catalog``, whose payload shape is
+    pinned and shared with LLM/CLI surfaces. Tag values keep the
+    qf.research_tags.v1 None-vs-empty convention verbatim (FP-4): ``None``
+    stays ``null`` and known-empty collections stay ``[]``.
+
+    ``config`` is unused today; the uniform builder signature keeps the
+    routing dispatch and monkeypatch seam identical across GET builders.
+    """
+
+    del config
+    from quant_forge.apps.web import server as _server
+
+    fields = [
+        {
+            "name": item.name,
+            "description": item.description,
+            "role": item.role,
+            "tags": item.tags.to_dict(),
+        }
+        for item in data_field_catalog()
+    ]
+    payload = {"fields": fields, "count": len(fields)}
+    return _server._web_public_json(_redact_web_text(payload))
+
+
+def _data_status_payload(config: QuantForgeConfig) -> dict[str, Any]:
+    """Coverage, quality gate result, and field availability in one payload.
+
+    All three views derive from a single ``validate()`` pass over the data
+    root. ``DataValidationResult.data_root`` / ``panel_path`` are absolute
+    local paths: the payload is built field-by-field so they are dropped
+    entirely and never serialized (no reliance on generic Path coercion).
+    ``missing_columns`` mixes schema names with quality tokens
+    (``duplicate_keys`` / ``null:*`` / ``dtype:*``); they are split
+    server-side so the frontend renders labels, never derived scalars (FP-4).
+    """
+
+    from quant_forge.apps.web import server as _server
+
+    validation = validate_data_root(config.paths.data_root)
+    declared = {item.name for item in data_field_catalog()}
+    missing_schema_columns = [name for name in validation.missing_columns if name in declared]
+    quality_problems = [token for token in validation.missing_columns if token not in declared]
+    payload = {
+        "ok": bool(validation.ok),
+        "coverage": {
+            "rows": validation.rows,
+            "instruments": validation.instruments,
+            "date_count": validation.date_count,
+            "start_date": validation.start_date,
+            "end_date": validation.end_date,
+        },
+        "quality": {
+            "missing_columns": missing_schema_columns,
+            "problems": quality_problems,
+            "synthesized_columns": list(validation.synthesized_columns),
+            "optional_columns": list(validation.optional_columns),
+        },
+        "fields": [
+            {"name": item.name, "role": item.role, "status": item.status}
+            for item in catalog_field_availability(validation)
+        ],
+    }
+    return _server._web_public_json(_redact_web_text(payload))
+
+
+def _factor_research_tags_by_id(config: QuantForgeConfig) -> dict[str, dict[str, Any]]:
+    """qf.research_tags.v1 dicts keyed by factor id; empty when unreadable.
+
+    A tags read failure degrades to ``{}`` so factor rows carry
+    ``tags: null`` (unobserved, FP-4) rather than turning the whole listing
+    into a 500.
+    """
+
+    try:
+        tags = list_factor_research_tags(
+            config.paths.factor_root,
+            factor_values_root=config.paths.factor_values_root,
+            factor_values_manifest_root=config.paths.factor_values_manifest_root,
+        )
+    except Exception:
+        return {}
+    return {str(tag.get("subject_id")): tag for tag in tags}
+
+
+def _registry_factor_row(factor: FactorDefinition, tags: dict[str, Any] | None) -> dict[str, Any]:
+    """Project one FactorDefinition into the Registry list/detail row shape.
+
+    Extends the pinned ``read_models.list_factors`` projection (which stays
+    unchanged for LLM/CLI surfaces) with ``description``, ``source``, and the
+    joined research tags. ``tags`` is ``None`` when unobservable (FP-4);
+    precomputed formulas already render as ``precomputed:<key>`` — no paths.
+    """
+
+    return {
+        "factor_id": factor.factor_id,
+        "name": factor.name,
+        "formula": factor.formula,
+        "status": factor.status,
+        "horizon_days": factor.horizon_days,
+        "universe_filters": list(factor.universe_filters),
+        "description": factor.description,
+        "source": factor.source,
+        "tags": tags,
+    }
+
+
+def _registry_factors_payload(config: QuantForgeConfig) -> dict[str, Any]:
+    """Registry list view: the full factor catalog with research tags.
+
+    A catalog read failure degrades to an empty list exactly like
+    ``_catalog_factor_ids`` (never a 500); the catalog is small, so there is
+    no pagination.
+    """
+
+    from quant_forge.apps.web import server as _server
+
+    try:
+        factors = FactorCatalog(
+            config.paths.factor_root,
+            factor_values_root=config.paths.factor_values_root,
+            factor_values_manifest_root=config.paths.factor_values_manifest_root,
+        ).list()
+    except Exception:
+        factors = []
+    tags_by_id = _factor_research_tags_by_id(config) if factors else {}
+    rows = [_registry_factor_row(factor, tags_by_id.get(factor.factor_id)) for factor in factors]
+    payload = {"factors": rows, "count": len(rows)}
+    return _server._web_public_json(_redact_web_text(payload))
+
+
+def _registry_factor_detail_payload(
+    config: QuantForgeConfig,
+    factor_id: str,
+    *,
+    limit: Any = None,
+    kind: Any = None,
+) -> dict[str, Any]:
+    """Registry detail view: one factor plus its evidence chain of runs.
+
+    The path-supplied id must match the FactorDefinition id rule before any
+    lookup; ids that do not match are treated as unknown (KeyError -> 404).
+    ``FileNotFoundError`` from the catalog also maps to KeyError -> 404, while
+    an ambiguous precomputed id keeps its ValueError -> 400 (reflected
+    per-route like the limit/kind validation). Runs come from the lineage run
+    index, newest first, projected through ``_run_record_payload`` so metric
+    highlights keep the MetricValue null-not-zero convention (FP-4).
+    """
+
+    from quant_forge.apps.web import server as _server
+
+    if not _REGISTRY_FACTOR_ID_RE.fullmatch(factor_id):
+        raise KeyError("unknown factor")
+    parsed_limit = _run_history_limit(limit)
+    parsed_kind = _run_kind_parameter(kind)
+    try:
+        factor = FactorCatalog(
+            config.paths.factor_root,
+            factor_values_root=config.paths.factor_values_root,
+            factor_values_manifest_root=config.paths.factor_values_manifest_root,
+        ).get(factor_id)
+    except FileNotFoundError:
+        raise KeyError(f"unknown factor: {factor_id}") from None
+    tags_by_id = _factor_research_tags_by_id(config)
+    rows = RunIndex(config.paths.artifact_root).search(factor_id=factor.factor_id, kind=parsed_kind)
+    ordered = list(reversed(rows))[:parsed_limit]
+    payload = {
+        "factor": _registry_factor_row(factor, tags_by_id.get(factor.factor_id)),
+        "runs": [_run_record_payload(row) for row in ordered],
+        "count": len(ordered),
+        "limit": parsed_limit,
+        "total": len(rows),
+    }
+    return _server._web_public_json(_redact_web_text(payload))

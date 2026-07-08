@@ -35,6 +35,7 @@ from quant_forge.apps.web.api import (
     _paths_payload,
     _query_parameter,
     _rd_status_payload,
+    _registry_factor_id_from_path,
 )
 from quant_forge.apps.web.html import _index_html
 from quant_forge.apps.web.jobs import LOGGER, RequestBodyTooLarge, _WebJobManager, _client_error_message
@@ -141,6 +142,32 @@ def create_local_web_server(
                         payload = _server._bench_runs_payload(
                             config,
                             limit=_query_parameter(parsed_url.query, "limit"),
+                        )
+                    except ValueError as exc:
+                        self._json({"error": str(exc)}, status=400)
+                    else:
+                        self._json(payload)
+                elif path == "/api/data/catalog":
+                    self._require_control_token()
+                    self._json(_server._data_catalog_payload(config))
+                elif path == "/api/data/status":
+                    # No per-route ValueError reflection here on purpose: this
+                    # route takes no parameters, and validation-layer errors
+                    # (for example an unreadable panel file) may carry local
+                    # path detail, so they keep the generic mapping below.
+                    self._require_control_token()
+                    self._json(_server._data_status_payload(config))
+                elif path == "/api/registry/factors":
+                    self._require_control_token()
+                    self._json(_server._registry_factors_payload(config))
+                elif path.startswith("/api/registry/factors/"):
+                    self._require_control_token()
+                    try:
+                        payload = _server._registry_factor_detail_payload(
+                            config,
+                            _registry_factor_id_from_path(path),
+                            limit=_query_parameter(parsed_url.query, "limit"),
+                            kind=_query_parameter(parsed_url.query, "kind"),
                         )
                     except ValueError as exc:
                         self._json({"error": str(exc)}, status=400)

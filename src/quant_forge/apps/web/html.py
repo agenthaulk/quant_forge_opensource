@@ -585,6 +585,33 @@ def _index_html(
       border-radius: 8px; padding: 10px 12px; margin: 0 0 10px; font-size: 13px; }}
     .notice.warn {{ border-left-color: var(--warn); background: var(--warn-wash); color: var(--ink); }}
     .notice.err  {{ border-left-color: var(--bad);  background: var(--bad-wash);  color: var(--ink); }}
+    /* CP6-3 Data console + Registry: token-referencing declarations only
+       (zero new color literals), so both themes come from the variables. */
+    .notice.ok  {{ border-left-color: var(--accent-2); background: var(--ok-wash); color: var(--ink); }}
+    .pill.muted {{ color: var(--faint); }}
+    .tile-range {{ display: block; margin-top: 10px; color: var(--ink);
+      font-family: var(--mono); font-size: 13px; line-height: 1.4; }}
+    .tag-chips  {{ margin-top: 6px; }}
+    .registry-layout {{ display: grid; grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
+      gap: 14px; align-items: start; }}
+    .registry-list {{ display: grid; gap: 8px; align-content: start; }}
+    .registry-row {{ width: 100%; margin: 0; padding: 10px 12px; border: 1px solid var(--line);
+      border-radius: 8px; background: var(--panel); color: var(--ink);
+      font-size: 13px; font-weight: 400; text-align: left; cursor: pointer; }}
+    .registry-row:hover {{ background: var(--wash); }}
+    .registry-row[aria-current="true"] {{ border-color: var(--accent); box-shadow: inset 2px 0 0 var(--accent); }}
+    .registry-row:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .registry-row-name {{ display: flex; justify-content: space-between; gap: 8px;
+      align-items: baseline; font-weight: 800; }}
+    .registry-row-formula {{ display: block; margin-top: 4px; color: var(--muted);
+      font-family: var(--mono); font-size: 11px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+    .registry-detail {{ min-width: 0; }}
+    .registry-runs-toolbar {{ display: flex; align-items: center; gap: 10px; margin: 0 0 10px; }}
+    .registry-runs-toolbar label {{ margin: 0; }}
+    .registry-runs-toolbar select {{ width: auto; padding: 6px 10px; font-size: 12px; }}
+    .nowrap {{ white-space: nowrap; }}
+    .table-scroll {{ overflow-x: auto; }}
     @media (prefers-color-scheme: dark) {{
       :root {{
         --ink: #e6ece8; --muted: #9fb0a8; --faint: #7d8d86;
@@ -622,6 +649,12 @@ def _index_html(
       .report-section {{ scroll-margin-top: 120px; }}
       .grid {{ grid-template-columns: repeat(2, minmax(140px, 1fr)); }}
       .evidence-grid {{ grid-template-columns: 1fr; }}
+      .registry-layout {{ grid-template-columns: 1fr; }}
+      /* Below the collapse point the dense tables keep a readable minimum
+         width and scroll sideways inside .table-scroll instead of
+         crushing cell content into vertical letter stacks. */
+      .data-fields-table {{ min-width: 640px; }}
+      .registry-runs-table {{ min-width: 520px; }}
       .hero-panel {{ grid-template-columns: 1fr; }}
       .formula-badge {{ justify-self: start; text-align: left; }}
     }}
@@ -727,11 +760,13 @@ def _index_html(
         <li class="step is-pending" data-step="rd"><span class="step-index">5</span><button type="button" class="step-link" data-step-action="rd">RD 循环</button></li>
       </ol>
     </nav>
-    <div class="lab-tabs" role="tablist" aria-label="Lab 工作台">
+    <div class="lab-tabs" role="tablist" aria-label="工作台视图">
       <button class="lab-tab" role="tab" id="lab-tab-factor" aria-controls="lab-panel-factor" aria-selected="true">因子工作台 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-rd" aria-controls="lab-panel-rd" aria-selected="false" tabindex="-1">RD 循环 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-history" aria-controls="lab-panel-history" aria-selected="false" tabindex="-1">研究历史 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-bench" aria-controls="lab-panel-bench" aria-selected="false" tabindex="-1">Benchmark <span class="lab-tab-dot" hidden></span></button>
+      <button class="lab-tab" role="tab" id="lab-tab-data" aria-controls="lab-panel-data" aria-selected="false" tabindex="-1">数据 <span class="lab-tab-dot" hidden></span></button>
+      <button class="lab-tab" role="tab" id="lab-tab-registry" aria-controls="lab-panel-registry" aria-selected="false" tabindex="-1">注册表 <span class="lab-tab-dot" hidden></span></button>
     </div>
     <div id="error" class="err"></div>
     <section class="lab-tabpanel" role="tabpanel" id="lab-panel-factor" aria-labelledby="lab-tab-factor" tabindex="0">
@@ -780,6 +815,30 @@ def _index_html(
         <div class="panel empty-state">
           <h3>暂无 bench 结果</h3>
           <p class="meta">运行 qf factor bench 后，多因子指标状态表会展示在这里。</p>
+        </div>
+      </div>
+    </section>
+    <section class="lab-tabpanel" role="tabpanel" id="lab-panel-data" aria-labelledby="lab-tab-data" tabindex="0" hidden>
+      <div class="section-title">
+        <h2>数据控制台</h2>
+        <p>字段目录、覆盖范围与质量门</p>
+      </div>
+      <div id="data-result">
+        <div class="panel empty-state">
+          <h3>等待加载</h3>
+          <p class="meta">打开本页签后，字段目录、覆盖范围和质量门结果会展示在这里。</p>
+        </div>
+      </div>
+    </section>
+    <section class="lab-tabpanel" role="tabpanel" id="lab-panel-registry" aria-labelledby="lab-tab-registry" tabindex="0" hidden>
+      <div class="section-title">
+        <h2>注册表</h2>
+        <p>因子定义与证据链</p>
+      </div>
+      <div id="registry-result">
+        <div class="panel empty-state">
+          <h3>等待加载</h3>
+          <p class="meta">因子目录加载后，定义详情与关联运行记录会展示在这里。</p>
         </div>
       </div>
     </section>

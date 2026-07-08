@@ -2,9 +2,10 @@
 
 Pins the Lab-view contract on top of the CP6-1 skeleton:
 
-- the served page carries the Lab chrome (flow stepper + tablist + four tab
-  panels) while every pre-existing mount id stays in the initial HTML, so
-  view modules that bind DOM at import time keep working;
+- the served page carries the Lab chrome (flow stepper + tablist + tab
+  panels; CP6-3 appends the data/registry tabs to the same strip) while
+  every pre-existing mount id stays in the initial HTML, so view modules
+  that bind DOM at import time keep working;
 - ``views/lab.js`` is a pure client-side controller (no fetch calls, no new
   endpoints) with keyboard navigation and hash routing;
 - ``views/spark.js`` renders the single inline-SVG sparkline and renders
@@ -69,24 +70,34 @@ def _get(base_url: str, path: str) -> tuple[int, str, bytes]:
 
 def test_index_page_hosts_mounts_inside_lab_tab_panels(web_config) -> None:
     html = web_server._index_html(web_config)
-    # Tablist wiring: four tabs, factor selected, panels labelled by tabs.
+    # Tablist wiring: six tabs (CP6-2 four + CP6-3 data/registry appended so
+    # existing tab indices stay stable), factor selected, panels labelled by
+    # tabs. The tablist spans non-Lab views since CP6-3, hence the label.
     assert 'role="tablist"' in html
-    assert 'aria-label="Lab 工作台"' in html
+    assert 'aria-label="工作台视图"' in html
     for tab, panel in (
         ("lab-tab-factor", "lab-panel-factor"),
         ("lab-tab-rd", "lab-panel-rd"),
         ("lab-tab-history", "lab-panel-history"),
         ("lab-tab-bench", "lab-panel-bench"),
+        ("lab-tab-data", "lab-panel-data"),
+        ("lab-tab-registry", "lab-panel-registry"),
     ):
         assert f'id="{tab}" aria-controls="{panel}"' in html
         assert f'id="{panel}" aria-labelledby="{tab}"' in html
-    assert html.count('role="tab"') == 4
-    assert html.count('role="tabpanel"') == 4
+    assert html.count('role="tab"') == 6
+    assert html.count('role="tabpanel"') == 6
     tablist = html[html.index('role="tablist"') : html.index('id="error"')]
     assert tablist.count('aria-selected="true"') == 1
-    assert tablist.count('aria-selected="false"') == 3
+    assert tablist.count('aria-selected="false"') == 5
     # Non-default panels start hidden; the default factor panel does not.
-    for panel in ("lab-panel-rd", "lab-panel-history", "lab-panel-bench"):
+    for panel in (
+        "lab-panel-rd",
+        "lab-panel-history",
+        "lab-panel-bench",
+        "lab-panel-data",
+        "lab-panel-registry",
+    ):
         start = html.index(f'id="{panel}"')
         assert "hidden" in html[start : html.index(">", start)], panel
     factor_start = html.index('id="lab-panel-factor"')
@@ -100,6 +111,10 @@ def test_index_page_hosts_mounts_inside_lab_tab_panels(web_config) -> None:
     assert html.index('id="lab-panel-history"') < html.index('id="history-result"')
     assert html.index('id="history-result"') < html.index('id="lab-panel-bench"')
     assert html.index('id="lab-panel-bench"') < html.index('id="bench-result"')
+    assert html.index('id="bench-result"') < html.index('id="lab-panel-data"')
+    assert html.index('id="lab-panel-data"') < html.index('id="data-result"')
+    assert html.index('id="data-result"') < html.index('id="lab-panel-registry"')
+    assert html.index('id="lab-panel-registry"') < html.index('id="registry-result"')
     # The global error line stays outside (above) the tab panels.
     assert html.index('id="error"') < html.index('id="lab-panel-factor"')
 

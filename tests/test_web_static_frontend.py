@@ -35,19 +35,22 @@ JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 HTML_CONTENT_TYPE = "text/html; charset=utf-8"
 JS_CONTENT_TYPE = "text/javascript; charset=utf-8"
 
-# The complete CP6-1 module set (+ CP6-2 Lab chrome). A new module must be
-# added here so the no-external-resources and single-renderer sweeps keep
-# covering everything.
+# The complete CP6-1 module set (+ CP6-2 Lab chrome + CP6-3 data/registry
+# views). A new module must be added here so the no-external-resources and
+# single-renderer sweeps keep covering everything.
 EXPECTED_STATIC_MODULES = (
     "api.js",
     "app.js",
     "metric.js",
     "views/bench.js",
+    "views/data.js",
     "views/factor.js",
     "views/history.js",
     "views/lab.js",
+    "views/registry.js",
     "views/research.js",
     "views/spark.js",
+    "views/tags.js",
 )
 
 # One definition site for every MetricValue rendering helper (metric.js).
@@ -174,6 +177,19 @@ def test_index_page_keeps_all_panel_sections_and_controls(web_app) -> None:
         '因子工作台',
         'RD 循环',
         '研究流程',
+    ):
+        assert marker in html, marker
+    # CP6-3 Data console + Registry tabs, panels, and mounts.
+    for marker in (
+        'id="lab-tab-data"',
+        'id="lab-tab-registry"',
+        'id="lab-panel-data"',
+        'id="lab-panel-registry"',
+        'id="data-result"',
+        'id="registry-result"',
+        '数据控制台',
+        '注册表',
+        '等待加载',
     ):
         assert marker in html, marker
     # Control rail forms and runtime strip.
