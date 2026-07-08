@@ -16,7 +16,6 @@ from uuid import uuid4
 from quant_forge.backtesting.service import EXTERNAL_OOS_ROLE, IN_SAMPLE_ROLE, run_factor_backtest
 from quant_forge.core.contracts import (
     BacktestResult,
-    BacktestSegmentMetric,
     EvaluationResult,
     FactorAssessmentBundle,
     FactorDefinition,
@@ -35,7 +34,16 @@ from quant_forge.lineage.store import (
     metric_highlight,
     relative_artifact_path,
 )
-from quant_forge.research_loop.candidate_gate import INSUFFICIENT_OOS_EVIDENCE
+from quant_forge.research_loop.candidate_gate import (
+    SegmentEvidence,
+    max_oos_decay_reasons,
+    min_net_return_retention_reasons,
+    min_oos_return_reasons,
+    net_return_retention_value,
+    oos_net_decay_exceeded,
+    oos_return_evidence,
+    turnover_reasons,
+)
 from quant_forge.research_loop.candidate_gate import evaluate_candidate as evaluate_structured_candidate
 from quant_forge.research_loop.context_builder import ResearchContextBuilder
 from quant_forge.research_loop.contracts import (
@@ -107,8 +115,18 @@ class ResearchGate:
     max_turnover_rate: float | None = None
     min_net_return_retention: float | None = None
     max_oos_net_return_decay: float | None = None
+    # F-5: when False, missing-evidence findings for the OOS/net-return
+    # clauses downgrade from blocking reasons to warnings (candidate-gate
+    # parity). Threshold violations always block. Default True preserves the
+    # pre-existing fail-closed behavior.
+    missing_oos_evidence_blocks: bool = True
 
     def __post_init__(self) -> None:
+        # Loader parity (F-5): a truthy non-bool (e.g. the string "false")
+        # must not silently flip the missing-evidence channel when the gate
+        # is constructed directly instead of via the strict YAML loader.
+        if not isinstance(self.missing_oos_evidence_blocks, bool):
+            raise ValueError("missing_oos_evidence_blocks must be a boolean")
         if self.min_ic_days < 0:
             raise ValueError("min_ic_days must be non-negative")
         if not 0 <= self.min_coverage <= 1:
@@ -295,7 +313,7 @@ class LocalSelfReviewGenerator:
         if _oos_decay(evaluation):
             risks.append("OOS2 ICIR decays versus IS")
             next_hypotheses.append(f"test a simpler or more robust variant of {candidate.name}")
-        if _oos_net_decay(backtest):
+        if oos_net_decay_exceeded(_segment_gate_evidence(backtest), 0.5):
             risks.append("OOS net return decays versus IS")
             next_hypotheses.append(f"validate {candidate.name} on a later OOS period")
         if not next_hypotheses:
@@ -339,6 +357,10 @@ class ResearchCandidateResult:
     gate_passed: bool
     gate_reasons: tuple[str, ...]
     self_review: ResearchSelfReview
+    # Warn-mode gate findings (e.g. INSUFFICIENT_OOS_EVIDENCE with
+    # missing_oos_evidence_blocks=False). A separate channel from
+    # ``gate_reasons`` so a warning can never read as a blocker downstream.
+    gate_warnings: tuple[str, ...] = ()
     transitioned_to_candidate: bool = False
     formula_fingerprint: str = ""
     result_signature: str = ""
@@ -1484,12 +1506,20 @@ class ResearchLoopService:
             sample_splits=self.sample_splits,
             include_external_oos=True,
         )
-        gate_passed, gate_reasons = apply_gate(
+        gate_passed, gate_blocking, gate_warnings = apply_gate_detailed(
             scored.evaluation,
             scored.backtest,
             scored.score,
             candidate_gate,
             oos_backtest=scored.external_oos_backtest,
+        )
+        # gate_reasons is the blocking-facing channel: on a pass it carries the
+        # pass marker plus visible warn-mode findings (FP-7); on a failure it
+        # carries ONLY blockers — warnings ride gate_warnings separately.
+        gate_reasons = (
+            tuple(dict.fromkeys(("passed smoke research gate", *gate_warnings)))
+            if gate_passed
+            else gate_blocking
         )
         result_signature = (
             _result_signature_from_scored(scored, precision=self.deduplication.result_precision)
@@ -1500,8 +1530,11 @@ class ResearchLoopService:
             existing_factor_id = result_signature_index.get(result_signature)
             if existing_factor_id and existing_factor_id != trial.factor.factor_id:
                 gate_passed = False
+                # Rebuild from the blocking channel so warn-mode findings do
+                # not leak into blocking reasons when a pass flips to a
+                # duplicate rejection.
                 gate_reasons = (
-                    *tuple(reason for reason in gate_reasons if reason != "passed smoke research gate"),
+                    *gate_blocking,
                     f"duplicate result signature matches {existing_factor_id}",
                 )
             else:
@@ -1568,6 +1601,7 @@ class ResearchLoopService:
             gate_passed=gate_passed,
             gate_reasons=gate_reasons,
             self_review=self_review,
+            gate_warnings=gate_warnings,
             transitioned_to_candidate=transitioned_to_candidate,
             formula_fingerprint=factor_formula_fingerprint(candidate),
             result_signature=result_signature,
@@ -1818,57 +1852,103 @@ def apply_gate(
     *,
     oos_backtest: BacktestResult | None = None,
 ) -> tuple[bool, tuple[str, ...]]:
+    """Research smoke gate; clause definitions shared with candidate_gate (F-2, FP-5).
+
+    Compatibility surface over ``apply_gate_detailed``: on a pass the reasons
+    tuple keeps warn-mode findings visible next to the pass marker (FP-7); on
+    a failure it carries ONLY blocking reasons — warn-mode messages ride the
+    separate warnings channel and must never read as blockers.
+    """
+
+    passed, blocking, warnings = apply_gate_detailed(
+        evaluation, backtest, score, gate, oos_backtest=oos_backtest
+    )
+    if passed:
+        return True, tuple(dict.fromkeys(("passed smoke research gate", *warnings)))
+    return False, blocking
+
+
+def apply_gate_detailed(
+    evaluation: EvaluationResult,
+    backtest: BacktestResult,
+    score: float,
+    gate: ResearchGate,
+    *,
+    oos_backtest: BacktestResult | None = None,
+) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
+    """Research smoke gate returning ``(passed, blocking, warnings)``.
+
+    The warn-mode channel (missing OOS/net-return evidence with
+    ``missing_oos_evidence_blocks=False``) stays separate from the blocking
+    payload so downstream consumers (memory failure statements, structured
+    gate decisions) can never mistake a warning for a blocker.
+    """
+
     # The OOS-specific gate clauses must judge the external out-of-sample
     # backtest when a distinct holdout window is configured; when no external
     # OOS backtest is supplied we fall back to the in-sample backtest so the
     # default (evaluation_profile == backtest_profile) behavior is unchanged.
     oos = oos_backtest if oos_backtest is not None else backtest
-    reasons: list[str] = []
+    blocking: list[str] = []
+    warnings: list[str] = []
     if evaluation.ic_days < gate.min_ic_days:
-        reasons.append(f"ic_days {evaluation.ic_days} < {gate.min_ic_days}")
+        blocking.append(f"ic_days {evaluation.ic_days} < {gate.min_ic_days}")
     if evaluation.coverage < gate.min_coverage:
-        reasons.append(f"coverage {evaluation.coverage:.4f} < {gate.min_coverage:.4f}")
+        blocking.append(f"coverage {evaluation.coverage:.4f} < {gate.min_coverage:.4f}")
     if backtest.periods < gate.min_backtest_periods:
-        reasons.append(f"backtest_periods {backtest.periods} < {gate.min_backtest_periods}")
+        blocking.append(f"backtest_periods {backtest.periods} < {gate.min_backtest_periods}")
     if score < gate.min_score:
-        reasons.append(f"score {score:.6f} < {gate.min_score:.6f}")
+        blocking.append(f"score {score:.6f} < {gate.min_score:.6f}")
+    segments = _segment_gate_evidence(oos)
     if gate.min_oos_net_annualized_return is not None:
-        oos_segments = _oos_segments(oos)
-        if not oos_segments:
-            reasons.append(
-                f"{INSUFFICIENT_OOS_EVIDENCE}: min_oos_net_annualized_return is configured "
-                "but the backtest reports no OOS segments"
-            )
-        for metric in oos_segments:
-            if metric.net_annualized_return is None:
-                reasons.append(f"{metric.name} net_annualized_return unavailable")
-            elif metric.net_annualized_return < gate.min_oos_net_annualized_return:
-                reasons.append(
-                    f"{metric.name} net_annualized_return {metric.net_annualized_return:.6f} "
-                    f"< {gate.min_oos_net_annualized_return:.6f}"
-                )
-    if gate.max_rebalance_rate is not None and backtest.rebalance_rate is not None and backtest.rebalance_rate > gate.max_rebalance_rate:
-        reasons.append(
-            f"rebalance_rate {backtest.rebalance_rate:.6f} "
-            f"> {gate.max_rebalance_rate:.6f}"
+        clause_blocking, clause_warnings = min_oos_return_reasons(
+            oos_return_evidence(segments),
+            gate.min_oos_net_annualized_return,
+            missing_blocks=gate.missing_oos_evidence_blocks,
         )
-    if gate.max_turnover_rate is not None and backtest.turnover_rate is not None and backtest.turnover_rate > gate.max_turnover_rate:
-        reasons.append(f"turnover_rate {backtest.turnover_rate:.6f} > {gate.max_turnover_rate:.6f}")
+        blocking.extend(clause_blocking)
+        warnings.extend(clause_warnings)
+    # FP-5 completion: the turnover-family clauses consume the same shared
+    # helper as the structured candidate gate (one definition, one message
+    # format). The research gate has no turnover warn channel, so findings
+    # always block here.
+    blocking.extend(
+        turnover_reasons(
+            {"rebalance_rate": backtest.rebalance_rate, "turnover_rate": backtest.turnover_rate},
+            max_rebalance_rate=gate.max_rebalance_rate,
+            max_turnover_rate=gate.max_turnover_rate,
+        )
+    )
     if gate.min_net_return_retention is not None:
-        retention = _net_return_retention(oos)
-        if retention < gate.min_net_return_retention:
-            reasons.append(f"net_return_retention {retention:.6f} < {gate.min_net_return_retention:.6f}")
+        clause_blocking, clause_warnings = min_net_return_retention_reasons(
+            net_return_retention_value(oos.net_annualized_return, oos.annualized_return),
+            gate.min_net_return_retention,
+            missing_blocks=gate.missing_oos_evidence_blocks,
+        )
+        blocking.extend(clause_blocking)
+        warnings.extend(clause_warnings)
     if gate.max_oos_net_return_decay is not None:
-        if _oos_net_decay(oos, gate.max_oos_net_return_decay):
-            reasons.append(f"OOS net return decay exceeds {gate.max_oos_net_return_decay:.6f}")
-        elif not _oos_decay_evidence_available(oos):
-            reasons.append(
-                f"{INSUFFICIENT_OOS_EVIDENCE}: max_oos_net_return_decay is configured "
-                "but IS/OOS net_annualized_return evidence is missing"
-            )
-    if not reasons:
-        reasons.append("passed smoke research gate")
-    return len(reasons) == 1 and reasons[0] == "passed smoke research gate", tuple(reasons)
+        clause_blocking, clause_warnings = max_oos_decay_reasons(
+            segments,
+            gate.max_oos_net_return_decay,
+            missing_blocks=gate.missing_oos_evidence_blocks,
+        )
+        blocking.extend(clause_blocking)
+        warnings.extend(clause_warnings)
+    blocking_out = tuple(dict.fromkeys(blocking))
+    warnings_out = tuple(dict.fromkeys(warnings))
+    return not blocking_out, blocking_out, warnings_out
+
+
+def _segment_gate_evidence(backtest: BacktestResult) -> tuple[SegmentEvidence, ...]:
+    return tuple(
+        SegmentEvidence(
+            name=metric.name,
+            net_annualized_return=metric.net_annualized_return,
+            periods=metric.periods,
+        )
+        for metric in backtest.segment_metrics
+    )
 
 
 def _validate_search_settings(
@@ -2531,6 +2611,10 @@ def _structured_result_from_candidate(
             artifact_refs=_artifact_refs(candidate),
         )
     )
+    # Warn-mode smoke-gate findings ride the decision's warnings channel on
+    # both branches — never blocking_reasons — so a downgraded
+    # INSUFFICIENT_OOS_EVIDENCE message stays distinguishable from a blocker.
+    merged_warnings = tuple(dict.fromkeys((*decision.warnings, *candidate.gate_warnings)))
     if candidate.gate_passed:
         decision = replace(
             decision,
@@ -2538,6 +2622,7 @@ def _structured_result_from_candidate(
             transition_reason=decision.transition_reason
             if candidate.transitioned_to_candidate
             else "Candidate passed research gates without a new status transition.",
+            warnings=merged_warnings,
         )
     else:
         decision = replace(
@@ -2545,6 +2630,7 @@ def _structured_result_from_candidate(
             status="blocked",
             accepted=False,
             blocking_reasons=tuple(dict.fromkeys((*decision.blocking_reasons, *candidate.gate_reasons))),
+            warnings=merged_warnings,
             should_transition_to_candidate=False,
             transition_reason="",
         )
@@ -2587,6 +2673,11 @@ def _backtest_metrics(backtest: BacktestResult) -> dict[str, object]:
         "net_long_short_sharpe": backtest.net_long_short_sharpe,
         "rebalance_rate": backtest.rebalance_rate,
         "turnover_rate": backtest.turnover_rate,
+        # F-3: propagate segment evidence so externally configured OOS clauses
+        # on the structured candidate gate judge real segments instead of
+        # fail-closing on absent evidence (FP-2); the gate reads these via
+        # candidate_gate._segments.
+        "segment_metrics": [asdict(metric) for metric in backtest.segment_metrics],
         "score_source": backtest.score_source,
         "score_cached_rows": backtest.score_cached_rows,
         "score_computed_rows": backtest.score_computed_rows,
@@ -2644,50 +2735,10 @@ def _oos_decay(evaluation: EvaluationResult) -> bool:
     return oos2_metric.rank_icir < is_metric.rank_icir * 0.5
 
 
-def _oos_segments(backtest: BacktestResult) -> tuple[BacktestSegmentMetric, ...]:
-    return tuple(metric for metric in backtest.segment_metrics if metric.name.upper().startswith("OOS"))
-
-
 def _cost_sensitive(backtest: BacktestResult) -> bool:
     if backtest.annualized_return is None or backtest.net_annualized_return is None:
         return False
     return backtest.annualized_return > 0 and backtest.net_annualized_return < backtest.annualized_return * 0.5
-
-
-def _net_return_retention(backtest: BacktestResult) -> float:
-    if backtest.annualized_return is None or backtest.net_annualized_return is None:
-        return 1.0
-    if backtest.annualized_return <= 0:
-        return 1.0 if backtest.net_annualized_return >= backtest.annualized_return else 0.0
-    return float(backtest.net_annualized_return / backtest.annualized_return)
-
-
-def _oos_decay_evidence_available(backtest: BacktestResult) -> bool:
-    split_by_name = {metric.name.upper(): metric for metric in backtest.segment_metrics}
-    is_metric = split_by_name.get("IS")
-    if is_metric is None or is_metric.net_annualized_return is None:
-        return False
-    return any(
-        name.startswith("OOS") and metric.net_annualized_return is not None
-        for name, metric in split_by_name.items()
-    )
-
-
-def _oos_net_decay(backtest: BacktestResult, max_decay: float = 0.5) -> bool:
-    split_by_name = {metric.name.upper(): metric for metric in backtest.segment_metrics}
-    is_metric = split_by_name.get("IS")
-    if is_metric is None or is_metric.periods == 0 or is_metric.net_annualized_return is None:
-        return False
-    for name, metric in split_by_name.items():
-        if name.startswith("OOS") and metric.periods > 0 and metric.net_annualized_return is not None:
-            if is_metric.net_annualized_return <= 0:
-                if metric.net_annualized_return < is_metric.net_annualized_return:
-                    return True
-                continue
-            ratio = metric.net_annualized_return / is_metric.net_annualized_return
-            if ratio < max_decay:
-                return True
-    return False
 
 
 def _oos_net_return_decay_value(backtest: BacktestResult) -> float | None:
@@ -2696,8 +2747,9 @@ def _oos_net_return_decay_value(backtest: BacktestResult) -> float | None:
     Returns None — never a fabricated number (FP-2/FP-4) — when the IS
     baseline or every OOS segment lacks ``net_annualized_return`` evidence,
     or when the IS baseline is non-positive so the ratio is undefined. At the
-    selector's 0.5 threshold this matches the gate helper ``_oos_net_decay``:
-    ``ratio < 0.5`` if and only if ``1 - ratio > 0.5``.
+    selector's 0.5 threshold this matches the shared gate definition
+    ``candidate_gate.oos_net_decay_exceeded`` (F-2, FP-5): ``1 - ratio > 0.5``
+    if and only if ``ratio < 0.5``.
     """
 
     split_by_name = {metric.name.upper(): metric for metric in backtest.segment_metrics}

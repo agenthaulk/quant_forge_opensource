@@ -6,6 +6,7 @@ from pathlib import Path
 
 from quant_forge.core.contracts import BacktestResult, BacktestSegmentMetric, EvaluationResult
 from quant_forge.research_loop.candidate_gate import (
+    INSUFFICIENT_EVIDENCE,
     INSUFFICIENT_OOS_EVIDENCE,
     CandidateGateConfig,
     evaluate_candidate,
@@ -14,7 +15,10 @@ from quant_forge.research_loop.contracts import FactorExperimentPlan, FactorExpe
 from quant_forge.research_loop.service import ResearchGate, apply_gate
 
 
-def _ready_result(backtest_metrics: dict[str, object] | None = None) -> FactorExperimentResult:
+def _ready_result(
+    backtest_metrics: dict[str, object] | None = None,
+    correlation_summary: dict[str, object] | None = None,
+) -> FactorExperimentResult:
     plan = FactorExperimentPlan(
         plan_id="plan-oos-evidence",
         hypothesis_id="hyp-1",
@@ -34,6 +38,7 @@ def _ready_result(backtest_metrics: dict[str, object] | None = None) -> FactorEx
             "score": 1.0,
         },
         backtest_metrics=dict(backtest_metrics or {}),
+        correlation_summary=dict(correlation_summary or {}),
     )
 
 
@@ -123,7 +128,12 @@ def _evaluation_stub() -> EvaluationResult:
     )
 
 
-def _backtest_stub(segment_metrics: tuple[BacktestSegmentMetric, ...] = ()) -> BacktestResult:
+def _backtest_stub(
+    segment_metrics: tuple[BacktestSegmentMetric, ...] = (),
+    *,
+    rebalance_rate: float | None = 0.0,
+    turnover_rate: float | None = 0.0,
+) -> BacktestResult:
     return BacktestResult(
         factor_id="f",
         periods=10,
@@ -133,6 +143,8 @@ def _backtest_stub(segment_metrics: tuple[BacktestSegmentMetric, ...] = ()) -> B
         annualized_volatility=0.1,
         max_drawdown=-0.05,
         artifact_path=Path("bt.json"),
+        rebalance_rate=rebalance_rate,
+        turnover_rate=turnover_rate,
         segment_metrics=segment_metrics,
     )
 
@@ -186,3 +198,129 @@ def test_apply_gate_with_present_evidence_keeps_existing_semantics() -> None:
     )
     assert passed
     assert not any(reason.startswith(INSUFFICIENT_OOS_EVIDENCE) for reason in reasons)
+
+
+# ---------------------------------------------------------------------------
+# F-1: retention/turnover/correlation clauses must not pass on missing
+# evidence either (same FP-2 class as A-P1-3, quantitative_core_audit.md §5)
+# ---------------------------------------------------------------------------
+
+
+def test_correlation_cap_blocks_without_correlation_evidence() -> None:
+    decision = evaluate_candidate(
+        _ready_result(),
+        CandidateGateConfig(max_abs_corr_with_active=0.5),
+    )
+    assert decision.status == "blocked"
+    assert any(
+        reason.startswith(INSUFFICIENT_EVIDENCE) and "max_abs_corr_with_active" in reason
+        for reason in decision.blocking_reasons
+    )
+
+
+def test_correlation_cap_keeps_existing_semantics_with_evidence() -> None:
+    clean = evaluate_candidate(
+        _ready_result(correlation_summary={"max_abs_corr_with_active": 0.3}),
+        CandidateGateConfig(max_abs_corr_with_active=0.5),
+    )
+    assert clean.status == "passed"
+
+    too_high = evaluate_candidate(
+        _ready_result(correlation_summary={"max_abs_corr_with_active": 0.6}),
+        CandidateGateConfig(max_abs_corr_with_active=0.5),
+    )
+    assert too_high.status == "blocked"
+    assert any("correlation too high" in reason for reason in too_high.blocking_reasons)
+
+
+def test_turnover_clauses_block_without_evidence() -> None:
+    decision = evaluate_candidate(
+        _ready_result(),
+        CandidateGateConfig(max_turnover_rate=1.0, max_rebalance_rate=0.8),
+    )
+    assert decision.status == "blocked"
+    markers = [
+        reason for reason in decision.blocking_reasons if reason.startswith(INSUFFICIENT_EVIDENCE)
+    ]
+    assert any("max_turnover_rate" in reason for reason in markers)
+    assert any("max_rebalance_rate" in reason for reason in markers)
+
+    with_evidence = evaluate_candidate(
+        _ready_result({"turnover_rate": 0.5, "rebalance_rate": 0.4}),
+        CandidateGateConfig(max_turnover_rate=1.0, max_rebalance_rate=0.8),
+    )
+    assert with_evidence.status == "passed"
+
+
+def test_turnover_missing_evidence_rides_the_warning_channel_when_configured() -> None:
+    decision = evaluate_candidate(
+        _ready_result(),
+        CandidateGateConfig(max_turnover_rate=1.0, turnover_blocks_candidate=False),
+    )
+    assert decision.status == "passed"
+    assert any(reason.startswith(INSUFFICIENT_EVIDENCE) for reason in decision.warnings)
+
+
+def test_apply_gate_turnover_clauses_block_without_evidence() -> None:
+    passed, reasons = apply_gate(
+        _evaluation_stub(),
+        _backtest_stub(rebalance_rate=None, turnover_rate=None),
+        1.0,
+        ResearchGate(max_turnover_rate=1.0, max_rebalance_rate=0.8),
+    )
+    assert not passed
+    markers = [reason for reason in reasons if reason.startswith(INSUFFICIENT_EVIDENCE)]
+    assert any("max_turnover_rate" in reason for reason in markers)
+    assert any("max_rebalance_rate" in reason for reason in markers)
+
+
+# ---------------------------------------------------------------------------
+# Zero-period segments are MISSING decay evidence, not usable evidence: the
+# evidence-availability check must apply the same usability rule as the
+# exceedance check (periods > 0), so a returns-present/periods=0 segment
+# fails closed under missing_oos_evidence_blocks instead of silently passing.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_gate_blocks_zero_period_decay_evidence() -> None:
+    """Codex xhigh reproduction: IS/OOS1 report returns but periods=0, with
+    max_oos_net_return_decay=0.1 configured. The exceedance check rightly
+    skips zero-period segments, but the evidence check trusted the bare
+    returns and the gate PASSED. It must block with the missing-evidence
+    marker instead."""
+
+    passed, reasons = apply_gate(
+        _evaluation_stub(),
+        _backtest_stub((_segment("IS", 0.25, periods=0), _segment("OOS1", 0.2, periods=0))),
+        1.0,
+        ResearchGate(max_oos_net_return_decay=0.1),
+    )
+    assert not passed
+    assert any(reason.startswith(INSUFFICIENT_OOS_EVIDENCE) for reason in reasons)
+
+
+def test_apply_gate_zero_period_decay_evidence_warns_in_warn_mode() -> None:
+    passed, reasons = apply_gate(
+        _evaluation_stub(),
+        _backtest_stub((_segment("IS", 0.25, periods=0), _segment("OOS1", 0.2, periods=0))),
+        1.0,
+        ResearchGate(max_oos_net_return_decay=0.1, missing_oos_evidence_blocks=False),
+    )
+    assert passed
+    # FP-2/FP-7: the downgrade must stay visible, never silent.
+    assert any(reason.startswith(INSUFFICIENT_OOS_EVIDENCE) for reason in reasons)
+
+
+def test_candidate_gate_treats_zero_period_segments_as_missing_decay_evidence() -> None:
+    metrics = {
+        "segment_metrics": [
+            {"name": "IS", "net_annualized_return": 0.25, "periods": 0},
+            {"name": "OOS1", "net_annualized_return": 0.2, "periods": 0},
+        ]
+    }
+    decision = evaluate_candidate(
+        _ready_result(metrics),
+        CandidateGateConfig(max_oos_net_return_decay=0.1),
+    )
+    assert decision.status == "blocked"
+    assert _marker_reasons(decision.blocking_reasons)
