@@ -130,7 +130,7 @@ pytest -q` + `python3 scripts/release_safety_scan.py` + CLI `--help` +
 - Verify: `git log --oneline 8f95f0a` exists; `tests/test_data_catalog_*.py`
   present; suite green.
 
-## CP6 — Interactive platform frontend (D6/D8) — 🔶 CP6-1 DONE
+## CP6 — Interactive platform frontend (D6/D8) — 🔶 CP6-1/CP6-2 DONE
 - Framework review = decision D8 (`a574674`, CP6_FRONTEND_PLAN.md): static
   ES-module app on the stdlib server, no build step / npm / external
   resources; sub-phases CP6-1 skeleton → CP6-2 Lab → CP6-3 Data+Registry
@@ -142,10 +142,25 @@ pytest -q` + `python3 scripts/release_safety_scan.py` + CLI `--help` +
   null-not-zero preserved verbatim); pyproject ships static/*.js. Codex
   xhigh review (fresh thread, after the first job hung) + Fable spot-check:
   all clean. Gate: combined barrier **748 passed**, scan 172, CLI, diff.
-- CP6-2/3/4 ⬜ TODO (CP6-3 depends on CP5 = done; each runs as a Workflow
-  wave with an Opus design pass then Codex review). Commercial boundary
-  (agent orchestration depth + portfolio rebalancing) stays out; D7/D7a
-  Extensions registry is the cuttable CP6-4 sub-item.
+- **CP6-2 ✅ DONE** (`d83f28e`): Lab workbench view — flow stepper
+  (想法→解析→验证→因子报告→RD 循环) + four tab panels re-hosting the
+  existing mounts; views/lab.js pure tab controller (zero fetch by
+  pinned contract), views/spark.js inline-SVG sparkline (null marks
+  skipped, never 0); factor/research componentized into section
+  renderers with byte-preserved markup; token-gated panels lazy-refresh
+  on activation + token storage. Opus design pass: computed WCAG audit,
+  4 contrast fixes (--accent-ink cut-out for dark), bench metric cells
+  adopt metricCellHtml. Codex xhigh fresh-thread review (fingerprint
+  verified): 3 major + 2 minor, all adjudicated accepted and fixed
+  (panel refresh wiring, FP-4 null-to-zero sweep, esc() interpolation
+  sweep, report-anchor deep links, 4 regression tests). Gate: **763
+  passed**, scan 175, CLI, diff-check clean.
+- CP6-3/4 ⬜ TODO (CP6-3 depends on CP5 = done; each runs as a Workflow
+  wave with an Opus design pass then Codex review; CP6-3 work order =
+  the recon packet's G1–G4 GET-endpoint specs from the CP6-2 wave).
+  Commercial boundary (agent orchestration depth + portfolio
+  rebalancing) stays out; D7/D7a Extensions registry is the cuttable
+  CP6-4 sub-item.
 - Optional cuttable sub-item per decision D7: declarative-only Extensions
   registry (manifest schema + 5 MVP contribution points + read-only
   browse panel; executable contributions rejected unconditionally; data.*
