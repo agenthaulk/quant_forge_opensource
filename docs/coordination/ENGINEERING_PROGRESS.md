@@ -130,7 +130,7 @@ pytest -q` + `python3 scripts/release_safety_scan.py` + CLI `--help` +
 - Verify: `git log --oneline 8f95f0a` exists; `tests/test_data_catalog_*.py`
   present; suite green.
 
-## CP6 — Interactive platform frontend (D6/D8) — 🔶 CP6-1/CP6-2 DONE
+## CP6 — Interactive platform frontend (D6/D8) — 🔶 CP6-1/2/3 DONE
 - Framework review = decision D8 (`a574674`, CP6_FRONTEND_PLAN.md): static
   ES-module app on the stdlib server, no build step / npm / external
   resources; sub-phases CP6-1 skeleton → CP6-2 Lab → CP6-3 Data+Registry
@@ -155,12 +155,24 @@ pytest -q` + `python3 scripts/release_safety_scan.py` + CLI `--help` +
   (panel refresh wiring, FP-4 null-to-zero sweep, esc() interpolation
   sweep, report-anchor deep links, 4 regression tests). Gate: **763
   passed**, scan 175, CLI, diff-check clean.
-- CP6-3/4 ⬜ TODO (CP6-3 depends on CP5 = done; each runs as a Workflow
-  wave with an Opus design pass then Codex review; CP6-3 work order =
-  the recon packet's G1–G4 GET-endpoint specs from the CP6-2 wave).
-  Commercial boundary (agent orchestration depth + portfolio
-  rebalancing) stays out; D7/D7a Extensions registry is the cuttable
-  CP6-4 sub-item.
+- **CP6-3 ✅ DONE** (`ad0889d`): Data console + Registry views. Four
+  GET-only endpoints (/api/data/catalog, /api/data/status,
+  /api/registry/factors, /api/registry/factors/{id}) with CP4-2
+  endpoint discipline; /api/data/status built field-by-field so
+  DataValidationResult path fields never enter the payload; factor-id
+  segment decode-once-then-validate. views/data.js + views/registry.js
+  + views/tags.js (single research-tag chip renderer; null-vs-empty
+  visible in UI). Codex xhigh fresh-thread review: 1 major
+  (percent-encoded legal ids 404ed) + 1 minor (id-class coverage) both
+  fixed. Gate: **795 passed**, scan 180, CLI, diff clean.
+  Residual (non-blocking, batch with integration findings): KeyError
+  404 bodies carry repr quotes (shared /api/jobs/ pattern);
+  fetchPanelJson errors lack HTTP status so 404/400 render unified;
+  history.js/bench.js duplicate status label for non-available metrics
+  (pre-existing CP4-2 quirk, fixed only in registry view).
+- CP6-4 ⬜ TODO (Docs view + declarative-only Extensions registry per
+  D7/D7a — proceeding, not cut; schedule permits). Commercial boundary
+  (agent orchestration depth + portfolio rebalancing) stays out.
 - Optional cuttable sub-item per decision D7: declarative-only Extensions
   registry (manifest schema + 5 MVP contribution points + read-only
   browse panel; executable contributions rejected unconditionally; data.*
