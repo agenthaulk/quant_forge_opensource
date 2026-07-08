@@ -8,15 +8,21 @@ beyond confirming their commits exist (`git log --oneline <range>`); resume
 at the FIRST phase not marked DONE by running its Verify command, then its
 remaining steps. Do not re-derive completed phases from transcripts.
 
-Branch: `fable/phase-c-research-platform-wave1` (base = Phase B tip
-`562a52b`). Gates definition: `PYTHONPATH=src python3 -m pytest -q` +
-`python3 scripts/release_safety_scan.py` + CLI `--help` + `git diff --check`.
+Branch: `fable/phase-c-platform-buildout` since CP4-1 landed (created from
+`fable/phase-c-research-platform-wave1` tip `8dc2731`, then merged
+`origin/main` @ `7e85b76` = PR #13 Phase A merge, zero tree delta — owner
+approved sync 2026-07-07; the wave1 branch is preserved at `8dc2731`).
+Earlier CPs landed on `fable/phase-c-research-platform-wave1` (base =
+Phase B tip `562a52b`). Gates definition: `PYTHONPATH=src python3 -m
+pytest -q` + `python3 scripts/release_safety_scan.py` + CLI `--help` +
+`git diff --check`.
 
 ---
 
 ## CP0 — Foundations (Phases A/B) — ✅ DONE
-- Phase A quant-core audit: merged approval given, **PR #13** submitted
-  (branch `fable/phase-a-quant-core-audit` @ bf19c73, 426 passed).
+- Phase A quant-core audit: **PR #13 MERGED** 2026-07-07 (true merge,
+  commit `7e85b76`; branch `fable/phase-a-quant-core-audit` @ bf19c73,
+  426 passed at submission). Local main fast-forwarded 7931522 → 7e85b76.
 - Phase B architecture + specs contracts: accepted @ `562a52b` (487 passed).
 - Verify (if ever needed): `git log --oneline bf19c73 562a52b` exist; PR #13 open/merged.
 
@@ -75,12 +81,31 @@ Branch: `fable/phase-c-research-platform-wave1` (base = Phase B tip
   diff clean. Adjudication table: WAVE1_REVIEW_RESOLUTION.md §CP3.
 - Verify: `git log --oneline 627bc34 445d4c7 4d4a4a3` exist; suite green.
 
-## CP4 — Server decomposition + Web research panels — ⬜ TODO
-- Order is binding (B4 F11): extract `apps/web/server.py` into
-  routing/api/html/jobs modules with characterization tests FIRST; only then
-  add Web "Research History" (run index reader) and "Benchmark" panels.
-- Acceptance: no behavior change in extraction step (route parity tests);
-  panels render statuses, never bare scalars.
+## CP4 — Server decomposition + Web research panels — 🔶 STEP 1 DONE
+- Step 1 (extraction) ✅ DONE. Order was binding (B4 F11): characterization
+  tests FIRST (`d682f20`, 23 tests, verified green against the pre-split
+  server via stash), then pure-move extraction (`8dc2731`): server.py
+  3451→167-line composition root re-exporting all 144 names; jobs.py 210 /
+  api.py 1391 / routing.py 353 / html.py 1594; 9 monkeypatch seams
+  late-bound at 24 call sites (in-function `import server as _server`);
+  `_index_html` byte-identical; logger channel pinned;
+  test_web_workbench.py untouched. Gate: **636 passed** (613→636), scan
+  153 files, compileall, CLI, diff-check all OK — Fable independent re-run.
+- Codex (GPT-5.5) strict review task-mrafznd5→task-mrbgqnk3: missed-seams /
+  early-binding / import-cycle / semantic-drift / re-export-completeness
+  ALL CLEAN (AST+grep audits). One minor ACCEPTED-DEFERRED to step 2: the
+  new test file behaviorally exercises only workflow-level seams (deep
+  seams are hasattr-only there; behavioral protection lives in
+  test_web_workbench.py within the same gate). `_web_public_json`
+  recursion now binds to the real implementation inside api.py (old code
+  resolved via module globals); adjudicated no-impact — the only existing
+  patch of that name is a whole-function replacement, not a delegating
+  wrapper.
+- Step 2 ⬜ TODO: strengthen deep-seam behavioral assertions in
+  tests/test_web_server_routes.py, then Web "Research History" (run index
+  reader) + "Benchmark" panels. Acceptance: panels render MetricValue
+  statuses, never bare scalars.
+- Verify: `git log --oneline d682f20 8dc2731 fe0fcdc` exist; suite green.
 
 ## CP5 — Data plane — ⬜ TODO
 - DataCatalogPort backed by the actually-loaded catalog (replaces the static
