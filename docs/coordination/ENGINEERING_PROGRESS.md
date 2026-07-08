@@ -131,6 +131,11 @@ pytest -q` + `python3 scripts/release_safety_scan.py` + CLI `--help` +
   run timeline, goal/criteria view, bench tables). Commercial boundary:
   agent orchestration depth + portfolio rebalancing stay out (capability
   tags mark the line). Will be split into its own sub-phases when opened.
+- Optional cuttable sub-item per decision D7: declarative-only Extensions
+  registry (manifest schema + 5 MVP contribution points + read-only
+  browse panel; executable contributions rejected unconditionally; data.*
+  points feed the CP5 DataCatalogPort, no parallel catalog). Defers to a
+  post-CP8 enhancement wave if CP6 runs tight.
 
 ## CP7 — Residual register — ⬜ TODO
 - Phase A F-1..F-6 (gate evidence extension to retention/turnover/corr,

@@ -14,6 +14,12 @@ Owner: project manager (haulk). Recorded by Fable.
 | D5 | Coordination docs in git | Yes, under `docs/coordination/`, PR-review exempt | This file; WORKING_STATE migration rides the next merge |
 | D6 | Open-source vs commercial split | Build an OPEN-SOURCE interactive platform on the QF_OS kernel, front-end modeled on Quant Forge Studio and surveyed projects. Commercial differentiation lives at the AGENT layer and PORTFOLIO REBALANCING layer | Open-source scope: full research workbench (factor research, evaluation, backtest, RD loop, research history, benchmarking, web UI). Commercial-reserved: advanced agent orchestration, multi-factor portfolio construction/rebalancing adapters. BacktestPort capability tags mark the boundary |
 
+## 2026-07-07 — Extensions decision (owner delegated the ruling to Fable)
+
+| # | Decision | Ruling (Fable, under owner delegation) | Implementation |
+| --- | --- | --- | --- |
+| D7 | Adopt Studio's Extensions system in the open-source platform? | **Adopt, declarative-only, as a cuttable CP6 sub-item.** Studio's system is a read-only control plane over pure-manifest metadata (~600 LOC; 5 MVP contribution points: data.snapshot_source, data.canonical_mapping, data.quality_rule, agent.context_pack, docs.pack; 5 reserved stubs) — verified: no dynamic code loading. Binding constraints for QF_OS: (1) STRICTER no-exec than Studio — `executable` contributions rejected unconditionally, no built-in exemption; (2) D6 boundary — agent.context_pack stays a declarative knowledge pack; agent.workflow remains a reserved stub in open source; (3) one-truth integration — data.* contribution points must feed the CP5 DataCatalogPort / field-expansion path, never a parallel catalog (FP-5); (4) manifests pass release-safety rules — no absolute paths or secrets; provider endpoints via env-var indirection only; (5) web surface read-only (GET-only endpoints + browse panel, control-token protected). | Optional sub-item of CP6, cuttable without replanning; defers to a post-CP8 enhancement wave if CP6 runs tight. Port the contract (manifest schema, registry, 5 MVP points), not the Studio code wholesale. |
+
 ## Standing inputs adopted
 
 - `docs/research_platform_optimization_from_vibe_quantgpt.md` (Codex memo)
