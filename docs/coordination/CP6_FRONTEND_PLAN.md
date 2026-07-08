@@ -72,6 +72,19 @@ prerequisite for the kernel or the default UI.
   data-interface points implementable per D7a) + GET-only endpoints +
   browse panel. CUTTABLE per D7 if the wave runs tight.
 
+## Design reference and optimization (owner directive 2026-07-07)
+
+- Visual/UX design for CP6-2..4 references the Quant Forge Studio design
+  language (read-only branch: navigation structure, layout patterns,
+  information hierarchy of Lab/Data/Registry views).
+- Each view sub-phase includes a design-optimization pass: an Opus
+  design lane applying Claude design guidance (visual hierarchy, spacing
+  and typography discipline, light/dark theming, accessible chart and
+  status-color conventions from the dataviz guidance) BEFORE the Codex
+  review stage. Design output must respect D8 (no build step, no
+  external fonts/assets — system font stack + inline SVG only) and FP-4
+  (status rendering is part of the design system, not decoration).
+
 ## Execution notes
 
 - Each sub-phase runs as a Workflow wave: disjoint-scope dev lanes
