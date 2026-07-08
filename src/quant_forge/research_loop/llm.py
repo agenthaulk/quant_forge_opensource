@@ -187,6 +187,10 @@ def _hypothesis_messages(
     )
     effective_ideas = list(context.effective_ideas)[:10] if context is not None else []
     next_hints = list(context.next_focus_hints)[:10] if context is not None else []
+    # Durable research memory (already redacted and bounded upstream): only
+    # statement + observation_count reach the prompt, max 5 items per tier.
+    memory_failures = _memory_items_for_prompt(context.recent_failures) if context is not None else []
+    memory_findings = _memory_items_for_prompt(context.recent_successes) if context is not None else []
     mechanism_guidance = _mechanism_guidance_for_prompt(seed)
     system = (
         "You are Quant Forge's RD hypothesis generator. Return one JSON object only. "
@@ -217,6 +221,8 @@ def _hypothesis_messages(
         f"Available operators: {json.dumps(operator_catalog, ensure_ascii=False)}\n"
         f"Effective ideas: {json.dumps(effective_ideas, ensure_ascii=False)}\n"
         f"Recent failure hints: {json.dumps(next_hints, ensure_ascii=False)}\n"
+        f"Research memory failures (avoid repeating): {json.dumps(memory_failures, ensure_ascii=False)}\n"
+        f"Research memory findings (build on if relevant): {json.dumps(memory_findings, ensure_ascii=False)}\n"
         f"Mechanism guidance: {json.dumps(mechanism_guidance, ensure_ascii=False)}\n"
         f"Generate up to {max_candidates} distinct hypotheses. "
         "Each rationale must include: economic mechanism, formula transformation, expected failure mode, "
@@ -301,6 +307,35 @@ def _repair_messages(
         ensure_ascii=False,
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+_MEMORY_PROMPT_ITEM_LIMIT = 5
+
+
+def _memory_items_for_prompt(items: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Bounded research-memory items for the hypothesis prompt.
+
+    Only rows marked ``source == "research_memory"`` qualify (trace entries in
+    the same tuples keep their existing prompt channels), and only the
+    already-redacted statement plus observation_count are forwarded.
+    """
+
+    bounded: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("source") != "research_memory":
+            continue
+        statement = str(item.get("statement") or "").strip()
+        if not statement:
+            continue
+        bounded.append(
+            {
+                "statement": statement,
+                "observation_count": int(item.get("observation_count") or 0),
+            }
+        )
+        if len(bounded) >= _MEMORY_PROMPT_ITEM_LIMIT:
+            break
+    return bounded
 
 
 def _catalog_for_prompt(items: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> list[dict[str, str]]:

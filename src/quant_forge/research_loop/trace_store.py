@@ -6,7 +6,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from quant_forge.research_loop.contracts import ResearchTraceEntry
 
@@ -75,12 +75,22 @@ class ResearchTraceStore:
         return rows[-max(limit, 0) :]
 
     def read_recent_entries(
-        self, *, limit: int = 20, phases: set[str] | frozenset[str] | None = None
+        self,
+        *,
+        limit: int = 20,
+        phases: set[str] | frozenset[str] | None = None,
+        run_id_filter: Callable[[str], bool] | None = None,
     ) -> list[dict[str, Any]]:
         if not self.runs_root.exists():
             return []
         rows: list[dict[str, Any]] = []
         for path in sorted(self.runs_root.glob("*/trace.jsonl"), key=lambda item: item.stat().st_mtime):
+            # Run scoping happens BEFORE the limit: a reader that only cares
+            # about one run chain (e.g. the strategy selector's seed chain)
+            # must not have its window erased by hundreds of rows from other
+            # runs. Filtering per run directory also skips whole foreign files.
+            if run_id_filter is not None and not run_id_filter(path.parent.name):
+                continue
             for line in path.read_text(encoding="utf-8").splitlines():
                 if not line.strip():
                     continue
@@ -89,6 +99,8 @@ class ResearchTraceStore:
                 # non-experiment rows (strategy_decision, round_summary) do not
                 # shrink a reader's effective window of real experiment rows.
                 if phases is not None and str(entry.get("phase") or "") not in phases:
+                    continue
+                if run_id_filter is not None and not run_id_filter(str(entry.get("run_id") or "")):
                     continue
                 rows.append(entry)
         return rows[-max(limit, 0) :]

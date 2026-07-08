@@ -485,3 +485,235 @@ def test_context_builder_without_memory_store_is_unchanged(tmp_path: Path) -> No
 
     assert context.recent_failures == ()
     assert context.recent_successes == ()
+
+
+# ---------------------------------------------------------------------------
+# Promotion evidence honesty (O3/O4/O5)
+# ---------------------------------------------------------------------------
+
+
+def test_promote_counts_distinct_events_not_exact_retries() -> None:
+    # O3: 2 distinct events + 1 exact retry -> observation_count 2, and the
+    # retry cannot push the group over the rule threshold.
+    first = _observation(run_id="rd-1", observed_at=T1, data_window=WINDOW_A)
+    second = _observation(run_id="rd-2", observed_at=T2, data_window=WINDOW_B)
+    exact_retry = _observation(run_id="rd-1", observed_at=T1, data_window=WINDOW_A)
+
+    decisions = promote([first, second, exact_retry])
+
+    assert len(decisions) == 1
+    decision = decisions[0]
+    assert decision.kind == "finding"  # 3 raw rows + 2 windows would have minted a rule
+    assert decision.observation_count == 2
+
+
+def test_promote_single_run_never_proposes_a_rule() -> None:
+    # O4: three distinct observations across two windows but ONE run id must
+    # not mint a rule (and cannot even become a finding without a second run).
+    observations = [
+        _observation(run_id="rd-1", observed_at=T1, data_window=WINDOW_A),
+        _observation(run_id="rd-1", observed_at=T2, data_window=WINDOW_A),
+        _observation(run_id="rd-1", observed_at=T3, data_window=WINDOW_B),
+    ]
+    assert promote(observations) == ()
+
+
+def test_failure_signature_crossing_rule_threshold_keeps_failure_row(tmp_path: Path) -> None:
+    # O5: rule minting must not swallow the failure record.
+    observations = [
+        _observation(run_id="rd-1", observed_at=T1, data_window=WINDOW_A, failure_class="gate_blocked"),
+        _observation(run_id="rd-2", observed_at=T2, data_window=WINDOW_A, failure_class="gate_blocked"),
+        _observation(run_id="rd-3", observed_at=T3, data_window=WINDOW_B, failure_class="gate_blocked"),
+    ]
+    decisions = promote(observations)
+    assert sorted(decision.kind for decision in decisions) == ["failure", "rule"]
+    by_kind = {decision.kind: decision for decision in decisions}
+    assert by_kind["rule"].status == RULE_CANDIDATE_STATUS
+    assert by_kind["failure"].status == "active"
+    assert by_kind["failure"].observation_count == 3
+
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    for observation in observations:
+        store.record_observation(
+            signature=observation.signature,
+            statement=observation.statement,
+            run_id=observation.run_id,
+            observed_at=observation.observed_at,
+            data_window=observation.data_window,
+            failure_class=observation.failure_class,
+        )
+    store.promote_pending()
+    assert len(_read_jsonl(store.path_for("rule"))) == 1
+    assert len(_read_jsonl(store.path_for("failure"))) == 1
+
+
+# ---------------------------------------------------------------------------
+# Timestamp and redaction hygiene (O9)
+# ---------------------------------------------------------------------------
+
+
+def test_memory_rejects_naive_timestamps(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    with pytest.raises(ValueError, match="timezone-aware"):
+        store.record_observation(
+            signature="sig_naive",
+            statement="naive timestamps are ambiguous",
+            run_id="rd-1",
+            observed_at="2026-07-01T00:00:00",
+        )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        MemoryObservation(
+            signature="sig_naive",
+            statement="naive timestamps are ambiguous",
+            run_id="rd-1",
+            observed_at="2026-07-01T00:00:00",
+        )
+    assert _read_jsonl(store.observations_path) == []
+
+
+def test_data_window_and_failure_class_are_redacted(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    home = str(Path.home())
+    store.record_observation(
+        signature="sig_redact_fields",
+        statement="fields must be redacted too",
+        run_id="rd-1",
+        observed_at=T1,
+        data_window=f"window at {home}/panel.parquet",
+        failure_class=f"gate_blocked at {home}/gate.log",
+    )
+    raw = store.observations_path.read_text(encoding="utf-8")
+    assert home not in raw
+    row = _read_jsonl(store.observations_path)[0]
+    assert "<redacted-path>" in row["data_window"]
+    assert "<redacted-path>" in row["failure_class"]
+
+
+# ---------------------------------------------------------------------------
+# End-to-end memory wiring in the research loop (O2)
+# ---------------------------------------------------------------------------
+
+
+def _memory_service(paths: dict[str, Path], **overrides):
+    from quant_forge.research_loop.service import ResearchDeduplicationConfig, ResearchLoopService
+
+    kwargs = dict(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        # Dedup off so a second identical run re-evaluates (and re-blocks) the
+        # same candidates instead of skipping them at the plan stage.
+        deduplication=ResearchDeduplicationConfig(enabled=False),
+    )
+    kwargs.update(overrides)
+    return ResearchLoopService(**kwargs)
+
+
+def test_rd_run_records_observations_and_second_run_promotes_failure(tmp_path: Path) -> None:
+    from quant_forge.research_loop.service import ResearchGate
+
+    paths = create_demo_workspace(tmp_path / "demo")
+    service = _memory_service(paths)
+    strict_gate = ResearchGate(min_score=10.0)  # every candidate blocks
+
+    service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1, gate=strict_gate)
+
+    store = ResearchMemoryStore(paths["artifact_root"])
+    observations = _read_jsonl(store.observations_path)
+    blocked = [row for row in observations if row["failure_class"] == "gate_blocked"]
+    assert blocked
+    assert blocked[0]["signature"].startswith("rd_gate_blocked:")
+    assert "gate blocked candidate formula family" in blocked[0]["statement"]
+    assert blocked[0]["run_id"].startswith("rd_FTR_DEMO_SMALL_CAP_")
+    assert blocked[0]["data_window"]  # run's evaluation window, start:end
+    # A single run stays trace-only: no knowledge row yet.
+    assert _read_jsonl(store.path_for("failure")) == []
+
+    service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1, gate=strict_gate)
+
+    failures = _read_jsonl(store.path_for("failure"))
+    assert failures
+    assert failures[-1]["status"] == "active"
+    assert failures[-1]["observation_count"] >= 2
+    assert "gate blocked candidate formula family" in failures[-1]["statement"]
+
+
+def test_rd_run_records_finding_observations_for_accepted_candidates(tmp_path: Path) -> None:
+    from quant_forge.research_loop.service import ResearchGate
+
+    paths = create_demo_workspace(tmp_path / "demo")
+    service = _memory_service(paths)
+    permissive_gate = ResearchGate(min_ic_days=0, min_coverage=0.0, min_score=-100.0, min_backtest_periods=0)
+
+    result = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1, gate=permissive_gate)
+
+    assert any(candidate.gate_passed for candidate in result.candidates)
+    store = ResearchMemoryStore(paths["artifact_root"])
+    observations = _read_jsonl(store.observations_path)
+    accepted = [row for row in observations if row["signature"].startswith("rd_accepted:")]
+    assert accepted
+    assert accepted[0]["failure_class"] == ""
+    assert "passed the research gate" in accepted[0]["statement"]
+
+
+def test_research_memory_disabled_removes_all_memory_writes(tmp_path: Path) -> None:
+    from quant_forge.research_loop.service import ResearchGate
+
+    paths = create_demo_workspace(tmp_path / "demo")
+    service = _memory_service(paths, research_memory_enabled=False)
+
+    result = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1, gate=ResearchGate(min_score=10.0))
+
+    assert not (paths["artifact_root"] / "research_memory").exists()
+    assert result.trace_root is not None
+    snapshot = json.loads((result.trace_root / "config_snapshot.json").read_text(encoding="utf-8"))
+    assert snapshot["research_memory_enabled"] is False
+
+
+def test_rd_config_maps_research_memory_flag(tmp_path: Path) -> None:
+    from quant_forge.research_loop.config import ResearchLoopConfig, load_research_loop_config
+
+    assert ResearchLoopConfig().research_memory_enabled is True
+    config_path = tmp_path / "rd.yaml"
+    config_path.write_text("research_memory_enabled: false\n", encoding="utf-8")
+    assert load_research_loop_config(config_path).research_memory_enabled is False
+
+
+def test_hypothesis_prompt_includes_bounded_memory_items(tmp_path: Path) -> None:
+    import quant_forge.research_loop.llm as rd_llm
+    from quant_forge.core.contracts import FactorDefinition
+
+    paths = create_demo_workspace(tmp_path / "demo")
+    memory = ResearchMemoryStore(paths["artifact_root"])
+    _promote_pairs(memory, prefix="fail", count=7, failure_class="gate_blocked")
+    _promote_pairs(memory, prefix="find", count=7)
+    context = ResearchContextBuilder(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        memory_store=memory,
+    ).build()
+    seed = FactorDefinition(factor_id="FTR_SEED", name="seed", formula="rank(close)", status="candidate")
+
+    messages = rd_llm._hypothesis_messages(seed, context=context, objective="balanced", max_candidates=2)  # noqa: SLF001
+
+    user = messages[1]["content"]
+    assert "Research memory failures" in user
+    assert "Research memory findings" in user
+    # Newest-first and bounded to 5 per tier: statements 6..2 appear, 0 does not.
+    assert "fail statement 6" in user
+    assert "find statement 6" in user
+    assert "fail statement 0" not in user
+    assert '"observation_count": 2' in user
+    # Only statement + observation_count reach the prompt — no refs, no run ids.
+    assert "evidence_refs" not in user
+    assert "run_ids" not in user
+
+    # Without a memory store the sections stay empty (no fabricated memory).
+    bare_context = ResearchContextBuilder(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+    ).build()
+    bare_user = rd_llm._hypothesis_messages(seed, context=bare_context, objective="balanced", max_candidates=2)[1][  # noqa: SLF001
+        "content"
+    ]
+    assert "Research memory failures (avoid repeating): []" in bare_user

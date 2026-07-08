@@ -190,3 +190,53 @@ def test_same_seed_is_deterministic_across_calls(tmp_path: Path) -> None:
     assert len(rows) == 2  # run history stays append-only
     assert rows[0]["config_fingerprint"] == rows[1]["config_fingerprint"]
     assert rows[0]["metric_highlights"] == rows[1]["metric_highlights"]
+
+
+# ---------------------------------------------------------------------------
+# Parity guard: per-date ICs derived from falsification_frame match
+# evaluate_factor().ic_series element-wise under a NON-default profile
+# ---------------------------------------------------------------------------
+
+
+def test_ic_series_parity_under_non_default_profile(tmp_path: Path) -> None:
+    from quant_forge.core.contracts import SimulationProfile
+    from quant_forge.evaluation.service import evaluate_factor
+
+    _, paths = _workbench(tmp_path)
+    # Non-default profile: delayed execution AND a truncated test period that
+    # still leaves the 126-trading-day display floor satisfied.
+    profile = SimulationProfile(
+        execution_delay_days=2,
+        test_period_start="2024-01-15",
+        test_period_end="2024-07-31",
+    )
+    evaluation = evaluate_factor(
+        FACTOR_ID,
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        simulation_profile=profile,
+    )
+    frame = falsification_frame(
+        FACTOR_ID,
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        simulation_profile=profile,
+    )
+
+    # Derive per-date rank ICs from the falsification frame with the same
+    # evaluable-date rule as evaluation/service._ic_summary.
+    usable = frame.dropna(subset=["score", "forward_return"])
+    derived: list[tuple[str, float]] = []
+    for date_value, group in usable.groupby("trade_date", sort=True):
+        if group["score"].nunique() < 2 or group["forward_return"].nunique() < 2:
+            continue
+        ic = group["score"].rank().corr(group["forward_return"].rank())
+        if pd.notna(ic):
+            derived.append((pd.Timestamp(date_value).date().isoformat(), float(ic)))
+
+    assert evaluation.ic_days > 0
+    assert len(derived) == evaluation.ic_days == len(evaluation.ic_series)
+    for entry, (date_label, derived_ic) in zip(evaluation.ic_series, derived, strict=True):
+        assert entry["date"] == date_label
+        assert abs(float(entry["ic"]) - derived_ic) <= 1e-9

@@ -361,23 +361,26 @@ def test_cli_goal_round_trip(tmp_path: Path, capsys: pytest.CaptureFixture[str])
     )
     assert row["evidence_refs"] == ["evaluations/eval_demo.json"]
 
-    # A missing evidence file is refused.
-    with pytest.raises(ValueError, match="do not exist under artifact_root"):
-        cli_main.main(
-            [
-                "goal",
-                "audit",
-                goal_id,
-                "--criterion",
-                "c2",
-                "--result",
-                "satisfied",
-                "--evidence",
-                "evaluations/never_written.json",
-                *root_arg,
-            ]
-        )
-    capsys.readouterr()
+    # A missing evidence file is refused with a friendly exit(2), not a traceback
+    # (O10: audit matches the show/complete error style).
+    refused = _cli_json(
+        capsys,
+        [
+            "goal",
+            "audit",
+            goal_id,
+            "--criterion",
+            "c2",
+            "--result",
+            "satisfied",
+            "--evidence",
+            "evaluations/never_written.json",
+            *root_arg,
+        ],
+        expect=2,
+    )
+    assert "goal audit failed" in refused
+    assert "do not exist under artifact_root" in refused
 
     _cli_json(
         capsys,
@@ -399,3 +402,127 @@ def test_cli_goal_round_trip(tmp_path: Path, capsys: pytest.CaptureFixture[str])
 
     missing = _cli_json(capsys, ["goal", "show", "no-such-goal-000000000000", *root_arg], expect=2)
     assert "goal not found" in missing
+
+
+# ---------------------------------------------------------------------------
+# O1: at least one required criterion, at both ends
+# ---------------------------------------------------------------------------
+
+
+def test_all_optional_goal_is_unrepresentable(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    with pytest.raises(ValueError, match="required criterion"):
+        _create_goal(
+            store,
+            criteria=(
+                GoalCriterion(criterion_id="c1", text="optional one", required=False),
+                GoalCriterion(criterion_id="c2", text="optional two", required=False),
+            ),
+        )
+
+
+def test_legacy_all_optional_goal_row_cannot_complete(tmp_path: Path) -> None:
+    # Defense in depth: a hand-built legacy artifact (written before the
+    # constructor rule) must still never complete vacuously. Loading it trips
+    # the constructor guard; nothing is appended to the audit log.
+    store = _store(tmp_path)
+    goal_id = "legacy-goal-aaaaaaaaaaaa"
+    payload = {
+        "schema_version": GOAL_SCHEMA_VERSION,
+        "goal_id": goal_id,
+        "objective": "legacy all-optional goal",
+        "criteria": [{"criterion_id": "c1", "text": "optional", "required": False}],
+        "seed_factor_id": "FTR_DEMO_SMALL_CAP",
+        "runtime_config_hash": RUNTIME_HASH,
+        "created_at": CREATED_AT,
+        "status": "active",
+        "evidence_refs": [],
+    }
+    store.goals_root.mkdir(parents=True, exist_ok=True)
+    store.goal_path(goal_id).write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises((GoalCompletionError, ValueError)):
+        store.complete_goal(goal_id, recorded_at=RECORDED_AT)
+    assert store.read_audit_rows(goal_id) == []
+
+
+# ---------------------------------------------------------------------------
+# O6: every status change routes through the transition table
+# ---------------------------------------------------------------------------
+
+
+def test_transition_table_legal_chain(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    goal = _create_goal(store, status="draft")
+    rel = _evidence(store)
+
+    # Draft goals accept no audits and cannot complete.
+    with pytest.raises(ValueError, match="draft"):
+        store.append_audit(goal.goal_id, criterion_id="c1", result="satisfied", evidence_refs=(rel,), recorded_at=RECORDED_AT)
+    with pytest.raises(GoalCompletionError, match="not allowed"):
+        store.complete_goal(goal.goal_id, recorded_at=RECORDED_AT)
+    assert store.effective_status(goal.goal_id) == "draft"
+
+    # Legal chain: draft -> active -> insufficient_evidence -> active -> complete.
+    store.transition(goal.goal_id, "active", recorded_at=RECORDED_AT)
+    assert store.effective_status(goal.goal_id) == "active"
+    store.transition(goal.goal_id, "insufficient_evidence", recorded_at=RECORDED_AT)
+    store.transition(goal.goal_id, "active", recorded_at=RECORDED_AT)
+    store.append_audit(goal.goal_id, criterion_id="c1", result="satisfied", evidence_refs=(rel,), recorded_at=RECORDED_AT)
+    store.append_audit(goal.goal_id, criterion_id="c2", result="not_applicable_user_accepted", recorded_at=RECORDED_AT)
+    assert store.complete_goal(goal.goal_id, recorded_at=RECORDED_AT)["to_status"] == "complete"
+
+    # Terminal states accept no further transitions.
+    with pytest.raises(ValueError, match="not allowed"):
+        store.transition(goal.goal_id, "active", recorded_at=RECORDED_AT)
+
+
+def test_transition_table_rejects_illegal_jumps(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    goal = _create_goal(store, status="draft")
+
+    # draft -> insufficient_evidence skips activation.
+    with pytest.raises(ValueError, match="not allowed"):
+        store.transition(goal.goal_id, "insufficient_evidence", recorded_at=RECORDED_AT)
+    # 'complete' is never reachable through transition(), even from active.
+    store.transition(goal.goal_id, "active", recorded_at=RECORDED_AT)
+    with pytest.raises(ValueError, match="complete_goal"):
+        store.transition(goal.goal_id, "complete", recorded_at=RECORDED_AT)
+    # Unknown statuses are rejected outright.
+    with pytest.raises(ValueError, match="status must be one of"):
+        store.transition(goal.goal_id, "archived", recorded_at=RECORDED_AT)
+
+
+# ---------------------------------------------------------------------------
+# O10: evidence containment — symlinks may not escape artifact_root
+# ---------------------------------------------------------------------------
+
+
+def test_symlinked_evidence_escaping_artifact_root_is_rejected(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    goal = _create_goal(store)
+    outside = tmp_path / "outside_evidence.json"
+    outside.write_text('{"ok": true}\n', encoding="utf-8")
+    link_rel = "evaluations/linked.json"
+    link_path = store.artifact_root / link_rel
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    link_path.symlink_to(outside)
+
+    # The audit path refuses the escaping ref even though the symlink resolves
+    # to an existing file.
+    with pytest.raises(ValueError, match="do not exist under artifact_root"):
+        store.append_audit(
+            goal.goal_id, criterion_id="c1", result="satisfied", evidence_refs=(link_rel,), recorded_at=RECORDED_AT
+        )
+
+    # Completion re-verification also refuses it: audit against a real file,
+    # then swap the file for an escaping symlink before completing.
+    real_rel = "evaluations/real.json"
+    real_path = store.artifact_root / real_rel
+    real_path.write_text('{"ok": true}\n', encoding="utf-8")
+    store.append_audit(goal.goal_id, criterion_id="c1", result="satisfied", evidence_refs=(real_rel,), recorded_at=RECORDED_AT)
+    store.append_audit(goal.goal_id, criterion_id="c2", result="not_applicable_user_accepted", recorded_at=RECORDED_AT)
+    real_path.unlink()
+    real_path.symlink_to(outside)
+    with pytest.raises(GoalCompletionError, match="exists under artifact_root"):
+        store.complete_goal(goal.goal_id, recorded_at=RECORDED_AT)

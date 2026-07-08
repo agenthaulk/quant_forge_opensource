@@ -1161,6 +1161,7 @@ def _run_research_once(
         deduplication=rd_config.deduplication,
         llm_formula_repair_attempts=rd_config.llm.max_formula_repair_attempts,
         strategy_selector_enabled=rd_config.strategy_selector_enabled,
+        research_memory_enabled=rd_config.research_memory_enabled,
         hypothesis_generator=hypothesis_generator,
         review_generator=review_generator,
         cancel_event=cancel_event,

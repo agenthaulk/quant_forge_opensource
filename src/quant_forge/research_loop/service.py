@@ -47,6 +47,7 @@ from quant_forge.research_loop.contracts import (
 )
 from quant_forge.research_loop.experiment_planner import ExperimentPlanner
 from quant_forge.research_loop.feedback_builder import build_feedback
+from quant_forge.research_loop.memory import ResearchMemoryStore
 from quant_forge.research_loop.operator_drafts import write_operator_draft_artifacts
 from quant_forge.research_loop.strategy_selector import (
     StrategyContext,
@@ -462,6 +463,7 @@ class ResearchLoopService:
         deduplication: ResearchDeduplicationConfig | None = None,
         llm_formula_repair_attempts: int = DEFAULT_LLM_FORMULA_REPAIR_ATTEMPTS,
         strategy_selector_enabled: bool = True,
+        research_memory_enabled: bool = True,
         cancel_event: Any | None = None,
     ) -> None:
         self.factor_root = factor_root
@@ -522,6 +524,10 @@ class ResearchLoopService:
             raise ValueError("llm_formula_repair_attempts must be between 0 and 3")
         self.llm_formula_repair_attempts = llm_formula_repair_attempts
         self.strategy_selector_enabled = strategy_selector_enabled
+        self.research_memory_enabled = research_memory_enabled
+        # Durable cross-run memory (observations + promoted knowledge rows)
+        # rooted at artifact_root; None when disabled so nothing is written.
+        self.memory_store = ResearchMemoryStore(self.artifact_root) if research_memory_enabled else None
         self.cancel_event = cancel_event
         self._active_run_id: str | None = None
         self._cancel_written = False
@@ -564,6 +570,7 @@ class ResearchLoopService:
             factor_values_root=self.factor_values_root,
             factor_values_manifest_root=self.factor_values_manifest_root,
             trace_store=self.trace_store,
+            memory_store=self.memory_store,
         ).build(objective=objective, seed_factor_ids=(seed_factor_id,))
         # Strategy selection happens BEFORE candidate generation and reads only
         # evidence already persisted by prior rounds (trace/dedup/gate state);
@@ -577,12 +584,15 @@ class ResearchLoopService:
             # leak gate reasons, round summaries, duplicate counts, or
             # fingerprints into this run's context; same-seed history is the
             # legitimate "prior rounds" evidence (and the fingerprint dedup
-            # memory) the selector was designed to consume.
-            recent_strategy_entries = [
-                entry
-                for entry in self.trace_store.read_recent_entries(limit=STRATEGY_CONTEXT_TRACE_LIMIT)
-                if _entry_belongs_to_seed_run_chain(entry, seed_factor_id=seed_factor_id, current_run_id=run_id)
-            ]
+            # memory) the selector was designed to consume. The filter runs
+            # INSIDE read_recent_entries, before its window limit, so heavy
+            # other-seed traffic cannot erase this seed's history (C2).
+            recent_strategy_entries = self.trace_store.read_recent_entries(
+                limit=STRATEGY_CONTEXT_TRACE_LIMIT,
+                run_id_filter=lambda candidate_run_id: _run_id_in_seed_chain(
+                    candidate_run_id, seed_factor_id=seed_factor_id, current_run_id=run_id
+                ),
+            )
             strategy_context = _strategy_context_from_trace_entries(recent_strategy_entries)
             strategy_decision = select_strategy(strategy_context)
             strategy_round_index = strategy_context.round_index
@@ -651,6 +661,7 @@ class ResearchLoopService:
             ],
             "deduplication": _deduplication_snapshot(self.deduplication),
             "strategy_selector_enabled": self.strategy_selector_enabled,
+            "research_memory_enabled": self.research_memory_enabled,
         }
         self.trace_store.write_config_snapshot(run_id, config_snapshot)
         seed_assessment = self._assess_factor(
@@ -837,6 +848,7 @@ class ResearchLoopService:
         for failed in failed_quick_results:
             self._trace_structured_result(run_id, failed, phase="experiment_failed")
         results: list[ResearchCandidateResult] = []
+        structured_by_result: dict[int, StructuredFactorExperimentResult] = {}
         for trial in final_trials:
             self._raise_if_cancelled()
             try:
@@ -858,8 +870,23 @@ class ResearchLoopService:
             if any(reason.startswith("duplicate result signature") for reason in candidate_result.gate_reasons):
                 dedup_summary["result_duplicates"] = int(dedup_summary["result_duplicates"]) + 1
             results.append(candidate_result)
-            self._trace_candidate_result(run_id, candidate_result, trial.plan)
+            structured_by_result[id(candidate_result)] = self._trace_candidate_result(
+                run_id, candidate_result, trial.plan
+            )
         results = sorted(results, key=lambda result: result.score, reverse=True)
+        # C1: the round WINNER's evidence (post-sort), not whichever candidate
+        # happened to be traced last in evaluation order. Persisted with the
+        # round summary so the next round's selector reads the winner's decay
+        # and gate reasons alongside best_score_delta_vs_seed.
+        winner = results[0] if results else None
+        winner_structured = structured_by_result.get(id(winner)) if winner is not None else None
+        winner_gate_blocking_reasons: tuple[str, ...] = ()
+        if winner_structured is not None and winner_structured.gate_decision is not None:
+            winner_gate_blocking_reasons = tuple(
+                str(reason) for reason in winner_structured.gate_decision.blocking_reasons
+            )
+        elif winner is not None and not winner.gate_passed:
+            winner_gate_blocking_reasons = tuple(str(reason) for reason in winner.gate_reasons)
         accepted = tuple(
             dict.fromkeys(
                 result.factor.factor_id
@@ -887,6 +914,11 @@ class ResearchLoopService:
                     seed_score=seed_assessment.selection_score,
                     dedup_summary=dedup_summary,
                     accepted_candidate_ids=accepted,
+                    winner_candidate_ref=winner.factor.factor_id if winner is not None else None,
+                    winner_oos_net_return_decay=(
+                        _oos_net_return_decay_value(winner.backtest) if winner is not None else None
+                    ),
+                    winner_gate_blocking_reasons=winner_gate_blocking_reasons,
                 ),
             }
         )
@@ -947,9 +979,48 @@ class ResearchLoopService:
             seed_assessment=seed_assessment,
             config_snapshot=config_snapshot,
         )
+        self._record_memory_observations(run_id, results)
         self._created_factor_ids.clear()
         self._promoted_factor_snapshots.clear()
         return result
+
+    def _record_memory_observations(self, run_id: str, results: list[ResearchCandidateResult]) -> None:
+        """Record this run's candidate outcomes as durable memory observations.
+
+        Gate-blocked candidates become failure-class observations; accepted
+        candidates become finding-class observations. Statements are compact
+        redacted summaries (formula fingerprint family + gate reasons) — no
+        raw data, no paths. ``promote_pending`` runs once at completion so
+        repeated signatures across runs can promote deterministically.
+        """
+
+        if self.memory_store is None:
+            return
+        for result in results:
+            fingerprint = result.formula_fingerprint or factor_formula_fingerprint(result.factor)
+            window = _memory_data_window(result.evaluation)
+            if result.gate_passed:
+                self.memory_store.record_observation(
+                    signature=f"rd_accepted:{fingerprint}",
+                    statement=(
+                        f"accepted candidate formula family {fingerprint[:12]} passed the research gate"
+                    ),
+                    run_id=run_id,
+                    data_window=window,
+                )
+            else:
+                families = _gate_reason_families(result.gate_reasons)
+                self.memory_store.record_observation(
+                    signature="rd_gate_blocked:" + fingerprint + ":" + ",".join(families),
+                    statement=(
+                        f"gate blocked candidate formula family {fingerprint[:12]}: "
+                        + "; ".join(result.gate_reasons)
+                    ),
+                    run_id=run_id,
+                    data_window=window,
+                    failure_class="gate_blocked",
+                )
+        self.memory_store.promote_pending()
 
     def _raise_if_cancelled(self) -> None:
         if self.cancel_event is not None and self.cancel_event.is_set():
@@ -1276,9 +1347,10 @@ class ResearchLoopService:
         run_id: str,
         candidate: ResearchCandidateResult,
         plan: FactorExperimentPlan | None,
-    ) -> None:
+    ) -> StructuredFactorExperimentResult:
         structured = _structured_result_from_candidate(candidate, plan)
         self._trace_structured_result(run_id, structured, phase="experiment_result")
+        return structured
 
     def _select_final_trials(
         self, trials: list[_ResearchTrial], objective_weights: ResearchObjectiveWeights
@@ -2654,26 +2726,50 @@ def _finite_float_or_none(value: Any) -> float | None:
     return number if isfinite(number) else None
 
 
+def _memory_data_window(evaluation: EvaluationResult) -> str:
+    """``start:end`` from the run's evaluation window, or "" when unknown (FP-4)."""
+
+    window = evaluation_data_window(evaluation)
+    if str(window.get("status")) != "available":
+        return ""
+    return f"{window.get('start_date')}:{window.get('end_date')}"
+
+
+def _gate_reason_families(reasons: tuple[str, ...]) -> tuple[str, ...]:
+    """Stable, value-free gate-reason families for memory signatures.
+
+    Gate reasons embed run-specific numbers ("score 0.0123 < 0.5"); the
+    signature must be identical when the SAME kind of failure recurs across
+    runs, so only the leading reason word (metric/clause name) is kept.
+    """
+
+    families: list[str] = []
+    for reason in reasons:
+        family = str(reason).split(":", 1)[0].split(" ", 1)[0].strip()
+        if family:
+            families.append(family)
+    return tuple(sorted(dict.fromkeys(families)))
+
+
 _RUN_ID_SUFFIX_RE = re.compile(r"\d{8}T\d{12}Z_[0-9a-f]{8}")
 
 
-def _entry_belongs_to_seed_run_chain(
-    entry: dict[str, Any],
+def _run_id_in_seed_chain(
+    run_id: str,
     *,
     seed_factor_id: str,
     current_run_id: str,
 ) -> bool:
-    """True when a trace entry belongs to the current run or a prior run of
-    the SAME seed factor id.
+    """True when ``run_id`` is the current run or a prior run of the SAME seed.
 
     Run ids are structural (``rd_<safe_seed>_<UTC timestamp>_<hex8>``, see
     :func:`_research_run_id`), so the seed chain is recognized without reading
     entry payloads. The timestamp/uuid suffix match prevents one seed id that
     is a prefix of another (``FTR_A`` vs ``FTR_A_X``) from matching the wrong
-    chain.
+    chain. Passed to ``ResearchTraceStore.read_recent_entries`` as its
+    ``run_id_filter`` so seed scoping happens BEFORE the window limit (C2).
     """
 
-    run_id = str(entry.get("run_id") or "")
     if not run_id:
         return False
     if run_id == current_run_id:
@@ -2760,7 +2856,19 @@ def _strategy_context_from_trace_entries(entries: list[dict[str, Any]]) -> Strat
 
     gate_blocking_reasons: tuple[str, ...] = ()
     oos_net_return_decay = None
-    if last_result_entry is not None:
+    if last_round_summary is not None and "winner_candidate_ref" in last_round_summary:
+        # C1: rounds completed after the winner-evidence fix persist the round
+        # WINNER's decay and gate reasons in the round summary; consume those
+        # so the evidence matches best_score_delta_vs_seed. Null/empty values
+        # are honest (a round with no candidates has no winner evidence).
+        gate_blocking_reasons = tuple(
+            str(reason) for reason in (last_round_summary.get("winner_gate_blocking_reasons") or ())
+        )
+        oos_net_return_decay = _finite_float_or_none(last_round_summary.get("winner_oos_net_return_decay"))
+    elif last_result_entry is not None:
+        # Fallback for traces written BEFORE the winner-evidence round summary
+        # existed: best effort from the last-traced experiment_result (which
+        # may be a losing candidate — exactly the bias the new rows remove).
         decision = last_result_entry.get("gate_decision")
         if isinstance(decision, dict):
             gate_blocking_reasons = tuple(
@@ -2835,6 +2943,9 @@ def _round_summary_payload(
     seed_score: float,
     dedup_summary: dict[str, object],
     accepted_candidate_ids: tuple[str, ...],
+    winner_candidate_ref: str | None = None,
+    winner_oos_net_return_decay: float | None = None,
+    winner_gate_blocking_reasons: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     best_score = _finite_float_or_none(results[0].score) if results else None
     seed_score_value = _finite_float_or_none(seed_score)
@@ -2860,6 +2971,14 @@ def _round_summary_payload(
         "best_score": best_score,
         "best_score_delta_vs_seed": delta,
         "accepted_candidate_ids": list(accepted_candidate_ids),
+        # C1: winner-specific evidence, persisted at round completion so the
+        # NEXT round's selector context reads the same candidate that produced
+        # best_score / best_score_delta_vs_seed — never a losing candidate
+        # that merely happened to be traced last. None/empty when the round
+        # produced no candidates (missing evidence is never fabricated).
+        "winner_candidate_ref": winner_candidate_ref,
+        "winner_oos_net_return_decay": _finite_float_or_none(winner_oos_net_return_decay),
+        "winner_gate_blocking_reasons": [str(reason) for reason in winner_gate_blocking_reasons],
     }
 
 

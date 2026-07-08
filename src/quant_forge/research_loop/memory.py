@@ -121,45 +121,60 @@ class PromotionDecision:
 def promote(observations: Iterable[MemoryObservation]) -> tuple[PromotionDecision, ...]:
     """PURE deterministic promotion policy over the full observation set.
 
-    - 1 observation of a signature -> trace only, no decision (no row);
-    - >=2 observations across >=2 distinct run ids -> finding, or failure when
-      the signature carries a gate-blocking/validation-error class;
-    - >=3 observations across >=2 distinct non-empty data windows -> rule
-      CANDIDATE with status ``needs_human_review`` (never active).
+    - exact duplicate resubmissions of the same event (identical payload) are
+      counted ONCE: ``observation_count`` counts distinct events, never retries;
+    - 1 distinct observation of a signature -> trace only, no decision (no row);
+    - >=2 distinct observations across >=2 distinct run ids -> finding, or
+      failure when the signature carries a gate-blocking/validation-error class;
+    - >=3 distinct observations across >=2 distinct non-empty data windows AND
+      >=2 distinct run ids -> rule CANDIDATE with status ``needs_human_review``
+      (never active); a single run can never propose a rule;
+    - a failure-class signature that crosses the rule threshold yields BOTH the
+      rule candidate and the failure row — rule minting must not swallow the
+      failure record.
 
     Empty data windows are unknowns (FP-4) and never count as distinct.
     """
 
     groups: dict[str, list[MemoryObservation]] = {}
+    seen_events: set[str] = set()
     for observation in observations:
+        event_fingerprint = canonical_fingerprint(observation.to_dict())
+        if event_fingerprint in seen_events:
+            continue  # exact retry of an already-counted event
+        seen_events.add(event_fingerprint)
         groups.setdefault(observation.signature, []).append(observation)
     decisions: list[PromotionDecision] = []
     for signature in sorted(groups):
         group = sorted(groups[signature], key=lambda item: (item.observed_at, item.run_id, item.evidence_ref))
         run_ids = tuple(sorted({item.run_id for item in group}))
         windows = tuple(sorted({item.data_window for item in group if item.data_window}))
-        if len(group) >= 3 and len(windows) >= 2:
-            kind, status = "rule", RULE_CANDIDATE_STATUS
+        is_failure = any(item.failure_class in FAILURE_SIGNATURE_CLASSES for item in group)
+        kinds: list[tuple[str, str]] = []
+        if len(group) >= 3 and len(windows) >= 2 and len(run_ids) >= 2:
+            kinds.append(("rule", RULE_CANDIDATE_STATUS))
+            if is_failure:
+                kinds.append(("failure", "active"))
         elif len(group) >= 2 and len(run_ids) >= 2:
-            is_failure = any(item.failure_class in FAILURE_SIGNATURE_CLASSES for item in group)
-            kind, status = ("failure", "active") if is_failure else ("finding", "active")
+            kinds.append(("failure", "active") if is_failure else ("finding", "active"))
         else:
             continue  # trace only: below every promotion threshold
-        decisions.append(
-            PromotionDecision(
-                signature=signature,
-                kind=kind,
-                status=status,
-                statement=group[0].statement,
-                scope=group[0].scope,
-                observation_count=len(group),
-                first_seen=group[0].observed_at,
-                last_seen=group[-1].observed_at,
-                evidence_refs=tuple(sorted({item.evidence_ref or item.run_id for item in group})),
-                run_ids=run_ids,
-                data_windows=windows,
+        for kind, status in kinds:
+            decisions.append(
+                PromotionDecision(
+                    signature=signature,
+                    kind=kind,
+                    status=status,
+                    statement=group[0].statement,
+                    scope=group[0].scope,
+                    observation_count=len(group),
+                    first_seen=group[0].observed_at,
+                    last_seen=group[-1].observed_at,
+                    evidence_refs=tuple(sorted({item.evidence_ref or item.run_id for item in group})),
+                    run_ids=run_ids,
+                    data_windows=windows,
+                )
             )
-        )
     return tuple(decisions)
 
 
@@ -198,8 +213,8 @@ class ResearchMemoryStore:
             statement=redact_free_text(statement),
             run_id=run_id,
             observed_at=observed_at if observed_at is not None else _utc_now_iso(),
-            data_window=data_window,
-            failure_class=failure_class,
+            data_window=redact_free_text(data_window),
+            failure_class=redact_free_text(failure_class),
             evidence_ref=evidence_ref,
             scope=redact_free_text(scope),
         )
@@ -323,9 +338,13 @@ def _require_relative_ref(ref: str) -> None:
 
 def _require_iso_timestamp(value: str) -> None:
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (TypeError, ValueError) as exc:
         raise ValueError(f"timestamp must be ISO format: {value!r}") from exc
+    if parsed.tzinfo is None:
+        # Consistent with the goal store: naive timestamps are ambiguous
+        # evidence and are rejected instead of being silently assumed UTC.
+        raise ValueError(f"timestamp must be timezone-aware: {value!r}")
 
 
 def _utc_now_iso() -> str:

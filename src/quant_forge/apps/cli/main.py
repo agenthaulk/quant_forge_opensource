@@ -32,6 +32,7 @@ from quant_forge.factor_library.repository import (
 )
 from quant_forge.lineage.store import (
     LineageStore,
+    RUN_KINDS,
     RunIndex,
     artifact_id_for,
     canonical_fingerprint,
@@ -239,7 +240,9 @@ def build_parser() -> argparse.ArgumentParser:
     runs_show.set_defaults(handler=_cmd_runs_show)
     runs_search = runs_subcommands.add_parser("search", help="search runs by factor id and kind")
     runs_search.add_argument("--factor", required=True, help="factor id to search for")
-    runs_search.add_argument("--kind", choices=["evaluate", "backtest", "bench"])
+    # Derived from the lineage store's RUN_KINDS so every recorded run kind
+    # (including rd/falsification) is searchable without a second hardcoded list.
+    runs_search.add_argument("--kind", choices=list(RUN_KINDS))
     _add_config_options(runs_search)
     runs_search.add_argument("--artifact-root", type=Path)
     runs_search.add_argument("--limit", type=int, default=20)
@@ -833,13 +836,17 @@ def _cmd_goal_create(args: argparse.Namespace) -> int:
     config = _config(args)
     rd_config = load_research_loop_config(args.rd_config, config.research, config.simulation)
     store = ResearchGoalStore(_runtime_paths_from_config(args, config).artifact_root)
-    goal = store.create_goal(
-        objective=args.objective,
-        criteria=_goal_criteria(args),
-        seed_factor_id=args.seed_factor_id,
-        runtime_config_hash=_goal_runtime_config_hash(rd_config),
-        created_at=datetime.now(timezone.utc).isoformat(),
-    )
+    try:
+        goal = store.create_goal(
+            objective=args.objective,
+            criteria=_goal_criteria(args),
+            seed_factor_id=args.seed_factor_id,
+            runtime_config_hash=_goal_runtime_config_hash(rd_config),
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+    except (ValueError, FileExistsError) as exc:
+        print(f"goal create failed: {exc}")
+        return 2
     _print_json(store.describe(goal.goal_id))
     return 0
 
@@ -862,14 +869,18 @@ def _cmd_goal_show(args: argparse.Namespace) -> int:
 
 def _cmd_goal_audit(args: argparse.Namespace) -> int:
     store = ResearchGoalStore(_runtime_paths(args).artifact_root)
-    row = store.append_audit(
-        args.goal_id,
-        criterion_id=args.criterion,
-        result=args.result,
-        evidence_refs=_goal_evidence_refs(args, store.artifact_root),
-        notes=args.notes,
-        recorded_at=datetime.now(timezone.utc).isoformat(),
-    )
+    try:
+        row = store.append_audit(
+            args.goal_id,
+            criterion_id=args.criterion,
+            result=args.result,
+            evidence_refs=_goal_evidence_refs(args, store.artifact_root),
+            notes=args.notes,
+            recorded_at=datetime.now(timezone.utc).isoformat(),
+        )
+    except (ValueError, FileExistsError) as exc:
+        print(f"goal audit failed: {exc}")
+        return 2
     _print_json(row)
     return 0
 
@@ -957,6 +968,7 @@ def _cmd_research_run_once(args: argparse.Namespace) -> int:
         factor_values_manifest_root=paths.factor_values_manifest_root,
         llm_formula_repair_attempts=rd_config.llm.max_formula_repair_attempts,
         strategy_selector_enabled=rd_config.strategy_selector_enabled,
+        research_memory_enabled=rd_config.research_memory_enabled,
         hypothesis_generator=hypothesis_generator,
         review_generator=review_generator,
     )

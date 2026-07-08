@@ -157,6 +157,7 @@ class ResearchLoopConfig:
     llm: ResearchLLMConfig = field(default_factory=ResearchLLMConfig)
     deduplication: ResearchDeduplicationConfig = field(default_factory=ResearchDeduplicationConfig)
     strategy_selector_enabled: bool = True
+    research_memory_enabled: bool = True
 
     def __post_init__(self) -> None:
         if self.default_max_candidates < 1 or self.default_max_candidates > 10:
@@ -287,6 +288,9 @@ def load_research_loop_config(
         deduplication=_load_deduplication(loaded.get("deduplication"), base.deduplication),
         strategy_selector_enabled=bool(
             loaded.get("strategy_selector_enabled", base.strategy_selector_enabled)
+        ),
+        research_memory_enabled=bool(
+            loaded.get("research_memory_enabled", base.research_memory_enabled)
         ),
     )
 

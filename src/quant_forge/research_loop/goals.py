@@ -57,11 +57,13 @@ AUDIT_ROW_TYPE_CRITERION = "criterion_audit"
 AUDIT_ROW_TYPE_STATUS = "status_transition"
 
 #: Transitions allowed via :meth:`ResearchGoalStore.transition`. ``complete``
-#: is reachable ONLY through :meth:`ResearchGoalStore.complete_goal`.
+#: is reachable ONLY through :meth:`ResearchGoalStore.complete_goal`, which
+#: additionally runs the completion rule; the table below is the single
+#: authority on which source statuses may reach it (no draft -> complete jump).
 _ALLOWED_TRANSITIONS: dict[str, tuple[str, ...]] = {
     "draft": ("active", "abandoned"),
-    "active": ("insufficient_evidence", "abandoned"),
-    "insufficient_evidence": ("active", "abandoned"),
+    "active": ("insufficient_evidence", "abandoned", "complete"),
+    "insufficient_evidence": ("active", "abandoned", "complete"),
     "complete": (),
     "abandoned": (),
 }
@@ -117,6 +119,10 @@ class ResearchGoal:
         criterion_ids = [criterion.criterion_id for criterion in self.criteria]
         if len(set(criterion_ids)) != len(criterion_ids):
             raise ValueError("criterion ids must be unique within a goal")
+        if not any(criterion.required for criterion in self.criteria):
+            # FP-2: a goal whose criteria are all optional would complete
+            # vacuously with zero audit rows; such a goal is unrepresentable.
+            raise ValueError("a research goal requires at least one required criterion")
         if not self.seed_factor_id.strip():
             raise ValueError("seed_factor_id is required")
         if not _SHA256_HEX_RE.fullmatch(self.runtime_config_hash):
@@ -277,6 +283,8 @@ class ResearchGoalStore:
         status = self.effective_status(goal_id)
         if status in TERMINAL_GOAL_STATUSES:
             raise ValueError(f"goal {goal_id} is {status}; its audit log is closed")
+        if status == "draft":
+            raise ValueError(f"goal {goal_id} is draft; transition it to active before auditing")
         known_ids = {criterion.criterion_id for criterion in goal.criteria}
         if criterion_id not in known_ids:
             raise ValueError(f"unknown criterion for goal {goal_id}: {criterion_id!r}")
@@ -288,7 +296,7 @@ class ResearchGoalStore:
             recorded_at=recorded_at,
         )
         if audit.result in EVIDENCE_REQUIRED_RESULTS:
-            missing = [ref for ref in audit.evidence_refs if not (self.artifact_root / ref).exists()]
+            missing = [ref for ref in audit.evidence_refs if not self._evidence_exists(ref)]
             if missing:
                 # FP-4: citing evidence that is not on disk is fabrication.
                 raise ValueError(f"evidence refs do not exist under artifact_root: {missing}")
@@ -321,6 +329,15 @@ class ResearchGoalStore:
         current = self.effective_status(goal_id)
         if current in TERMINAL_GOAL_STATUSES:
             raise GoalCompletionError(f"goal {goal_id} is already {current}")
+        # Completion routes through the same transition table as every other
+        # status change: e.g. a draft goal can never jump straight to complete.
+        if "complete" not in _ALLOWED_TRANSITIONS.get(current, ()):
+            raise GoalCompletionError(f"transition {current!r} -> 'complete' is not allowed")
+        if not any(criterion.required for criterion in goal.criteria):
+            # Defense in depth for legacy artifacts that predate the
+            # at-least-one-required-criterion constructor rule (FP-2: an
+            # all-optional goal must never complete vacuously).
+            raise GoalCompletionError(f"goal {goal_id} has no required criteria and cannot complete")
         failures: list[str] = []
         latest_rows = self._latest_criterion_rows(goal_id)
         for criterion in goal.criteria:
@@ -336,7 +353,7 @@ class ResearchGoalStore:
                 continue
             if result in EVIDENCE_REQUIRED_RESULTS:
                 refs = [str(ref) for ref in row.get("evidence_refs") or []]
-                if not any((self.artifact_root / ref).exists() for ref in refs):
+                if not any(self._evidence_exists(ref) for ref in refs):
                     failures.append(
                         f"required criterion {criterion.criterion_id} cites no evidence ref "
                         "that exists under artifact_root"
@@ -346,6 +363,16 @@ class ResearchGoalStore:
         return self._append_status_row(
             goal_id, from_status=current, to_status="complete", recorded_at=recorded_at, reason="completion rule satisfied"
         )
+
+    def _evidence_exists(self, ref: str) -> bool:
+        """True only when ``ref`` resolves to an existing file CONTAINED in
+        ``artifact_root`` (symlinks that escape the root do not count)."""
+
+        root = self.artifact_root.resolve(strict=False)
+        candidate = (self.artifact_root / ref).resolve(strict=False)
+        if candidate != root and root not in candidate.parents:
+            return False
+        return candidate.exists()
 
     def _latest_criterion_rows(self, goal_id: str) -> dict[str, dict[str, Any]]:
         latest: dict[str, dict[str, Any]] = {}

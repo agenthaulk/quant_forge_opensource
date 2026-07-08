@@ -2435,3 +2435,135 @@ def test_strategy_context_duplicate_rate_uses_attempted_plan_denominator() -> No
     # 1 duplicate out of 2 attempted plans; the old planner-call denominator
     # (4 experiment_plan rows) would have reported 0.25.
     assert context.duplicate_rate == pytest.approx(0.5)
+
+
+def test_strategy_context_uses_round_winner_not_last_traced_result() -> None:
+    # C1: candidates are traced in EVALUATION order while the round is sorted
+    # afterwards, so a losing candidate traced last must never drive the next
+    # round's selector. Rounds persisted after the fix carry the WINNER's
+    # decay/gate reasons in the round summary; the selector prefers those.
+    from quant_forge.research_loop.service import _strategy_context_from_trace_entries
+
+    run_id = "rd_FTR_SEED_20240101T000000000000Z_00000000"
+    winner_row = {
+        "run_id": run_id,
+        "phase": "experiment_result",
+        "gate_decision": {"accepted": True, "blocking_reasons": []},
+        "backtest_summary": {"oos_net_return_decay": 0.1},
+        "artifact_refs": {},
+    }
+    loser_row_traced_last = {
+        "run_id": run_id,
+        "phase": "experiment_result",
+        "gate_decision": {
+            "accepted": False,
+            "blocking_reasons": ["OOS net return decay exceeds 0.500000", "turnover_rate 2.000000 > 1.500000"],
+        },
+        "backtest_summary": {"oos_net_return_decay": 0.9},
+        "artifact_refs": {},
+    }
+    summary_payload = {
+        "seed_factor_id": "FTR_SEED",
+        "round_index": 0,
+        "planned_count": 2,
+        "candidate_count": 2,
+        "duplicate_count": 0,
+        "duplicate_rate": 0.0,
+        "seed_score": 0.5,
+        "best_score": 1.0,
+        "best_score_delta_vs_seed": 0.5,
+        "accepted_candidate_ids": ["FTR_WINNER"],
+        "winner_candidate_ref": "FTR_WINNER",
+        "winner_oos_net_return_decay": 0.1,
+        "winner_gate_blocking_reasons": [],
+    }
+    entries = [
+        winner_row,
+        loser_row_traced_last,
+        {"run_id": run_id, "phase": "round_summary", "round_summary": summary_payload},
+    ]
+
+    context = _strategy_context_from_trace_entries(entries)
+    # The WINNER's evidence, not the last-traced loser's.
+    assert context.oos_net_return_decay == pytest.approx(0.1)
+    assert context.gate_blocking_reasons == ()
+    assert context.turnover_breach is False
+    assert context.best_score_delta_vs_seed == pytest.approx(0.5)
+
+    # Legacy traces (round summaries written BEFORE the winner-evidence keys)
+    # keep the old best-effort fallback to the last-traced experiment_result.
+    legacy_payload = {
+        key: value for key, value in summary_payload.items() if not key.startswith("winner_")
+    }
+    legacy = _strategy_context_from_trace_entries(
+        [winner_row, loser_row_traced_last, {"run_id": run_id, "phase": "round_summary", "round_summary": legacy_payload}]
+    )
+    assert legacy.oos_net_return_decay == pytest.approx(0.9)
+    assert legacy.turnover_breach is True
+
+
+def test_round_summary_persists_winner_evidence_for_next_round(tmp_path: Path) -> None:
+    # C1 end-to-end: the persisted round summary names the round winner
+    # (results[0] after sorting) and carries the winner's own decay evidence.
+    from quant_forge.research_loop.service import _oos_net_return_decay_value
+
+    paths = create_demo_workspace(tmp_path / "demo")
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+    )
+    result = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=2)
+
+    assert result.trace_root is not None
+    assert result.candidates
+    rows = _trace_rows_for(result.trace_root)
+    summary_rows = [row for row in rows if row["phase"] == "round_summary"]
+    assert len(summary_rows) == 1
+    summary = summary_rows[0]["round_summary"]
+    winner = result.candidates[0]
+    assert summary["winner_candidate_ref"] == winner.factor.factor_id
+    expected_decay = _oos_net_return_decay_value(winner.backtest)
+    if expected_decay is None:
+        assert summary["winner_oos_net_return_decay"] is None
+    else:
+        assert summary["winner_oos_net_return_decay"] == pytest.approx(expected_decay)
+    assert isinstance(summary["winner_gate_blocking_reasons"], list)
+    if winner.gate_passed:
+        assert summary["winner_gate_blocking_reasons"] == []
+
+
+def test_read_recent_entries_seed_scoping_survives_other_seed_floods(tmp_path: Path) -> None:
+    # C2: seed-chain scoping must happen BEFORE the read window limit. One
+    # same-seed entry followed by 200+ other-seed entries used to erase the
+    # seed's entire history from the selector context.
+    import os
+
+    from quant_forge.research_loop.service import _run_id_in_seed_chain
+
+    store = ResearchTraceStore(tmp_path / "rd_trace")
+    same_seed_run = "rd_FTR_SEED_20240101T000000000000Z_00000000"
+    other_seed_run = "rd_FTR_OTHER_20240102T000000000000Z_00000001"
+    store.append_trace({"run_id": same_seed_run, "phase": "round_summary", "round_summary": {"round_index": 0}})
+    for index in range(205):
+        store.append_trace({"run_id": other_seed_run, "phase": "experiment_plan", "lane_id": f"lane-{index}"})
+    # Pin the same-seed trace file older so the unfiltered control below is
+    # deterministic under mtime-ordered reads.
+    same_seed_path = store.run_dir(same_seed_run) / "trace.jsonl"
+    stat = same_seed_path.stat()
+    os.utime(same_seed_path, (stat.st_atime - 3600, stat.st_mtime - 3600))
+
+    def seed_filter(run_id: str) -> bool:
+        return _run_id_in_seed_chain(
+            run_id,
+            seed_factor_id="FTR_SEED",
+            current_run_id="rd_FTR_SEED_20240103T000000000000Z_00000002",
+        )
+
+    # Control (old behavior): the global window is saturated by the other seed.
+    unfiltered = store.read_recent_entries(limit=200)
+    assert all(entry["run_id"] == other_seed_run for entry in unfiltered)
+
+    scoped = store.read_recent_entries(limit=200, run_id_filter=seed_filter)
+    assert [entry["run_id"] for entry in scoped] == [same_seed_run]
+    assert scoped[0]["round_summary"]["round_index"] == 0
