@@ -216,8 +216,32 @@ pytest -q` + `python3 scripts/release_safety_scan.py` + CLI `--help` +
 - Verify: `git log --oneline f89bc72 b6e0b48 dbe8381 e274012 7b10667`
   exist; suite green.
 
-## CP8 — Integration acceptance + merge prep — ⬜ TODO
-- Full-chain integration test (Docker/web/RD per docs/integration_workflow.md
-  if environment allows); final cross-review; PR(s) for Phase B + Phase C
-  branches after owner approval; WORKING_STATE migration into
-  docs/coordination/.
+## CP8 — Integration acceptance + merge prep — 🔶 INTEGRATION ACCEPTED
+- **Full integration test PASSED end-to-end** (owner directive
+  2026-07-08; per docs/full_integration_test_prompt.md, adapted to test
+  the Phase C branch pre-merge): fresh `git archive` of the branch tip
+  into a clean python:3.12-slim container (constraints pins), real
+  DeepSeek LLM, real desktop Chrome (Playwright-CDP Level 2 fallback —
+  Computer-Use tooling unavailable that session) over the whole flow:
+  3 seeds parse → 11-param adjust → validate/evaluate → RD ×1/×2 →
+  all eight tabs → deep-link reloads → zero console errors →
+  true-375px (CDP device metrics). Zero blocking issues. Evidence:
+  37 screenshots + findings register (session scratchpad).
+- **Findings batch-fixed and re-verified against the running system**:
+  F-001..F-010 landed in `7983795` (4 disjoint lanes + Codex xhigh
+  review; its 1 major — invalidate-during-in-flight refresh race — and
+  1 minor fixed with a 14-check node state-machine smoke) and
+  F-011/F-012 in `4906072` (job-failure reasons surfaced in all five
+  handlers; .github/ ships in the image so the in-container pytest
+  gate passes). Re-verification round: all findings VERIFIED-FIXED in
+  a fresh container built from the new reference Dockerfile.
+  Gate: **894 passed**, release scan 194 files (roots now include
+  Dockerfile/extensions/constraints.txt/CLAUDE.md), CLI, diff clean,
+  docker build OK.
+- Known cosmetic residuals (deliberately deferred): failed RD
+  schedule-start leaves its placeholder; KeyError 404 bodies carry
+  repr quotes; fetchPanelJson errors lack HTTP status; history/bench
+  duplicate status label on non-available metrics.
+- Remaining for CP8 closure: Phase C PR (stacked on PR #14) after the
+  sensitive-info leak sweep; WORKING_STATE migration into
+  docs/coordination/; final cross-review at merge time.
