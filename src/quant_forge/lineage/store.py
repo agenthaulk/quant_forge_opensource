@@ -11,13 +11,19 @@ reach disk.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
 import re
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
+
+try:  # pragma: no cover - fcntl is available on every POSIX platform
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX (e.g. Windows) fallback
+    fcntl = None  # type: ignore[assignment]
 
 from quant_forge.core.contracts import MetricValue
 from quant_forge.factor_library.classification import FACTOR_CATEGORY_DIRS
@@ -46,6 +52,14 @@ _POSIX_PATH_RE = re.compile(
     r"(?:~|/(?:Users|home|root|private|var|tmp|opt|mnt|srv|etc|usr|Volumes|Library))(?:/[^\s'\"`;,)\]}]+)+"
 )
 _WINDOWS_PATH_RE = re.compile(r"\b[A-Za-z]:[\\/][^\s'\"`;,)\]}]+")
+# UNC network paths (double-backslash server, share, and at least one further
+# separator-delimited component). Built structurally so no literal
+# user-home-like marker appears in this public source file.
+_UNC_PATH_RE = re.compile(r"\\\\[^\s\\'\"`;,)\]}]+(?:\\[^\s\\'\"`;,)\]}]+)+")
+# file:// URLs in both host form (file://host/share/...) and local form
+# (file:///abs/path); applied before the POSIX rule so the scheme prefix is
+# redacted together with the path.
+_FILE_URL_RE = re.compile(r"\bfile://[^\s'\"`;,)\]}]+", re.IGNORECASE)
 _ENV_SECRET_RE = re.compile(
     r"\b(?P<key>[A-Za-z_][A-Za-z0-9_]*(?:key|token|secret|password|passwd|credential)s?[A-Za-z0-9_]*)"
     r"\s*=\s*(?P<value>[^\s'\"]+)",
@@ -61,9 +75,33 @@ def redact_free_text(text: str) -> str:
     if len(home) > 1:
         redacted = redacted.replace(home, _REDACTED_PATH)
     redacted = _ENV_SECRET_RE.sub(lambda match: f"{match.group('key')}={_REDACTED_VALUE}", redacted)
+    redacted = _FILE_URL_RE.sub(_REDACTED_PATH, redacted)
+    redacted = _UNC_PATH_RE.sub(_REDACTED_PATH, redacted)
     redacted = _WINDOWS_PATH_RE.sub(_REDACTED_PATH, redacted)
     redacted = _POSIX_PATH_RE.sub(_REDACTED_PATH, redacted)
     return redacted
+
+
+@contextmanager
+def _advisory_file_lock(lock_path: Path) -> Iterator[None]:
+    """Advisory ``fcntl.flock`` exclusive lock on a sidecar ``.lock`` file.
+
+    Serializes the read-then-append critical sections of the lineage and run
+    indexes against concurrent same-host writers. On platforms without
+    ``fcntl`` (non-POSIX, e.g. Windows) this degrades to a no-op: appends stay
+    append-only but the read+append dedup window is not serialized there.
+    """
+
+    if fcntl is None:
+        yield
+        return
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def canonical_fingerprint(payload: Mapping[str, Any]) -> str:
@@ -179,6 +217,7 @@ class LineageStore:
     def __init__(self, artifact_root: Path) -> None:
         self.artifact_root = artifact_root.expanduser()
         self.index_path = self.artifact_root / _LINEAGE_INDEX_RELATIVE
+        self.lock_path = self.index_path.with_suffix(".lock")
 
     def record_artifact(
         self,
@@ -202,8 +241,12 @@ class LineageStore:
                 redact_free_text(str(key)): redact_free_text(str(value)) for key, value in (metadata or {}).items()
             },
         )
-        if not self._edge_recorded(record):
-            self._append(self._row_for(record))
+        # The read-then-append dedup below is a critical section: two writers
+        # interleaving between the read and the append would both append the
+        # same edge. The advisory lock serializes same-host writers.
+        with _advisory_file_lock(self.lock_path):
+            if not self._edge_recorded(record):
+                self._append(self._row_for(record))
         return record
 
     def read_rows(self) -> list[dict[str, Any]]:
@@ -244,6 +287,7 @@ class RunIndex:
     def __init__(self, artifact_root: Path) -> None:
         self.artifact_root = artifact_root.expanduser()
         self.index_path = self.artifact_root / _RUN_INDEX_RELATIVE
+        self.lock_path = self.index_path.with_suffix(".lock")
 
     def append_run(
         self,
@@ -291,7 +335,8 @@ class RunIndex:
             "artifact_paths_rel": paths_rel,
             "warnings_count": int(warnings_count),
         }
-        _append_jsonl(self.index_path, row)
+        with _advisory_file_lock(self.lock_path):
+            _append_jsonl(self.index_path, row)
         return row
 
     def read_rows(self) -> list[dict[str, Any]]:

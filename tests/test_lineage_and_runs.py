@@ -392,3 +392,89 @@ def test_cli_factor_bench_requires_a_selection(tmp_path: Path, capsys: pytest.Ca
     )
     assert exit_code == 2
     assert "no factors selected" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Redaction: UNC paths and file:// URLs (C4)
+# ---------------------------------------------------------------------------
+
+
+def test_redact_free_text_redacts_unc_paths(tmp_path: Path) -> None:
+    # Regression: UNC network paths used to round-trip unchanged.
+    text = "panel copied from " + "\\\\fileserver\\research\\panels\\cn_a.parquet before the run"
+    redacted = redact_free_text(text)
+    assert "fileserver" not in redacted
+    assert "cn_a.parquet" not in redacted
+    assert "<redacted-path>" in redacted
+    assert "before the run" in redacted
+
+
+def test_redact_free_text_redacts_file_urls(tmp_path: Path) -> None:
+    # Regression: file:// URLs (host form and local triple-slash form) used to
+    # round-trip unchanged.
+    local_url = "file:///opt/qf/artifacts/report.json"
+    host_url = "file://nas01/exports/panel.parquet"
+    redacted = redact_free_text(f"see {local_url} and {host_url} for details")
+    assert "opt/qf" not in redacted
+    assert "nas01" not in redacted
+    assert "file://" not in redacted
+    assert redacted.count("<redacted-path>") == 2
+    assert "for details" in redacted
+
+
+# ---------------------------------------------------------------------------
+# Advisory locking around read-then-append dedup (C5)
+# ---------------------------------------------------------------------------
+
+
+def test_lineage_and_run_index_appends_take_an_advisory_lock(tmp_path: Path) -> None:
+    artifact_root = tmp_path / "artifacts"
+    # Two independent writer instances (separate read-then-append sections)
+    # must still deduplicate the identical edge, and the sidecar lock file
+    # pins the serialization mechanism.
+    first_writer = LineageStore(artifact_root)
+    second_writer = LineageStore(artifact_root)
+    for writer in (first_writer, second_writer):
+        writer.record_artifact(
+            artifact_type="factor_definition",
+            payload={"factor_id": "F_LOCK"},
+            created_at=CREATED_AT,
+            generated_by="factor_root",
+        )
+    assert len(_read_jsonl(first_writer.index_path)) == 1
+    assert first_writer.lock_path.exists()
+    assert first_writer.lock_path.name == "artifact_index.lock"
+
+    index = RunIndex(artifact_root)
+    index.append_run(
+        run_id="bench-20260706T000000000000Z-abcdef12",
+        kind="bench",
+        factor_ids=["F_LOCK"],
+        created_at=CREATED_AT,
+        data_window={"start_date": None, "end_date": None, "status": "unavailable"},
+        config_fingerprint="c" * 64,
+        metric_highlights={},
+        artifact_paths_rel=["bench/report.json"],
+        warnings_count=0,
+    )
+    assert index.lock_path.exists()
+    assert index.lock_path.name == "index.lock"
+    assert len(index.read_rows()) == 1
+
+
+# ---------------------------------------------------------------------------
+# qf runs search --kind covers every recorded run kind (C6/O7)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_runs_search_kind_choices_cover_all_run_kinds(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from quant_forge.lineage.store import RUN_KINDS
+
+    artifact_root = str(tmp_path / "artifacts")
+    assert set(RUN_KINDS) == {"evaluate", "backtest", "bench", "rd", "falsification"}
+    for kind in RUN_KINDS:
+        exit_code = cli_main.main(
+            ["runs", "search", "--factor", "FTR_DEMO_SMALL_CAP", "--kind", kind, "--artifact-root", artifact_root]
+        )
+        assert exit_code == 0
+        assert "no runs matched" in capsys.readouterr().out
