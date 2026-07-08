@@ -1,7 +1,7 @@
 # Owner Decision Register
 
 Per decision D5, coordination records live in git under `docs/coordination/`.
-Owner: project manager (haulk). Recorded by Fable.
+Owner: the project owner. Recorded by Fable.
 
 ## 2026-07-06 — Phase B/C decision set
 
