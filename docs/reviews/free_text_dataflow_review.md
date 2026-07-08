@@ -1,13 +1,14 @@
-# Untrusted-text dataflow review
+# Free-text data-handling and input-validation review
 
 > CP7 review item (ENGINEERING_PROGRESS.md CP7). Produced 2026-07-07 by a
 > read-only Opus review agent under Fable orchestration; adjudicated by
 > Fable: findings F1–F6 accepted, hardening proposals P1–P5 accepted and
-> scheduled as the CP7-H hardening batch (after the CP5/D1 landing).
-> Trust levels: *operator* (local human at CLI/web UI), *model* (LLM
-> output), *provider-channel* (non-model bytes from the provider
-> endpoint), *disk* (JSONL/YAML under artifact_root/factor_root —
-> trusted-at-write, unverified-at-read).
+> scheduled as the CP7-H hardening batch (after the CP5/D1 landing). This
+> is ordinary input-validation and data-robustness engineering, not a
+> security assessment. Provenance levels: *operator* (local human at
+> CLI/web UI), *model* (LLM output), *provider-channel* (non-model bytes
+> from the provider endpoint), *disk* (JSONL/YAML under
+> artifact_root/factor_root — validated-at-write, re-read-without-recheck).
 
 ## Review scope and method
 
@@ -29,9 +30,9 @@ cited by test-name inspection, not execution.
 
 ## Data flows
 
-| # | Flow | Source trust | Verified safeguards | Residual gap |
+| # | Flow | Source provenance | Verified safeguards | Residual gap |
 |---|------|--------------|--------------------|--------------|
-| A1 | Research-memory statements → hypothesis prompt (`context_builder.py:84-99` → `llm.py:192-193, 224-225`) | disk (written by service templates at `service.py:999-1022`) | `redact_free_text` at write time (`memory.py:212-219, 284`); prompt forwards only `statement`+`observation_count`, max 5/tier, `source=="research_memory"` filter (`llm.py:315-338`); deterministic promotion, rules never auto-activate (`memory.py:101-104, 121-178`; `tests/test_research_memory.py:148, 249, 337, 453`) | Read path trusts disk: statements re-read verbatim, never re-validated, unbounded length (`memory.py:245-258, 260-275, 303`; `llm.py:327`). Redaction strips paths/secrets only, not imperative text (`lineage/store.py:70-82`) |
+| A1 | Research-memory statements → hypothesis prompt (`context_builder.py:84-99` → `llm.py:192-193, 224-225`) | disk (written by service templates at `service.py:999-1022`) | `redact_free_text` at write time (`memory.py:212-219, 284`); prompt forwards only `statement`+`observation_count`, max 5/tier, `source=="research_memory"` filter (`llm.py:315-338`); deterministic promotion, rules never auto-activate (`memory.py:101-104, 121-178`; `tests/test_research_memory.py:148, 249, 337, 453`) | Read path trusts disk: statements re-read verbatim, never re-validated, unbounded length (`memory.py:245-258, 260-275, 303`; `llm.py:327`). Redaction strips paths/secrets only, not free-form directive text (`lineage/store.py:70-82`) |
 | A2 | Trace summaries → hypothesis prompt | disk | Trace dicts enter `ResearchContext` (`context_builder.py:78-79`) but prompt assembly forwards only research-memory rows and `next_focus_hints` (`llm.py:188-193`); hints are producer-side fixed templates (`feedback_builder.py:15, 22, 29, 46-60`) | Hint strings are read back from `trace.jsonl` without checking they belong to the template set (`context_builder.py:126-134`) |
 | B1 | Web factor-idea text → LLM parser (`routing.py` POST → `api.py:66-118, 145-164` → `llm_factor_parser.py:28-51`) | operator (loopback-only bind default, `routing.py:52-58`; bearer token required only for `0.0.0.0`, `api.py:1222-1231`) — effectively also any same-host process | Idea text goes verbatim into the LLM user message (`llm_factor_parser.py:80`) by design; model output gated: name slugged (`llm_factor_parser.py:122-124`), formula through registry+AST gate (`llm_factor_parser.py:88-92`), digest factor_id (`llm_factor_parser.py:99-101`) | `description` (`llm_factor_parser.py:93`) and `universe_filters` (`llm_factor_parser.py:98`) kept as free text and persisted (see C2) |
 | B2 | Web "edited draft factor" JSON → persistence (`api.py:121-142, 614-631, 180-182`) | operator / same-host | `factor_id` regex contract (`core/contracts.py:58-59`); `horizon_days` positive int (`api.py:628`); invalid formulas rejected at evaluation time by the registry gate | Arbitrary `name`/`description`/`formula`/`status` strings persist to `factor_root`; `status:"active"` immediately qualifies the row for prompt recycling (`context_builder.py:50-52`) |
@@ -41,12 +42,12 @@ cited by test-name inspection, not execution.
 | C4 | Data-window notes → memory rows | derived from evaluation results | `start:end` template, empty when unavailable (`service.py:2729-2735`); tz-aware ISO enforced on memory timestamps (`memory.py:339-347`) | None found |
 | D1 | Model output → file name/path (`repository.py:89-96`; `operator_drafts.py:35-36`) | model | factor_id digest-based (`llm_factor_parser.py:99-101`, `service.py:1916-1918`) + regex `[A-Za-z][A-Za-z0-9_=-]*` in the dataclass contract (`contracts.py:58-59`); `get`/`delete` pre-validate ids (`repository.py:20-28`; `tests/test_repository_security.py:19-31`); draft dirs slugged+capped (`operator_drafts.py:144-148`) | None found (charset excludes `/`, `\`, `.`) |
 | D2 | Model output → DSL program | model | AST-only parse, node whitelist, no `eval`/`exec`/`compile` anywhere in `src` (grep-verified); interpreter over whitelisted ops (`formula_parser.py:129-158`; `executor.py:66-149`); fields must be existing numeric columns (`executor.py:255-261`); filters reduced to literal `is_st == false` or rejected (`experiment_planner.py:197-211`, `service.py:2451-2457`, `executor.py:264-270`) | No upper bound on window arguments or formula size (`executor.py:242-245` floors to ≥1 but never caps; `formula_parser.py` has no length limit) |
-| D3 | Model output → config values | model | `horizon_days` int-coerced, ≥1 (`llm_factor_parser.py:94, 111-119`; `contracts.py:60-61`); `expected_direction`/`source` enum-coerced (`llm.py:579-590`); web `objective` must match a configured weight profile before generation (`research_loop/config.py:298-305`, called at `api.py:705`) | `horizon_days` has no upper bound (robustness, not injection) |
+| D3 | Model output → config values | model | `horizon_days` int-coerced, ≥1 (`llm_factor_parser.py:94, 111-119`; `contracts.py:60-61`); `expected_direction`/`source` enum-coerced (`llm.py:579-590`); web `objective` must match a configured weight profile before generation (`research_loop/config.py:298-305`, called at `api.py:705`) | `horizon_days` has no upper bound (robustness only) |
 
 ## Findings ranked by priority
 
 **F1 (highest). Prompt context trusts free text read back from
-`artifact_root`; redaction is not instruction-neutralization.**
+`artifact_root`; redaction does not validate statement structure.**
 `redact_free_text` removes paths and `KEY=value` secrets only
 (`lineage/store.py:70-82`). Memory statements are redacted at write
 (`memory.py:212-219`) but re-enter prompts verbatim from disk with no
@@ -54,13 +55,13 @@ read-time shape/length check (`memory.py:245-258, 303`;
 `context_builder.py:95`; `llm.py:327`, then `llm.py:224-225`). Concrete
 failure scenario: a row appended to
 `artifact_root/research_memory/failures.jsonl` by any other same-host
-process, sync tool, or hand edit — with a `statement` containing
-imperative instructions — is included verbatim, up to 5 items per tier,
-in every subsequent hypothesis prompt and can steer generation for as
-long as the row stays live. Damage is bounded by the DSL gate and
-candidate gates (a steered hypothesis still cannot execute arbitrary code
-or touch arbitrary paths), but research direction, compute waste, and
-result quality are exposed.
+process, sync tool, or hand edit — with a `statement` containing arbitrary
+free-form text — is included verbatim, up to 5 items per tier,
+in every subsequent hypothesis prompt and can influence generation for as
+long as the row stays live. Impact is bounded by the DSL gate and
+candidate gates (a resulting hypothesis still cannot execute arbitrary code
+or reach arbitrary paths), but research direction, compute waste, and
+result quality are affected.
 
 **F2. Provider-channel text can enter durable memory statements.**
 `llm_client.py:275-280` raises `RuntimeError(f"LLM request failed with
@@ -69,8 +70,8 @@ the configured endpoint. `_repair_failed_plan` folds `str(exc)` into plan
 blocking reasons (`service.py:2288-2290`); blocking reasons become gate
 reasons (`candidate_gate.py:42`) and are joined verbatim into the
 persisted memory statement (`service.py:1016-1017`). Concrete failure
-scenario: a misbehaving or compromised OpenAI-compatible endpoint returns
-HTTP 4xx with an instruction-bearing body; that text is persisted into
+scenario: a misbehaving or misconfigured OpenAI-compatible endpoint returns
+HTTP 4xx with an arbitrary text body; that text is persisted into
 `failures.jsonl` and, after promotion, replays into future hypothesis
 prompts via F1. The signature-side family reduction
 (`service.py:2738-2751`) protects the *signature* only, not the
@@ -84,11 +85,11 @@ limits.** `_factor_from_request` accepts arbitrary `name`, `description`,
 (`context_builder.py:50-52`), placing its free-text `name`, `formula`,
 and `universe_filters` into every hypothesis prompt (`llm.py:222`); if
 later used as a seed, its `description` also enters the prompt
-(`llm.py:409-418`). Trust level is "local operator" (loopback bind
-default, `routing.py:52-58`), so this is a robustness issue rather than a
-remote one — but it is the widest free-text channel into prompt assembly,
-and the loopback bind carries no token (`api.py:1222-1224`), so any
-same-host process can use it.
+(`llm.py:409-418`). Provenance is "local operator" (loopback bind
+default, `routing.py:52-58`), so this is a local robustness issue rather
+than a remotely reachable one — but it is the widest free-text channel
+into prompt assembly, and the loopback bind carries no token
+(`api.py:1222-1224`), so any same-host process can use it.
 
 **F4. `next_focus_hints` template set is enforced only at the producer.**
 Hints are generated exclusively from a fixed template set
@@ -97,20 +98,20 @@ Hints are generated exclusively from a fixed template set
 before entering the prompt (`llm.py:223`). Same disk-trust scenario as
 F1, smaller surface.
 
-**F5 (robustness, not injection). DSL numeric arguments and formula size
+**F5 (robustness only). DSL numeric arguments and formula size
 are unbounded.** A model-supplied `ts_mean(close, 999999999)` passes
 validation (`formula_parser.py:274-278` only checks "is a number";
 `executor.py:242-245` floors but never caps) and drives
 `formula_lookback_rows`/rolling windows; arbitrarily long formula strings
-are parsed without a length cap. Concrete failure scenario: one hostile
+are parsed without a length cap. Concrete failure scenario: one malformed
 or degenerate hypothesis stalls an RD run with memory/CPU blowup.
 `horizon_days` similarly has no upper bound (`contracts.py:60-61`).
 
 **F6 (minor inconsistency). Lineage timestamps accept naive datetimes.**
 `memory.py:339-347` and `new_run_id` (`store.py:183-184`) require
 tz-aware timestamps, but the lineage/run-index `_require_iso_timestamp`
-(`store.py:400-404`) accepts naive ISO strings. Not exploitable; noted
-for contract symmetry.
+(`store.py:400-404`) accepts naive ISO strings. No correctness impact;
+noted for contract symmetry.
 
 ## Minimal hardening proposals (all ACCEPTED by Fable → CP7-H batch)
 
@@ -122,10 +123,10 @@ prefixes: `"accepted candidate formula family "` and
 item whose statement does not start with a known prefix, collapse it to a
 single line, and cap it (e.g. 300 chars). ~6 lines at the single choke
 point every memory statement must pass to reach a prompt; no schema
-change, no migration; turns the "hostile JSONL under artifact_root" class
-into silently-skipped rows. A one-line counterpart in `_next_focus_hints`
-(`context_builder.py:126-134`) — keep only hints found in the enumerable
-`feedback_builder` template set — closes F4 the same way.
+change, no migration; turns the "non-conforming JSONL under artifact_root"
+class into silently-skipped rows. A one-line counterpart in
+`_next_focus_hints` (`context_builder.py:126-134`) — keep only hints found
+in the enumerable `feedback_builder` template set — closes F4 the same way.
 
 **P2 — Family-reduce the memory statement, not just the signature (closes
 F2 at the write side).** In `_record_memory_observations`, build the
@@ -190,7 +191,7 @@ every legitimate formula in the repo is far below them.
   by `api.py`/`service.py` only; no reference in `research_loop/llm.py`
   or `context_builder.py`. Writes structurally validated
   (`store.py:307-321, 360-397`); web reads pass `_redact_web_text`.
-- **Web `objective` cannot inject free text into the prompt.**
+- **Web `objective` cannot introduce free text into the prompt.**
   `weights_for_objective` raises for unconfigured objectives
   (`research_loop/config.py:298-305`, called at `api.py:705`).
 - **LLM prose cannot mint active rules.** Promotion is a pure function of

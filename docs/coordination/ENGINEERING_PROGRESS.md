@@ -162,20 +162,19 @@ pytest -q` + `python3 scripts/release_safety_scan.py` + CLI `--help` +
   F-3 _backtest_metrics segment_metrics; F-4 demo fillna removed; F-5
   rd.yaml missing_oos_evidence_blocks knob. Codex xhigh review majors
   fixed in-commit.
-- Untrusted-input handling review (the "prompt-injection review item"):
-  read-only dataflow analysis landed as docs/reviews/
-  untrusted_text_dataflow_review.md (`e274012`); findings F1-F6, proposals
-  P1-P5 accepted.
+- Free-text data-handling review (input-validation robustness item):
+  read-only dataflow analysis landed as
+  docs/reviews/free_text_dataflow_review.md (`e274012`, reworded to
+  neutral framing in a later commit); findings F1-F6, proposals P1-P5
+  accepted.
 - CP7-H hardening batch (`7b10667`): P1 read-time statement/hint template
   gates (whole-statement match to the exact service templates), P2
   family-reduced memory statements, P3 provider error-body cap, P4 factor
   free-text caps + web-path slug + draft-only status, P5 DSL window/
   formula-length caps + horizon bound, F6 tz-aware lineage timestamps.
-  Codex xhigh review found 2 gaps (prefix-only auth; wq_min/wq_max window
+  Codex xhigh review found 2 gaps (prefix-only match; wq_min/wq_max window
   skip) — both fixed by an Opus lane. Test fixtures use benign structural
-  markers, not free-form payloads. (Note: this untrusted-input thread
-  tripped Fable 5's dual-use safeguard; the batch was completed on Opus
-  4.8 per standing owner protocol, then the model returns to Fable.)
+  markers, not free-form values.
 - Gate: combined barrier **748 passed**, scan 172, CLI, diff-check.
 - Verify: `git log --oneline f89bc72 b6e0b48 dbe8381 e274012 7b10667`
   exist; suite green.
