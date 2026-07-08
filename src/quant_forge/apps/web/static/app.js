@@ -72,6 +72,20 @@ let validatedFactorId = null;
 function clearGlobalError() {
   errorEl.textContent = '';
 }
+// Failed-run notices (integration finding F-011): a failed job must not
+// leave its result region on the stale "running" placeholder, and the
+// job's error field must reach the visible failure surface. The card
+// carries a text label (never color alone), matching the parse-warning
+// notice pattern; an empty error message falls back to the api-layer
+// generic so the notice never renders 'undefined'.
+function jobFailureReason(error) {
+  return (error && error.message) || 'request failed';
+}
+function showJobFailureNotice(mountId, reason) {
+  const mount = document.getElementById(mountId);
+  if (!mount) return;
+  mount.innerHTML = `<div class="notice err"><span class="status-pill status-pill--fail">失败</span> ${esc(reason)}</div>`;
+}
 function setValidationInputsEnabled(enabled) {
   Object.values(validationInputs).forEach(input => {
     input.disabled = !enabled;
@@ -455,17 +469,21 @@ button.addEventListener('click', async () => {
           statusEl.innerHTML = '<span class="ok">已使用本地规则解析，等待确认参数</span>';
           return;
         } catch (fallbackError) {
+          const reason = jobFailureReason(fallbackError);
           setStep('parse', 'pending');
           setTabDot('lab-tab-factor', 'error');
-          errorEl.textContent = fallbackError.message;
+          showJobFailureNotice('result', reason);
+          errorEl.textContent = reason;
           statusEl.textContent = '运行失败';
           return;
         }
       }
     }
+    const reason = jobFailureReason(error);
     setStep('parse', 'pending');
     setTabDot('lab-tab-factor', 'error');
-    errorEl.textContent = error.message;
+    showJobFailureNotice('result', reason);
+    errorEl.textContent = reason;
     statusEl.textContent = '运行失败';
   } finally {
     activeIdeaJobId = null;
@@ -507,9 +525,11 @@ validateButton.addEventListener('click', async () => {
       statusEl.innerHTML = '<span class="warn">运行已中断</span>';
       return;
     }
+    const reason = jobFailureReason(error);
     setStep('validate', 'pending');
     setTabDot('lab-tab-factor', 'error');
-    errorEl.textContent = error.message;
+    showJobFailureNotice('result', reason);
+    errorEl.textContent = reason;
     statusEl.textContent = '验证失败';
   } finally {
     activeIdeaJobId = null;
@@ -543,8 +563,10 @@ staggeredButton.addEventListener('click', async () => {
       statusEl.innerHTML = '<span class="warn">运行已中断</span>';
       return;
     }
+    const reason = jobFailureReason(error);
     setTabDot('lab-tab-factor', 'error');
-    errorEl.textContent = error.message;
+    showJobFailureNotice('staggered-result', reason);
+    errorEl.textContent = reason;
     statusEl.textContent = '稳健性回测失败';
   } finally {
     activeIdeaJobId = null;
@@ -600,9 +622,11 @@ rdRun.addEventListener('click', async () => {
       resetRdResult('RD 已中断', '本次 RD 已取消，未产生新的候选结果。');
       rdStatusEl.textContent = 'RD 已中断';
     } else {
+      const reason = jobFailureReason(error);
       setStep('rd', 'pending');
       setTabDot('lab-tab-rd', 'error');
-      rdStatusEl.textContent = error.message;
+      showJobFailureNotice('rd-result', reason);
+      rdStatusEl.innerHTML = `<span class="err">${esc(reason)}</span>`;
     }
   } finally {
     activeRdJobId = null;

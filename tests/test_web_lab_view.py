@@ -336,6 +336,48 @@ def test_job_completion_invalidates_dependent_panels() -> None:
     assert "isStale" not in lab_js
 
 
+def test_job_failure_branches_surface_error_and_replace_stale_placeholders() -> None:
+    # Integration finding F-011: when a job fails (e.g. RD requested on a
+    # parse-only draft whose seed factor was never persisted), the job's
+    # error field must reach the visible failure surface instead of the
+    # result region keeping its stale "running" placeholder next to a
+    # generic status line. Every job handler's failure branch renders a
+    # design-system error notice (text label, never color alone) with the
+    # escaped error message; an empty/missing message falls back to the
+    # api-layer generic, so the notice never renders 'undefined'.
+    app_js = _static_module_text("app.js")
+    assert "function jobFailureReason(error) {" in app_js
+    assert "return (error && error.message) || 'request failed';" in app_js
+    assert "function showJobFailureNotice(mountId, reason) {" in app_js
+    assert (
+        '<div class="notice err"><span class="status-pill status-pill--fail">失败</span> ${esc(reason)}</div>'
+        in app_js
+    )
+    parse_click = app_js.index("button.addEventListener('click', async () => {")
+    validate_click = app_js.index("validateButton.addEventListener('click', async () => {")
+    staggered_click = app_js.index("staggeredButton.addEventListener('click', async () => {")
+    rd_click = app_js.index("rdRun.addEventListener('click', async () => {")
+    # Every failure branch derives its message through the fallback helper:
+    # parse (primary + rule fallback), validate, staggered, RD.
+    assert app_js.count("const reason = jobFailureReason(") == 5
+    assert app_js.count("const reason = jobFailureReason(fallbackError);", parse_click, validate_click) == 1
+    assert app_js.count("const reason = jobFailureReason(error);", parse_click, validate_click) == 1
+    # Parse failures (primary + rule fallback) replace the stale "解析中"
+    # card in #result; validate replaces its stale placeholder in the same
+    # mount; staggered replaces the running panel in #staggered-result; RD
+    # replaces the stale "RD 运行中" placeholder in #rd-result.
+    assert app_js.count("showJobFailureNotice('result', reason);", parse_click, validate_click) == 2
+    assert app_js.count("showJobFailureNotice('result', reason);", validate_click, staggered_click) == 1
+    assert app_js.count("showJobFailureNotice('staggered-result', reason);", staggered_click, rd_click) == 1
+    assert app_js.count("showJobFailureNotice('rd-result', reason);", rd_click) == 1
+    # The idea-flow handlers keep surfacing the reason on the global error
+    # line; the RD handler surfaces it into #rd-status through the esc()
+    # pattern (styled err span), never a raw template interpolation.
+    assert app_js.count("errorEl.textContent = reason;") == 4
+    assert 'rdStatusEl.innerHTML = `<span class="err">${esc(reason)}</span>`;' in app_js
+    assert "rdStatusEl.textContent = error.message;" not in app_js[rd_click:app_js.index("rdCancel.addEventListener", rd_click)]
+
+
 def test_report_anchor_deep_link_keeps_the_report_fragment() -> None:
     # A #report-* hash activates the factor tab without rewriting the URL
     # fragment, so reload / back / copy-link keep the section anchor.

@@ -39,6 +39,9 @@ COPY tests/ tests/
 COPY docs/ docs/
 COPY extensions/ extensions/
 COPY scripts/ scripts/
+# The in-container pytest gate asserts the CI workflow file exists
+# (tests/test_release_cleanliness.py), so .github/ ships in the image.
+COPY .github/ .github/
 
 # constraints.txt reproduces the documented Python 3.12 baseline package set
 # exactly; the [dev] extra adds pytest for the in-container smoke gate
