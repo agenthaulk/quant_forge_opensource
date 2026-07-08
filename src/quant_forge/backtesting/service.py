@@ -1217,6 +1217,22 @@ def _segment_metrics(
             sample_role=sample_role,
             volatility_returns=complete_net_returns,
         )
+        # F-6 (Phase A residual register): persist the boundary-purge COUNT,
+        # not only the SEGMENT_BOUNDARY_PURGED code, so the magnitude of the
+        # exclusion survives into the artifact and lineage (FP-7: a statistic
+        # carries its own validity context). The count is always observed —
+        # the boundary rule ran — so zero is a true zero, never a placeholder.
+        purge_metric = MetricValue(
+            value=float(purged_count),
+            unit="count",
+            status="available",
+            observation_count=len(segment) + purged_count,
+            method="segment_boundary_purge_count",
+            source_series="period_rows",
+            sample_role=sample_role,
+            segment=spec.name,
+            warning_codes=(SEGMENT_BOUNDARY_PURGED,) if purged_count else (),
+        )
         metrics.append(
             BacktestSegmentMetric(
                 name=spec.name,
@@ -1232,6 +1248,7 @@ def _segment_metrics(
                 net_long_short_sharpe=net["long_short_sharpe"],
                 net_max_drawdown=net["max_drawdown"],
                 sample_role=sample_role,
+                metrics={"purged_period_count": purge_metric},
                 warning_codes=(SEGMENT_BOUNDARY_PURGED,) if purged_count else (),
             )
         )
