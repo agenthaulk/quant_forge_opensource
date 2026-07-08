@@ -500,14 +500,21 @@ def test_index_html_contains_research_history_and_bench_panels(web_config) -> No
     html = web_server._index_html(web_config)
     assert "研究历史" in html
     assert 'id="history-result"' in html
-    assert "/api/research/history" in html
     assert "Benchmark" in html
     assert 'id="bench-result"' in html
-    assert "/api/bench" in html
-    assert "function renderHistory" in html
-    assert "function renderBench" in html
-    assert "function metricValueText" in html
-    assert "不显示为 0" in html
+    # CP6-1 (D8): the panel scripts are delivered as static ES modules
+    # referenced from the page; the fetch endpoints and render functions now
+    # live in the served module files instead of inline page script.
+    assert '<script type="module" src="/static/app.js"></script>' in html
+    history_js = (web_server.STATIC_ROOT / "views" / "history.js").read_text(encoding="utf-8")
+    bench_js = (web_server.STATIC_ROOT / "views" / "bench.js").read_text(encoding="utf-8")
+    metric_js = (web_server.STATIC_ROOT / "metric.js").read_text(encoding="utf-8")
+    assert "/api/research/history" in history_js
+    assert "/api/bench" in bench_js
+    assert "function renderHistory" in history_js
+    assert "function renderBench" in bench_js
+    assert "function metricValueText" in metric_js
+    assert "不显示为 0" in bench_js
 
 
 def test_get_history_and_bench_routes_dispatch_via_server_namespace(monkeypatch, web_app) -> None:

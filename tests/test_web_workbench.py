@@ -50,6 +50,21 @@ from quant_forge.research_loop.service import (
 )
 
 
+# CP6-1 (D8): executable frontend code is delivered as static ES modules
+# referenced by the page (script type="module" src="/static/app.js").
+# Assertions about JS *delivery* (code text) therefore target the served
+# module files; assertions about server-rendered *semantics* (panel ids,
+# form fields, option values, Chinese UI text) stay on the page HTML.
+def _static_module_text(name: str) -> str:
+    return (web_server.STATIC_ROOT / name).read_text(encoding="utf-8")
+
+
+def _frontend_js_bundle() -> str:
+    modules = sorted(web_server.STATIC_ROOT.rglob("*.js"))
+    assert modules, "static frontend modules missing"
+    return "\n".join(path.read_text(encoding="utf-8") for path in modules)
+
+
 def test_web_workbench_rule_workflow_runs_end_to_end(tmp_path) -> None:
     paths = create_demo_workspace(tmp_path / "demo")
     config = QuantForgeConfig().resolve(tmp_path / "demo")
@@ -1003,13 +1018,19 @@ allowed_interval_days: [5]
     )
     monkeypatch.setattr(web_server, "DEFAULT_RD_CONFIG_PATH", rd_path)
     html = web_server._index_html(config)
+    # CP6-1 (D8): JS is delivered through the served static modules; the page
+    # must reference the entry module, and the code-text assertions below
+    # target the module bundle instead of inline page script.
+    bundle = _frontend_js_bundle()
 
-    assert "/api/jobs/research-run-once" in html
-    assert "/api/jobs/parse-idea" in html
-    assert "/api/jobs/validate-idea" in html
-    assert "/api/jobs/staggered-entry" in html
+    assert '<script type="module" src="/static/app.js"></script>' in html
+    assert "/api/jobs/research-run-once" in bundle
+    assert "/api/jobs/parse-idea" in bundle
+    assert "/api/jobs/validate-idea" in bundle
+    assert "/api/jobs/staggered-entry" in bundle
     assert "/api/research/campaign" not in html
-    assert "/api/research/schedule" in html
+    assert "/api/research/campaign" not in bundle
+    assert "/api/research/schedule" in bundle
     assert "解析因子" in html
     assert "验证并评测" in html
     assert "首月逐日建仓稳健性回测" in html
@@ -1023,33 +1044,33 @@ allowed_interval_days: [5]
     assert "llm-api-key-mode" in html
     assert "llm-api-key" in html
     assert 'data-secret-policy="not-submitted"' in html
-    assert "手动输入不会保存或提交" in html
+    assert "手动输入不会保存或提交" in bundle
     assert "中断本次运行" in html
     assert "中断本次RD" in html
-    assert "function clearGlobalError" in html
-    assert "function resetRdResult" in html
-    assert "function optimizationStatusText" in html
-    assert "function valueOr" in html
-    assert "function parserDefaultParameterMessage" in html
-    assert "function assumptionLabel" in html
-    assert "解析器已生成默认评测参数" in html
-    assert "调仓率 = 相邻调仓的成分替换率" in html
-    assert "换手率 = 基于组合权重变化估算的真实换手率" in html
-    assert "attempted_no_acceptance" in html
-    assert "recommended factor" in html
-    assert "last accepted" in html
-    assert "last explored" in html
-    assert "next exploration seed" in html
-    assert "未过 gate，仅用于探索" in html
-    assert "round reports" in html
-    assert "aggregateAccepted" in html
-    assert "join(' ')" in html
-    assert "RD 已中断" in html
-    assert "本次 RD 已取消，未产生新的候选结果" in html
-    assert "已运行超过10秒" in html
+    assert "function clearGlobalError" in bundle
+    assert "function resetRdResult" in bundle
+    assert "function optimizationStatusText" in bundle
+    assert "function valueOr" in bundle
+    assert "function parserDefaultParameterMessage" in bundle
+    assert "function assumptionLabel" in bundle
+    assert "解析器已生成默认评测参数" in bundle
+    assert "调仓率 = 相邻调仓的成分替换率" in bundle
+    assert "换手率 = 基于组合权重变化估算的真实换手率" in bundle
+    assert "attempted_no_acceptance" in bundle
+    assert "recommended factor" in bundle
+    assert "last accepted" in bundle
+    assert "last explored" in bundle
+    assert "next exploration seed" in bundle
+    assert "未过 gate，仅用于探索" in bundle
+    assert "round reports" in bundle
+    assert "aggregateAccepted" in bundle
+    assert "join(' ')" in bundle
+    assert "RD 已中断" in bundle
+    assert "本次 RD 已取消，未产生新的候选结果" in bundle
+    assert "已运行超过10秒" in bundle
     assert "LLM 语义解析" in html
     assert "本地规则解析" in html
-    assert "是否改用本地规则解析" in html
+    assert "是否改用本地规则解析" in bundle
     assert "rd-objective" in html
     assert "rd-iterations" in html
     assert "RD迭代次数" in html
@@ -1057,6 +1078,8 @@ allowed_interval_days: [5]
     assert "rd-campaign-seeds" not in html
     assert "rd-campaign" not in html
     assert "RD Campaign" not in html
+    assert "rd-campaign" not in bundle
+    assert "RD Campaign" not in bundle
     assert 'value="5"' in html
     assert 'value="2"' in html
     assert '<option value="rank_icir" selected>ICIR</option>' in html
@@ -1068,49 +1091,49 @@ allowed_interval_days: [5]
     assert '<option value="glm">glm / fake-glm · env QF_TEST_GLM_KEY</option>' in html
     assert "QF_TEST_DEEPSEEK_KEY" in html
     assert ">set<" not in html
-    assert "毛年化收益" in html
-    assert "净年化收益" in html
-    assert "HAC t-stat" in html
-    assert "完整持有期数" in html
-    assert "numIfStable" in html
-    assert "pctIfStable" in html
-    assert "调仓率" in html
-    assert "换手率" in html
-    assert "风险提示" in html
-    assert "口径说明" in html
-    assert "研究口径，不是生产交易口径" in html
-    assert "RD 因子迭代对比" in html
-    assert "function comparisonRows" in html
-    assert "function renderComparisonTable" in html
-    assert "external_oos_net_cumulative_return" in html
+    assert "毛年化收益" in bundle
+    assert "净年化收益" in bundle
+    assert "HAC t-stat" in bundle
+    assert "完整持有期数" in bundle
+    assert "numIfStable" in bundle
+    assert "pctIfStable" in bundle
+    assert "调仓率" in bundle
+    assert "换手率" in bundle
+    assert "风险提示" in bundle
+    assert "口径说明" in bundle
+    assert "研究口径，不是生产交易口径" in bundle
+    assert "RD 因子迭代对比" in bundle
+    assert "function comparisonRows" in bundle
+    assert "function renderComparisonTable" in bundle
+    assert "external_oos_net_cumulative_return" in bundle
 
 
-def test_web_html_contract_clears_stale_errors_before_new_submissions(tmp_path) -> None:
-    config = QuantForgeConfig().resolve(tmp_path / "demo")
+def test_web_html_contract_clears_stale_errors_before_new_submissions() -> None:
+    # CP6-1 (D8): the click handlers moved verbatim into the served entry
+    # module; the clear-before-submit ordering contract is asserted there.
+    app_js = _static_module_text("app.js")
 
-    html = web_server._index_html(config)
-
-    parse_click = html.index("button.addEventListener('click', async () => {")
-    parse_clear = html.index("clearGlobalError();", parse_click)
-    parse_submit = html.index("const payload = await submitParse(parserMode);", parse_click)
-    validate_click = html.index("validateButton.addEventListener('click', async () => {")
-    validate_clear = html.index("clearGlobalError();", validate_click)
-    validate_submit = html.index("const payload = await submitValidation();", validate_click)
-    rd_run_click = html.index("rdRun.addEventListener('click', async () => {")
-    rd_run_clear = html.index("clearGlobalError();", rd_run_click)
-    rd_run_submit = html.index("const job = await postJson('/api/jobs/research-run-once', rdPayload());", rd_run_click)
+    parse_click = app_js.index("button.addEventListener('click', async () => {")
+    parse_clear = app_js.index("clearGlobalError();", parse_click)
+    parse_submit = app_js.index("const payload = await submitParse(parserMode);", parse_click)
+    validate_click = app_js.index("validateButton.addEventListener('click', async () => {")
+    validate_clear = app_js.index("clearGlobalError();", validate_click)
+    validate_submit = app_js.index("const payload = await submitValidation();", validate_click)
+    rd_run_click = app_js.index("rdRun.addEventListener('click', async () => {")
+    rd_run_clear = app_js.index("clearGlobalError();", rd_run_click)
+    rd_run_submit = app_js.index("const job = await postJson('/api/jobs/research-run-once', rdPayload());", rd_run_click)
 
     assert parse_clear < parse_submit
     assert validate_clear < validate_submit
     assert rd_run_clear < rd_run_submit
 
 
-def test_web_html_contract_keeps_aggregate_status_fallback_for_single_round_payloads(tmp_path) -> None:
-    config = QuantForgeConfig().resolve(tmp_path / "demo")
+def test_web_html_contract_keeps_aggregate_status_fallback_for_single_round_payloads() -> None:
+    # CP6-1 (D8): the aggregate-status fallback moved verbatim into the
+    # research view module.
+    research_js = _static_module_text("views/research.js")
 
-    html = web_server._index_html(config)
-
-    assert "const status = payload.optimization_status || (payload.optimization_performed ? 'performed' : 'no_optimization_performed');" in html
+    assert "const status = payload.optimization_status || (payload.optimization_performed ? 'performed' : 'no_optimization_performed');" in research_js
 
 
 def test_web_research_scheduler_http_start_stop_and_validation(tmp_path) -> None:
@@ -1611,8 +1634,11 @@ def test_web_server_requires_control_token_for_docker_bind(monkeypatch, tmp_path
         assert str(tmp_path) not in html
         assert "QF_TEST_WEB_TOKEN" not in html
         assert "api_key_env" not in html
-        assert "refreshRuntimeStatus" in html
         assert "runtime-llm" in html
+        # CP6-1 (D8): the runtime-refresh logic is delivered via the served
+        # entry module, which the redacted page must still reference.
+        assert '<script type="module" src="/static/app.js"></script>' in html
+        assert "refreshRuntimeStatus" in _get_text(f"{base_url}/static/app.js")
         with pytest.raises(urllib.error.HTTPError) as status_exc:
             _get_json(f"{base_url}/api/status")
         assert status_exc.value.code == 401
@@ -2463,43 +2489,49 @@ def test_web_html_does_not_fake_rd_seed_when_factor_root_empty(tmp_path) -> None
 
 
 def test_web_research_cards_include_cache_paths_and_artifacts() -> None:
-    html = web_server._index_html(QuantForgeConfig())
+    # CP6-1 (D8): candidate cards render from the served research view module.
+    research_js = _static_module_text("views/research.js")
 
-    assert "factor_values:" in html
-    assert "artifacts:" in html
+    assert "factor_values:" in research_js
+    assert "artifacts:" in research_js
 
 
 def test_web_result_sections_separate_roles_and_diagnostics() -> None:
-    html = web_server._index_html(QuantForgeConfig())
+    # CP6-1 (D8): the result sections render from the served factor view module.
+    factor_js = _static_module_text("views/factor.js")
 
-    assert "样本内研究评价" in html
-    assert "外部样本外组合评测" in html
-    assert "样本充分性与诊断" in html
-    assert "research_evaluation" in html
-    assert "external_oos_backtest" in html
-    assert "HAC t-stat" in html
-    assert "外部样本外仅包含 1 个完整持有期" in html
+    assert "样本内研究评价" in factor_js
+    assert "外部样本外组合评测" in factor_js
+    assert "样本充分性与诊断" in factor_js
+    assert "research_evaluation" in factor_js
+    assert "external_oos_backtest" in factor_js
+    assert "HAC t-stat" in factor_js
+    assert "外部样本外仅包含 1 个完整持有期" in factor_js
 
 
 def test_web_backtest_metric_labels_match_metric_units() -> None:
-    html = web_server._index_html(QuantForgeConfig())
+    # CP6-1 (D8): metric tile labels render from the served frontend modules;
+    # the negatives sweep the whole bundle so no module reintroduces them.
+    factor_js = _static_module_text("views/factor.js")
+    bundle = _frontend_js_bundle()
 
-    assert "年化Sharpe" in html
-    assert "年化波动率" in html
-    assert "净值最大回撤" in html
-    assert "日频Sharpe" not in html
-    assert "日频波动率" not in html
-    assert "日频最大回撤" not in html
+    assert "年化Sharpe" in factor_js
+    assert "年化波动率" in factor_js
+    assert "净值最大回撤" in factor_js
+    assert "日频Sharpe" not in bundle
+    assert "日频波动率" not in bundle
+    assert "日频最大回撤" not in bundle
 
 
 def test_web_does_not_coerce_unavailable_metrics_to_zero() -> None:
-    html = web_server._index_html(QuantForgeConfig())
+    # CP6-1 (D8): FP-4 null-not-zero must hold across every served module.
+    bundle = _frontend_js_bundle()
 
-    assert "valueOr(evaluation.rank_ic_t_stat, 0)" not in html
-    assert "valueOr(backtest.net_annualized_return, 0)" not in html
-    assert "valueOr(backtest.net_long_short_sharpe" not in html
-    assert "valueOr(backtest.rebalance_rate, 0)" not in html
-    assert "valueOr(backtest.turnover_rate, 0)" not in html
+    assert "valueOr(evaluation.rank_ic_t_stat, 0)" not in bundle
+    assert "valueOr(backtest.net_annualized_return, 0)" not in bundle
+    assert "valueOr(backtest.net_long_short_sharpe" not in bundle
+    assert "valueOr(backtest.rebalance_rate, 0)" not in bundle
+    assert "valueOr(backtest.turnover_rate, 0)" not in bundle
 
 
 def _insufficient_sample_evaluation(artifact_path: Path) -> EvaluationResult:
@@ -2638,15 +2670,21 @@ def test_web_validation_payload_reports_insufficient_metrics_as_null(tmp_path) -
 
 
 def test_web_html_renders_metric_status_instead_of_placeholder_zero() -> None:
-    html = web_server._index_html(QuantForgeConfig())
+    # CP6-1 (D8): metricNum is defined once in the served metric module and
+    # every call site in the view modules goes through it; the negatives
+    # sweep the whole bundle so no module bypasses the status-aware renderer.
+    metric_js = _static_module_text("metric.js")
+    factor_js = _static_module_text("views/factor.js")
+    bundle = _frontend_js_bundle()
 
-    assert "function metricNum(" in html
-    assert "metricNum(evaluation.rank_ic_mean, evaluation.rank_ic_mean_status)" in html
-    assert "metricNum(evaluation.rank_icir, evaluation.rank_icir_status, 2)" in html
-    assert "metricNum(evaluation.rank_ic_t_stat, evaluation.rank_ic_t_stat_status, 2)" in html
-    assert "num(evaluation.rank_ic_mean)" not in html
-    assert "num(evaluation.rank_icir, 2)" not in html
-    assert "num(evaluation.rank_ic_t_stat, 2)" not in html
+    assert "function metricNum(" in metric_js
+    assert bundle.count("function metricNum(") == 1
+    assert "metricNum(evaluation.rank_ic_mean, evaluation.rank_ic_mean_status)" in factor_js
+    assert "metricNum(evaluation.rank_icir, evaluation.rank_icir_status, 2)" in factor_js
+    assert "metricNum(evaluation.rank_ic_t_stat, evaluation.rank_ic_t_stat_status, 2)" in factor_js
+    assert "num(evaluation.rank_ic_mean)" not in bundle
+    assert "num(evaluation.rank_icir, 2)" not in bundle
+    assert "num(evaluation.rank_ic_t_stat, 2)" not in bundle
 
 
 def _fake_research_result(

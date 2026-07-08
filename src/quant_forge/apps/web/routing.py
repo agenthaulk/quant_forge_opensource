@@ -3,6 +3,11 @@
 Workflow callables and ``DEFAULT_RD_CONFIG_PATH`` are resolved through
 :mod:`quant_forge.apps.web.server` at request time so monkeypatches on the
 server module namespace keep taking effect.
+
+Static frontend assets (decision D8, CP6-1) are served from the whitelisted
+``static/`` directory next to this module through :func:`_static_asset`,
+which enforces resolve()+is_relative_to containment, serves plain files
+only (no directory listing), and rejects everything else with a 404.
 """
 
 from __future__ import annotations
@@ -10,8 +15,9 @@ from __future__ import annotations
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from quant_forge.apps.web.api import (
     _active_llm,
@@ -42,6 +48,37 @@ from quant_forge.research_loop.scheduler import (
 
 
 MAX_REQUEST_BODY_BYTES = 1024 * 1024
+
+STATIC_URL_PREFIX = "/static/"
+STATIC_ROOT = Path(__file__).resolve().parent / "static"
+STATIC_CONTENT_TYPES = {
+    ".js": "text/javascript; charset=utf-8",
+}
+
+
+def _static_asset(url_path: str) -> tuple[bytes, str]:
+    """Resolve a ``/static/`` URL path to ``(body, content_type)``.
+
+    Containment contract (D8): only plain files with a whitelisted suffix
+    directly inside the ``static/`` directory tree are served. Traversal
+    segments (including percent-encoded ones), absolute paths, backslashes,
+    directories (no listing), symlink escapes, and unknown suffixes all raise
+    ``KeyError``, which the request handlers map to HTTP 404.
+    """
+
+    relative = unquote(url_path[len(STATIC_URL_PREFIX):])
+    if not relative or "\x00" in relative or "\\" in relative:
+        raise KeyError(f"unknown static asset: {url_path}")
+    if relative.startswith("/") or ".." in relative.split("/"):
+        raise KeyError(f"unknown static asset: {url_path}")
+    root = STATIC_ROOT.resolve()
+    candidate = (root / relative).resolve()
+    if candidate == root or not candidate.is_relative_to(root):
+        raise KeyError(f"unknown static asset: {url_path}")
+    content_type = STATIC_CONTENT_TYPES.get(candidate.suffix)
+    if content_type is None or not candidate.is_file():
+        raise KeyError(f"unknown static asset: {url_path}")
+    return candidate.read_bytes(), content_type
 
 
 def create_local_web_server(
@@ -131,6 +168,11 @@ def create_local_web_server(
                 elif path.startswith("/api/jobs/"):
                     self._require_control_token()
                     self._json(job_manager.get(_job_id_from_path(path)))
+                elif path.startswith(STATIC_URL_PREFIX):
+                    # Static frontend modules are public like the index page
+                    # itself; they contain no runtime values or secrets.
+                    body, content_type = _static_asset(path)
+                    self._bytes(body, content_type)
                 else:
                     self._html(
                         _index_html(
@@ -359,6 +401,13 @@ def create_local_web_server(
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
             self.wfile.write(encoded)
+
+        def _bytes(self, body: bytes, content_type: str) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def _require_control_token(self) -> None:
             if not control_token_required:

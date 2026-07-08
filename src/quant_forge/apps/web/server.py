@@ -164,6 +164,7 @@ from quant_forge.apps.web.api import (
 
 from quant_forge.apps.web.html import (
     _index_html as _index_html,
+    _page_config_json as _page_config_json,
     _provider_options_script_payload as _provider_options_script_payload,
     _provider_readiness_label as _provider_readiness_label,
     _script_json as _script_json,
@@ -172,6 +173,10 @@ from quant_forge.apps.web.html import (
 
 from quant_forge.apps.web.routing import (
     MAX_REQUEST_BODY_BYTES as MAX_REQUEST_BODY_BYTES,
+    STATIC_CONTENT_TYPES as STATIC_CONTENT_TYPES,
+    STATIC_ROOT as STATIC_ROOT,
+    STATIC_URL_PREFIX as STATIC_URL_PREFIX,
+    _static_asset as _static_asset,
     create_local_web_server as create_local_web_server,
     run_local_web as run_local_web,
 )
