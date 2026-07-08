@@ -1039,13 +1039,21 @@ def _normalization_source_roots(args: argparse.Namespace) -> tuple[Path, ...]:
 
 
 def _cmd_web(args: argparse.Namespace) -> int:
-    from quant_forge.apps.web.server import run_local_web
+    from quant_forge.apps.web.server import WebControlTokenError, run_local_web
 
     config = bootstrap_runtime_config(args.config, args.workspace)
     rd_config = load_research_loop_config(args.rd_config, config.research, config.simulation)
     host = args.host or config.web.host
     port = args.port or config.web.port
-    run_local_web(host=host, port=port, config=config, rd_config=rd_config)
+    try:
+        run_local_web(host=host, port=port, config=config, rd_config=rd_config)
+    except WebControlTokenError as exc:
+        # Predictable startup misconfiguration: the refusal to start is
+        # correct and stays; only the presentation changes from a raw
+        # traceback to one actionable line. Every other exception type
+        # still propagates unchanged -- no blanket catch.
+        print(f"qf web startup blocked: {exc}")
+        return 2
     return 0
 
 

@@ -246,12 +246,23 @@ export function renderAnchorNav(sections) {
   return `<nav class="anchor-nav" aria-label="报告章节">${links}</nav>`;
 }
 
+/* No-silent-fallback (F-010): the parse payload carries `warnings` whenever
+ * the parser landed on the generic fallback formula. Render each one as a
+ * design-system warn notice with a text label (never color alone), ahead of
+ * the report hero so a fallback parse can never look like a confident one. */
+export function renderParseWarnings(warnings) {
+  return (warnings || []).map(item =>
+    `<div class="notice warn"><span class="status-pill status-pill--running">警告</span> ${esc(item)}</div>`
+  ).join('');
+}
+
 export function renderParsed(payload) {
   const factor = payload.factor;
-  resultEl.innerHTML = renderReportHero(factor, payload.parser, {
-    horizonDays: factor.horizon_days,
-    metaLines: [esc(parserDefaultParameterMessage(payload.parser))]
-  }) + renderPendingParams(payload.parameters);
+  resultEl.innerHTML = renderParseWarnings(payload.warnings)
+    + renderReportHero(factor, payload.parser, {
+      horizonDays: factor.horizon_days,
+      metaLines: [esc(parserDefaultParameterMessage(payload.parser))]
+    }) + renderPendingParams(payload.parameters);
 }
 
 export function render(payload) {

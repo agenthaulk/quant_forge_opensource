@@ -129,6 +129,13 @@ def research_tags_for_factor(
     formula parser the experiment planner uses — FP-5, one field-extraction
     definition). Pass ``None`` when inputs are not observable, for example for
     precomputed factors.
+
+    ``decay_horizon_days`` semantics for factor subjects: the value carried is
+    ``FactorDefinition.horizon_days`` — the holding/signal horizon — because no
+    measured decay estimate exists on-tree and inventing one would violate
+    FP-4. The key name is frozen by the ``qf.research_tags.v1`` payload
+    contract; renderers must label the value as a horizon, not a decay
+    parameter (integration finding F-009).
     """
 
     return ResearchTags(

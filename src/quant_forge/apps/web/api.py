@@ -324,6 +324,10 @@ def _parse_payload(parsed: ParsedFactor, rd_config: ResearchLoopConfig) -> dict[
         "parser": _parser_payload(parsed),
         "factor": _json_safe(parsed.factor),
         "parameters": _default_validation_parameters(parsed.factor, rd_config),
+        # No-silent-fallback: always present so the frontend can rely on the
+        # field; non-empty exactly when the parse landed on the generic
+        # fallback formula (see llm_factor_parser.generic_fallback_warnings).
+        "warnings": list(parsed.warnings),
     }
 
 
@@ -1242,15 +1246,28 @@ def _rd_generation_mode(mode: str) -> str:
     return normalized
 
 
+class WebControlTokenError(ValueError):
+    """Predictable control-token startup misconfiguration for a 0.0.0.0 bind.
+
+    Subclasses ``ValueError`` so existing callers that catch or pin
+    ``ValueError`` keep working; the CLI boundary catches this specific
+    type to print one actionable line instead of a traceback. The refusal
+    to start without a token is deliberate and must stay.
+    """
+
+
 def _control_token_for_bind(host: str, config: QuantForgeConfig) -> str:
     if host != "0.0.0.0":
         return ""
     token_env = config.web.control_token_env.strip()
     if not token_env:
-        raise ValueError("web.control_token_env is required when binding the web adapter to 0.0.0.0")
+        raise WebControlTokenError("web.control_token_env is required when binding the web adapter to 0.0.0.0")
     control_value = os.environ.get(token_env, "")
     if not control_value:
-        raise ValueError(f"web control token environment variable is not set: {token_env}")
+        raise WebControlTokenError(
+            f"web control token environment variable is not set: {token_env}; "
+            f"set {token_env} to a non-empty secret value before binding to 0.0.0.0"
+        )
     return control_value
 
 

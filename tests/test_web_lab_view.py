@@ -255,16 +255,18 @@ def test_control_token_storage_refreshes_token_gated_panels() -> None:
 
 
 def test_tab_activation_lazy_refresh_wiring_lives_in_app_module() -> None:
-    # A history / bench panel that has not rendered real data yet retries
-    # its refresh when its tab becomes active. All fetch wiring stays in
-    # app.js: lab.js only invokes the activation callback it was handed.
+    # A panel refreshes on tab activation when it has never rendered real
+    # data OR a completed job marked it stale (integration finding F-008:
+    # panels must not serve their first render forever). All fetch wiring
+    # stays in app.js: lab.js only invokes the activation callback it was
+    # handed.
     app_js = _static_module_text("app.js")
     lab_js = _static_module_text("views/lab.js")
     assert "initLabTabs({" in app_js
     assert "onActivate" in app_js
     assert "'lab-tab-history': historyPanel" in app_js
     assert "'lab-tab-bench': benchPanel" in app_js
-    assert "if (panel && !panel.hasLoaded()) panel.refresh();" in app_js
+    assert "if (panel && (panel.isStale() || !panel.hasLoaded())) panel.refresh();" in app_js
     # lab.js purity is preserved: no requests, no panel refreshers.
     assert "fetch(" not in lab_js
     assert "/api/" not in lab_js
@@ -276,6 +278,62 @@ def test_tab_activation_lazy_refresh_wiring_lives_in_app_module() -> None:
         module_text = _static_module_text(name)
         assert "if (!payload) return false;" in module_text, name
         assert "return true;" in module_text, name
+
+
+def test_job_completion_invalidates_dependent_panels() -> None:
+    # Integration finding F-008: a successfully completed job changes what
+    # the history / bench / registry endpoints return, so those panels are
+    # marked stale at every job-completion point instead of staying frozen
+    # on their first render. The data console reads only the local data
+    # root, which no job mutates, so it stays out of the dependent set.
+    app_js = _static_module_text("app.js")
+    # The tracked wrapper gains stale marking on top of the existing
+    # in-flight de-dupe; starting a fetch is the only thing that clears it.
+    assert "isStale: () => stale," in app_js
+    assert "invalidate() {" in app_js
+    refresh_start = app_js.index("refresh() {")
+    assert app_js.index("stale = false;", refresh_start) < app_js.index(
+        "inFlight = refreshPanel()", refresh_start
+    )
+    # Settle recheck: an invalidation that lands while a refresh is in
+    # flight de-dupes into a response that may predate the job's writes,
+    # so a success settle that still sees the stale mark chains exactly
+    # one follow-up refresh. Gating on `rendered` keeps the error
+    # semantics: a failed fetch (the refreshers resolve false, never
+    # reject) chains nothing and leaves the mark for the next activation.
+    settle_recheck = "if (rendered && stale) tracker.refresh();"
+    assert app_js.count(settle_recheck) == 1
+    # The recheck runs only after the in-flight slot clears, so the
+    # chained call starts a real fetch instead of de-duping into the
+    # promise that just settled.
+    assert app_js.index("inFlight = null;", refresh_start) < app_js.index(
+        settle_recheck, refresh_start
+    )
+    assert (
+        "const JOB_DEPENDENT_PANEL_TABS = ['lab-tab-history', 'lab-tab-bench', 'lab-tab-registry'];"
+        in app_js
+    )
+    # Immediate refresh when the dependent tab is already active: the user
+    # is looking at the stale panel at the moment the job completes.
+    assert "if (tab && tab.getAttribute('aria-selected') === 'true') panel.refresh();" in app_js
+    # One invalidation call per success path, inside the try block (before
+    # the handler's catch), never in finally: parse (primary + rule
+    # fallback), validate, staggered, RD.
+    parse_click = app_js.index("button.addEventListener('click', async () => {")
+    validate_click = app_js.index("validateButton.addEventListener('click', async () => {")
+    staggered_click = app_js.index("staggeredButton.addEventListener('click', async () => {")
+    rd_click = app_js.index("rdRun.addEventListener('click', async () => {")
+    call = "invalidateJobDependentPanels();"
+    assert app_js.count(call, parse_click, validate_click) == 2
+    assert app_js.count(call, validate_click, staggered_click) == 1
+    assert app_js.count(call, staggered_click, rd_click) == 1
+    assert app_js.count(call, rd_click) == 1
+    for handler_start in (validate_click, staggered_click, rd_click):
+        assert app_js.index(call, handler_start) < app_js.index("} catch (error) {", handler_start)
+    # lab.js stays fetch-free: invalidation wiring lives in app.js only.
+    lab_js = _static_module_text("views/lab.js")
+    assert "invalidate" not in lab_js
+    assert "isStale" not in lab_js
 
 
 def test_report_anchor_deep_link_keeps_the_report_fragment() -> None:

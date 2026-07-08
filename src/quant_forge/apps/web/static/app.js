@@ -299,23 +299,47 @@ async function submitStaggeredEntry() {
 // Token-gated panel refreshes skip silently until a control token is
 // stored, so each panel remembers whether it has rendered real data yet.
 // The tracked wrapper de-duplicates in-flight refreshes; the underlying
-// view refreshers resolve true/false and never reject.
+// view refreshers resolve true/false and never reject. `invalidate()`
+// marks already-rendered data stale (integration finding F-008): a
+// completed job can change what the panel endpoint returns, so a loaded
+// panel must not keep serving its first render. A refresh clears the
+// stale mark only when it actually starts a fetch; an invalidation that
+// lands while a refresh is in flight therefore survives it, because the
+// in-flight response may predate the job's writes. Surviving is not
+// enough while the tab stays active: the settle recheck below chains the
+// follow-up fetch that actually replaces the pre-job data.
 function trackedPanelRefresh(refreshPanel) {
   let loaded = false;
+  let stale = false;
   let inFlight = null;
-  return {
+  const tracker = {
     hasLoaded: () => loaded,
+    isStale: () => stale,
+    invalidate() {
+      stale = true;
+    },
     refresh() {
       if (!inFlight) {
+        stale = false;
         inFlight = refreshPanel().then(rendered => {
           inFlight = null;
           if (rendered) loaded = true;
+          // Settle recheck: an invalidation that landed while this fetch
+          // was in flight means the response it de-duped into may predate
+          // the job's writes, so chain exactly one follow-up refresh. The
+          // follow-up clears the stale mark when it starts, so repeated
+          // invalidations converge on one trailing fetch instead of
+          // storming. Only a success settle chains: a failed fetch
+          // (rendered=false, the refreshers never reject) keeps the stale
+          // mark for the next activation rather than retry-looping here.
+          if (rendered && stale) tracker.refresh();
           return rendered;
         });
       }
       return inFlight;
     }
   };
+  return tracker;
 }
 const historyPanel = trackedPanelRefresh(refreshHistoryPanel);
 const benchPanel = trackedPanelRefresh(refreshBenchPanel);
@@ -331,14 +355,34 @@ const lazyPanelsByTab = {
   'lab-tab-docs': docsPanel,
   'lab-tab-extensions': extensionsPanel
 };
+// Panels whose endpoints a successfully completed job can change (F-008):
+// validate/staggered/RD append run-index records (history, bench filters
+// the same index) and save factor definitions (registry); parse completes
+// through the same handlers, so it invalidates uniformly rather than
+// encoding per-job server knowledge here. The data console reads only the
+// local data root, which no job mutates, so it is not invalidated.
+const JOB_DEPENDENT_PANEL_TABS = ['lab-tab-history', 'lab-tab-bench', 'lab-tab-registry'];
+function invalidateJobDependentPanels() {
+  JOB_DEPENDENT_PANEL_TABS.forEach(tabId => {
+    const panel = lazyPanelsByTab[tabId];
+    if (!panel) return;
+    panel.invalidate();
+    const tab = document.getElementById(tabId);
+    // If the dependent tab is already active the user is looking at the
+    // stale panel right now, so it refreshes immediately instead of
+    // waiting for the next activation.
+    if (tab && tab.getAttribute('aria-selected') === 'true') panel.refresh();
+  });
+}
 initLabTabs({
-  // Lazy refresh on tab activation: a history / bench panel that has not
-  // rendered real data yet (e.g. the startup refresh skipped because the
-  // control token was missing) retries when its tab becomes active. The
-  // refresh never switches tabs; it only fills the already-active panel.
+  // Lazy refresh on tab activation: a panel refreshes when it has never
+  // rendered real data (e.g. the startup refresh skipped because the
+  // control token was missing) OR a completed job marked it stale
+  // (F-008). The refresh never switches tabs; it only fills the
+  // already-active panel.
   onActivate: tabId => {
     const panel = lazyPanelsByTab[tabId];
-    if (panel && !panel.hasLoaded()) panel.refresh();
+    if (panel && (panel.isStale() || !panel.hasLoaded())) panel.refresh();
   }
 });
 onControlTokenStored(() => {
@@ -387,6 +431,7 @@ button.addEventListener('click', async () => {
     renderParsed(payload);
     setStep('parse', 'done');
     setTabDot('lab-tab-factor', 'done');
+    invalidateJobDependentPanels();
     statusEl.innerHTML = '<span class="ok">解析完成，等待确认参数</span>';
   } catch (error) {
     if (error.message === '运行已中断') {
@@ -406,6 +451,7 @@ button.addEventListener('click', async () => {
           renderParsed(payload);
           setStep('parse', 'done');
           setTabDot('lab-tab-factor', 'done');
+          invalidateJobDependentPanels();
           statusEl.innerHTML = '<span class="ok">已使用本地规则解析，等待确认参数</span>';
           return;
         } catch (fallbackError) {
@@ -452,6 +498,7 @@ validateButton.addEventListener('click', async () => {
     setStep('validate', 'done');
     setStep('report', 'done');
     setTabDot('lab-tab-factor', 'done');
+    invalidateJobDependentPanels();
     statusEl.innerHTML = '<span class="ok">验证完成</span>';
   } catch (error) {
     if (error.message === '运行已中断') {
@@ -486,6 +533,7 @@ staggeredButton.addEventListener('click', async () => {
     const payload = await submitStaggeredEntry();
     renderStaggered(payload);
     setTabDot('lab-tab-factor', 'done');
+    invalidateJobDependentPanels();
     const staggeredSection = document.getElementById('report-staggered');
     if (staggeredSection) staggeredSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
     statusEl.innerHTML = '<span class="ok">首月逐日建仓稳健性回测完成</span>';
@@ -542,6 +590,7 @@ rdRun.addEventListener('click', async () => {
     renderResearch(payload);
     setStep('rd', 'done');
     setTabDot('lab-tab-rd', 'done');
+    invalidateJobDependentPanels();
     clearGlobalError();
     rdStatusEl.innerHTML = '<span class="ok">RD 完成</span>';
   } catch (error) {

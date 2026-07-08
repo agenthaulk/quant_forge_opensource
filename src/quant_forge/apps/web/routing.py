@@ -210,7 +210,19 @@ def create_local_web_server(
                     # itself; they contain no runtime values or secrets.
                     body, content_type = _static_asset(path)
                     self._bytes(body, content_type)
+                elif path == "/api" or path.startswith("/api/"):
+                    # Unmatched paths in the API namespace are contract
+                    # errors: scripts and JSON consumers probing a typo'd
+                    # endpoint need 404 JSON, never the HTML shell. The
+                    # response is uniform for every unknown API path and
+                    # carries no runtime state, so like the index page it
+                    # does not require the control token.
+                    self._json({"error": f"unknown API path: {path}"}, status=404)
                 else:
+                    # Deliberate single-page fallthrough: the frontend is a
+                    # hash-routed single page, so every unknown non-API GET
+                    # path serves the index shell (deep links and typos
+                    # alike land in the app).
                     self._html(
                         _index_html(
                             config,
@@ -462,5 +474,9 @@ def run_local_web(
 ) -> None:
     server = create_local_web_server(host=host, port=port, config=config, rd_config=rd_config)
     actual_host, actual_port = server.server_address
-    print(f"Quant Forge local web listening on http://{actual_host}:{actual_port}")
+    # flush=True: with stdout redirected to a file or pipe (docker logs,
+    # shell redirection) the interpreter block-buffers, and serve_forever()
+    # never returns, so an unflushed line would stay invisible while the
+    # server is healthy.
+    print(f"Quant Forge local web listening on http://{actual_host}:{actual_port}", flush=True)
     server.serve_forever()

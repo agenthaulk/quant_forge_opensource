@@ -15,6 +15,15 @@ from quant_forge.llm_client import extract_json_object, generate_chat_text
 from quant_forge.mcp.read_models import list_available_fields, list_available_operators
 from quant_forge.operator_registry.resolver import resolve_formula_operators
 
+# Single source of truth for the generic-fallback warning contract lives in
+# specs/nl_flow.py ("a fallback parse must never look like a confident one").
+# Reuse it here instead of defining a parallel copy so the web parse path and
+# the spec flow can never drift apart.
+from quant_forge.specs.nl_flow import (  # noqa: E402  (grouped with the contract note above)
+    _FALLBACK_WARNING as GENERIC_FALLBACK_WARNING,
+    _GENERIC_FALLBACK_FORMULA as GENERIC_FALLBACK_FORMULA,
+)
+
 # Shape limits for persisted factor free text (P4). Applied on both factor
 # ingestion paths — this LLM parser and the web edited-draft path
 # (apps/web/api._factor_from_request) — before anything reaches factor_root.
@@ -45,6 +54,24 @@ class ParsedFactor:
     provider: str
     model: str
     raw_response: str = ""
+    # Honest-fallback contract: non-empty whenever the parse landed on the
+    # generic catch-all formula, so no caller can present a fallback parse as
+    # a confident one (no-silent-fallback principle).
+    warnings: tuple[str, ...] = ()
+
+
+def generic_fallback_warnings(formula: str) -> tuple[str, ...]:
+    """Warnings a parse result must carry when it landed on the generic formula.
+
+    Both parse modes are covered identically: the deterministic rule parser
+    only ever emits ``rank(close)`` from its catch-all branch, and an LLM
+    ``rank(close)`` answer cannot be distinguished from a guess, so either way
+    the result is flagged for review rather than presented as confident.
+    """
+
+    if formula == GENERIC_FALLBACK_FORMULA:
+        return (GENERIC_FALLBACK_WARNING,)
+    return ()
 
 
 def parse_factor_idea(text: str, llm: LLMSettings, *, mode: str = "llm") -> ParsedFactor:
@@ -52,7 +79,13 @@ def parse_factor_idea(text: str, llm: LLMSettings, *, mode: str = "llm") -> Pars
 
     if mode == "rule":
         factor = parse_idea_to_definition(text)
-        return ParsedFactor(factor=factor, source="rule", provider="rule", model="deterministic")
+        return ParsedFactor(
+            factor=factor,
+            source="rule",
+            provider="rule",
+            model="deterministic",
+            warnings=generic_fallback_warnings(factor.formula),
+        )
     if mode != "llm":
         raise ValueError(f"unsupported parser mode: {mode}")
     selected_llm = llm.select_provider()
@@ -70,6 +103,7 @@ def _parse_with_configured_llm(text: str, llm: LLMSettings) -> ParsedFactor:
         provider=result.provider,
         model=result.model,
         raw_response=result.content,
+        warnings=generic_fallback_warnings(factor.formula),
     )
 
 

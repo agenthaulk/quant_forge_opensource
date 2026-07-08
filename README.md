@@ -44,18 +44,30 @@ database-backed platform features.
 
 ## Install / 安装
 
-Recommended first-run baseline:
+Python versions:
 
-- Python `3.12.x` on macOS/Linux, or Docker image `python:3.12-slim`.
+- Supported: Python 3.11 or newer (`requires-python >= 3.11` in
+  `pyproject.toml`).
+- Reference (tested) baseline: Python `3.12.x` on macOS/Linux, or Docker
+  image `python:3.12-slim`. Tests and full integration runs are executed
+  against this baseline.
+- `constraints.txt` reproduces the reference baseline package set exactly
+  (`pip install -e ".[dev]" -c constraints.txt`); the same pins also install
+  cleanly on Python 3.11.
 - Package dependency floors are in `pyproject.toml`: `numpy>=1.24`,
   `pandas>=2.0`, `pyarrow>=14.0.1`, `pyyaml>=6.0`, `pytest>=8.0` for dev.
 - Avoid starting a new setup with a bleeding-edge image such as
   `python:latest` or a new Python minor line until the dependency stack has
   been checked locally.
 
-推荐首次联调基线：
+Python 版本说明：
 
-- 本机使用 Python `3.12.x`，Docker 使用 `python:3.12-slim`。
+- 支持范围：Python 3.11 及以上（`pyproject.toml` 中 `requires-python >= 3.11`）。
+- 参考（测试）基线：本机 Python `3.12.x`，Docker 使用 `python:3.12-slim`；
+  测试与全量联调均在该基线上执行。
+- `constraints.txt` 用于精确复现参考基线依赖
+  （`pip install -e ".[dev]" -c constraints.txt`）；同一组 pin 在 Python 3.11
+  上同样可以安装。
 - 依赖下限见 `pyproject.toml`：`numpy>=1.24`、`pandas>=2.0`、
   `pyarrow>=14.0.1`、`pyyaml>=6.0`，开发测试使用 `pytest>=8.0`。
 - 不建议新人第一次就使用 `python:latest` 或过新的 Python 镜像；先用稳定镜像跑通
@@ -65,7 +77,42 @@ Recommended first-run baseline:
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -e ".[dev]"
+# Reproduce the reference baseline exactly instead / 精确复现参考基线：
+# python3 -m pip install -e ".[dev]" -c constraints.txt
 ```
+
+### Docker Quickstart / Docker 快速开始
+
+The repository root ships a reference `Dockerfile` built on the documented
+`python:3.12-slim` baseline. It installs with `constraints.txt`, copies an
+explicit file list so ignored local config and env files never end up inside
+the image, and starts the web workbench against the built-in demo workspace.
+
+仓库根目录提供基于 `python:3.12-slim` 基线的参考 `Dockerfile`：使用
+`constraints.txt` 安装依赖，按显式文件清单拷贝源码（被忽略的本地配置和 env
+文件不会进入镜像），并针对内置演示工作区启动 Web 工作台。
+
+```bash
+docker build -t quant-forge .
+export QF_WEB_CONTROL_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+docker run --rm -p 127.0.0.1:8765:8765 -e QF_WEB_CONTROL_TOKEN quant-forge
+```
+
+Then open `http://127.0.0.1:8765/`. `-e QF_WEB_CONTROL_TOKEN` passes the
+environment variable by NAME; its value is inherited from your shell at run
+time and never appears in the image or in any tracked file. Pass LLM keys the
+same way (`-e DEEPSEEK_API_KEY`) or with `--env-file` pointing at an ignored
+local env file. If host port `8765` is busy, publish
+`-p 127.0.0.1:8876:8765` and open `http://127.0.0.1:8876/`. To run the test
+suite inside the container as a smoke gate:
+`docker run --rm quant-forge python -m pytest`.
+
+然后在浏览器打开 `http://127.0.0.1:8765/`。`-e QF_WEB_CONTROL_TOKEN` 只传环境
+变量名，值在运行时从当前 shell 继承，不会写入镜像或任何被 git 跟踪的文件。
+LLM key 同样通过 `-e DEEPSEEK_API_KEY` 或 `--env-file` 指向被忽略的本地 env
+文件传入。宿主机 8765 被占用时，可发布为 `-p 127.0.0.1:8876:8765` 并打开
+`http://127.0.0.1:8876/`。如需在容器内跑 smoke 测试：
+`docker run --rm quant-forge python -m pytest`。
 
 ### Common Local/Docker Issues / 常见本地与 Docker 问题
 
@@ -80,9 +127,11 @@ python3 -m pip install -e ".[dev]"
 - Docker Desktop must be allowed to share the mounted data drive. If the
   mounted drive is not visible inside the container, add it in Docker Desktop
   file-sharing settings and mount it with `-v`.
-- Use Python 3.11 or newer. If dependency installation fails, verify
-  `python --version`, recreate the virtual environment, and reinstall with
-  `python -m pip install -e ".[dev]"`.
+- Supported Python is 3.11 or newer; the reference tested baseline is 3.12
+  with the `constraints.txt` pins (see Install above). If dependency
+  installation fails, verify `python --version`, recreate the virtual
+  environment, and reinstall with
+  `python -m pip install -e ".[dev]" -c constraints.txt`.
 - LLM-backed RD plus parameter search on a full mounted dataset can take
   several minutes. For first-time smoke testing, use an ignored local RD config
   with `default_max_candidates: 1` and a small parameter/profile grid; expand
@@ -218,6 +267,13 @@ PY
 qf web --config configs/default.local.yaml --rd-config configs/rd.yaml --host 0.0.0.0 --port 8765
 # docker run example: publish as 127.0.0.1:8765:8765 on the host
 ```
+
+The reference `Dockerfile` at the repository root (see Docker Quickstart in
+the Install section) generates an equivalent container-local config at build
+time, so the manual steps above are only needed for custom containers.
+
+仓库根目录的参考 `Dockerfile`（见安装章节的 Docker 快速开始）会在构建时生成
+等价的容器内配置；只有自定义容器才需要手动执行上述步骤。
 
 ## LLM Provider Setup / 大模型配置
 

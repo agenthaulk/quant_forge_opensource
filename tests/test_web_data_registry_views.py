@@ -208,6 +208,20 @@ def test_tags_module_preserves_null_vs_empty_and_absent_values() -> None:
     assert "if (tags.decay_horizon_days != null)" in tags_js
 
 
+def test_tags_module_labels_horizon_value_as_horizon_not_decay() -> None:
+    # Integration finding F-009: the qf.research_tags.v1 payload key stays
+    # `decay_horizon_days` (the key is frozen by the payload-shape pins in
+    # test_web_data_registry_api / test_data_catalog_expansion), but for
+    # factor subjects the backend populates it from
+    # FactorDefinition.horizon_days — the holding/signal horizon — because
+    # no measured decay estimate exists (research_tags.py, FP-4). The chip
+    # label must state what the value holds; a "decay" label would claim a
+    # decay parameter the run never had.
+    tags_js = _static_module_text("views/tags.js")
+    assert "chip('horizon ' + tags.decay_horizon_days + 'd')" in tags_js
+    assert "'decay '" not in tags_js
+
+
 # ---------------------------------------------------------------------------
 # views/registry.js — master-detail, hash sync, kind filter, FP-4
 # ---------------------------------------------------------------------------

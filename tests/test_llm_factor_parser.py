@@ -8,7 +8,8 @@ import pytest
 
 from quant_forge.config import LLMSettings
 from quant_forge.factor_library.repository import parse_idea_to_definition
-from quant_forge.llm_factor_parser import _factor_from_llm_json, parse_factor_idea
+from quant_forge.llm_factor_parser import GENERIC_FALLBACK_WARNING, _factor_from_llm_json, parse_factor_idea
+from quant_forge.specs import nl_flow
 
 
 class FakeLLMHandler(BaseHTTPRequestHandler):
@@ -377,3 +378,80 @@ def test_rule_parser_supports_volume_strength() -> None:
     assert factor.formula == "rank(volume)"
     assert factor.name == "volume_strength"
     assert factor.universe_filters == ("is_st == false",)
+
+
+def test_rule_mode_generic_fallback_carries_shared_warning_contract() -> None:
+    # F-010 no-silent-fallback: unrecognized text lands on the generic
+    # catch-all formula, and the parse result must say so.
+    parsed = parse_factor_idea(
+        "今天天气很好，和因子研究无关的一句话。",
+        LLMSettings(provider="rule"),
+        mode="rule",
+    )
+
+    assert parsed.factor.formula == "rank(close)"
+    assert parsed.warnings == (GENERIC_FALLBACK_WARNING,)
+    # Single definition: the parser reuses the nl_flow warning contract
+    # verbatim instead of maintaining a parallel copy.
+    assert GENERIC_FALLBACK_WARNING == nl_flow._FALLBACK_WARNING
+    assert "generic fallback formula rank(close)" in GENERIC_FALLBACK_WARNING
+    assert "review before running" in GENERIC_FALLBACK_WARNING
+
+
+def test_rule_mode_recognized_idea_carries_no_fallback_warning() -> None:
+    parsed = parse_factor_idea(
+        "非ST的小市值股票未来表现更好",
+        LLMSettings(provider="rule"),
+        mode="rule",
+    )
+
+    assert parsed.factor.formula == "-rank(market_cap)"
+    assert parsed.warnings == ()
+
+
+def test_llm_mode_generic_formula_carries_identical_fallback_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The LLM path is covered identically to the rule path: a rank(close)
+    # answer cannot be distinguished from a guess, so it is flagged for review.
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeOpenAICompatibleHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    try:
+        parsed = parse_factor_idea(
+            "收盘价强势",
+            LLMSettings(
+                provider="openai",
+                model="fake-openai",
+                base_url=f"http://127.0.0.1:{server.server_port}",
+                api_key_env="OPENAI_API_KEY",
+            ),
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+    assert parsed.factor.formula == "rank(close)"
+    assert parsed.warnings == (GENERIC_FALLBACK_WARNING,)
+
+
+def test_llm_mode_specific_formula_carries_no_fallback_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeLLMHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("QF_TEST_DEEPSEEK_KEY", "test-key")
+    try:
+        parsed = parse_factor_idea(
+            "非ST的小市值股票未来表现更好",
+            LLMSettings(
+                provider="deepseek",
+                model="fake-deepseek",
+                base_url=f"http://127.0.0.1:{server.server_port}",
+                api_key_env="QF_TEST_DEEPSEEK_KEY",
+            ),
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+    assert parsed.factor.formula == "-rank(market_cap)"
+    assert parsed.warnings == ()

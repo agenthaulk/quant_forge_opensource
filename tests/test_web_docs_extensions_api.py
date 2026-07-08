@@ -28,6 +28,7 @@ Fixture strings use neutral MARKER_XYZ-style content only.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import threading
 import urllib.error
@@ -301,9 +302,7 @@ def test_docs_list_skips_names_outside_charset(docs_root, web_app) -> None:
     assert "AT&T" not in text
 
 
-def test_docs_document_symlink_escape_and_unreadable_file_return_404(
-    docs_root, web_app, tmp_path
-) -> None:
+def test_docs_document_symlink_escape_returns_404(docs_root, web_app, tmp_path) -> None:
     outside = tmp_path / "outside.md"
     outside.write_text("# Outside\n", encoding="utf-8")
     (docs_root / "escape.md").symlink_to(outside)
@@ -311,6 +310,22 @@ def test_docs_document_symlink_escape_and_unreadable_file_return_404(
     status, _, body = _get(f"{web_app}/api/docs/escape.md")
     assert status == 404
     assert "unknown doc" in json.loads(body.decode("utf-8"))["error"]
+
+
+def test_docs_document_unreadable_file_returns_404(docs_root, web_app) -> None:
+    """The permission-denied branch needs a fixture the server cannot read.
+
+    ``chmod 0o000`` does not restrict uid 0, so when the suite runs as root
+    (the default user in a plain Docker container) this branch cannot be
+    exercised; skip rather than report a false failure on a healthy install.
+    The symlink-escape containment test above still runs as root.
+    """
+
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip(
+            "running as uid 0: chmod 0o000 cannot make the fixture unreadable, "
+            "so the permission-denied 404 branch is not observable"
+        )
 
     locked = docs_root / "locked.md"
     locked.write_text("# Locked\n", encoding="utf-8")

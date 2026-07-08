@@ -133,6 +133,36 @@ def test_web_parse_workflow_returns_editable_defaults_without_evaluation(monkeyp
         FactorRepository(config.paths.factor_root).get(result["factor"]["factor_id"])
 
 
+def test_web_parse_payload_surfaces_generic_fallback_warning(tmp_path) -> None:
+    # F-010 no-silent-fallback: unrecognized text lands on the generic
+    # rank(close) formula; the parse payload must carry the warning so the
+    # frontend can never present the fallback as a confident parse. The
+    # message text is pinned because it is the user-facing warning contract
+    # defined once in specs/nl_flow.py.
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+
+    result = run_idea_parse_workflow(config, "今天天气很好，和因子研究无关的一句话。", parser_mode="rule")
+
+    assert result["factor"]["formula"] == "rank(close)"
+    assert result["warnings"] == [
+        "idea parsed to the generic fallback formula rank(close); the parser may "
+        "not have understood the idea - review before running"
+    ]
+
+
+def test_web_parse_payload_warnings_field_is_empty_for_recognized_idea(tmp_path) -> None:
+    # The field is always present (empty means no fallback), so the frontend
+    # can rely on it without a silent default.
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+
+    result = run_idea_parse_workflow(config, "非ST的小市值股票未来表现更好", parser_mode="rule")
+
+    assert result["factor"]["formula"] == "-rank(market_cap)"
+    assert result["warnings"] == []
+
+
 def test_web_parse_workflow_returns_distinct_role_scoped_defaults(tmp_path) -> None:
     create_demo_workspace(tmp_path / "demo")
     config = QuantForgeConfig().resolve(tmp_path / "demo")
@@ -2507,6 +2537,16 @@ def test_web_result_sections_separate_roles_and_diagnostics() -> None:
     assert "external_oos_backtest" in factor_js
     assert "HAC t-stat" in factor_js
     assert "外部样本外仅包含 1 个完整持有期" in factor_js
+
+
+def test_web_parse_result_renders_fallback_warning_notice() -> None:
+    # F-010 no-silent-fallback: the parse renderer must surface payload
+    # warnings as a labeled design-system warn notice ahead of the report
+    # hero (text label, never color alone).
+    factor_js = _static_module_text("views/factor.js")
+
+    assert "renderParseWarnings(payload.warnings)" in factor_js
+    assert '<div class="notice warn"><span class="status-pill status-pill--running">警告</span>' in factor_js
 
 
 def test_web_backtest_metric_labels_match_metric_units() -> None:

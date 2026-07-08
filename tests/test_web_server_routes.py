@@ -15,8 +15,10 @@ They must pass unchanged before and after the server.py module split.
 
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
+import sys
 import threading
 import time
 import urllib.error
@@ -202,10 +204,34 @@ def test_get_root_serves_html_index(web_app) -> None:
 
 
 def test_get_unknown_path_falls_back_to_html_index(web_app) -> None:
-    status, content_type, body = _get(f"{web_app}/definitely-not-a-route")
-    assert status == 200
-    assert content_type == HTML_CONTENT_TYPE
-    assert body.decode("utf-8").startswith("<!doctype html>")
+    """Non-API fallthrough to the index shell is intentional (F-007).
+
+    The frontend is a hash-routed single page, so unknown GET paths outside
+    the ``/api`` namespace deliberately serve the index (deep links and typos
+    land in the app). Only the API namespace returns 404 JSON -- see
+    ``test_get_unknown_api_path_returns_404_json``.
+    """
+
+    for path in ("/definitely-not-a-route", "/some/random/page"):
+        status, content_type, body = _get(f"{web_app}{path}")
+        assert status == 200
+        assert content_type == HTML_CONTENT_TYPE
+        assert body.decode("utf-8").startswith("<!doctype html>")
+
+
+def test_get_unknown_api_path_returns_404_json(web_app) -> None:
+    """Unknown GET paths in the API namespace return 404 JSON (F-007).
+
+    Scripts and health probes hitting a typo'd endpoint must see a JSON
+    error, never HTTP 200 with the HTML shell.
+    """
+
+    for path in ("/api/nonexistent", "/api/runtime", "/api", "/api/"):
+        status, content_type, body = _get(f"{web_app}{path}")
+        assert status == 404, path
+        assert content_type == JSON_CONTENT_TYPE, path
+        payload = json.loads(body.decode("utf-8"))
+        assert "unknown API path" in payload["error"], path
 
 
 def test_post_run_idea_dispatches_workflow_via_server_namespace(monkeypatch, web_app) -> None:
@@ -693,3 +719,82 @@ def test_get_api_status_internal_value_error_is_not_reflected(monkeypatch, web_a
     text = body.decode("utf-8")
     assert "SENTINEL-CONFIG-DETAIL" not in text
     assert json.loads(text) == {"error": "request failed"}
+
+
+def test_run_local_web_flushes_startup_url_line(monkeypatch) -> None:
+    """The startup URL line must reach a redirected stdout immediately (F-004).
+
+    With stdout redirected to a file or pipe (docker logs, shell
+    redirection) the interpreter block-buffers, and ``serve_forever`` never
+    returns, so a print without ``flush=True`` leaves the listening URL
+    invisible while the server is healthy. Pin that ``run_local_web``
+    flushes stdout after writing the line.
+    """
+
+    import quant_forge.apps.web.routing as web_routing
+
+    class _RecordingStream(io.StringIO):
+        def __init__(self) -> None:
+            super().__init__()
+            self.flushed_after_write = False
+
+        def flush(self) -> None:  # pragma: no cover - trivial
+            if self.getvalue():
+                self.flushed_after_write = True
+            super().flush()
+
+    class _FakeServer:
+        server_address = ("127.0.0.1", 8123)
+
+        def serve_forever(self) -> None:
+            return None
+
+    captured_kwargs: dict[str, object] = {}
+
+    def fake_create_local_web_server(**kwargs):
+        captured_kwargs.update(kwargs)
+        return _FakeServer()
+
+    monkeypatch.setattr(web_routing, "create_local_web_server", fake_create_local_web_server)
+    stream = _RecordingStream()
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    web_routing.run_local_web(host="127.0.0.1", port=8123, config=QuantForgeConfig(), rd_config=None)
+
+    assert captured_kwargs["host"] == "127.0.0.1"
+    assert "Quant Forge local web listening on http://127.0.0.1:8123" in stream.getvalue()
+    assert stream.flushed_after_write
+
+
+def test_cmd_web_missing_control_token_prints_single_actionable_line(monkeypatch, tmp_path, capsys) -> None:
+    """A predictable control-token misconfiguration must not raise a traceback (F-006).
+
+    ``qf web`` bound to 0.0.0.0 without the control token env var set is a
+    correct refusal; the CLI boundary must present it as one actionable line
+    naming the env var and exit nonzero. Other exception types still
+    propagate (no blanket catch) -- see the sibling unreadable-config path,
+    which is out of scope here.
+    """
+
+    monkeypatch.delenv("QF_ROUTES_WEB_MISSING_TOKEN", raising=False)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+web:
+  host: 0.0.0.0
+  allow_docker_bind: true
+  control_token_env: QF_ROUTES_WEB_MISSING_TOKEN
+""",
+        encoding="utf-8",
+    )
+
+    exit_code = cli_main.main(["web", "--config", str(config_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
+    lines = [line for line in captured.out.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert "QF_ROUTES_WEB_MISSING_TOKEN" in lines[0]
+    assert "qf web startup blocked" in lines[0]
