@@ -7,10 +7,15 @@ from pathlib import Path
 from quant_forge.factor_library.catalog import FactorCatalog, is_precomputed_formula
 from quant_forge.mcp.read_models import list_available_fields, list_available_operators
 from quant_forge.research_loop.contracts import ResearchContext
+from quant_forge.research_loop.feedback_builder import NEXT_HYPOTHESIS_HINT_TEMPLATES
 from quant_forge.research_loop.memory import ResearchMemoryStore
 from quant_forge.research_loop.trace_store import ResearchTraceStore
 
 _MEMORY_CONTEXT_LIMIT = 5
+
+# Hints are producer-side fixed templates; rows read back from trace.jsonl
+# must match the template set or they are silently skipped (P1/F4).
+_KNOWN_FOCUS_HINTS = frozenset(NEXT_HYPOTHESIS_HINT_TEMPLATES)
 
 
 class ResearchContextBuilder:
@@ -129,7 +134,7 @@ def _next_focus_hints(failures: tuple[dict[str, object], ...]) -> tuple[str, ...
         hint = str(entry.get("next_hypothesis_hint") or "")
         if not hint and isinstance(entry.get("feedback"), dict):
             hint = str(entry["feedback"].get("next_hypothesis_hint") or "")  # type: ignore[index]
-        if hint:
+        if hint in _KNOWN_FOCUS_HINTS:
             hints.append(hint)
     return tuple(sorted(set(hints)))
 

@@ -1011,9 +1011,10 @@ class ResearchLoopService:
 
         Gate-blocked candidates become failure-class observations; accepted
         candidates become finding-class observations. Statements are compact
-        redacted summaries (formula fingerprint family + gate reasons) — no
-        raw data, no paths. ``promote_pending`` runs once at completion so
-        repeated signatures across runs can promote deterministically.
+        redacted summaries (formula fingerprint family + gate reason
+        families) — no raw data, no paths, no free text. ``promote_pending``
+        runs once at completion so repeated signatures across runs can
+        promote deterministically.
         """
 
         if self.memory_store is None:
@@ -1032,11 +1033,15 @@ class ResearchLoopService:
                 )
             else:
                 families = _gate_reason_families(result.gate_reasons)
+                # P2: the durable statement carries only the value-free reason
+                # families; full gate reasons stay in trace/report artifacts so
+                # provider-channel or repair-exception free text never reaches
+                # durable memory.
                 self.memory_store.record_observation(
                     signature="rd_gate_blocked:" + fingerprint + ":" + ",".join(families),
                     statement=(
                         f"gate blocked candidate formula family {fingerprint[:12]}: "
-                        + "; ".join(result.gate_reasons)
+                        + ", ".join(families)
                     ),
                     run_id=run_id,
                     data_window=window,

@@ -32,7 +32,13 @@ from quant_forge.core.contracts import (
 from quant_forge.factor_library.catalog import FactorCatalog
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.lineage.store import RunIndex, redact_free_text
-from quant_forge.llm_factor_parser import ParsedFactor
+from quant_forge.llm_factor_parser import (
+    FACTOR_DESCRIPTION_MAX_CHARS,
+    UNIVERSE_FILTER_MAX_CHARS,
+    ParsedFactor,
+    sanitize_factor_text,
+    slugify_factor_name,
+)
 from quant_forge.research_loop.config import (
     ResearchLoopConfig,
     load_research_loop_config,
@@ -619,14 +625,21 @@ def _factor_from_request(raw: dict[str, Any] | FactorDefinition) -> FactorDefini
     filters_raw = raw.get("universe_filters", ())
     if not isinstance(filters_raw, list | tuple):
         raise ValueError("factor.universe_filters must be a list")
+    # P4: the idea-validation endpoint persists request-supplied factor JSON,
+    # so it accepts draft rows only (promotion has its own audited path in
+    # factor_library.repository) and applies the same name slug and free-text
+    # shape limits as the LLM parser path before anything reaches factor_root.
+    status = str(raw.get("status", "draft"))
+    if status != "draft":
+        raise ValueError("idea validation accepts factor.status 'draft' only")
     return FactorDefinition(
         factor_id=str(raw["factor_id"]),
-        name=str(raw.get("name", raw["factor_id"])),
+        name=slugify_factor_name(str(raw.get("name", raw["factor_id"]))),
         formula=str(raw["formula"]),
-        status=str(raw.get("status", "draft")),  # type: ignore[arg-type]
-        description=str(raw.get("description", "")),
+        status=status,  # type: ignore[arg-type]
+        description=sanitize_factor_text(str(raw.get("description", "")), FACTOR_DESCRIPTION_MAX_CHARS),
         horizon_days=_positive_int_parameter(raw.get("horizon_days", 5), "factor.horizon_days"),
-        universe_filters=tuple(str(item) for item in filters_raw),
+        universe_filters=tuple(sanitize_factor_text(str(item), UNIVERSE_FILTER_MAX_CHARS) for item in filters_raw),
         source=str(raw.get("source", "user")),
     )
 

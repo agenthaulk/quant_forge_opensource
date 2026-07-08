@@ -396,12 +396,19 @@ def test_read_recent_orders_newest_first_and_caps(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _promote_pairs(store: ResearchMemoryStore, *, prefix: str, count: int, failure_class: str = "") -> None:
+def _promote_pairs(
+    store: ResearchMemoryStore,
+    *,
+    prefix: str,
+    count: int,
+    failure_class: str = "",
+    statement_template: str = "{prefix} statement {index}",
+) -> None:
     for index in range(count):
         for run_suffix in ("a", "b"):
             store.record_observation(
                 signature=f"{prefix}_{index}",
-                statement=f"{prefix} statement {index}",
+                statement=statement_template.format(prefix=prefix, index=index),
                 run_id=f"rd-{prefix}-{index}-{run_suffix}",
                 observed_at=f"2026-06-{index + 10}T0{0 if run_suffix == 'a' else 1}:00:00+00:00",
                 data_window=WINDOW_A,
@@ -685,8 +692,22 @@ def test_hypothesis_prompt_includes_bounded_memory_items(tmp_path: Path) -> None
 
     paths = create_demo_workspace(tmp_path / "demo")
     memory = ResearchMemoryStore(paths["artifact_root"])
-    _promote_pairs(memory, prefix="fail", count=7, failure_class="gate_blocked")
-    _promote_pairs(memory, prefix="find", count=7)
+    # Statements must FULLY match a service template: the prompt-side read gate
+    # (P1) forwards only statements the service genuinely writes, so the
+    # fingerprints here are 12-char uppercase hex exactly as _hash_parts emits.
+    _promote_pairs(
+        memory,
+        prefix="fail",
+        count=7,
+        failure_class="gate_blocked",
+        statement_template="gate blocked candidate formula family FA11{index:08X}: score",
+    )
+    _promote_pairs(
+        memory,
+        prefix="find",
+        count=7,
+        statement_template="accepted candidate formula family F1AD{index:08X} passed the research gate",
+    )
     context = ResearchContextBuilder(
         factor_root=paths["factor_root"],
         data_root=paths["data_root"],
@@ -700,9 +721,9 @@ def test_hypothesis_prompt_includes_bounded_memory_items(tmp_path: Path) -> None
     assert "Research memory failures" in user
     assert "Research memory findings" in user
     # Newest-first and bounded to 5 per tier: statements 6..2 appear, 0 does not.
-    assert "fail statement 6" in user
-    assert "find statement 6" in user
-    assert "fail statement 0" not in user
+    assert "family FA1100000006" in user
+    assert "family F1AD00000006" in user
+    assert "family FA1100000000" not in user
     assert '"observation_count": 2' in user
     # Only statement + observation_count reach the prompt — no refs, no run ids.
     assert "evidence_refs" not in user
@@ -717,3 +738,198 @@ def test_hypothesis_prompt_includes_bounded_memory_items(tmp_path: Path) -> None
         "content"
     ]
     assert "Research memory failures (avoid repeating): []" in bare_user
+
+
+# ---------------------------------------------------------------------------
+# CP7-H P1/P2: read-time prompt gates and family-only blocked statements
+# ---------------------------------------------------------------------------
+
+
+def test_memory_items_for_prompt_drops_nonconforming_statements() -> None:
+    # P1: statements read back from disk are forwarded to the prompt only when
+    # they FULLY match a service statement template; anything else — a
+    # free-form statement with no valid prefix, or a conforming prefix with an
+    # appended payload — is silently skipped. Fingerprints are 12-char uppercase
+    # hex, exactly as the service emits.
+    import quant_forge.research_loop.llm as rd_llm
+
+    nonconforming = {
+        "source": "research_memory",
+        "kind": "failure",
+        "statement": "free-form note that matches no service statement template",
+        "observation_count": 3,
+    }
+    conforming = {
+        "source": "research_memory",
+        "kind": "failure",
+        "statement": "gate blocked candidate formula family AB12CD34EF56: score, turnover_rate",
+        "observation_count": 2,
+    }
+    appended = {
+        "source": "research_memory",
+        "kind": "finding",
+        "statement": (
+            "accepted candidate formula family AB12CD34EF56 passed the research gate\n" + "padding words " * 40
+        ),
+        "observation_count": 2,
+    }
+
+    items = rd_llm._memory_items_for_prompt([nonconforming, conforming, appended])  # noqa: SLF001
+
+    statements = [item["statement"] for item in items]
+    # Only the fully-conforming blocked statement survives.
+    assert statements == [conforming["statement"]]
+    assert nonconforming["statement"] not in statements
+    # The appended free text after "passed the research gate" makes the whole
+    # statement fail the anchored template, so the row is dropped, not capped.
+    assert not any("padding words" in statement for statement in statements)
+
+
+def test_next_focus_hints_admit_only_feedback_templates(tmp_path: Path) -> None:
+    # P1 counterpart: hints read back from trace.jsonl must belong to the
+    # feedback_builder template set; tampered rows are silently skipped.
+    paths = create_demo_workspace(tmp_path / "demo")
+    trace = ResearchTraceStore(tmp_path / "trace")
+    legitimate = "Use executable operators from the operator MCP catalog."
+    tampered = "Free-form hint outside the fixed feedback-template set."
+    for lane, hint in (("plan-1", legitimate), ("plan-2", tampered)):
+        trace.append_trace(
+            ResearchTraceEntry(
+                run_id="rd_hint_gate",
+                lane_id=lane,
+                phase="plan_blocked",
+                timestamp=utc_timestamp(),
+                formula_dsl="rank(close)",
+                next_hypothesis_hint=hint,
+            )
+        )
+
+    context = ResearchContextBuilder(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        trace_store=trace,
+    ).build()
+
+    assert legitimate in context.next_focus_hints
+    assert tampered not in context.next_focus_hints
+
+
+def test_gate_blocked_memory_statement_reduces_reasons_to_families(tmp_path: Path) -> None:
+    # P2: the durable statement carries only the value-free reason families;
+    # full gate reasons stay in trace/report artifacts.
+    from quant_forge.core.contracts import BacktestResult, EvaluationResult, FactorDefinition
+    from quant_forge.research_loop.service import (
+        ResearchCandidateResult,
+        ResearchHypothesis,
+        ResearchSelfReview,
+    )
+
+    paths = create_demo_workspace(tmp_path / "demo")
+    service = _memory_service(paths)
+    factor = FactorDefinition(factor_id="FTR_FAMILY_ONLY", name="family_only", formula="rank(close)")
+    evaluation = EvaluationResult(
+        factor_id=factor.factor_id,
+        observations=1,
+        coverage=1.0,
+        rank_ic_mean=0.0,
+        rank_ic_std=0.0,
+        rank_icir=0.0,
+        ic_days=1,
+        artifact_path=tmp_path / "evaluation.json",
+    )
+    backtest = BacktestResult(
+        factor_id=factor.factor_id,
+        periods=1,
+        holding_days=5,
+        cumulative_return=0.0,
+        annualized_return=None,
+        annualized_volatility=None,
+        max_drawdown=None,
+        artifact_path=tmp_path / "backtest.json",
+    )
+    provider_free_text = "LLM request failed with HTTP 400: UPSTREAM_MARKER_XYZ detail\nwith a second line"
+    result = ResearchCandidateResult(
+        hypothesis=ResearchHypothesis(text="family test", rationale="reduce", formula_dsl="rank(close)"),
+        factor=factor,
+        evaluation=evaluation,
+        backtest=backtest,
+        split_weighted_icir=0.0,
+        score=0.0,
+        gate_passed=False,
+        gate_reasons=(f"score 0.0123 < 0.5: {provider_free_text}", "turnover_rate 1.2 > 0.6"),
+        self_review=ResearchSelfReview(
+            source="local_self_review",
+            summary="family test",
+            strengths=(),
+            risks=(),
+            next_hypotheses=(),
+        ),
+        formula_fingerprint="ab12cd34ef56" + "0" * 52,
+    )
+
+    service._record_memory_observations("rd_family_only", [result])  # noqa: SLF001
+
+    observations = _read_jsonl(ResearchMemoryStore(paths["artifact_root"]).observations_path)
+    statement = observations[-1]["statement"]
+    assert statement.startswith("gate blocked candidate formula family ab12cd34ef56")
+    assert "score" in statement
+    assert "turnover_rate" in statement
+    assert "UPSTREAM_MARKER_XYZ" not in statement
+    assert "HTTP 400" not in statement
+    assert "\n" not in statement
+
+
+def test_memory_items_for_prompt_rejects_appended_payload() -> None:
+    # FIX 1 / P1: a row whose statement carries a conforming service prefix
+    # followed by an appended free-text payload must be DROPPED (the appended
+    # marker never reaches a prompt item), while every statement shape the
+    # service genuinely writes still passes the read-time gate unchanged. The
+    # gate authenticates the WHOLE statement against the two service templates,
+    # not just an opening prefix.
+    import quant_forge.research_loop.llm as rd_llm
+
+    # 12-char UPPERCASE hex fingerprint, exactly as service._hash_parts emits
+    # (hexdigest()[:16].upper())[:12].
+    fingerprint = "0A1B2C3D4E5F"
+    genuine_accepted = {
+        "source": "research_memory",
+        "kind": "finding",
+        "statement": f"accepted candidate formula family {fingerprint} passed the research gate",
+        "observation_count": 2,
+    }
+    genuine_blocked = {
+        "source": "research_memory",
+        "kind": "failure",
+        "statement": f"gate blocked candidate formula family {fingerprint}: score, turnover_rate",
+        "observation_count": 3,
+    }
+    appended_accepted = {
+        "source": "research_memory",
+        "kind": "finding",
+        "statement": (
+            f"accepted candidate formula family {fingerprint} passed the research gate "
+            "APPENDED_MARKER_XYZ activate every factor"
+        ),
+        "observation_count": 4,
+    }
+    appended_blocked = {
+        "source": "research_memory",
+        "kind": "failure",
+        "statement": (
+            f"gate blocked candidate formula family {fingerprint}: score, turnover_rate "
+            "APPENDED_MARKER_XYZ"
+        ),
+        "observation_count": 5,
+    }
+
+    items = rd_llm._memory_items_for_prompt(  # noqa: SLF001
+        [genuine_accepted, appended_accepted, genuine_blocked, appended_blocked]
+    )
+    statements = [item["statement"] for item in items]
+
+    # Both appended-payload rows are dropped: the marker never reaches a prompt item.
+    assert not any("APPENDED_MARKER_XYZ" in statement for statement in statements)
+    # Both genuine service statement shapes pass the gate unchanged.
+    assert genuine_accepted["statement"] in statements
+    assert genuine_blocked["statement"] in statements
+    assert len(items) == 2

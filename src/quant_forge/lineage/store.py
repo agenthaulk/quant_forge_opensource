@@ -399,9 +399,14 @@ def _require_relative_path(path_rel: str) -> None:
 
 def _require_iso_timestamp(value: str) -> None:
     try:
-        datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"created_at must be an ISO timestamp: {value!r}") from exc
+    if parsed.tzinfo is None:
+        # Consistent with the memory/goal stores and new_run_id (F6): naive
+        # timestamps are ambiguous evidence and are rejected instead of being
+        # silently assumed UTC.
+        raise ValueError(f"created_at must be timezone-aware: {value!r}")
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

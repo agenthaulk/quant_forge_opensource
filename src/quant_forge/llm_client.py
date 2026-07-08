@@ -71,6 +71,10 @@ _PROVIDER_ALIASES = {
 _TRANSIENT_HTTP_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 _MAX_HTTP_ATTEMPTS = 3
 _HTTP_RETRY_BACKOFF_SECONDS = (0.25, 1.0)
+# Provider error bodies are non-model provider-channel bytes; only a short
+# single-line extract may enter exception text (P3), because str(exc) can
+# propagate into plan blocking reasons and operator-facing surfaces.
+_HTTP_ERROR_BODY_MAX_CHARS = 120
 
 
 @dataclass(frozen=True)
@@ -277,7 +281,7 @@ def _urlopen_json_with_retries(
             if _should_retry_http(exc.code, attempt):
                 _sleep_before_retry(attempt)
                 continue
-            raise RuntimeError(f"LLM request failed with HTTP {exc.code}: {body[:500]}") from exc
+            raise RuntimeError(f"LLM request failed with HTTP {exc.code}: {_error_body_extract(body)}") from exc
         except urllib.error.URLError as exc:
             if attempt < _MAX_HTTP_ATTEMPTS:
                 _sleep_before_retry(attempt)
@@ -289,6 +293,12 @@ def _urlopen_json_with_retries(
                 continue
             raise RuntimeError("LLM request timed out") from exc
     raise RuntimeError("LLM request failed after retries")
+
+
+def _error_body_extract(body: str) -> str:
+    """Single-line, length-capped extract of a provider HTTP error body."""
+
+    return " ".join(body.split())[:_HTTP_ERROR_BODY_MAX_CHARS]
 
 
 def _should_retry_http(status_code: int, attempt: int) -> bool:

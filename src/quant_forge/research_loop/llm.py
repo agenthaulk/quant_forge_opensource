@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import warnings
 from typing import Any
 
@@ -310,6 +311,32 @@ def _repair_messages(
 
 
 _MEMORY_PROMPT_ITEM_LIMIT = 5
+# The service writes durable memory statements in exactly two fully-structured
+# shapes (service._record_memory_observations):
+#   "accepted candidate formula family {fp} passed the research gate"
+#   "gate blocked candidate formula family {fp}: {families}"
+# where {fp} is the leading 12 chars of an UPPERCASE SHA-1 hex fingerprint
+# (service._hash_parts -> hashlib.sha1(...).hexdigest()[:16].upper()) and
+# {families} is a comma-space-joined, sorted list of value-free gate-reason
+# families (service._gate_reason_families): each is the leading word of a gate
+# reason and, for every reason the shipped gate emits, is drawn from the
+# [A-Za-z0-9_] identifier charset (metric names, INSUFFICIENT_* constants, and
+# IS/OOS* split names). The prompt-side read gate authenticates the WHOLE
+# collapsed statement against these anchored shapes, not merely an opening
+# prefix, so a conforming prefix followed by an appended free-text payload is
+# dropped instead of steering prompts (P1).
+_MEMORY_FINGERPRINT_PATTERN = r"[0-9A-F]{12}"
+_MEMORY_FAMILY_PATTERN = r"[A-Za-z0-9_]+"
+_MEMORY_STATEMENT_PATTERNS = (
+    re.compile(rf"^accepted candidate formula family {_MEMORY_FINGERPRINT_PATTERN} passed the research gate$"),
+    re.compile(
+        rf"^gate blocked candidate formula family {_MEMORY_FINGERPRINT_PATTERN}: "
+        rf"{_MEMORY_FAMILY_PATTERN}(?:, {_MEMORY_FAMILY_PATTERN})*$"
+    ),
+)
+# Defense-in-depth secondary bound only; the anchored templates above are the
+# primary gate. Legitimate statements are far shorter than this.
+_MEMORY_STATEMENT_MAX_CHARS = 300
 
 
 def _memory_items_for_prompt(items: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -317,15 +344,23 @@ def _memory_items_for_prompt(items: tuple[dict[str, Any], ...] | list[dict[str, 
 
     Only rows marked ``source == "research_memory"`` qualify (trace entries in
     the same tuples keep their existing prompt channels), and only the
-    already-redacted statement plus observation_count are forwarded.
+    already-redacted statement plus observation_count are forwarded. Disk is
+    not trusted at read time: after collapsing the statement to a single line it
+    must FULLY match one of the two service statement templates
+    (``_MEMORY_STATEMENT_PATTERNS``). A conforming prefix followed by an
+    appended payload does not match and is dropped, so free text written by any
+    other same-host writer cannot steer prompts. ``_MEMORY_STATEMENT_MAX_CHARS``
+    is a secondary defense-in-depth length bound, not the primary gate.
     """
 
     bounded: list[dict[str, Any]] = []
     for item in items:
         if not isinstance(item, dict) or item.get("source") != "research_memory":
             continue
-        statement = str(item.get("statement") or "").strip()
-        if not statement:
+        statement = " ".join(str(item.get("statement") or "").split())
+        if len(statement) > _MEMORY_STATEMENT_MAX_CHARS:
+            continue
+        if not any(pattern.match(statement) for pattern in _MEMORY_STATEMENT_PATTERNS):
             continue
         bounded.append(
             {

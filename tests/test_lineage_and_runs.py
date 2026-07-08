@@ -126,6 +126,48 @@ def test_lineage_deduplicates_identical_edges(tmp_path: Path) -> None:
     assert len(_read_jsonl(store.index_path)) == 1
 
 
+def test_lineage_and_run_index_reject_naive_timestamps(tmp_path: Path) -> None:
+    # F6: contract symmetry with the memory/goals stores — naive ISO
+    # timestamps are ambiguous evidence and must be rejected at write time.
+    naive = "2026-07-06T00:00:00"
+    store = LineageStore(tmp_path / "artifacts")
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        store.record_artifact(
+            artifact_type="factor_definition",
+            payload={"factor_id": "F"},
+            created_at=naive,
+            generated_by="test",
+        )
+
+    index = RunIndex(tmp_path / "artifacts")
+    fingerprint = canonical_fingerprint({"kind": "evaluate"})
+    valid = dict(
+        run_id="evaluate-x-tz",
+        kind="evaluate",
+        factor_ids=("F",),
+        created_at=CREATED_AT,
+        data_window={"start_date": None, "end_date": None, "status": "unavailable"},
+        config_fingerprint=fingerprint,
+        metric_highlights={},
+        artifact_paths_rel=("evaluations/F.json",),
+        warnings_count=0,
+    )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        index.append_run(**{**valid, "created_at": naive})
+
+    # tz-aware timestamps (offset and Z forms) stay accepted.
+    index.append_run(**valid)
+    index.append_run(**{**valid, "run_id": "evaluate-x-tz-z", "created_at": "2026-07-06T00:00:00Z"})
+    record = store.record_artifact(
+        artifact_type="factor_definition",
+        payload={"factor_id": "F"},
+        created_at="2026-07-06T00:00:00Z",
+        generated_by="test",
+    )
+    assert record.created_at == "2026-07-06T00:00:00Z"
+
+
 # ---------------------------------------------------------------------------
 # Run index axiom guards
 # ---------------------------------------------------------------------------

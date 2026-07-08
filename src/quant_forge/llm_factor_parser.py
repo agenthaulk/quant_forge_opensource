@@ -15,6 +15,28 @@ from quant_forge.llm_client import extract_json_object, generate_chat_text
 from quant_forge.mcp.read_models import list_available_fields, list_available_operators
 from quant_forge.operator_registry.resolver import resolve_formula_operators
 
+# Shape limits for persisted factor free text (P4). Applied on both factor
+# ingestion paths — this LLM parser and the web edited-draft path
+# (apps/web/api._factor_from_request) — before anything reaches factor_root.
+FACTOR_DESCRIPTION_MAX_CHARS = 500
+UNIVERSE_FILTER_MAX_CHARS = 120
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def sanitize_factor_text(value: str, max_chars: int) -> str:
+    """Single-line, control-character-free, length-capped factor free text."""
+
+    cleaned = _CONTROL_CHARS_RE.sub(" ", value)
+    return " ".join(cleaned.split())[:max_chars]
+
+
+def slugify_factor_name(value: str) -> str:
+    """Reduce a factor name to the shared ``[a-z0-9_]`` slug charset."""
+
+    slug = re.sub(r"[^a-zA-Z0-9_]+", "_", value.strip().lower())
+    return slug.strip("_") or "llm_factor"
+
 
 @dataclass(frozen=True)
 class ParsedFactor:
@@ -90,12 +112,12 @@ def _factor_from_llm_json(payload: dict[str, Any], text: str) -> FactorDefinitio
         details = json.dumps(resolution.to_dict(), ensure_ascii=False, sort_keys=True)
         raise RuntimeError(f"LLM formula failed operator registry gate: {details}")
     formula = resolution.canonical_formula
-    description = str(payload.get("description", "")).strip()
+    description = sanitize_factor_text(str(payload.get("description", "")), FACTOR_DESCRIPTION_MAX_CHARS)
     horizon_days = _normalize_horizon_days(int(payload.get("horizon_days", 5)), text)
     filters_raw = payload.get("universe_filters", [])
     if not isinstance(filters_raw, list):
         raise RuntimeError("LLM field universe_filters must be a list")
-    filters = tuple(str(item) for item in filters_raw)
+    filters = tuple(sanitize_factor_text(str(item), UNIVERSE_FILTER_MAX_CHARS) for item in filters_raw)
     digest = hashlib.sha1(f"{name}:{formula}:{horizon_days}:{filters}:{text}".encode("utf-8")).hexdigest()[:8].upper()
     return FactorDefinition(
         factor_id=f"FTR_LLM_{digest}",
@@ -120,5 +142,4 @@ def _normalize_horizon_days(horizon_days: int, text: str) -> int:
 
 
 def _slug(value: str) -> str:
-    value = re.sub(r"[^a-zA-Z0-9_]+", "_", value.strip().lower())
-    return value.strip("_") or "llm_factor"
+    return slugify_factor_name(value)
