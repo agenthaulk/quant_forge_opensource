@@ -2,11 +2,10 @@
 
 Covers ``GET /api/synthesis/methods`` and ``quant_forge.synthesis.methods``:
 
-- the catalog payload equals the design §9 JSON with the CP0 interim
-  amendment applied: fitted methods (``ic_weighted`` / ``icir_weighted``)
-  ship ``available: false`` (reserved 预留) until the fitted phase lands,
-  while ``equal_weight`` / ``weighted`` are runnable and honestly
-  ``is_fitted: false``;
+- the catalog payload equals the design §9 literal JSON — the post-P6 end
+  state: ALL FOUR methods ``available: true`` now that the fitted
+  implementation (point-in-time IC/ICIR, §4.4) has landed, with
+  ``is_fitted`` truthful per method nature;
 - generic ParamSpec discipline over the wire payload: every ``params[]``
   entry carries only declared ParamSpec fields with a renderable ``type``
   (the frontend form is schema-driven with zero per-method hardcoding),
@@ -17,7 +16,10 @@ Covers ``GET /api/synthesis/methods`` and ``quant_forge.synthesis.methods``:
   namespace (the monkeypatch seam contract shared by all GET builders);
 - ``validate_params_against_schema`` unit coverage: required/missing,
   unknown names, per-type checks (int/float/bool/enum), minimum/maximum
-  bounds, and structural weights-map validation.
+  bounds, and structural weights-map validation;
+- ``apply_param_defaults`` unit coverage: declared defaults fill absent
+  optional params, explicit values always win, and the input is never
+  mutated.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ from quant_forge.data.local import create_demo_workspace
 from quant_forge.synthesis.methods import (
     PARAM_TYPES,
     ParamSpec,
+    apply_param_defaults,
     method_catalog_payload,
     validate_params_against_schema,
 )
@@ -44,9 +47,8 @@ from quant_forge.synthesis.methods import (
 
 JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 
-# Design §9 literal payload with the CP0 interim amendment applied: ONLY the
-# `available` flag differs from §9 on the two fitted rows (false until the
-# fitted phase lands); every name, label, param, and help string is verbatim.
+# Design §9 literal payload — the post-P6 end state: every name, label,
+# param, help string, AND `available: true` on all four methods, verbatim.
 EXPECTED_CATALOG = {
     "methods": [
         {
@@ -76,7 +78,7 @@ EXPECTED_CATALOG = {
         {
             "name": "ic_weighted",
             "label": "IC 加权合成（拟合）",
-            "available": False,
+            "available": True,
             "required_standardization": False,
             "is_fitted": True,
             "params": [
@@ -98,7 +100,7 @@ EXPECTED_CATALOG = {
         {
             "name": "icir_weighted",
             "label": "ICIR 加权合成（拟合）",
-            "available": False,
+            "available": True,
             "required_standardization": False,
             "is_fitted": True,
             "params": [
@@ -224,11 +226,16 @@ def test_synthesis_methods_paramspec_discipline_is_generic(web_app) -> None:
     weighted_params = {spec["name"]: spec for spec in by_name["weighted"]["params"]}
     assert weighted_params["weights"]["type"] == "weights"
     assert weighted_params["weights"]["required"] is True
-    # Fitted methods stay reserved (available:false) at this phase, while
-    # is_fitted stays truthful about what they will be once runnable.
+    # Fitted methods are runnable post-P6 and truthfully claim their nature;
+    # the RUN-level is_fitted can still downgrade (NO_FITTED_PERIODS, RB-8).
     for name in ("ic_weighted", "icir_weighted"):
-        assert by_name[name]["available"] is False
+        assert by_name[name]["available"] is True
         assert by_name[name]["is_fitted"] is True
+        params = {spec["name"]: spec for spec in by_name[name]["params"]}
+        assert params["ic_min_periods"]["type"] == "int"
+        assert params["ic_min_periods"]["default"] == 6
+        assert params["ic_min_periods"]["minimum"] == 3
+        assert params["ic_min_periods"]["maximum"] == 60
 
     standardizations = payload["standardizations"]
     assert [entry["name"] for entry in standardizations] == ["zscore", "rank"]
@@ -447,3 +454,40 @@ def test_validate_params_returns_plain_dict_copy() -> None:
     result = validate_params_against_schema((INT_SPEC,), params)
     assert result == {"periods": 6}
     assert result is not params
+
+
+# ---------------------------------------------------------------------------
+# apply_param_defaults — schema-driven default resolution (P6 honesty rule)
+# ---------------------------------------------------------------------------
+
+
+DEFAULTED_SPEC = ParamSpec(
+    name="ic_min_periods", label="IC 最小拟合期数", type="int", default=6, minimum=3, maximum=60
+)
+
+
+def test_apply_param_defaults_fills_absent_declared_defaults() -> None:
+    # The run's echoed params (and its composite-id digest) must state what
+    # it ACTUALLY used: an omitted optional param resolves to the catalog
+    # default instead of staying silently implicit.
+    assert apply_param_defaults((DEFAULTED_SPEC,), {}) == {"ic_min_periods": 6}
+
+
+def test_apply_param_defaults_never_overrides_explicit_values() -> None:
+    assert apply_param_defaults((DEFAULTED_SPEC,), {"ic_min_periods": 12}) == {
+        "ic_min_periods": 12
+    }
+
+
+def test_apply_param_defaults_leaves_defaultless_params_absent() -> None:
+    # No declared default -> nothing is fabricated (weights stays required
+    # and its absence is the validator's concern, not a silent fill).
+    assert apply_param_defaults((WEIGHTS_SPEC,), {}) == {}
+
+
+def test_apply_param_defaults_returns_copy_without_mutating_input() -> None:
+    params: dict[str, object] = {}
+    resolved = apply_param_defaults((DEFAULTED_SPEC,), params)
+    assert resolved == {"ic_min_periods": 6}
+    assert params == {}
+    assert resolved is not params

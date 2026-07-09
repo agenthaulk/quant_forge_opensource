@@ -9,21 +9,23 @@ nothing else defines the catalog.
 
 Contract honesty rules baked in here:
 
-- The wire payload is the design §9 JSON with one interim amendment (CP0):
-  the fitted methods ``ic_weighted`` / ``icir_weighted`` ship
-  ``available: false`` (reserved 预留 options) until the fitted
-  implementation phase lands. The frontend renders reserved methods as
-  disabled options generically, so advertising them is honest capability
-  disclosure, never a runnable claim. §9's literal JSON (all four
-  ``available: true``) is the post-fitted-phase end state.
+- The wire payload is the design §9 literal JSON — the post-P6 end state:
+  all four methods ship ``available: true`` now that the fitted
+  implementation (point-in-time IC/ICIR, §4.4) has landed. The CP0 interim
+  amendment (fitted methods reserved as 预留 ``available: false``) is
+  retired; the frontend still renders any FUTURE reserved method as a
+  disabled option generically, so the reserved mechanism stays supported.
 - ``is_fitted`` describes each method's nature truthfully: the two a-priori
-  methods never claim fitting, and the reserved fitted methods stay marked
-  ``is_fitted: true`` even while unavailable so the catalog never mislabels
-  what they will do once runnable.
+  methods never claim fitting, and the fitted methods' ``true`` is a
+  catalog-level nature claim — the RUN-level ``is_fitted`` in provenance
+  still downgrades to ``false`` when a window admits zero genuinely fitted
+  rebalances (``NO_FITTED_PERIODS``, design §3 RB-8).
 - Parameter validation is entirely schema-driven: every check reads only the
   declared :class:`ParamSpec` list, so a method added to the catalog is
   validated with zero per-method hardcoding — the same rule the shipped
   frontend form follows (``synthesis.js`` renders purely from ``params[]``).
+  Declared defaults are resolved the same way (:func:`apply_param_defaults`),
+  so what a run reports as its parameters is what it actually used.
 """
 
 from __future__ import annotations
@@ -173,11 +175,11 @@ class StandardizationSpec:
         return {"name": self.name, "label": self.label}
 
 
-# Design §9 catalog with the CP0 interim amendment applied: the fitted
-# methods are reserved (available=False) until the fitted implementation
-# phase lands, at which point ONLY their `available` flag flips to True —
-# labels, params, and `is_fitted` are already the §9 end state. Labels and
-# help strings are §9 verbatim; the frontend escapes and renders them as-is.
+# Design §9 catalog, post-P6 end state: all four methods available. The
+# fitted methods flipped ONLY their `available` flag when the §4.4
+# implementation landed — labels, params, and `is_fitted` were the §9 end
+# state from P1. Labels and help strings are §9 verbatim; the frontend
+# escapes and renders them as-is.
 SYNTHESIS_METHODS: tuple[MethodSpec, ...] = (
     MethodSpec(
         name="equal_weight",
@@ -204,7 +206,7 @@ SYNTHESIS_METHODS: tuple[MethodSpec, ...] = (
     MethodSpec(
         name="ic_weighted",
         label="IC 加权合成（拟合）",
-        available=False,
+        available=True,
         is_fitted=True,
         params=(
             ParamSpec(
@@ -225,7 +227,7 @@ SYNTHESIS_METHODS: tuple[MethodSpec, ...] = (
     MethodSpec(
         name="icir_weighted",
         label="ICIR 加权合成（拟合）",
-        available=False,
+        available=True,
         is_fitted=True,
         params=(
             ParamSpec(
@@ -262,6 +264,28 @@ def method_catalog_payload() -> dict[str, Any]:
         "methods": [method.to_dict() for method in SYNTHESIS_METHODS],
         "standardizations": [standardization.to_dict() for standardization in STANDARDIZATIONS],
     }
+
+
+def apply_param_defaults(
+    schema: Sequence[ParamSpec], params: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Resolve declared ParamSpec defaults for absent optional params.
+
+    Schema-driven like everything else in this module: only a spec that
+    declares a ``default`` fills in, an explicitly supplied value always
+    wins, and nothing is coerced. The run workflow applies this AFTER
+    :func:`validate_params_against_schema`, so the parameters a run echoes
+    into provenance (and hashes into its composite id) are the values it
+    actually used — a fitted run submitted without ``ic_min_periods``
+    truthfully reports the catalog default it ran with instead of an empty
+    mapping.
+    """
+
+    resolved = {str(name): value for name, value in params.items()}
+    for spec in schema:
+        if spec.default is not None and spec.name not in resolved:
+            resolved[spec.name] = spec.default
+    return resolved
 
 
 def _validate_numeric_bounds(spec: ParamSpec, value: float, *, owner: str, label: str) -> None:

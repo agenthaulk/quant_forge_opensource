@@ -104,10 +104,48 @@ Phase P4 (materialize + drive the shipped engine by id) adds:
   overlay directory. On success the definition stays as a first-class
   factor; a retention/GC policy for accumulated successful composite
   definitions is a recorded deferred question.
+
+Phase P6 (fitted methods, §4.4) adds the point-in-time IC/ICIR combination:
+
+- **Anti-peek embargo (the load-bearing invariant):** at a rebalance date
+  ``d`` the IC estimate uses ONLY periods ``s`` on the SHARED
+  ``rebalance_indices`` grid with ``idx(s) + delay + holding <= idx(d)``
+  and ``s >= start`` — periods whose forward-return window has fully
+  closed on or before ``d``. A period closing exactly AT ``d`` is
+  eligible; one closing at ``d + 1`` is not. Forward returns come from the
+  engine's own ``_with_period_return`` close-to-close primitive (RB-5), so
+  the IC that sets the weights and the return the engine realizes are the
+  same object.
+- **Weight rule (§4.4 pseudocode, NaN-hardened):** per-factor raw weight is
+  the mean per-period cross-sectional Spearman rank IC (``ic_weighted``)
+  or mean/std with an explicit ``std == 0`` guard (``icir_weighted``);
+  negative and non-finite raws clip to 0 through an explicit finite check
+  (never a bare ``max``, which is NaN-order-dependent); an all-zero vector
+  falls back to per-date equal weight flagged ``IC_DEGENERATE_EQUAL_WEIGHT``
+  rather than emptying the rebalance. Fewer than ``ic_min_periods`` closed
+  periods runs the date equal-weight flagged ``WARM_UP_IC_UNFITTED``. Zero
+  genuinely fitted rebalances in the whole window downgrades the run:
+  ``is_fitted=False`` + ``NO_FITTED_PERIODS`` (RB-8) — the payload never
+  advertises fitting on an all-fallback run.
+- **Fold-in before materialization:** the stored composite frame carries
+  already-combined values; each calendar date adopts the weight vector of
+  the most recent grid rebalance at or before it (weights estimated from
+  strictly older closed periods stay point-in-time valid for later dates),
+  so the value the engine reads at a grid signal date is exactly
+  ``sum_f w_{f,d} * t_{f,d,i}``. Per-date weights are exposed as
+  diagnostics (``weights_path`` / ``fitted_weights_latest``), NEVER as
+  ``weights_effective`` — that provenance field is an a-priori raw-declared
+  claim (FP-1) and fitted runs omit it entirely.
+- **Advisory redundancy diagnostic:** ``member_rank_ic_redundancy`` reports
+  the pairwise correlation of the members' realized per-period rank-IC
+  series over the window (crowding check). Advisory only — it never gates
+  and never feeds weights — with real ``None`` cells when unobservable
+  (FP-4).
 """
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 import hashlib
@@ -124,6 +162,7 @@ from quant_forge.backtesting.service import (
     EXTERNAL_OOS_ROLE,
     REBALANCE_SKIPPED_NO_COVERAGE,
     REBALANCE_SKIPPED_THIN,
+    _with_period_return,
     rebalance_indices,
     run_factor_backtest,
 )
@@ -155,6 +194,18 @@ PHASE_SENSITIVE_SMALL_SAMPLE = "PHASE_SENSITIVE_SMALL_SAMPLE"
 # 126-trading-day display floor (`MIN_DISPLAY_TRADING_DAYS`); the backtest
 # itself still runs (its real gate is max(2, holding+delay+1), RF-4).
 EVALUATION_WINDOW_TOO_SHORT = "EVALUATION_WINDOW_TOO_SHORT"
+# §4.4 fitted-method codes (P6). WARM_UP_IC_UNFITTED: a rebalance with fewer
+# than ic_min_periods fully-closed prior periods trades the per-date
+# equal-weight fallback, flagged. IC_DEGENERATE_EQUAL_WEIGHT: a fittable
+# rebalance whose clipped raw weight vector summed to zero (all ICs
+# negative/non-finite/empty) trades the same fallback instead of collapsing
+# the cross-section to NaN and silently emptying the rebalance.
+# NO_FITTED_PERIODS: the RB-8 downgrade — ZERO rebalances in the window
+# produced a genuinely fitted vector, so the run reports ``is_fitted=false``
+# (it traded equal weight throughout and must never advertise fitting).
+WARM_UP_IC_UNFITTED = "WARM_UP_IC_UNFITTED"
+IC_DEGENERATE_EQUAL_WEIGHT = "IC_DEGENERATE_EQUAL_WEIGHT"
+NO_FITTED_PERIODS = "NO_FITTED_PERIODS"
 
 COMPOSITE_ID_PREFIX = "COMPOSITE_"
 # RB-10: id = COMPOSITE_ + first 12 hex of a stable sha256 over ALL inputs.
@@ -168,6 +219,11 @@ COVERAGE_RULE_ALL_FACTORS = "all_factors"
 COVERAGE_RULE_MIN_FACTOR_COVERAGE = "min_factor_coverage"
 
 APRIORI_METHODS: tuple[str, ...] = ("equal_weight", "weighted")
+FITTED_METHODS: tuple[str, ...] = ("ic_weighted", "icir_weighted")
+# §4.4/§9 catalog default for ic_min_periods; the web workflow resolves the
+# request value through the catalog ParamSpec schema (which declares the same
+# literal), so this constant only backs direct library callers.
+DEFAULT_IC_MIN_PERIODS = 6
 
 SCAN_STATUS_OK = "ok"
 SCAN_STATUS_EMPTY = "empty"
@@ -510,6 +566,90 @@ def _resolve_apriori_weights(
     return resolved
 
 
+def _apply_coverage_rule(
+    directed_matrix: pd.DataFrame,
+    min_factor_coverage: int | None,
+    *,
+    row_weightable: pd.Series | None = None,
+) -> tuple[pd.DataFrame, CoverageAccounting]:
+    """Mask rows below the coverage requirement and account coverage (§4.5).
+
+    Shared by the a-priori and fitted combiners so both branches carry
+    identical coverage semantics: a row enters only with at least the
+    required number of finite members (default: all), rows below the
+    threshold are masked to NaN entirely (never summed into a fabricated
+    value), and per-factor counts are observed — an unobservable ratio is a
+    real ``None`` (FP-4), never 0. ``row_weightable``, when given (fitted
+    branch), additionally excludes rows whose date has no defined weight
+    vector (dates before the first grid rebalance under a non-zero start),
+    so ``rows_in_composite`` never counts rows that could not enter the
+    weighted sum; ``rows_scored`` stays a pure data-presence observation.
+    """
+
+    columns = [str(column) for column in directed_matrix.columns]
+    total = len(columns)
+    if min_factor_coverage is None:
+        required = total
+    else:
+        if isinstance(min_factor_coverage, bool) or not isinstance(min_factor_coverage, int):
+            raise ValueError("min_factor_coverage must be an integer")
+        if not 1 <= min_factor_coverage <= total:
+            raise ValueError(f"min_factor_coverage must be between 1 and {total}")
+        required = min_factor_coverage
+    coverage_rule = (
+        COVERAGE_RULE_ALL_FACTORS if required == total else COVERAGE_RULE_MIN_FACTOR_COVERAGE
+    )
+
+    working = directed_matrix.sort_index()
+    available = working.notna()
+    row_counts = available.sum(axis=1)
+    keep = row_counts >= required
+    if row_weightable is not None:
+        keep = keep & row_weightable
+    masked = working.copy()
+    if not bool(keep.all()):
+        masked.loc[~keep, :] = np.nan
+
+    in_composite = masked.notna()
+    per_factor: list[FactorCoverage] = []
+    for column in columns:
+        rows_scored = int(available[column].sum())
+        rows_in_composite = int(in_composite[column].sum())
+        ratio = (rows_in_composite / rows_scored) if rows_scored > 0 else None
+        per_factor.append(
+            FactorCoverage(
+                factor_id=column,
+                rows_scored=rows_scored,
+                rows_in_composite=rows_in_composite,
+                coverage_ratio=ratio,
+            )
+        )
+    coverage = CoverageAccounting(
+        coverage_rule=coverage_rule,
+        min_factor_coverage=required,
+        rows_required=int(len(working.index)),
+        rows_full_coverage=int((row_counts == total).sum()),
+        per_factor=tuple(per_factor),
+    )
+    return masked, coverage
+
+
+def _finalize_composite(
+    composite: pd.Series,
+) -> tuple[pd.DataFrame, tuple[pd.Timestamp, ...], tuple[str, ...]]:
+    """RB-9 degenerate-date erasure + tidy output, shared by both combiners."""
+
+    composite, degenerate_dates = _mask_degenerate_dates(composite)
+    warning_codes = (DEGENERATE_CROSS_SECTION,) if degenerate_dates else ()
+    tidy = (
+        composite.rename("score")
+        .reset_index()[list(_SCORE_COLUMNS)]
+        .sort_values(["trade_date", "instrument"])
+        .reset_index(drop=True)
+    )
+    return tidy, degenerate_dates, warning_codes
+
+
 def _mask_degenerate_dates(
     composite: pd.Series,
 ) -> tuple[pd.Series, tuple[pd.Timestamp, ...]]:
@@ -565,64 +705,13 @@ def combine_apriori(
         raise ValueError("a composite requires at least 2 member factors")
     weights_used = _resolve_apriori_weights(columns, method=method, weights=weights)
 
-    total = len(columns)
-    if min_factor_coverage is None:
-        required = total
-    else:
-        if isinstance(min_factor_coverage, bool) or not isinstance(min_factor_coverage, int):
-            raise ValueError("min_factor_coverage must be an integer")
-        if not 1 <= min_factor_coverage <= total:
-            raise ValueError(f"min_factor_coverage must be between 1 and {total}")
-        required = min_factor_coverage
-    coverage_rule = (
-        COVERAGE_RULE_ALL_FACTORS if required == total else COVERAGE_RULE_MIN_FACTOR_COVERAGE
-    )
-
-    working = directed_matrix.sort_index()
-    available = working.notna()
-    row_counts = available.sum(axis=1)
-    keep = row_counts >= required
-    masked = working.copy()
-    if not bool(keep.all()):
-        masked.loc[~keep, :] = np.nan
-
+    masked, coverage = _apply_coverage_rule(directed_matrix, min_factor_coverage)
     weight_series = pd.Series(weights_used, dtype="float64")
     # skipna sum with min_count=1: available members contribute w_f * t_f,
     # missing members are excluded from the sum, and a fully-masked row stays
     # NaN instead of collapsing to a fabricated 0 (FP-4).
     composite = masked.mul(weight_series, axis=1).sum(axis=1, min_count=1)
-
-    in_composite = masked.notna()
-    per_factor: list[FactorCoverage] = []
-    for column in columns:
-        rows_scored = int(available[column].sum())
-        rows_in_composite = int(in_composite[column].sum())
-        ratio = (rows_in_composite / rows_scored) if rows_scored > 0 else None
-        per_factor.append(
-            FactorCoverage(
-                factor_id=column,
-                rows_scored=rows_scored,
-                rows_in_composite=rows_in_composite,
-                coverage_ratio=ratio,
-            )
-        )
-    coverage = CoverageAccounting(
-        coverage_rule=coverage_rule,
-        min_factor_coverage=required,
-        rows_required=int(len(working.index)),
-        rows_full_coverage=int((row_counts == total).sum()),
-        per_factor=tuple(per_factor),
-    )
-
-    composite, degenerate_dates = _mask_degenerate_dates(composite)
-    warning_codes = (DEGENERATE_CROSS_SECTION,) if degenerate_dates else ()
-
-    tidy = (
-        composite.rename("score")
-        .reset_index()[list(_SCORE_COLUMNS)]
-        .sort_values(["trade_date", "instrument"])
-        .reset_index(drop=True)
-    )
+    tidy, degenerate_dates, warning_codes = _finalize_composite(composite)
     return CompositeResult(
         composite=tidy,
         method=method,
@@ -663,6 +752,575 @@ def build_apriori_composite(
         standardization=standardization,
         degenerate_dates_by_factor=standardized.degenerate_dates_by_factor,
     )
+
+
+# ---------------------------------------------------------------------------
+# P6 — fitted combination (§4.4 point-in-time IC/ICIR on the shared grid)
+# ---------------------------------------------------------------------------
+
+
+_CLOSE_COLUMNS: tuple[str, ...] = ("trade_date", "instrument", "close")
+
+# §4.4 ICIR std==0 guard, hardened for floating point: ``np.std`` over N
+# bit-identical IC values returns summation noise (~1e-16), not exactly 0,
+# and dividing the mean by that noise fabricates a near-infinite "perfectly
+# stable" weight out of rounding error. A std at or below this RELATIVE
+# scale of the mean magnitude is numerically indistinguishable from a
+# constant series (real IC variation sits many orders of magnitude above
+# machine epsilon), so it takes the std==0 branch: raw weight 0.
+_ICIR_RELATIVE_STD_FLOOR = 1e-12
+
+
+@dataclass(frozen=True)
+class FittedWeightEntry:
+    """One rebalance slot on the shared grid with its resolved weight vector.
+
+    ``flag`` is ``None`` for a genuinely fitted vector, ``WARM_UP_IC_UNFITTED``
+    when fewer than ``ic_min_periods`` prior periods had closed (the date
+    trades the equal-weight fallback), or ``IC_DEGENERATE_EQUAL_WEIGHT`` when
+    the clipped raw vector summed to zero and fell back to equal weight.
+    ``eligible_period_count`` is the number of grid periods whose forward
+    window had fully closed on or before this signal date — the §4.4 embargo
+    set size, exposed so tests and provenance can audit the boundary.
+    """
+
+    signal_index: int
+    signal_date: pd.Timestamp
+    weights: dict[str, float]
+    eligible_period_count: int
+    flag: str | None
+
+
+@dataclass(frozen=True)
+class FittedCompositeResult:
+    """Fitted composite output: combined frame + honest fit diagnostics.
+
+    ``composite`` carries the ALREADY-COMBINED values (weights folded in
+    before materialization — §4.4 materialization consequence), in the same
+    tidy shape as :class:`CompositeResult`. There is deliberately NO
+    ``weights_effective`` field: that provenance key is an a-priori
+    raw-declared claim (FP-1) and fitted runs must omit it; the honest story
+    lives in ``weights_path`` (per-signal-date diagnostic),
+    ``fitted_weights_latest`` (last GENUINELY fitted vector, or ``None``),
+    ``fitted_period_fraction`` and ``warmup_period_count``.
+
+    ``is_fitted`` is the REALIZED truth: ``True`` only when at least one
+    rebalance produced a genuinely fitted vector. When zero did (all warmup
+    and/or all degenerate fallbacks) the run is downgraded per §3 RB-8: it
+    traded equal weight throughout, ``is_fitted`` is ``False`` and
+    ``warning_codes`` carries ``NO_FITTED_PERIODS``. ``method`` keeps the
+    REQUESTED fitted method name — the §8 payload branch (fitted fields
+    present, ``weights_effective`` absent) keys off the request while
+    ``is_fitted`` reports what actually happened.
+    """
+
+    composite: pd.DataFrame
+    method: str
+    is_fitted: bool
+    coverage: CoverageAccounting
+    degenerate_dates: tuple[pd.Timestamp, ...]
+    warning_codes: tuple[str, ...]
+    weights_path: tuple[FittedWeightEntry, ...]
+    fitted_weights_latest: dict[str, float] | None
+    fitted_period_count: int
+    warmup_period_count: int
+    degenerate_weight_period_count: int
+    fitted_period_fraction: float | None
+    ic_min_periods: int
+    standardization: str | None = None
+    degenerate_dates_by_factor: Mapping[str, tuple[pd.Timestamp, ...]] = field(
+        default_factory=dict
+    )
+
+
+def _validate_grid_params(delay: object, holding: object, start_signal_index: object) -> None:
+    if isinstance(delay, bool) or not isinstance(delay, int) or delay < 1:
+        raise ValueError("delay must be an integer >= 1")
+    if isinstance(holding, bool) or not isinstance(holding, int) or holding < 1:
+        raise ValueError("holding must be an integer >= 1")
+    if (
+        isinstance(start_signal_index, bool)
+        or not isinstance(start_signal_index, int)
+        or start_signal_index < 0
+    ):
+        raise ValueError("start_signal_index must be an integer >= 0")
+
+
+def _validated_calendar(dates: Sequence[object]) -> list[pd.Timestamp]:
+    calendar = [pd.Timestamp(value) for value in dates]
+    if any(later <= earlier for earlier, later in zip(calendar, calendar[1:])):
+        raise ValueError("dates must be strictly increasing trade dates")
+    return calendar
+
+
+def _require_matrix_dates_on_calendar(
+    matrix: pd.DataFrame, calendar: Sequence[pd.Timestamp]
+) -> None:
+    known = set(calendar)
+    outside = sorted(
+        {date for date in matrix.index.get_level_values("trade_date") if date not in known}
+    )
+    if outside:
+        raise ValueError(
+            "score matrix trade dates are not on the provided calendar: "
+            f"{[date.date().isoformat() for date in outside[:5]]}"
+        )
+
+
+def _validated_close_frame(close: pd.DataFrame) -> pd.DataFrame:
+    missing = [column for column in _CLOSE_COLUMNS if column not in close.columns]
+    if missing:
+        raise ValueError(f"close frame is missing columns: {missing}")
+    frame = close[list(_CLOSE_COLUMNS)].copy()
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"])
+    frame["instrument"] = frame["instrument"].astype(str)
+    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    return frame
+
+
+def _spearman_rank_ic(scores: pd.Series, forward_returns: pd.Series) -> float:
+    """Cross-sectional Spearman rank IC over the common finite cross-section.
+
+    Implemented as the Pearson correlation of average-method ranks — the
+    EXACT primitive the shipped evaluation layer uses for its daily rank IC
+    (``evaluation/service.py``: ``group["score"].rank().corr(group[
+    "forward_return"].rank())``) — so the fitted weights and the reported
+    evaluation diagnostics measure the same quantity, and no dependency
+    beyond pandas/numpy is introduced. Returns NaN when undefined (fewer
+    than 2 common names, or a zero-variance side) — callers exclude
+    non-finite ICs per the §4.4 pseudocode's explicit finite check. Average
+    ranks over ties are order-independent, keeping the estimate
+    deterministic under permuted inputs (RB-3 posture).
+    """
+
+    frame = pd.concat({"score": scores, "fwd": forward_returns}, axis=1, join="inner")
+    if frame.empty:
+        return float("nan")
+    values = frame.to_numpy(dtype="float64")
+    frame = frame.loc[np.isfinite(values).all(axis=1)]
+    if len(frame) < 2:
+        return float("nan")
+    score_ranks = frame["score"].rank()
+    return_ranks = frame["fwd"].rank()
+    if score_ranks.nunique() < 2 or return_ranks.nunique() < 2:
+        return float("nan")
+    return float(score_ranks.corr(return_ranks))
+
+
+def _period_rank_ic_by_signal_index(
+    directed_matrix: pd.DataFrame,
+    *,
+    close: pd.DataFrame,
+    calendar: Sequence[pd.Timestamp],
+    grid: Sequence[int],
+    delay: int,
+    holding: int,
+) -> dict[int, dict[str, float]]:
+    """Per-member realized rank IC for every grid period that closed in-window.
+
+    The forward return of period ``s`` is the engine's own
+    ``_with_period_return`` over ``[dates[s+delay], dates[s+delay+holding]]``
+    (RB-5: same close-to-close primitive, same last-mark/survivorship fill),
+    so the IC that drives the weights matches the return the engine realizes.
+    Periods whose scheduled exit falls beyond the window are omitted — they
+    can never satisfy the §4.4 embargo at any in-window rebalance.
+    """
+
+    columns = [str(column) for column in directed_matrix.columns]
+    total = len(calendar)
+    by_period: dict[int, dict[str, float]] = {}
+    for signal_index in grid:
+        exit_index = signal_index + delay + holding
+        if exit_index >= total:
+            continue
+        forward = _with_period_return(close, calendar[signal_index + delay], calendar[exit_index])
+        returns = forward.set_index("instrument")["period_return"].astype("float64")
+        returns.index = returns.index.astype(str)
+        returns = returns[np.isfinite(returns.to_numpy())]
+        signal_date = calendar[signal_index]
+        try:
+            cross_section = directed_matrix.xs(signal_date, level="trade_date")
+        except KeyError:
+            cross_section = None
+        ics: dict[str, float] = {}
+        for column in columns:
+            if cross_section is None:
+                ics[column] = float("nan")
+            else:
+                ics[column] = _spearman_rank_ic(cross_section[column], returns)
+        by_period[signal_index] = ics
+    return by_period
+
+
+def _normalize_ic_weights(
+    raw: Mapping[str, float], factors: Sequence[str]
+) -> tuple[dict[str, float], str | None]:
+    """Clip + normalize a raw IC weight vector (§4.4 pseudocode, verbatim).
+
+    Negative AND non-finite raw weights clip to 0 through an explicit
+    ``isfinite`` check — never a bare ``max``, whose result is
+    NaN-order-dependent (``max(nan, 0)`` is NaN while ``max(0, nan)`` is 0).
+    An all-zero clipped vector falls back to per-date equal weight with the
+    ``IC_DEGENERATE_EQUAL_WEIGHT`` flag rather than collapsing the whole
+    cross-section to NaN and silently emptying the rebalance.
+    """
+
+    clipped = {
+        str(factor): (
+            float(raw[factor])
+            if np.isfinite(raw[factor]) and float(raw[factor]) > 0.0
+            else 0.0
+        )
+        for factor in factors
+    }
+    total = sum(clipped.values())
+    if total <= 0.0:
+        equal = 1.0 / len(factors)
+        return {str(factor): equal for factor in factors}, IC_DEGENERATE_EQUAL_WEIGHT
+    return {factor: value / total for factor, value in clipped.items()}, None
+
+
+def fitted_weights_by_rebalance(
+    directed_matrix: pd.DataFrame,
+    *,
+    close: pd.DataFrame,
+    dates: Sequence[object],
+    delay: int,
+    holding: int,
+    method: str,
+    ic_min_periods: int = DEFAULT_IC_MIN_PERIODS,
+    start_signal_index: int = 0,
+) -> tuple[FittedWeightEntry, ...]:
+    """§4.4 point-in-time weight vectors for EVERY shared-grid rebalance.
+
+    The grid is ``rebalance_indices`` — the single source of truth the engine
+    trades (RB-5), never a re-derived schedule. At rebalance index ``d`` the
+    eligible periods are exactly the grid signals ``s`` with
+    ``s + delay + holding <= d`` and ``s >= start_signal_index`` (forward
+    window fully closed on/before ``d``, expanding from the window start):
+    the anti-peek embargo. Per eligible period the cross-sectional Spearman
+    rank IC of each member's standardized, direction-applied score against
+    the ``_with_period_return`` realized forward return feeds the §4.4
+    weight rule; the finite-check clip, the ICIR ``std == 0`` guard
+    (population std, matching the pseudocode's ``np.std``), the all-zero
+    equal-weight fallback and the warm-up fallback are implemented verbatim.
+    """
+
+    _require_score_matrix(directed_matrix)
+    _validate_grid_params(delay, holding, start_signal_index)
+    if method not in FITTED_METHODS:
+        raise ValueError(f"unknown fitted method: {method}; expected one of {FITTED_METHODS}")
+    if isinstance(ic_min_periods, bool) or not isinstance(ic_min_periods, int) or ic_min_periods < 1:
+        raise ValueError("ic_min_periods must be an integer >= 1")
+    factors = [str(column) for column in directed_matrix.columns]
+    if len(factors) < 2:
+        raise ValueError("a composite requires at least 2 member factors")
+    calendar = _validated_calendar(dates)
+    working = directed_matrix.sort_index()
+    _require_matrix_dates_on_calendar(working, calendar)
+    close_frame = _validated_close_frame(close)
+
+    grid = rebalance_indices(
+        calendar, delay=delay, holding=holding, start_signal_index=start_signal_index
+    )
+    ic_by_period = _period_rank_ic_by_signal_index(
+        working, close=close_frame, calendar=calendar, grid=grid, delay=delay, holding=holding
+    )
+    equal = {factor: 1.0 / len(factors) for factor in factors}
+
+    entries: list[FittedWeightEntry] = []
+    for d_index in grid:
+        # The §4.4 embargo, measured on the SAME grid the engine trades: a
+        # period closing exactly AT d is eligible (<=); one closing at d+1
+        # is not. Non-closed tail periods never appear in ic_by_period.
+        eligible = [
+            s
+            for s in grid
+            if s + delay + holding <= d_index and s >= start_signal_index and s in ic_by_period
+        ]
+        if len(eligible) < ic_min_periods:
+            entries.append(
+                FittedWeightEntry(
+                    signal_index=d_index,
+                    signal_date=calendar[d_index],
+                    weights=dict(equal),
+                    eligible_period_count=len(eligible),
+                    flag=WARM_UP_IC_UNFITTED,
+                )
+            )
+            continue
+        raw: dict[str, float] = {}
+        for factor in factors:
+            series = np.asarray(
+                [
+                    ic_by_period[s][factor]
+                    for s in eligible
+                    if np.isfinite(ic_by_period[s][factor])
+                ],
+                dtype=float,
+            )
+            if series.size == 0:
+                raw[factor] = 0.0
+            elif method == "ic_weighted":
+                raw[factor] = float(np.mean(series))
+            else:  # icir_weighted
+                mean = float(np.mean(series))
+                deviation = float(np.std(series))
+                # Explicit std == 0 guard: a constant IC series carries no
+                # stability signal, so the raw weight is 0 (clipped below),
+                # never an inf/NaN division artifact. The comparison is
+                # noise-hardened (see _ICIR_RELATIVE_STD_FLOOR): a series
+                # constant to floating-point precision is the std==0 case,
+                # not a license to divide by summation rounding error.
+                if deviation <= abs(mean) * _ICIR_RELATIVE_STD_FLOOR:
+                    raw[factor] = 0.0
+                else:
+                    raw[factor] = mean / deviation
+        weights, flag = _normalize_ic_weights(raw, factors)
+        entries.append(
+            FittedWeightEntry(
+                signal_index=d_index,
+                signal_date=calendar[d_index],
+                weights=weights,
+                eligible_period_count=len(eligible),
+                flag=flag,
+            )
+        )
+    return tuple(entries)
+
+
+def combine_fitted(
+    directed_matrix: pd.DataFrame,
+    *,
+    method: str,
+    close: pd.DataFrame,
+    dates: Sequence[object],
+    delay: int,
+    holding: int,
+    ic_min_periods: int = DEFAULT_IC_MIN_PERIODS,
+    min_factor_coverage: int | None = None,
+    start_signal_index: int = 0,
+) -> FittedCompositeResult:
+    """Combine with §4.4 point-in-time fitted weights, folded in pre-materialization.
+
+    Weight vectors come from :func:`fitted_weights_by_rebalance` (one per
+    shared-grid rebalance). Because the engine reads the freshest composite
+    as-of each signal date, the stored frame folds the weights in per
+    calendar date as a step function: every date adopts the vector of the
+    most recent grid rebalance at or before it — weights estimated from
+    strictly older closed periods remain point-in-time valid for later
+    dates, so no date ever carries information from a period that had not
+    closed by its own weight-fit date. At a grid signal date this is exactly
+    ``sum_f w_{f,d} * t_{f,d,i}``, the value the engine trades. Dates before
+    the first grid rebalance (possible only under a non-zero
+    ``start_signal_index``) have no defined vector and stay out of the
+    composite. Coverage and RB-9 degenerate-date handling are the SAME
+    helpers the a-priori combiner uses.
+
+    Downgrade semantics (§3 RB-8): when ZERO rebalances produced a genuinely
+    fitted vector the run traded per-date equal weight throughout —
+    ``is_fitted`` is ``False`` and ``NO_FITTED_PERIODS`` is flagged; the
+    result never advertises fitting on an all-fallback run.
+    """
+
+    entries = fitted_weights_by_rebalance(
+        directed_matrix,
+        close=close,
+        dates=dates,
+        delay=delay,
+        holding=holding,
+        method=method,
+        ic_min_periods=ic_min_periods,
+        start_signal_index=start_signal_index,
+    )
+    calendar = _validated_calendar(dates)
+    working = directed_matrix.sort_index()
+    columns = [str(column) for column in working.columns]
+
+    # Step-function fold-in: map every matrix date to the latest grid entry
+    # at or before it (None before the first grid rebalance).
+    date_positions = {date: position for position, date in enumerate(calendar)}
+    row_dates = working.index.get_level_values("trade_date")
+    unique_dates = row_dates.unique()
+    entry_positions = [entry.signal_index for entry in entries]
+    weights_for_date: dict[pd.Timestamp, dict[str, float] | None] = {}
+    for date in unique_dates:
+        slot = bisect_right(entry_positions, date_positions[date]) - 1
+        weights_for_date[date] = entries[slot].weights if slot >= 0 else None
+
+    per_date_weights = (
+        pd.DataFrame.from_dict(
+            {date: (weights_for_date[date] or {}) for date in unique_dates}, orient="index"
+        )
+        .reindex(columns=columns)
+        .astype("float64")
+    )
+    weightable_by_date = pd.Series(
+        {date: weights_for_date[date] is not None for date in unique_dates}
+    )
+    row_weightable = pd.Series(
+        weightable_by_date.reindex(row_dates).to_numpy(dtype=bool), index=working.index
+    )
+
+    masked, coverage = _apply_coverage_rule(
+        working, min_factor_coverage, row_weightable=row_weightable
+    )
+    expanded = per_date_weights.reindex(row_dates)
+    expanded.index = masked.index
+    # Same §4.4 sum as the a-priori combiner, with per-date weights: missing
+    # members are excluded per name, fully-masked rows stay NaN (FP-4).
+    composite = masked.mul(expanded).sum(axis=1, min_count=1)
+    tidy, degenerate_dates, degenerate_codes = _finalize_composite(composite)
+
+    warmup_count = sum(1 for entry in entries if entry.flag == WARM_UP_IC_UNFITTED)
+    degenerate_weight_count = sum(
+        1 for entry in entries if entry.flag == IC_DEGENERATE_EQUAL_WEIGHT
+    )
+    fitted_count = sum(1 for entry in entries if entry.flag is None)
+    is_fitted = fitted_count >= 1
+    fitted_weights_latest = next(
+        (dict(entry.weights) for entry in reversed(entries) if entry.flag is None), None
+    )
+    fitted_period_fraction = (fitted_count / len(entries)) if entries else None
+
+    warning_codes: list[str] = []
+    if warmup_count:
+        warning_codes.append(WARM_UP_IC_UNFITTED)
+    if degenerate_weight_count:
+        warning_codes.append(IC_DEGENERATE_EQUAL_WEIGHT)
+    if not is_fitted:
+        warning_codes.append(NO_FITTED_PERIODS)
+    warning_codes.extend(degenerate_codes)
+
+    return FittedCompositeResult(
+        composite=tidy,
+        method=method,
+        is_fitted=is_fitted,
+        coverage=coverage,
+        degenerate_dates=degenerate_dates,
+        warning_codes=tuple(warning_codes),
+        weights_path=entries,
+        fitted_weights_latest=fitted_weights_latest,
+        fitted_period_count=fitted_count,
+        warmup_period_count=warmup_count,
+        degenerate_weight_period_count=degenerate_weight_count,
+        fitted_period_fraction=fitted_period_fraction,
+        ic_min_periods=ic_min_periods,
+    )
+
+
+def build_fitted_composite(
+    member_scores: Mapping[str, pd.DataFrame],
+    *,
+    directions: Mapping[str, int],
+    standardization: str,
+    method: str,
+    close: pd.DataFrame,
+    dates: Sequence[object],
+    delay: int,
+    holding: int,
+    ic_min_periods: int = DEFAULT_IC_MIN_PERIODS,
+    min_factor_coverage: int | None = None,
+    start_signal_index: int = 0,
+) -> FittedCompositeResult:
+    """Full pure fitted pipeline: matrix -> standardize -> direction -> PIT combine.
+
+    The fitted analog of :func:`build_apriori_composite` and the blessed P6
+    entry point. ``close`` must be the engine's working-panel close frame
+    (``[trade_date, instrument, close]`` over the SAME in-window ``dates``)
+    so the forward returns driving the IC fit are the returns the engine
+    realizes (RB-5).
+    """
+
+    matrix = build_score_matrix(member_scores)
+    standardized = standardize_matrix(matrix, standardization=standardization)
+    directed = apply_directions(standardized.matrix, directions)
+    result = combine_fitted(
+        directed,
+        method=method,
+        close=close,
+        dates=dates,
+        delay=delay,
+        holding=holding,
+        ic_min_periods=ic_min_periods,
+        min_factor_coverage=min_factor_coverage,
+        start_signal_index=start_signal_index,
+    )
+    return replace(
+        result,
+        standardization=standardization,
+        degenerate_dates_by_factor=standardized.degenerate_dates_by_factor,
+    )
+
+
+def member_rank_ic_redundancy(
+    member_scores: Mapping[str, pd.DataFrame],
+    *,
+    directions: Mapping[str, int],
+    standardization: str,
+    close: pd.DataFrame,
+    dates: Sequence[object],
+    delay: int,
+    holding: int,
+    start_signal_index: int = 0,
+) -> dict[str, object]:
+    """Advisory rank-IC redundancy matrix across members (§4.5 crowding check).
+
+    Pairwise Pearson correlation of the members' REALIZED per-period
+    cross-sectional rank-IC series over every shared-grid period whose
+    forward window closed inside the data window. Members whose IC series
+    move together earn from the same states of the world — the crowding
+    diagnostic QuantGPT computes across candidates. Advisory only: the
+    matrix never gates a run and never feeds the fitted weights, and it is
+    computed once over the whole realized window (a run-level diagnostic,
+    not a point-in-time estimate). Unobservable cells — fewer than 2 common
+    finite periods, or a zero-variance series — are real ``None`` (FP-4),
+    never a fabricated number.
+    """
+
+    _validate_grid_params(delay, holding, start_signal_index)
+    matrix = build_score_matrix(member_scores)
+    standardized = standardize_matrix(matrix, standardization=standardization)
+    directed = apply_directions(standardized.matrix, directions).sort_index()
+    calendar = _validated_calendar(dates)
+    _require_matrix_dates_on_calendar(directed, calendar)
+    grid = rebalance_indices(
+        calendar, delay=delay, holding=holding, start_signal_index=start_signal_index
+    )
+    ic_by_period = _period_rank_ic_by_signal_index(
+        directed,
+        close=_validated_close_frame(close),
+        calendar=calendar,
+        grid=grid,
+        delay=delay,
+        holding=holding,
+    )
+    factors = [str(column) for column in directed.columns]
+    closed_periods = sorted(ic_by_period)
+    series = {
+        factor: np.asarray([ic_by_period[s][factor] for s in closed_periods], dtype=float)
+        for factor in factors
+    }
+    matrix_rows: list[list[float | None]] = []
+    for row_factor in factors:
+        row: list[float | None] = []
+        for column_factor in factors:
+            both_finite = np.isfinite(series[row_factor]) & np.isfinite(series[column_factor])
+            if int(both_finite.sum()) < 2:
+                row.append(None)
+                continue
+            pair = np.corrcoef(
+                series[row_factor][both_finite], series[column_factor][both_finite]
+            )[0, 1]
+            row.append(float(pair) if np.isfinite(pair) else None)
+        matrix_rows.append(row)
+    return {
+        "advisory": True,
+        "basis": "pearson_correlation_of_realized_period_rank_ic_series",
+        "period_count": len(closed_periods),
+        "factors": factors,
+        "matrix": matrix_rows,
+    }
 
 
 def prescan_rebalance_coverage(

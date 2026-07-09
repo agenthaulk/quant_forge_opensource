@@ -8,9 +8,10 @@ amendments):
 - request-rejection matrix as CLEAN 4xx JSON errors (never 500s, never
   failed background jobs): <2 factors, non-±1 direction, missing REQUIRED
   ``holding_days`` (RF-5, no ``horizon_days`` fallback), weights not covering
-  exactly the checked set, unknown/reserved method, missing/unknown
-  standardization, unknown factor, ``WINDOW_TOO_SHORT`` (RB-2) and
-  ``UNIVERSE_MISMATCH`` (RB-6);
+  exactly the checked set, unknown/reserved method, out-of-bounds
+  ``ic_min_periods`` (schema minimum 3 / maximum 60 / int-typed),
+  missing/unknown standardization, unknown factor, ``WINDOW_TOO_SHORT``
+  (RB-2) and ``UNIVERSE_MISMATCH`` (RB-6);
 - full §8 payload closure on the deterministic demo fixture: every top-level
   block present, ``backtest`` carrying every scalar tile the reused
   ``factor.js`` renderers read (FP-3), typed MetricValue statuses preserved
@@ -18,13 +19,23 @@ amendments):
   member formulas (CP0), the a-priori FP-1 branch (raw ``weights_effective``
   present, fitted fields absent), the §8 literal validity caveats, and the
   RB-1/RB-7/RB-9 warning codes surfaced;
+- the fitted FP-1 branch (P6): an ``ic_weighted`` run over the demo fixture
+  OMITS ``weights_effective`` entirely and carries the fitted diagnostic
+  fields (``fitted_weights_latest`` / per-signal-date ``fitted_weights_path``
+  / ``fitted_period_fraction`` / ``warmup_period_count``) with a truthful
+  run-level ``is_fitted``; an all-warmup window downgrades to
+  ``is_fitted=false`` + ``NO_FITTED_PERIODS`` (RB-8) while keeping the
+  fitted fields auditable; the §4.5 advisory ``rank_ic_redundancy`` matrix
+  is attached for BOTH branches;
 - FP-2 same-window evaluation: available diagnostics on a long window,
   honest degraded slot (statuses + ``EVALUATION_WINDOW_TOO_SHORT``, never a
   fabricated zero) when the window is under the 126-day evaluation floor;
-- a Node fixture drive of the REAL wire payload through
-  ``renderSynthesisReportHtml`` / ``renderProvenanceCardHtml`` (the same
-  stdlib-only harness convention as tests/test_web_synthesis_view.py),
-  closing the payload->renderer contract end-to-end without a browser.
+- a Node fixture drive of the REAL wire payloads (a-priori AND fitted)
+  through ``renderSynthesisReportHtml`` / ``renderProvenanceCardHtml`` (the
+  same stdlib-only harness convention as tests/test_web_synthesis_view.py),
+  closing the payload->renderer contract end-to-end without a browser —
+  including that a fitted payload never renders the a-priori raw-weights
+  caption (FP-1's exact frontend concern).
 """
 
 from __future__ import annotations
@@ -39,6 +50,7 @@ import urllib.request
 
 import pytest
 
+import quant_forge.apps.web.api as web_api
 import quant_forge.apps.web.server as web_server
 from quant_forge.apps.web.api import (
     _multi_factor_backtest_settings,
@@ -50,11 +62,14 @@ from quant_forge.core.contracts import FactorDefinition
 from quant_forge.data.local import create_demo_workspace
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.research_loop.config import load_research_loop_config
+from quant_forge.synthesis.methods import SYNTHESIS_METHODS, MethodSpec
 from quant_forge.synthesis.service import (
     EVALUATION_WINDOW_TOO_SHORT,
+    NO_FITTED_PERIODS,
     NON_OVERLAPPING_COHORTS,
     PHASE_SENSITIVE_SMALL_SAMPLE,
     UNIVERSE_MISMATCH,
+    WARM_UP_IC_UNFITTED,
     WINDOW_TOO_SHORT,
     CoverageAccounting,
     FactorCoverage,
@@ -322,14 +337,32 @@ def test_rejects_unknown_method(web_app) -> None:
     _assert_rejected(web_app, request, needle="unknown synthesis method")
 
 
-def test_rejects_reserved_fitted_methods_while_unavailable(web_app) -> None:
-    # CP0 interim state: the fitted methods are advertised as reserved
-    # (available:false) 预留 options; submitting them is rejected until the
-    # fitted phase flips their availability.
-    for name in ("ic_weighted", "icir_weighted"):
-        request = _valid_request()
-        request["synthesis"] = {"method": name, "params": {}}
-        _assert_rejected(web_app, request, needle="reserved and not runnable")
+def test_rejects_reserved_methods_via_catalog_guard(monkeypatch, web_app) -> None:
+    # Post-P6 the shipped catalog has no reserved methods (ic/icir flipped to
+    # available:true), but the guard must keep rejecting any FUTURE reserved
+    # entry — pinned here through a synthetic catalog row so the behavior
+    # cannot silently rot while unrepresented in the shipped catalog.
+    reserved = MethodSpec(name="optimizer", label="预留优化器", available=False, is_fitted=True)
+    monkeypatch.setattr(web_api, "SYNTHESIS_METHODS", (*SYNTHESIS_METHODS, reserved))
+    request = _valid_request()
+    request["synthesis"] = {"method": "optimizer", "params": {}}
+    _assert_rejected(web_app, request, needle="reserved and not runnable")
+
+
+def test_rejects_out_of_bounds_ic_min_periods(web_app) -> None:
+    # The §9 ParamSpec bounds (int, minimum 3, maximum 60) are re-asserted
+    # server-side by the schema validator for the now-runnable fitted methods.
+    request = _valid_request()
+    request["synthesis"] = {"method": "ic_weighted", "params": {"ic_min_periods": 2}}
+    _assert_rejected(web_app, request, needle="must be >= 3")
+
+    request = _valid_request()
+    request["synthesis"] = {"method": "icir_weighted", "params": {"ic_min_periods": 61}}
+    _assert_rejected(web_app, request, needle="must be <= 60")
+
+    request = _valid_request()
+    request["synthesis"] = {"method": "ic_weighted", "params": {"ic_min_periods": 6.5}}
+    _assert_rejected(web_app, request, needle="must be an integer")
 
 
 def test_rejects_missing_and_unknown_standardization(web_app) -> None:
@@ -539,6 +572,13 @@ def test_provenance_apriori_branch_and_pinned_member_formulas(apriori_payload) -
     }
     for key in FITTED_ONLY_KEYS:
         assert key not in provenance, key
+    # §4.5 advisory crowding diagnostic rides along on BOTH branches —
+    # advisory only, never a gate.
+    redundancy = provenance["rank_ic_redundancy"]
+    assert redundancy["advisory"] is True
+    assert redundancy["factors"] == ["FTR_DEMO_SMALL_CAP", "FTR_DEMO_MOMENTUM"]
+    assert len(redundancy["matrix"]) == 2 and len(redundancy["matrix"][0]) == 2
+    assert redundancy["period_count"] >= 2
     # Backtest-only: the single external_oos_backtest role, with the exact
     # row fields renderCoverageByRoleHtml reads (synthesis.js:342-352).
     role = provenance["coverage_by_role"]["external_oos_backtest"]
@@ -644,6 +684,148 @@ def test_weighted_method_echoes_raw_declared_weights(web_config) -> None:
     for key in FITTED_ONLY_KEYS:
         assert key not in provenance, key
     assert provenance["standardization"] == "rank"
+
+
+# ---------------------------------------------------------------------------
+# P6 fitted branch — FP-1 payload contract, truthful is_fitted both ways
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def fitted_payload(tmp_path_factory):
+    """One shared in-process ic_weighted run over the demo fixture.
+
+    The full demo window (160 trade dates, holding=5, delay=1) admits ~32
+    grid rebalances; with the catalog default ic_min_periods=6 the early
+    slots are warm-up and the rest fit genuinely — so this payload exercises
+    warm-up flagging AND a truthful ``is_fitted: true`` in one run.
+    """
+
+    workspace = tmp_path_factory.mktemp("mfb-fitted")
+    create_demo_workspace(workspace / "demo")
+    config = QuantForgeConfig().resolve(workspace / "demo")
+    request = _valid_request()
+    request["synthesis"] = {"method": "ic_weighted", "params": {}}
+    payload = web_server.run_multi_factor_backtest_workflow(
+        config,
+        factor_refs=request["factor_refs"],
+        synthesis=request["synthesis"],
+        standardization=request["standardization"],
+        parameters=request["parameters"],
+        rd_config=_rd_config(config),
+    )
+    return web_server._json_safe(web_server._web_public_json(payload))
+
+
+def test_fitted_payload_omits_weights_effective_and_carries_fitted_fields(
+    fitted_payload,
+) -> None:
+    provenance = fitted_payload["synthesis_provenance"]
+    # FP-1: the frontend captions weights_effective unconditionally as an
+    # a-priori raw-declared claim (synthesis.js:386-388); a fitted run must
+    # omit the field ENTIRELY — the honest story lives in the fitted fields.
+    assert "weights_effective" not in provenance
+    for key in FITTED_ONLY_KEYS:
+        assert key in provenance, key
+
+    assert provenance["method"] == "ic_weighted"
+    assert provenance["is_fitted"] is True
+    # The schema default was resolved into the echo: the run reports the
+    # ic_min_periods it ACTUALLY used, not an empty mapping.
+    assert provenance["method_params"] == {"ic_min_periods": 6}
+
+    latest = provenance["fitted_weights_latest"]
+    assert set(latest) == {"FTR_DEMO_SMALL_CAP", "FTR_DEMO_MOMENTUM"}
+    assert all(value >= 0.0 for value in latest.values())
+    assert sum(latest.values()) == pytest.approx(1.0)
+
+    path = provenance["fitted_weights_path"]
+    assert isinstance(path, list) and path
+    for entry in path:
+        assert set(entry) == {"signal_date", "weights", "eligible_period_count", "flag"}
+        assert set(entry["weights"]) == {"FTR_DEMO_SMALL_CAP", "FTR_DEMO_MOMENTUM"}
+        assert sum(entry["weights"].values()) == pytest.approx(1.0)
+        assert entry["flag"] in (None, WARM_UP_IC_UNFITTED, "IC_DEGENERATE_EQUAL_WEIGHT")
+    flags = [entry["flag"] for entry in path]
+    assert WARM_UP_IC_UNFITTED in flags  # early slots have no closed history
+    assert None in flags  # and later slots genuinely fit
+
+    warmup_count = sum(1 for flag in flags if flag == WARM_UP_IC_UNFITTED)
+    fitted_count = sum(1 for flag in flags if flag is None)
+    assert provenance["warmup_period_count"] == warmup_count
+    assert provenance["fitted_period_fraction"] == pytest.approx(fitted_count / len(path))
+    assert 0.0 < provenance["fitted_period_fraction"] <= 1.0
+    # The last genuinely fitted vector IS the latest one reported.
+    last_genuine = [entry for entry in path if entry["flag"] is None][-1]
+    assert latest == last_genuine["weights"]
+
+    # The fit covers the FULL shared grid, a superset of the traded periods
+    # (the wire backtest payload carries no resolved_schedule — the exact
+    # realized-schedule == fit-grid equality is pinned against the real
+    # BacktestResult in tests/test_synthesis_grid_fidelity_fitted.py).
+    assert len(path) >= fitted_payload["backtest"]["periods"]
+
+    # Warm-up disclosure reaches the top-level warning surface.
+    assert WARM_UP_IC_UNFITTED in fitted_payload["backtest"]["warning_codes"]
+    assert NO_FITTED_PERIODS not in fitted_payload["backtest"]["warning_codes"]
+
+    # §4.5 advisory redundancy matrix: symmetric, unit diagonal, advisory.
+    redundancy = provenance["rank_ic_redundancy"]
+    assert redundancy["advisory"] is True
+    assert redundancy["factors"] == ["FTR_DEMO_SMALL_CAP", "FTR_DEMO_MOMENTUM"]
+    matrix = redundancy["matrix"]
+    assert matrix[0][0] == pytest.approx(1.0)
+    assert matrix[1][1] == pytest.approx(1.0)
+    assert matrix[0][1] == pytest.approx(matrix[1][0])
+
+    # The rest of the §8 contract is unchanged by the branch.
+    assert set(fitted_payload) == {
+        "factor",
+        "parameters",
+        "evaluation",
+        "in_sample_backtest",
+        "backtest",
+        "validity",
+        "synthesis_provenance",
+    }
+    assert fitted_payload["factor"]["factor_id"] == provenance["composite_id"]
+
+
+def test_fitted_all_warmup_window_downgrades_honestly(web_config) -> None:
+    # RB-8: ic_min_periods=60 (the schema maximum) can never be satisfied by
+    # a ~43-date window (N=9 grid slots), so EVERY rebalance is warm-up and
+    # the run must report is_fitted=false + NO_FITTED_PERIODS while still
+    # running (as equal weight) and keeping the fitted fields auditable.
+    # icir_weighted drives the second fitted method through the workflow.
+    request = _valid_request()
+    payload = web_server.run_multi_factor_backtest_workflow(
+        web_config,
+        factor_refs=request["factor_refs"],
+        synthesis={"method": "icir_weighted", "params": {"ic_min_periods": 60}},
+        standardization={"method": "zscore", "params": {}},
+        parameters={
+            "holding_days": 5,
+            "backtest_start": "2024-01-02",
+            "backtest_end": "2024-03-01",
+        },
+        rd_config=_rd_config(web_config),
+    )
+    provenance = payload["synthesis_provenance"]
+    assert provenance["method"] == "icir_weighted"
+    assert provenance["is_fitted"] is False
+    assert provenance["method_params"] == {"ic_min_periods": 60}
+    assert "weights_effective" not in provenance  # never a fabricated a-priori claim
+    assert provenance["fitted_weights_latest"] is None
+    assert provenance["fitted_period_fraction"] == 0.0
+    assert provenance["warmup_period_count"] == len(provenance["fitted_weights_path"])
+    assert all(
+        entry["flag"] == WARM_UP_IC_UNFITTED for entry in provenance["fitted_weights_path"]
+    )
+    codes = payload["backtest"]["warning_codes"]
+    assert NO_FITTED_PERIODS in codes
+    assert WARM_UP_IC_UNFITTED in codes
+    # The downgraded run still trades: periods realized, engine untouched.
+    assert payload["backtest"]["periods"] >= 2
 
 
 # ---------------------------------------------------------------------------
@@ -817,3 +999,70 @@ def test_node_renderers_consume_real_wire_payload(apriori_payload, tmp_path) -> 
         "PASS card.explicit_directions",
     ):
         assert marker in result.stdout, marker
+
+
+_FITTED_RENDER_HARNESS = """
+import { readFileSync } from 'node:fs';
+globalThis.document = {
+  getElementById: () => null,
+  querySelectorAll: () => [],
+  addEventListener: () => {}
+};
+const mod = await import(process.env.QF_SYNTH_URL);
+const payload = JSON.parse(readFileSync(process.env.QF_PAYLOAD_JSON, 'utf8'));
+let failed = 0;
+function check(name, ok) {
+  if (ok) { console.log('PASS ' + name); } else { failed += 1; console.log('FAIL ' + name); }
+}
+
+const card = mod.renderProvenanceCardHtml(payload.synthesis_provenance);
+// FP-1's exact frontend concern: the a-priori raw-declared caption must
+// NEVER appear over a fitted run's weights (weights_effective is omitted,
+// so weightsLine renders '').
+check('fitted.no_apriori_weights_caption', !card.includes('权重为先验原始声明值'));
+// is_fitted:true -> the 先验声明 · 未拟合 pill must not be fabricated.
+check('fitted.no_unfitted_pill', !card.includes('先验声明 · 未拟合'));
+check('fitted.card_renders', typeof card === 'string' && card.length > 0);
+
+const html = mod.renderSynthesisReportHtml(payload);
+check('fitted.report_renders', typeof html === 'string' && html.length > 0);
+check('fitted.no_apriori_weights_caption_report', !html.includes('权重为先验原始声明值'));
+check('fitted.no_undefined_leak', !html.includes('undefined'));
+check('fitted.warning_code_pills', html.includes('WARM_UP_IC_UNFITTED'));
+
+console.log('FIXTURE RESULT: ' + failed + ' failed');
+if (failed) process.exit(1);
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runtime not available")
+def test_node_renderers_never_show_apriori_caption_on_fitted_payload(
+    fitted_payload, tmp_path
+) -> None:
+    """§13 renderer closure for the fitted branch, on a REAL wire payload.
+
+    Locks the FP-1 outcome end-to-end: because the backend omits
+    ``weights_effective``, the shipped provenance card renders NO a-priori
+    raw-weights caption and NO 未拟合 pill for a genuinely fitted run —
+    and the extra fitted/redundancy keys leak no 'undefined' text anywhere.
+    """
+
+    payload_path = tmp_path / "fitted_payload.json"
+    payload_path.write_text(json.dumps(fitted_payload, ensure_ascii=False), encoding="utf-8")
+    harness = tmp_path / "render_fitted_payload.mjs"
+    harness.write_text(_FITTED_RENDER_HARNESS, encoding="utf-8")
+    import os
+
+    result = subprocess.run(
+        ["node", str(harness)],
+        capture_output=True,
+        text=True,
+        env={
+            **dict(os.environ),
+            "QF_SYNTH_URL": SYNTHESIS_JS_PATH.resolve().as_uri(),
+            "QF_PAYLOAD_JSON": str(payload_path),
+        },
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + "\n" + result.stderr
+    assert "FIXTURE RESULT: 0 failed" in result.stdout

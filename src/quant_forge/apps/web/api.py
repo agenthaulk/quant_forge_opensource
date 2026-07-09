@@ -64,23 +64,28 @@ from quant_forge.synthesis.methods import (
     STANDARDIZATIONS,
     SYNTHESIS_METHODS,
     MethodSpec,
+    apply_param_defaults,
     method_catalog_payload,
     validate_params_against_schema,
 )
 from quant_forge.synthesis.service import (
     COVERAGE_RULE_ALL_FACTORS,
+    DEFAULT_IC_MIN_PERIODS,
     EVALUATION_WINDOW_TOO_SHORT,
     NON_OVERLAPPING_COHORTS,
     PHASE_SENSITIVE_SMALL_SAMPLE,
     CompositeBacktestRun,
     CompositeResult,
     CoverageAccounting,
+    FittedCompositeResult,
     MemberFetchSpec,
     RebalancePrescan,
     build_apriori_composite,
+    build_fitted_composite,
     build_member_fetch_plan,
     cleanup_composite_artifacts,
     derive_composite_id,
+    member_rank_ic_redundancy,
     prescan_rebalance_coverage,
     require_backtest_window,
     resolve_pinned_universe,
@@ -658,6 +663,10 @@ def _prepare_multi_factor_backtest(
     method_params = validate_params_against_schema(
         method.params, synthesis_request["params"], owner="synthesis.params"
     )
+    # Schema-declared defaults resolve here so provenance echoes and the
+    # composite-id digest carry the values the run ACTUALLY used (a fitted
+    # request without ic_min_periods truthfully reports the catalog default).
+    method_params = apply_param_defaults(method.params, method_params)
     factor_ids = [ref["factor_id"] for ref in refs]
     weights = _synthesis_weights_for_members(method, method_params, factor_ids)
     standardization_name, standardization_pinned = _resolve_synthesis_standardization(
@@ -766,7 +775,10 @@ def run_multi_factor_backtest_workflow(
     """Run the multi-factor composite backtest end-to-end (design §10 steps 1-6).
 
     Mirrors ``_validate_factor_workflow``: validate, fetch member scores with
-    the ONE pinned universe, standardize/direction/combine (a-priori),
+    the ONE pinned universe, standardize/direction/combine — a-priori, or
+    the §4.4 point-in-time IC/ICIR fit on the shared ``rebalance_indices``
+    grid with ``_with_period_return`` forward returns (P6), with the
+    time-varying weights folded into the composite BEFORE materialization —
     pre-scan the shared rebalance grid, materialize + drive the engine
     (decay pinned to 0 on the engine profile — LA-1), fill the same-window
     evaluation slot (FP-2), and assemble the §8 payload. Any failure after
@@ -797,12 +809,45 @@ def run_multi_factor_backtest_workflow(
             factor_values_overlay_root=config.paths.factor_values_overlay_root,
         ).scores
         _raise_if_cancelled(cancel_event)
-    composite = build_apriori_composite(
+    # The working-panel close frame over the SAME in-window dates the engine
+    # trades: the RB-5 forward-return source for the fitted IC estimate and
+    # the advisory redundancy diagnostic.
+    working_close = apply_test_period(plan.panel, plan.settings.profile)[
+        ["trade_date", "instrument", "close"]
+    ].copy()
+    delay = plan.settings.profile.execution_delay_days
+    composite: CompositeResult | FittedCompositeResult
+    if plan.method.is_fitted:
+        composite = build_fitted_composite(
+            member_scores,
+            directions=plan.directions,
+            standardization=plan.standardization,
+            method=plan.method.name,
+            close=working_close,
+            dates=plan.dates,
+            delay=delay,
+            holding=plan.settings.holding_days,
+            ic_min_periods=int(
+                plan.method_params.get("ic_min_periods", DEFAULT_IC_MIN_PERIODS)
+            ),
+        )
+    else:
+        composite = build_apriori_composite(
+            member_scores,
+            directions=plan.directions,
+            standardization=plan.standardization,
+            method=plan.method.name,
+            weights=plan.weights,
+        )
+    _raise_if_cancelled(cancel_event)
+    redundancy = member_rank_ic_redundancy(
         member_scores,
         directions=plan.directions,
         standardization=plan.standardization,
-        method=plan.method.name,
-        weights=plan.weights,
+        close=working_close,
+        dates=plan.dates,
+        delay=delay,
+        holding=plan.settings.holding_days,
     )
     prescan = prescan_rebalance_coverage(
         composite.composite,
@@ -831,7 +876,9 @@ def run_multi_factor_backtest_workflow(
         _raise_if_cancelled(cancel_event)
         evaluation_payload = _same_window_evaluation(config, plan, run, rd_config)
         _raise_if_cancelled(cancel_event)
-        return _multi_factor_backtest_payload(plan, composite, prescan, run, evaluation_payload)
+        return _multi_factor_backtest_payload(
+            plan, composite, prescan, run, evaluation_payload, redundancy
+        )
     except Exception:
         cleanup_composite_artifacts(
             config.paths.factor_root,
@@ -986,19 +1033,30 @@ def _synthesis_provenance_payload(
     skipped_rebalances: int,
     degenerate_cross_sections: int,
     weights_effective: dict[str, float] | None,
+    fitted: FittedCompositeResult | None = None,
+    rank_ic_redundancy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """§8 ``synthesis_provenance`` block (a-priori branch).
+    """§8 ``synthesis_provenance`` block (both FP-1 branches).
 
     ``factors[]`` carries each member's formula PINNED at plan-build time
     (CP0 amendment) so downstream consumers never depend on the live
     registry. ``coverage_by_role`` carries the single backtest-only role;
     ``coverage_ratio`` is a real ``null`` when unobservable (FP-4) — the
-    frontend renders it n/a, never 0 (synthesis.js:349). FP-1: a-priori runs
-    carry ``weights_effective`` RAW (equal_weight echoes its uniform 1.0
-    claim) and NO fitted fields; the fitted phase must instead emit
-    ``fitted_weights_latest``/``fitted_weights_path`` (+ fraction/warmup) and
-    OMIT ``weights_effective`` — the frontend captions that field
-    unconditionally as an a-priori claim (synthesis.js:386-388).
+    frontend renders it n/a, never 0 (synthesis.js:349).
+
+    FP-1 branch selection keys off the REQUESTED method family (``fitted``):
+    a-priori runs carry ``weights_effective`` RAW (equal_weight echoes its
+    uniform 1.0 claim) and NO fitted fields; fitted runs OMIT
+    ``weights_effective`` entirely — the frontend captions that field
+    unconditionally as an a-priori raw-declared claim (synthesis.js:386-388)
+    — and instead carry ``fitted_weights_latest`` (last GENUINELY fitted
+    vector, or ``null``), the per-signal-date ``fitted_weights_path``
+    diagnostic, ``fitted_period_fraction`` and ``warmup_period_count``.
+    ``is_fitted`` is the run-level REALIZED truth: a fitted request that
+    downgraded (``NO_FITTED_PERIODS``, §3 RB-8) reports ``false`` while
+    keeping the fitted diagnostic fields so the downgrade is auditable.
+    ``rank_ic_redundancy`` is the §4.5 advisory crowding matrix — attached
+    for both branches, never a gate.
     """
 
     directions = {spec.factor_id: spec.direction for spec in member_plan}
@@ -1040,31 +1098,56 @@ def _synthesis_provenance_payload(
             }
         },
     }
-    if not is_fitted and weights_effective is not None:
+    if fitted is None and weights_effective is not None:
+        # A-priori branch only: the raw declared claim (FP-1). A fitted run
+        # never routes any vector through this field — not even a downgraded
+        # equal-weight fallback, which the user never declared.
         payload["weights_effective"] = dict(weights_effective)
+    if fitted is not None:
+        payload["fitted_period_fraction"] = fitted.fitted_period_fraction
+        payload["warmup_period_count"] = fitted.warmup_period_count
+        payload["fitted_weights_latest"] = (
+            dict(fitted.fitted_weights_latest)
+            if fitted.fitted_weights_latest is not None
+            else None
+        )
+        payload["fitted_weights_path"] = [
+            {
+                "signal_date": entry.signal_date.date().isoformat(),
+                "weights": dict(entry.weights),
+                "eligible_period_count": entry.eligible_period_count,
+                "flag": entry.flag,
+            }
+            for entry in fitted.weights_path
+        ]
+    if rank_ic_redundancy is not None:
+        payload["rank_ic_redundancy"] = dict(rank_ic_redundancy)
     return payload
 
 
 def _multi_factor_backtest_payload(
     plan: _MultiFactorBacktestPlan,
-    composite: CompositeResult,
+    composite: CompositeResult | FittedCompositeResult,
     prescan: RebalancePrescan,
     run: CompositeBacktestRun,
     evaluation_payload: dict[str, Any],
+    redundancy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the exact §8 response the shipped renderers consume.
 
     ``backtest`` is ``_backtest_payload`` output VERBATIM (FP-3 — every
     top-level scalar tile factor.js:136-176 reads), extended additively with
     the synthesis disclosure codes: ``NON_OVERLAPPING_COHORTS`` +
-    ``PHASE_SENSITIVE_SMALL_SAMPLE`` (RB-1), the pre-scan skip codes (RB-7)
-    and ``DEGENERATE_CROSS_SECTION`` (RB-9); the engine's own codes —
-    including the inherited ``FINAL_PARTIAL_PERIOD_EXCLUDED`` handling — stay
-    first and unchanged. ``in_sample_backtest`` is ``null``: the module is
-    backtest-only over ONE window, a second same-window engine pass would
-    duplicate ``backtest`` under a misleading in-sample label, and the
-    renderer is null-safe (synthesis.js:449 ``|| null``; factor.js:131
-    returns ``''``).
+    ``PHASE_SENSITIVE_SMALL_SAMPLE`` (RB-1), the pre-scan skip codes (RB-7),
+    ``DEGENERATE_CROSS_SECTION`` (RB-9) and — on the fitted branch — the
+    §4.4 fit codes (``WARM_UP_IC_UNFITTED`` / ``IC_DEGENERATE_EQUAL_WEIGHT``
+    / ``NO_FITTED_PERIODS``) carried by ``composite.warning_codes``; the
+    engine's own codes — including the inherited
+    ``FINAL_PARTIAL_PERIOD_EXCLUDED`` handling — stay first and unchanged.
+    ``in_sample_backtest`` is ``null``: the module is backtest-only over ONE
+    window, a second same-window engine pass would duplicate ``backtest``
+    under a misleading in-sample label, and the renderer is null-safe
+    (synthesis.js:449 ``|| null``; factor.js:131 returns ``''``).
     """
 
     backtest_payload = _backtest_payload(run.result)
@@ -1085,6 +1168,7 @@ def _multi_factor_backtest_payload(
     )
     backtest_payload["warnings"] = warnings
 
+    fitted_result = composite if isinstance(composite, FittedCompositeResult) else None
     provenance = _synthesis_provenance_payload(
         member_plan=plan.member_plan,
         method_name=plan.method.name,
@@ -1092,7 +1176,12 @@ def _multi_factor_backtest_payload(
         standardization=plan.standardization,
         standardization_pinned=plan.standardization_pinned,
         composite_id=run.composite_id,
-        is_fitted=plan.method.is_fitted,
+        # Run-level realized truth: a fitted request that produced zero
+        # genuinely fitted rebalances reports false (RB-8 downgrade);
+        # a-priori methods are false by nature.
+        is_fitted=(
+            fitted_result.is_fitted if fitted_result is not None else plan.method.is_fitted
+        ),
         coverage=composite.coverage,
         universe_filters=plan.universe_filters,
         period_count=plan.period_count,
@@ -1100,7 +1189,11 @@ def _multi_factor_backtest_payload(
         # the pre-scan is a score-side lower bound and feeds warning codes.
         skipped_rebalances=int(run.result.skipped_rebalances),
         degenerate_cross_sections=len(composite.degenerate_dates),
-        weights_effective=composite.weights_effective,
+        weights_effective=(
+            None if fitted_result is not None else composite.weights_effective
+        ),
+        fitted=fitted_result,
+        rank_ic_redundancy=redundancy,
     )
     return {
         "factor": _json_safe(run.materialized.definition),

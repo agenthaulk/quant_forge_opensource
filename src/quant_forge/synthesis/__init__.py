@@ -15,6 +15,7 @@ from quant_forge.synthesis.methods import (
     MethodSpec,
     ParamSpec,
     StandardizationSpec,
+    apply_param_defaults,
     method_catalog_payload,
     validate_params_against_schema,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "MethodSpec",
     "ParamSpec",
     "StandardizationSpec",
+    "apply_param_defaults",
     "method_catalog_payload",
     "validate_params_against_schema",
 ]
