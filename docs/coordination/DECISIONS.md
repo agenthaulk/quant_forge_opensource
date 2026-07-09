@@ -122,3 +122,50 @@ Workflow B branch: `fable/phase-e-external-backends`, forked from `main@81ed4cf`
 (PR-independent; file scopes disjoint from A; CP-INT merges both locally for the
 integration container only). Deferred question (recorded, not blocking):
 retention/GC policy for successful `COMPOSITE_*` registry entries.
+
+### CP0 amendments (same day, after the mandated Opus adversarial round)
+
+The adversarial review confirmed 7 rulings and required 3 revisions; adjudicated:
+
+1. **D-i ignore durability (accepted).** The `worldquant/` ignore rule existed
+   only as an *uncommitted* working-tree edit in the main checkout — one
+   `git checkout --`/`reset --hard` away from exposing third-party-derived
+   capture to a stray `git add -A`. Now: `worldquant/` and
+   `.claude/skills/worldquant-brain/` are **committed** ignore rules on this
+   branch and mirrored in the repo-local `.git/info/exclude` for immediate
+   effect across every worktree. D-i's "zero `.gitignore` edits" note is
+   corrected to "one committed ignore commit".
+2. **D-viii member-formula pinning (accepted).** `synthesis_provenance.factors[]`
+   additionally carries each member's **`formula` pinned at run time**. The
+   workflow-B translator consumes the **full report artifact** (so
+   `parameters.decay_days` is visible too), never resolves member formulas from
+   the live registry, and refuses on registry drift with closed code
+   `MEMBER_FORMULA_DRIFT`. This closes the hole where editing a member factor
+   after synthesis would let a submit target an expression that was never
+   backtested (FP-G/FP-I).
+3. **Merge order + coordination-doc ownership (accepted).** Branch A merges
+   before branch B. Branch B does **not** modify `docs/coordination/*` or
+   `docs/design/*`; B's decision/progress records are carried in this register
+   (branch A) and appended on B only at PR-rebase time after A lands.
+4. **D-iv anti-squatting opt-in (accepted, folded into CP1).** A backend
+   resolves only when (a) present in the reviewed static table, (b) explicitly
+   enabled via `QF_ENABLE_BACKEND_<ID>=1`, and (c) importable — new closed code
+   `BACKEND_NOT_ENABLED`. An unpublished module name alone can no longer be
+   activated by an unrelated installed package.
+5. **D9-supersession hygiene.** Of the D9-recorded CP10 rulings: **superseded**
+   — the `custom_weight`/`rank_average` method naming, "`ic_weighted` ships no
+   implementation" (P6 ships it), and the per-role composite byte-match;
+   **still binding** — FP-4 coverage honesty, truthful `is_fitted`,
+   schema-driven single-source param validation, and no optimizer / covariance
+   / risk model (D6).
+6. **Review-substitution scope (clarified).** The owner's waiver of pre-PR
+   Codex passes is a standing decision for this cycle (Codex auto-reviews the
+   PRs); the quota embargo (until 2026-07-10 ~06:00Z) independently forbids
+   Codex plugin calls. CP4-class strict review = Opus adversarial lenses
+   in-cycle + Codex on the PRs.
+7. **Evidence hygiene (folded into lane prompts).** RF-3's citation corrected
+   in the design doc (conclusion unchanged); P1's catalog source is the TASK
+   brief interim (fitted `available:false` until P6), not design §9 verbatim;
+   new `docs/design/` files require `git add -f` (blanket `design/` ignore
+   rule) or they silently escape both git and the release scan; public gate
+   tests use synthetic `SubmissionGateSpec` values only.

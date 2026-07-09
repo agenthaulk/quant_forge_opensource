@@ -561,4 +561,20 @@ Each adversarial-review finding, its resolution, the section it landed in, and t
 - **Drifted-weight cost accounting (RB-4).** Costing against a daily-drifted book (rather than the previous target book) would remove the disclosed turnover/cost understatement; deferred to P8 with the shared-primitive extraction.
 - **Full `run_backtest_on_scores` extraction (P8).** Ships as an optional refactor to remove the materialization round-trip entirely; the shared `rebalance_indices` helper (P2) already closes the correctness-critical grid-fidelity gap in the interim.
 
+## CP0 amendments (2026-07-09, Fable — post-adversarial-review)
+
+- **§8 provenance:** `synthesis_provenance.factors[]` carries `formula` — each
+  member's formula **pinned at run time** — so downstream consumers (e.g. an
+  external-backend translator) never depend on the live registry's current
+  state; consumers must refuse on drift (closed code `MEMBER_FORMULA_DRIFT`).
+  FE renderers ignore the extra key (additive change).
+- **§9 interim state:** until P6 lands, the shipped catalog marks
+  `ic_weighted`/`icir_weighted` as `available:false` (reserved 预留) per the
+  TASK brief; §9's literal JSON is the **post-P6** end state.
+- **§11 RF-3 evidence correction:** `_looks_like_factor_dir` *does* match an
+  `incremental/`-only parquet dir (`catalog.py:406-408`); the reason hand-built
+  `overlay_root/<id>` dirs still fail is the candidate-name/category resolution
+  in `value_store.py:180-198`. RF-3's operative rule is unchanged: materialize
+  via `FactorValueStore._resolve_factor_paths` and assert engine read-back.
+
 **Key design commitments recap:** reuse `run_factor_backtest`'s schedule/cost/NAV/metric machinery, adding only two minimal additive honesty fixes (deterministic tie-break, skip-warning stub) and a shared `rebalance_indices` helper; materialize the composite as a colon-free `COMPOSITE_<hash-of-all-inputs>` `precomputed:` factor via the store's own path resolution and `FactorRepository.save` into `factor_root`; pin decay to members only (engine profile `decay_days=0`); pin one universe across members and composite; cadence == `holding_days` ⇒ non-overlapping K=1, disclosed with a period count and phase caveat; fitted IC/ICIR weights estimated on the engine's exact grid with `_with_period_return` forward returns and a strict `idx(s)+delay+holding ≤ idx(d)` embargo, downgrading honestly on short windows; fitted weights never routed through the a-priori-captioned `weights_effective`; every coverage/metric honestly typed with real `null` for the unobservable and explicit warning codes for every skip/degeneracy.
