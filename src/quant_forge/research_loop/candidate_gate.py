@@ -96,7 +96,14 @@ def oos_return_evidence(segments: Iterable[SegmentEvidence]) -> OOSReturnEvidenc
     for segment in segments:
         if not segment.name.upper().startswith("OOS"):
             continue
-        if segment.net_annualized_return is None:
+        # Unify with the decay clause (line ~136): a segment is usable evidence
+        # only when it reports a return AND is not a zero-period segment. Both
+        # OOS clauses now agree that a 0-period segment is missing evidence
+        # (fail closed) rather than counting it as observed here while the
+        # decay exceedance check silently skips it. ``_usable`` is module-level
+        # and resolves at call time, so referencing it before its definition
+        # is fine.
+        if not _usable(segment):
             unavailable.append(segment.name)
         else:
             observed.append(segment)

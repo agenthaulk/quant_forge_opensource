@@ -9,7 +9,11 @@ from quant_forge.research_loop.candidate_gate import (
     INSUFFICIENT_EVIDENCE,
     INSUFFICIENT_OOS_EVIDENCE,
     CandidateGateConfig,
+    SegmentEvidence,
     evaluate_candidate,
+    min_oos_return_reasons,
+    oos_decay_evidence_available,
+    oos_return_evidence,
 )
 from quant_forge.research_loop.contracts import FactorExperimentPlan, FactorExperimentResult
 from quant_forge.research_loop.service import ResearchGate, apply_gate
@@ -321,6 +325,58 @@ def test_candidate_gate_treats_zero_period_segments_as_missing_decay_evidence() 
     decision = evaluate_candidate(
         _ready_result(metrics),
         CandidateGateConfig(max_oos_net_return_decay=0.1),
+    )
+    assert decision.status == "blocked"
+    assert _marker_reasons(decision.blocking_reasons)
+
+
+# ---------------------------------------------------------------------------
+# F5: the min_oos_net_annualized_return evidence classifier must apply the
+# same _usable rule as the decay clause. A zero-period OOS segment that reports
+# a non-null return is NOT observed evidence — it is unavailable (fail closed),
+# so the two OOS clauses share one 'sufficient evidence' definition.
+# ---------------------------------------------------------------------------
+
+
+def test_oos_return_evidence_zero_period_segment_is_unavailable() -> None:
+    zero_period_oos = SegmentEvidence(name="OOS1", net_annualized_return=0.2, periods=0)
+    usable_oos = SegmentEvidence(name="OOS2", net_annualized_return=0.15, periods=5)
+
+    evidence = oos_return_evidence((zero_period_oos, usable_oos))
+
+    # The zero-period segment is unavailable, not observed (pre-fix it was
+    # counted as observed because its return was non-null).
+    assert "OOS1" in evidence.unavailable
+    assert all(segment.name != "OOS1" for segment in evidence.observed)
+    # A periods>0 segment is still observed.
+    assert any(segment.name == "OOS2" for segment in evidence.observed)
+
+    # min_oos clause now agrees with the decay clause: the zero-period OOS
+    # segment is missing evidence (the decay-availability check treats it the
+    # same, because _usable is False for periods=0).
+    is_segment = SegmentEvidence(name="IS", net_annualized_return=0.25, periods=5)
+    assert not oos_decay_evidence_available((is_segment, zero_period_oos))
+
+    # With missing_blocks=True the unavailable zero-period segment produces a
+    # blocking INSUFFICIENT_OOS_EVIDENCE reason (no warnings).
+    blocking, warnings = min_oos_return_reasons(
+        oos_return_evidence((zero_period_oos,)),
+        0.0,
+        missing_blocks=True,
+    )
+    assert any(reason.startswith(INSUFFICIENT_OOS_EVIDENCE) for reason in blocking)
+    assert warnings == ()
+
+
+def test_candidate_gate_min_oos_blocks_on_zero_period_segment() -> None:
+    metrics = {
+        "segment_metrics": [
+            {"name": "OOS1", "net_annualized_return": 0.2, "periods": 0},
+        ]
+    }
+    decision = evaluate_candidate(
+        _ready_result(metrics),
+        CandidateGateConfig(min_oos_net_annualized_return=0.0),
     )
     assert decision.status == "blocked"
     assert _marker_reasons(decision.blocking_reasons)
