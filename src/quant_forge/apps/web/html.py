@@ -975,8 +975,6 @@ def _index_html(
               <label><span>Decay / 天</span><input id="synth-param-decay-days" type="number" min="0" step="1"></label>
               <label><span>Top Quantile</span><input id="synth-param-top-quantile" type="number" min="0.01" max="0.5" step="0.01"></label>
               <label><span>Delay / 天</span><input id="synth-param-delay-days" type="number" min="1" step="1"></label>
-              <label><span>评测开始</span><input id="synth-param-evaluation-start" type="date"></label>
-              <label><span>评测结束</span><input id="synth-param-evaluation-end" type="date"></label>
               <label><span>回测开始</span><input id="synth-param-backtest-start" type="date"></label>
               <label><span>回测结束</span><input id="synth-param-backtest-end" type="date"></label>
               <label><span>手续费 bps</span><input id="synth-param-commission-bps" type="number" min="0" step="0.1"></label>

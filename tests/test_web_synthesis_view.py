@@ -112,8 +112,6 @@ def test_index_page_hosts_the_synthesis_module_skeleton(web_config) -> None:
         'id="synth-param-decay-days"',
         'id="synth-param-top-quantile"',
         'id="synth-param-delay-days"',
-        'id="synth-param-evaluation-start"',
-        'id="synth-param-evaluation-end"',
         'id="synth-param-backtest-start"',
         'id="synth-param-backtest-end"',
         'id="synth-param-commission-bps"',
@@ -128,6 +126,10 @@ def test_index_page_hosts_the_synthesis_module_skeleton(web_config) -> None:
         "合成回测完成后，评价、样本内回测、外部样本外评测与合成 provenance 会展示在这里。",
     ):
         assert marker in html, marker
+    # Backtest-only module (owner directive): the research-evaluation date
+    # interval is intentionally absent — only the backtest window is offered.
+    assert 'id="synth-param-evaluation-start"' not in html
+    assert 'id="synth-param-evaluation-end"' not in html
     # holding_days is REQUIRED; the prefilled 5 is a suggestion only and the
     # label says so.
     assert '<input id="synth-param-holding-days" type="number" min="1" step="1" value="5">' in html

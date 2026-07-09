@@ -691,9 +691,9 @@ const BACKTEST_NUMBER_FIELDS = [
   ['slippage_bps', 'synth-param-slippage-bps'],
   ['short_borrow_bps_annual', 'synth-param-short-borrow-bps']
 ];
+/* Multi-factor module is backtest-only: it carries no research-evaluation
+ * date interval (owner directive) — only the backtest window is collected. */
 const BACKTEST_DATE_FIELDS = [
-  ['evaluation_start', 'synth-param-evaluation-start'],
-  ['evaluation_end', 'synth-param-evaluation-end'],
   ['backtest_start', 'synth-param-backtest-start'],
   ['backtest_end', 'synth-param-backtest-end']
 ];
