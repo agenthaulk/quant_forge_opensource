@@ -19,6 +19,7 @@ from quant_forge.lineage.store import (
     canonical_fingerprint,
     redact_free_text,
 )
+from quant_forge.lineage.store import _read_jsonl as _tolerant_read_jsonl
 from quant_forge.workbench.service import WorkbenchService
 
 CREATED_AT = "2026-07-06T00:00:00+00:00"
@@ -520,3 +521,52 @@ def test_cli_runs_search_kind_choices_cover_all_run_kinds(tmp_path: Path, capsys
         )
         assert exit_code == 0
         assert "no runs matched" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Tolerant JSONL read: one torn/partial line must not poison the whole index
+# ---------------------------------------------------------------------------
+
+
+def test_read_jsonl_skips_trailing_partial_line_without_raising(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Regression: a single malformed/partial trailing line (e.g. a writer
+    # killed mid-append, or a torn final line read concurrently) used to make
+    # every subsequent read raise JSONDecodeError, taking down the whole
+    # run/lineage history from one bad row.
+    index_path = tmp_path / "artifacts" / "runs" / "index.jsonl"
+    index_path.parent.mkdir(parents=True)
+    good_a = {"run_id": "evaluate-a", "kind": "evaluate"}
+    good_b = {"run_id": "evaluate-b", "kind": "backtest"}
+    index_path.write_text(
+        json.dumps(good_a) + "\n" + json.dumps(good_b) + "\n" + '{"run_id": "evaluate-c", "ki',
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING", logger="quant_forge.lineage.store"):
+        rows = _tolerant_read_jsonl(index_path)
+
+    assert rows == [good_a, good_b]
+    # The public read path over the same file is equally tolerant.
+    assert RunIndex(tmp_path / "artifacts").read_rows() == [good_a, good_b]
+    # The warning names the file and the 1-based line number of the bad row.
+    assert any(str(index_path) in message and "3" in message for message in caplog.messages)
+
+
+def test_read_jsonl_skips_garbage_line_between_valid_rows(tmp_path: Path) -> None:
+    # A garbage line BETWEEN two valid rows is skipped while both valid rows
+    # are still returned, in their original order.
+    index_path = tmp_path / "artifacts" / "lineage" / "artifact_index.jsonl"
+    index_path.parent.mkdir(parents=True)
+    good_a = {"artifact_id": "a" * 64, "artifact_type": "evaluation"}
+    good_b = {"artifact_id": "b" * 64, "artifact_type": "backtest"}
+    index_path.write_text(
+        json.dumps(good_a) + "\n" + "}{ not json at all }{\n" + json.dumps(good_b) + "\n",
+        encoding="utf-8",
+    )
+
+    rows = _tolerant_read_jsonl(index_path)
+    assert rows == [good_a, good_b]
+    # The public LineageStore read path is equally tolerant.
+    assert LineageStore(tmp_path / "artifacts").read_rows() == [good_a, good_b]

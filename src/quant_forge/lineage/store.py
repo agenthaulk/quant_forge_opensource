@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 from pathlib import Path
 import re
 from typing import Any, Iterable, Iterator, Mapping
@@ -27,6 +28,8 @@ except ImportError:  # pragma: no cover - non-POSIX (e.g. Windows) fallback
 
 from quant_forge.core.contracts import MetricValue
 from quant_forge.factor_library.classification import FACTOR_CATEGORY_DIRS
+
+logger = logging.getLogger(__name__)
 
 LINEAGE_SCHEMA_VERSION = "qf.lineage.v1"
 RUN_INDEX_SCHEMA_VERSION = "qf.run_index.v1"
@@ -413,10 +416,18 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     rows: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         stripped = line.strip()
-        if stripped:
+        if not stripped:
+            continue
+        try:
             rows.append(json.loads(stripped))
+        except json.JSONDecodeError:
+            # One torn/partial line (e.g. a writer killed mid-append or a
+            # final line read concurrently) must not poison the whole index:
+            # skip it and keep the successfully-parsed rows in order.
+            logger.warning("skipping malformed JSONL line %d in %s", line_number, path)
+            continue
     return rows
 
 
