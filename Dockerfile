@@ -59,6 +59,17 @@ raw['web']['allow_docker_bind'] = True; \
 raw['web']['control_token_env'] = 'QF_WEB_CONTROL_TOKEN'; \
 pathlib.Path('configs/docker.container.yaml').write_text(yaml.safe_dump(raw, sort_keys=False), encoding='utf-8')"
 
+# Drop root before the runtime CMD. Root is only needed for the apt-get and
+# constraints-pinned editable install above; the running server needs no
+# privileges. Create the account here, AFTER every build step, and hand it
+# ownership of /app so the unprivileged process can still create and write the
+# demo workspace (`qf init --workspace /app/qf-demo`) plus any lineage/artifact
+# output the server emits underneath it. A container escape or a mis-published
+# port then lands an attacker as an ordinary user, not root-in-container.
+RUN useradd --create-home --uid 10001 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 # The server listens on 8765 inside the container. Publish it to the host
 # loopback only, e.g. `-p 127.0.0.1:8765:8765`, or `-p 127.0.0.1:8876:8765`
 # when host port 8765 is already in use.
