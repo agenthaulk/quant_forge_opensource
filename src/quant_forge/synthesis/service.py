@@ -63,26 +63,95 @@ Contract highlights implemented here:
 - **Member-formula pinning (CP0 amendment)** captures each member's formula
   string into the fetch plan at plan-build time so provenance carries the
   formulas actually run, independent of later registry state.
+
+Phase P4 (materialize + drive the shipped engine by id) adds:
+
+- **Composite id (RB-10 / RF-1):** ``derive_composite_id`` hashes the
+  canonical JSON of ALL run inputs — the ordered ``(factor_id, direction)``
+  list, method, method_params, standardization, backtest window, decay,
+  delay, top_quantile, coverage rule, min_factor_coverage, and the pinned
+  universe — into ``COMPOSITE_<12 uppercase hex>``. Hashing every input is
+  what stops ``_merge_score_updates`` retain-old-dates poisoning: any config
+  change mints a fresh id. The hex is UPPERCASE by construction because
+  ``FactorCatalog`` canonicalizes precomputed formulas to the uppercased id
+  (``_canonical_factor_id``); an already-canonical id makes the write-time
+  formula equal the read-time formula, so the value-store signature filter
+  matches. The id is colon-free by construction (RF-1).
+- **Materialization (RF-2 / RF-3):** ``materialize_composite`` writes the
+  composite frame through the store's OWN layout resolution
+  (``FactorValueStore._resolve_factor_paths`` + ``write_incremental_values``)
+  — never a hand-built ``overlay_root/<id>`` directory — and registers the
+  ``FactorDefinition`` via ``FactorRepository(factor_root).save`` (there is
+  no ``register_factor`` symbol). The stored ``formula_signature`` is the
+  store's own ``_formula_signature(factor_id, executable_formula,
+  universe_filters)`` — the exact value ``prepare_scores`` filters by at
+  read time; writing the raw formula string instead would silently read
+  back zero rows. A catalog round-trip guard asserts the resolved
+  definition carries the identical formula/filters before any engine run.
+- **Engine drive (LA-1 / RB-5):** ``run_composite_backtest`` pins the
+  engine-driving profile to ``decay_days=0`` structurally (members were
+  already EWMA-decayed inside ``prepare_factor_scores_result`` under the
+  shared profile; the combined composite must not be decayed a second
+  time), drives ``run_factor_backtest`` by the composite id over a per-run
+  overlay, and then asserts grid fidelity: the realized
+  ``resolved_schedule`` signal dates must equal the shared
+  ``rebalance_indices`` grid (after the engine's own disclosed D3
+  final-partial exclusion) — a mismatch raises ``GridFidelityError``, never
+  passes silently.
+- **Failure cleanup:** any exception after materialization begins removes
+  the registered definition (restoring a pre-existing one, mirroring
+  ``_restore_factor_after_failed_validation``) and deletes the per-run
+  overlay directory. On success the definition stays as a first-class
+  factor; a retention/GC policy for accumulated successful composite
+  definitions is a recorded deferred question.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+import hashlib
+import json
+from pathlib import Path
+import re
+import shutil
+import uuid
 
 import numpy as np
 import pandas as pd
 
 from quant_forge.backtesting.service import (
+    EXTERNAL_OOS_ROLE,
     REBALANCE_SKIPPED_NO_COVERAGE,
     REBALANCE_SKIPPED_THIN,
     rebalance_indices,
+    run_factor_backtest,
 )
-from quant_forge.core.contracts import FactorDefinition
+from quant_forge.core.contracts import (
+    BacktestResult,
+    FactorDefinition,
+    SimulationProfile,
+    TransactionCostModel,
+)
+from quant_forge.data.local import LocalPanelDataProvider
+from quant_forge.factor_engine.signal_processing import apply_test_period
+from quant_forge.factor_engine.value_store import FactorValueStore, _formula_signature
+from quant_forge.factor_library.catalog import FactorCatalog
+from quant_forge.factor_library.repository import FactorRepository
+from quant_forge.operator_registry.resolver import resolve_executable_formula
 
 DEGENERATE_CROSS_SECTION = "DEGENERATE_CROSS_SECTION"
 WINDOW_TOO_SHORT = "WINDOW_TOO_SHORT"
 UNIVERSE_MISMATCH = "UNIVERSE_MISMATCH"
+GRID_FIDELITY_MISMATCH = "GRID_FIDELITY_MISMATCH"
+
+COMPOSITE_ID_PREFIX = "COMPOSITE_"
+# RB-10: id = COMPOSITE_ + first 12 hex of a stable sha256 over ALL inputs.
+_COMPOSITE_HASH_HEX_CHARS = 12
+# Uppercase hex only: FactorCatalog canonicalizes precomputed ids/formulas to
+# uppercase, so an uppercase id round-trips identically and the write-time
+# value-store signature equals the read-time one (see module docstring).
+_COMPOSITE_ID_RE = re.compile(r"COMPOSITE_[0-9A-F]{10,16}")
 
 COVERAGE_RULE_ALL_FACTORS = "all_factors"
 COVERAGE_RULE_MIN_FACTOR_COVERAGE = "min_factor_coverage"
@@ -123,6 +192,19 @@ class UniverseMismatchError(SynthesisPreconditionError):
     """RB-6: member factors declare conflicting universe filter sets."""
 
     code = UNIVERSE_MISMATCH
+
+
+class GridFidelityError(RuntimeError):
+    """RB-5/RB-7: the engine's realized schedule diverged from the shared grid.
+
+    Raised AFTER an engine run when ``resolved_schedule`` signal dates differ
+    from ``dates[rebalance_indices(...)]`` (filtered only by the engine's own
+    disclosed D3 final-partial exclusion). This is an internal-contract
+    failure, not a request precondition, so it is a ``RuntimeError``: the run
+    result must never be reported as if it traded the declared grid.
+    """
+
+    code = GRID_FIDELITY_MISMATCH
 
 
 @dataclass(frozen=True)
@@ -829,3 +911,517 @@ def build_member_fetch_plan(
             )
         )
     return tuple(plan)
+
+
+# ---------------------------------------------------------------------------
+# P4 — composite id (RB-10), materialization (RF-2/RF-3), engine drive (LA-1)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MaterializedComposite:
+    """Artifacts produced by :func:`materialize_composite`.
+
+    ``values_dir`` is the store-resolved write directory (RF-3), never a
+    hand-built path; ``definition_path`` is the ``factor.yaml`` the
+    repository wrote into ``factor_root`` (RF-2). ``formula_signature`` is
+    the exact signature stamped on the written rows — the value the read
+    path must recompute identically for the engine to see any rows.
+    """
+
+    composite_id: str
+    formula: str
+    formula_signature: str
+    definition: FactorDefinition
+    definition_path: Path
+    values_dir: Path
+    overlay_root: Path
+    rows_written: int
+
+
+@dataclass(frozen=True)
+class CompositeBacktestRun:
+    """Result of :func:`run_composite_backtest` (P4 engine drive).
+
+    ``engine_profile`` is the profile the engine actually ran with —
+    ``decay_days`` pinned to 0 (LA-1) regardless of the shared profile's
+    decay, because members were already decayed before combination.
+    ``expected_signal_dates`` is the shared-grid expectation the realized
+    schedule was verified against (RB-5).
+    """
+
+    composite_id: str
+    result: BacktestResult
+    materialized: MaterializedComposite
+    engine_profile: SimulationProfile
+    overlay_root: Path
+    expected_signal_dates: tuple[str, ...]
+
+
+def derive_composite_id(
+    *,
+    factor_refs: Sequence[tuple[str, int]],
+    method: str,
+    method_params: Mapping[str, object] | None,
+    standardization: str,
+    backtest_start: str | None,
+    backtest_end: str | None,
+    decay_days: int,
+    execution_delay_days: int,
+    top_quantile: float,
+    coverage_rule: str,
+    min_factor_coverage: int | None,
+    universe_filters: Sequence[str],
+) -> str:
+    """Derive the ``COMPOSITE_<hash>`` id from ALL run inputs (RB-10, RF-1).
+
+    The digest covers every §11 input: the ORDERED ``(factor_id, direction)``
+    list (member order is identity-bearing), method, method_params,
+    standardization, the backtest window, decay, delay, top_quantile,
+    coverage rule, min_factor_coverage, and the pinned universe. Any single
+    change mints a fresh id, which — together with the per-run overlay — is
+    what prevents ``_merge_score_updates`` from blending stale prior-run
+    rows into a new run's read. The canonical JSON uses sorted keys, so
+    mapping insertion order never changes the id; the member LIST order
+    does, by design. The hex segment is UPPERCASE so the id is a fixed
+    point of ``FactorCatalog`` canonicalization (write-time formula ==
+    read-time formula == matching value-store signature) and colon-free by
+    construction (RF-1).
+    """
+
+    if len(factor_refs) < 2:
+        raise ValueError("a composite requires at least 2 (factor_id, direction) refs")
+    ordered_refs: list[list[object]] = []
+    for ref in factor_refs:
+        factor_id, direction = ref
+        factor_id = str(factor_id)
+        if not factor_id.strip():
+            raise ValueError("factor_id must be a non-empty string in factor_refs")
+        ordered_refs.append([factor_id, _validate_direction(factor_id, direction)])
+    if not str(method).strip():
+        raise ValueError("method is required")
+    if not str(standardization).strip():
+        raise ValueError("standardization is required")
+    if not str(coverage_rule).strip():
+        raise ValueError("coverage_rule is required")
+    if isinstance(decay_days, bool) or not isinstance(decay_days, int) or decay_days < 0:
+        raise ValueError("decay_days must be an integer >= 0")
+    if (
+        isinstance(execution_delay_days, bool)
+        or not isinstance(execution_delay_days, int)
+        or execution_delay_days < 1
+    ):
+        raise ValueError("execution_delay_days must be an integer >= 1")
+    top_quantile = float(top_quantile)
+    if not 0.0 < top_quantile <= 0.5:
+        raise ValueError("top_quantile must be in (0, 0.5]")
+    if min_factor_coverage is not None and (
+        isinstance(min_factor_coverage, bool) or not isinstance(min_factor_coverage, int)
+    ):
+        raise ValueError("min_factor_coverage must be an integer or None")
+    payload = {
+        "factor_refs": ordered_refs,
+        "method": str(method),
+        "method_params": {str(key): value for key, value in (method_params or {}).items()},
+        "standardization": str(standardization),
+        "backtest_start": str(backtest_start) if backtest_start is not None else None,
+        "backtest_end": str(backtest_end) if backtest_end is not None else None,
+        "decay_days": int(decay_days),
+        "execution_delay_days": int(execution_delay_days),
+        "top_quantile": top_quantile,
+        "coverage_rule": str(coverage_rule),
+        "min_factor_coverage": min_factor_coverage,
+        "universe_filters": [str(item) for item in universe_filters],
+    }
+    try:
+        raw = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    except TypeError as error:
+        raise ValueError(f"composite id inputs must be JSON-serializable: {error}") from error
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:_COMPOSITE_HASH_HEX_CHARS]
+    return f"{COMPOSITE_ID_PREFIX}{digest.upper()}"
+
+
+def composite_formula(composite_id: str) -> str:
+    """The ``precomputed:`` formula for a validated composite id (RF-1)."""
+
+    _require_composite_id(composite_id)
+    return f"precomputed:factor_id={composite_id}"
+
+
+def create_composite_overlay_root(artifact_root: Path, composite_id: str) -> Path:
+    """Create the per-run factor-values overlay directory (RB-10).
+
+    Every run gets a fresh directory under the run's artifact scope —
+    ``<artifact_root>/synthesis_runs/<composite_id>_<token>`` — so even a
+    hash collision cannot surface stale rows from a prior run. Non-reuse is
+    structural: the token is random and creation refuses to adopt an
+    existing directory.
+    """
+
+    _require_composite_id(composite_id)
+    runs_root = Path(artifact_root).expanduser() / "synthesis_runs"
+    for _ in range(3):
+        candidate = runs_root / f"{composite_id}_{uuid.uuid4().hex[:12]}"
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            continue
+        return candidate
+    raise RuntimeError("could not allocate a fresh per-run overlay directory")
+
+
+def materialize_composite(
+    composite_scores: pd.DataFrame,
+    *,
+    factor_root: Path,
+    overlay_root: Path,
+    composite_id: str,
+    holding_days: int,
+    universe_filters: Sequence[str],
+    name: str | None = None,
+) -> MaterializedComposite:
+    """Materialize the composite as a synthetic ``precomputed:`` factor.
+
+    Writes the tidy composite frame through the store's OWN path resolution
+    (``_resolve_factor_paths`` -> ``write_incremental_values``, RF-3) into
+    the per-run ``overlay_root``, stamped with the store's own
+    ``_formula_signature`` over ``(factor_id, executable formula, pinned
+    universe_filters)`` — exactly what the engine's read path recomputes, so
+    the rows are actually readable back (writing the raw formula string, as
+    an earlier sketch did, reads back zero rows). Registers the definition
+    in ``factor_root`` via ``FactorRepository.save`` (RF-2; the engine
+    resolves it through ``FactorCatalog(factor_root).get``) with
+    ``source="synthesis"``, ``status="candidate"``,
+    ``horizon_days=holding_days`` and the ONE pinned universe set (RB-6),
+    then asserts the catalog round-trip returns the identical
+    formula/filters — any canonicalization drift would silently change the
+    read-time signature, so it is a hard error here instead.
+
+    The caller owns failure cleanup (see :func:`run_composite_backtest`);
+    NaN composite rows are written as-is: they encode "no signal at this
+    date/name" (RB-9 degenerate-date erasure) and the engine drops them per
+    signal date.
+    """
+
+    _require_composite_id(composite_id)
+    _require_holding_days(holding_days)
+    missing_columns = [column for column in _SCORE_COLUMNS if column not in composite_scores.columns]
+    if missing_columns:
+        raise ValueError(f"composite frame is missing columns: {missing_columns}")
+    scores = composite_scores[list(_SCORE_COLUMNS)].copy()
+    scores["trade_date"] = pd.to_datetime(scores["trade_date"])
+    scores["instrument"] = scores["instrument"].astype(str)
+    scores["score"] = pd.to_numeric(scores["score"], errors="coerce")
+    if scores.empty:
+        raise ValueError("composite frame has no rows to materialize")
+    if int(scores["score"].notna().sum()) == 0:
+        raise ValueError("composite frame has no finite values to materialize")
+
+    pinned = tuple(str(item) for item in universe_filters)
+    factor_name = str(name) if name else composite_id
+    formula = composite_formula(composite_id)
+    store = FactorValueStore(overlay_root, write_root=overlay_root)
+    paths = store._resolve_factor_paths(  # RF-3: the store's own canonical layout
+        factor_id=composite_id, factor_name=factor_name, formula=formula
+    )
+    if paths.write_dir is None:
+        raise RuntimeError("factor value store did not resolve a write directory")
+    # The signature the read path recomputes: resolve_executable_formula is a
+    # pass-through for precomputed formulas, mirrored here literally so the
+    # two sides can never drift apart.
+    formula_signature = _formula_signature(
+        composite_id, resolve_executable_formula(formula), pinned
+    )
+    store.write_incremental_values(
+        paths.write_dir,
+        factor_id=composite_id,
+        factor_name=factor_name,
+        formula_signature=formula_signature,
+        scores=scores,
+    )
+
+    definition = FactorDefinition(
+        factor_id=composite_id,
+        name=factor_name,
+        formula=formula,
+        status="candidate",
+        description="Synthesized multi-factor composite materialized as precomputed values.",
+        horizon_days=holding_days,
+        universe_filters=pinned,
+        source="synthesis",
+    )
+    definition_path = FactorRepository(factor_root).save(definition)  # RF-2
+
+    resolved = FactorCatalog(factor_root).get(composite_id)
+    if (
+        resolved.factor_id != composite_id
+        or resolved.formula != formula
+        or tuple(resolved.universe_filters) != pinned
+    ):
+        raise RuntimeError(
+            "materialized composite does not round-trip through the catalog: "
+            f"saved (factor_id={composite_id}, formula={formula}, universe_filters={list(pinned)}) "
+            f"resolved (factor_id={resolved.factor_id}, formula={resolved.formula}, "
+            f"universe_filters={list(resolved.universe_filters)}); the read-time value-store "
+            "signature would differ from the written one and the engine would read zero rows"
+        )
+    return MaterializedComposite(
+        composite_id=composite_id,
+        formula=formula,
+        formula_signature=formula_signature,
+        definition=definition,
+        definition_path=definition_path,
+        values_dir=paths.write_dir,
+        overlay_root=Path(overlay_root).expanduser(),
+        rows_written=int(len(scores)),
+    )
+
+
+def expected_engine_signal_dates(
+    dates: Sequence[object],
+    *,
+    delay: int,
+    holding: int,
+    start_signal_index: int = 0,
+    include_partial_final_period: bool = False,
+) -> tuple[pd.Timestamp, ...]:
+    """Signal dates the engine must realize from the shared grid (RB-5).
+
+    Walks ``rebalance_indices`` — the single grid source of truth — and
+    applies ONLY the engine's own disclosed schedule breaks: the default D3
+    exclusion of the trailing signal whose scheduled exit falls beyond the
+    window, and (under the mark-to-market opt-in) the degenerate tail whose
+    actual exit would not clear the entry bar. Skipped/thin rebalances are
+    NOT filtered here: the engine keeps those slots visible as ledger stubs,
+    so they must appear in the realized schedule too.
+    """
+
+    calendar = [pd.Timestamp(value) for value in dates]
+    total = len(calendar)
+    expected: list[pd.Timestamp] = []
+    for signal_index in rebalance_indices(
+        calendar, delay=delay, holding=holding, start_signal_index=start_signal_index
+    ):
+        scheduled_exit_index = signal_index + delay + holding
+        if scheduled_exit_index < total:
+            actual_exit_index = scheduled_exit_index
+        elif include_partial_final_period:
+            actual_exit_index = total - 1
+        else:
+            break
+        if actual_exit_index <= signal_index + delay:
+            break
+        expected.append(calendar[signal_index])
+    return tuple(expected)
+
+
+def assert_engine_schedule_matches_grid(
+    resolved_schedule: Sequence[Mapping[str, object]],
+    dates: Sequence[object],
+    *,
+    delay: int,
+    holding: int,
+    start_signal_index: int = 0,
+    include_partial_final_period: bool = False,
+) -> tuple[str, ...]:
+    """Hard-assert the realized schedule equals the shared grid (RB-5/RB-7).
+
+    Compares the engine's ``resolved_schedule`` signal dates — including
+    skipped-rebalance stubs, which stay visible by contract — against
+    ``dates[rebalance_indices(...)]`` filtered only by the engine's own
+    disclosed final-partial rule. Raises :class:`GridFidelityError`
+    (``GRID_FIDELITY_MISMATCH``) on any divergence; returns the expected
+    signal-date labels on success so callers can attach them to provenance.
+    """
+
+    expected = tuple(
+        timestamp.date().isoformat()
+        for timestamp in expected_engine_signal_dates(
+            dates,
+            delay=delay,
+            holding=holding,
+            start_signal_index=start_signal_index,
+            include_partial_final_period=include_partial_final_period,
+        )
+    )
+    realized = tuple(str(row["signal_date"]) for row in resolved_schedule)
+    if realized != expected:
+        raise GridFidelityError(
+            "engine schedule diverged from the shared rebalance grid "
+            f"({GRID_FIDELITY_MISMATCH}): expected signal dates {list(expected)}, "
+            f"realized {list(realized)}"
+        )
+    return expected
+
+
+def run_composite_backtest(
+    composite_scores: pd.DataFrame,
+    *,
+    composite_id: str,
+    factor_root: Path,
+    data_root: Path,
+    artifact_root: Path,
+    holding_days: int,
+    profile: SimulationProfile,
+    universe_filters: Sequence[str] = (),
+    transaction_costs: TransactionCostModel | None = None,
+    composite_name: str | None = None,
+    group_count: int = 5,
+    overlay_root: Path | None = None,
+    factor_values_root: Path | None = None,
+    factor_values_manifest_root: Path | None = None,
+    include_partial_final_period: bool = False,
+    panel: pd.DataFrame | None = None,
+) -> CompositeBacktestRun:
+    """Materialize the composite and drive the shipped engine by id (P4).
+
+    ``profile`` is the SHARED profile the members were fetched with (it may
+    carry ``decay_days > 1``); the engine-driving profile is pinned to
+    ``decay_days=0`` here, structurally (LA-1) — decay is a member-level
+    transform applied exactly once before combination, and the precomputed
+    read path applies the profile decay unconditionally, so a non-zero value
+    would EWMA the composite a second time. ``holding_days`` is REQUIRED
+    with no ``horizon_days`` fallback (RF-5). The run targets a fresh
+    per-run overlay (created under ``artifact_root`` when not supplied;
+    a supplied ``overlay_root`` must be dedicated to this run — it is
+    deleted on failure). After the engine run the realized schedule is
+    verified against the shared grid (RB-5) — a mismatch is a hard
+    :class:`GridFidelityError`.
+
+    On any exception after materialization begins, the registered
+    definition is removed (or a pre-existing definition restored, mirroring
+    the single-factor validation restore pattern) and the per-run overlay
+    deleted. On success the definition stays in ``factor_root`` as a
+    first-class factor; retention of accumulated composite definitions is a
+    recorded deferred question. ``panel``, when provided, must be the
+    ``data_root`` panel; it only feeds the grid-fidelity date calendar.
+    """
+
+    _require_composite_id(composite_id)
+    _require_holding_days(holding_days)
+    engine_profile = profile if profile.decay_days == 0 else replace(profile, decay_days=0)
+    if overlay_root is None:
+        run_overlay = create_composite_overlay_root(artifact_root, composite_id)
+    else:
+        run_overlay = Path(overlay_root).expanduser()
+        run_overlay.mkdir(parents=True, exist_ok=True)
+    _require_disjoint_overlay(run_overlay, factor_root=factor_root, data_root=data_root)
+
+    repository = FactorRepository(factor_root)
+    previous_definition = _existing_definition(repository, composite_id)
+    try:
+        materialized = materialize_composite(
+            composite_scores,
+            factor_root=factor_root,
+            overlay_root=run_overlay,
+            composite_id=composite_id,
+            holding_days=holding_days,
+            universe_filters=universe_filters,
+            name=composite_name,
+        )
+        result = run_factor_backtest(
+            composite_id,
+            factor_root=factor_root,
+            data_root=data_root,
+            artifact_root=artifact_root,
+            holding_days=holding_days,
+            group_count=group_count,
+            simulation_profile=engine_profile,
+            transaction_costs=transaction_costs,
+            factor_values_root=factor_values_root,
+            factor_values_overlay_root=run_overlay,
+            factor_values_manifest_root=factor_values_manifest_root,
+            sample_role=EXTERNAL_OOS_ROLE,
+            include_partial_final_period=include_partial_final_period,
+        )
+        working_panel = apply_test_period(
+            panel if panel is not None else LocalPanelDataProvider(data_root).load_panel(),
+            engine_profile,
+        )
+        dates = sorted(working_panel["trade_date"].drop_duplicates())
+        expected_signal_dates = assert_engine_schedule_matches_grid(
+            result.resolved_schedule,
+            dates,
+            delay=engine_profile.execution_delay_days,
+            holding=holding_days,
+            include_partial_final_period=include_partial_final_period,
+        )
+    except Exception:
+        _cleanup_composite_artifacts(
+            repository,
+            composite_id=composite_id,
+            previous_definition=previous_definition,
+            overlay_root=run_overlay,
+        )
+        raise
+    return CompositeBacktestRun(
+        composite_id=composite_id,
+        result=result,
+        materialized=materialized,
+        engine_profile=engine_profile,
+        overlay_root=run_overlay,
+        expected_signal_dates=expected_signal_dates,
+    )
+
+
+def _require_composite_id(composite_id: str) -> str:
+    if not isinstance(composite_id, str) or not _COMPOSITE_ID_RE.fullmatch(composite_id):
+        raise ValueError(
+            "composite_id must match COMPOSITE_<10-16 uppercase hex chars> "
+            f"(colon-free, catalog-canonical — RF-1/RB-10); got: {composite_id!r}"
+        )
+    return composite_id
+
+
+def _require_holding_days(value: object) -> int:
+    """RF-5: ``holding_days`` is required — no ``horizon_days`` fallback."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(
+            "holding_days is required and must be a positive integer for a "
+            "composite backtest; there is no horizon_days fallback (RF-5)"
+        )
+    return value
+
+
+def _require_disjoint_overlay(overlay_root: Path, *, factor_root: Path, data_root: Path) -> None:
+    """Refuse overlay locations that would let failure cleanup touch source roots."""
+
+    overlay = Path(overlay_root).expanduser().resolve()
+    for label, root in (("factor_root", factor_root), ("data_root", data_root)):
+        resolved = Path(root).expanduser().resolve()
+        if overlay == resolved or overlay.is_relative_to(resolved) or resolved.is_relative_to(overlay):
+            raise ValueError(
+                f"overlay_root must be disjoint from {label}: overlay={overlay} {label}={resolved}"
+            )
+
+
+def _existing_definition(repository: FactorRepository, factor_id: str) -> FactorDefinition | None:
+    try:
+        return repository.get(factor_id)
+    except FileNotFoundError:
+        return None
+
+
+def _cleanup_composite_artifacts(
+    repository: FactorRepository,
+    *,
+    composite_id: str,
+    previous_definition: FactorDefinition | None,
+    overlay_root: Path,
+) -> None:
+    """Failure cleanup: remove the definition and the per-run overlay.
+
+    Mirrors the single-factor ``_restore_factor_after_failed_validation``
+    pattern: a pre-existing definition under the same id is restored, a
+    fresh one is deleted. The per-run overlay is removed best-effort
+    (``ignore_errors``) so cleanup never masks the original failure.
+    """
+
+    try:
+        if previous_definition is None:
+            repository.delete(composite_id)
+        else:
+            repository.save(previous_definition)
+    finally:
+        shutil.rmtree(overlay_root, ignore_errors=True)
