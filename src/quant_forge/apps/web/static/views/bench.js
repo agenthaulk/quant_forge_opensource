@@ -4,8 +4,17 @@
  * status-pill convention for factor error rows (text label always present —
  * color is never the sole signal). */
 
-import { esc, metricCellHtml, metricStatusSuffix } from '../metric.js';
+import { esc, metricCellHtml, metricStatusSuffix, num } from '../metric.js';
+import { barChart, emptyState } from './charts.js';
 import { fetchPanelJson } from '../api.js';
+
+// C8: the canonical factor-quality metric to chart across factors, in priority
+// order. The first metric that at least one factor reports as available is
+// charted; a factor whose entry is missing or blocked becomes an "n/a" tick,
+// never a 0 bar. A run where NO factor reports any canonical metric as
+// available renders an explicit empty-state chart instead — a silent
+// omission would hide that every metric was withheld (FP-4-adjacent).
+const BENCH_CHART_METRIC_PRIORITY = ['rank_ic_mean', 'rank_icir', 'rank_ic_t_stat'];
 
 const benchResultEl = document.getElementById('bench-result');
 
@@ -47,10 +56,29 @@ export function renderBench(payload) {
       </tr>`;
   }).join('');
   const summary = latest.summary || {};
+  const chartMetric = BENCH_CHART_METRIC_PRIORITY.find(name =>
+    factors.some(row => {
+      const entry = (row.metrics || {})[name];
+      return entry && entry.status === 'available';
+    })
+  );
+  const metricChart = `<div class="qf-chart-row">${chartMetric
+    ? barChart(
+        factors.map(row => {
+          const entry = (row.metrics || {})[chartMetric];
+          const status = entry && entry.status;
+          const value = entry && (status === 'available' || status === 'legacy') ? entry.value : null;
+          return { label: row.factor_id || '', value };
+        }),
+        { ariaLabel: `Benchmark ${chartMetric} 对比`, yFormat: value => num(value, 4), emptyMessage: '暂无对比' }
+      )
+    : emptyState('Benchmark 指标对比', { message: '无可用指标 / metrics withheld' })
+  }</div>`;
   benchResultEl.innerHTML = `
     <div class="panel">
       <h3>Benchmark · ${esc(latest.run_id || '')}</h3>
       <p class="meta">${esc(latest.created_at || '')} · evaluated ${esc(summary.evaluated_factor_count ?? 'n/a')} · errors ${esc(summary.error_factor_count ?? 'n/a')} · 指标不可用时展示状态标签，不显示为 0。</p>
+      ${metricChart}
       <table class="comparison-table">
         <thead>
           <tr>

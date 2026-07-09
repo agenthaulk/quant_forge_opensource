@@ -207,7 +207,7 @@ def test_metric_module_gains_only_additive_status_helpers() -> None:
     assert "export function metricCellHtml(" in metric_js
     # Blocked statuses render their label; a missing entry renders
     # not_recorded; null is never coerced to a scalar.
-    assert '<span class="metric-blocked">${esc(status)}</span>' in metric_js
+    assert '<span class="metric-blocked" title="${esc(status)}">${esc(status)}</span>' in metric_js
     assert '<span class="metric-missing">not_recorded</span>' in metric_js
     assert "status-badge--legacy" in metric_js
 
@@ -421,10 +421,12 @@ def test_factor_report_is_componentized_under_stable_section_ids() -> None:
         'id="report-staggered"',
         'class="anchor-nav"',
         'class="eyebrow"',
-        "sparklineSvg(",
+        # CP9-1: the staggered #report-staggered NAV row is now an honest
+        # inline-SVG line chart (charts.js) instead of the spark sparkline.
+        "lineChart(",
     ):
         assert marker in factor_js, marker
-    assert "from './spark.js'" in factor_js
+    assert "from './charts.js'" in factor_js
 
 
 def test_research_gate_markers_carry_text_labels() -> None:

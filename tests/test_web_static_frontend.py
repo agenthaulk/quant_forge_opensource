@@ -47,6 +47,7 @@ EXPECTED_STATIC_MODULES = (
     "app.js",
     "metric.js",
     "views/bench.js",
+    "views/charts.js",
     "views/data.js",
     "views/docs.js",
     "views/extensions.js",
@@ -343,9 +344,12 @@ def test_metric_renderer_helpers_defined_once_in_metric_module(web_app) -> None:
         total = sum(text.count(definition) for text in served.values())
         assert total == 1, f"{definition} defined {total} times"
         assert definition in served["metric.js"]
-    # FP-4: the shared renderer keeps null-not-zero and status-over-scalar.
+    # FP-4: the shared renderer keeps null-not-zero and status-over-scalar. A
+    # withheld status now renders through statusLabelHtml (a titled span so long
+    # labels wrap inside a tile) — still its label, never a fabricated scalar.
     metric_js = served["metric.js"]
-    assert "if (status && status !== 'available' && status !== 'legacy') return esc(status);" in metric_js
+    assert "if (status && status !== 'available' && status !== 'legacy') return statusLabelHtml(status);" in metric_js
+    assert 'class="metric-status" title="${esc(status)}">${esc(status)}</span>' in metric_js
     assert "value === undefined || value === null" in metric_js
 
 

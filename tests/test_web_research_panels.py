@@ -322,6 +322,92 @@ def test_bench_endpoint_preserves_null_metric_values_with_status(web_config, web
     assert metrics["rank_ic_mean"] == AVAILABLE_METRIC
 
 
+def test_bench_all_unavailable_metrics_reach_client_and_render_explicit_empty_state(web_config, web_app) -> None:
+    """CP9-1 C8 all-unavailable branch: a bench run where NO factor reports any
+    canonical chart metric (rank_ic_mean / rank_icir / rank_ic_t_stat) as
+    available must (a) arrive with every canonical metric non-available and
+    null-valued — never coerced to 0 — and (b) hit the bench.js branch that
+    renders the explicit charts.js empty-state instead of silently dropping
+    the chart (string-contract pins on the served module, same convention as
+    test_index_html_contains_research_history_and_bench_panels)."""
+
+    run_id = "bench-20260106T000000000000Z-abcdef01"
+    created_at = "2026-01-06T00:00:00+00:00"
+    json_rel = f"bench/{run_id}.json"
+    blocked_metric = {"value": None, "unit": "", "status": "blocked_missing_data", "observation_count": 0}
+    payload = {
+        "schema_version": "qf.bench.v1",
+        "run_id": run_id,
+        "created_at": created_at,
+        "config_fingerprint": "1" * 64,
+        "shared_config": {"kind": "bench", "factor_ids": ["FTR_A", "FTR_B"]},
+        "factors": [
+            {
+                "factor_id": "FTR_A",
+                "status": "evaluated",
+                "metrics": {
+                    "rank_ic_mean": dict(blocked_metric),
+                    "rank_icir": dict(blocked_metric),
+                    "rank_ic_t_stat": dict(NULL_VALUE_METRIC),
+                },
+                "warnings_count": 1,
+                "artifact_path_rel": "evaluations/FTR_A.json",
+            },
+            {
+                "factor_id": "FTR_B",
+                "status": "error",
+                "error": "factor load failed",
+                "metrics": {},
+                "warnings_count": 0,
+            },
+        ],
+        "summary": {"evaluated_factor_count": 1, "error_factor_count": 1},
+    }
+    artifact_path = web_config.paths.artifact_root / json_rel
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(json.dumps(payload), encoding="utf-8")
+    _append_run(
+        web_config,
+        run_id=run_id,
+        kind="bench",
+        factor_ids=["FTR_A", "FTR_B"],
+        created_at=created_at,
+        artifact_paths_rel=(json_rel,),
+        fingerprint="1" * 64,
+    )
+
+    status, content_type, body = _get(f"{web_app}/api/bench")
+
+    assert status == 200
+    assert content_type == JSON_CONTENT_TYPE
+    api_payload = json.loads(body.decode("utf-8"))
+    latest = api_payload["latest"]
+    assert latest["available"] is True
+    assert latest["run_id"] == run_id
+    # Precondition of the all-unavailable branch: no factor reports any
+    # canonical metric as available, and every carried value stays null.
+    canonical_names = ("rank_ic_mean", "rank_icir", "rank_ic_t_stat")
+    assert latest["factors"], "fixture must exercise the populated-factors path"
+    for factor_row in latest["factors"]:
+        for name in canonical_names:
+            entry = (factor_row.get("metrics") or {}).get(name)
+            if entry is not None:
+                assert entry["status"] != "available"
+                assert entry["value"] is None
+
+    # String-contract on the served renderer: the no-available-metric branch
+    # mounts the explicit charts.js empty-state with the withheld-metrics
+    # reason label inside the chart row — never an empty string.
+    bench_js = (web_server.STATIC_ROOT / "views" / "bench.js").read_text(encoding="utf-8")
+    assert "import { barChart, emptyState } from './charts.js';" in bench_js
+    assert ": emptyState('Benchmark 指标对比', { message: '无可用指标 / metrics withheld' })" in bench_js
+    # The chart row mounts unconditionally with the ternary INSIDE it, so the
+    # no-available-metric branch can never collapse to an empty string (the
+    # old silent-omission form was `const metricChart = chartMetric ? ... : '';`).
+    assert 'const metricChart = `<div class="qf-chart-row">${chartMetric' in bench_js
+    assert "const metricChart = chartMetric" not in bench_js
+
+
 def test_bench_endpoint_reports_missing_artifact_without_failing(web_config, web_app) -> None:
     _write_bench_run(web_config, write_artifact=False)
 

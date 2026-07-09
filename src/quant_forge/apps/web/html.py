@@ -571,6 +571,14 @@ def _index_html(
       letter-spacing: .1em; text-transform: uppercase; }}
     .sparkline-row {{ margin: 0 0 10px; }}
     .sparkline {{ display: block; max-width: 100%; color: var(--accent-2); }}
+    /* CP9-1 inline-SVG charts (charts.js). SVG <text> inherits the app's
+       system sans (D8: no external font) instead of the SVG-default serif;
+       all colors come from the theme tokens the module references. */
+    .qf-chart {{ display: block; max-width: 100%; height: auto; color: var(--accent-2); }}
+    .qf-chart text {{ font-family: inherit; font-size: 11px; }}
+    .qf-chart .qf-note {{ font-size: 10px; }}
+    .qf-chart--empty text {{ font-size: 12px; }}
+    .qf-chart-row {{ margin: 0 0 12px; }}
     .status-pill {{ display: inline-block; padding: 3px 9px; border: 1px solid var(--line);
       border-radius: 999px; font-size: 10px; font-weight: 800; }}
     .status-pill--ok      {{ background: var(--ok-wash);   border-color: var(--ok-line);   color: var(--accent-2); }}
@@ -581,6 +589,16 @@ def _index_html(
       color: var(--warn); border-radius: 5px; padding: 1px 5px; font-size: 10px; font-weight: 800; }}
     .metric-blocked {{ color: var(--muted); font-weight: 400; }}
     .metric-missing {{ color: var(--faint); }}
+    /* Long status labels (e.g. insufficient_sample) never overflow their metric
+       cell: they wrap and expose the full token via the title attribute. Inside
+       a metric tile the status renders as a smaller muted label — a status is
+       not a number, so it sheds the big mono value type — keeping the FP-4
+       contract that a withheld metric shows its label, never a fabricated 0. */
+    .metric-status {{ overflow-wrap: anywhere; }}
+    .metric-blocked, .metric-missing {{ overflow-wrap: anywhere; }}
+    .tile b .metric-status, .tile b .metric-blocked, .tile b .metric-missing {{
+      display: block; font-family: inherit; font-size: 13px; font-weight: 700;
+      line-height: 1.25; letter-spacing: 0; color: var(--muted); }}
     .notice {{ border: 1px solid var(--line); border-left: 4px solid var(--muted);
       border-radius: 8px; padding: 10px 12px; margin: 0 0 10px; font-size: 13px; }}
     .notice.warn {{ border-left-color: var(--warn); background: var(--warn-wash); color: var(--ink); }}
