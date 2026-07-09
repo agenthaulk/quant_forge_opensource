@@ -44,6 +44,13 @@ _CONTRIBUTION_POINT_ROWS: tuple[tuple[str, str, str], ...] = (
     ("agent.context_pack", "supported", "declarative knowledge pack; no workflow execution"),
     ("docs.pack", "supported", "declarative documentation set"),
     (
+        "integration.factor_backend",
+        "supported",
+        "declarative factor-backend metadata only; executable binding happens "
+        "exclusively via the reviewed static import table (D-iv/CP0), so a "
+        "declared id absent from that table stays declared-but-unbound",
+    ),
+    (
         "data.provider_adapter",
         "reserved",
         "reserved; in-repo adapter implementation permitted per D7a, no dynamic loading",

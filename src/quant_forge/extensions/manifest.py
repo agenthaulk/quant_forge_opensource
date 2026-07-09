@@ -30,6 +30,15 @@ MVP_CONTRIBUTION_POINTS: tuple[str, ...] = (
     "docs.pack",
 )
 
+# Metadata-only integration vocabulary (D-iv/CP0): a contribution here
+# declares that a backend exists; executable binding happens exclusively via
+# the reviewed static import table in quant_forge.integrations.registry. An
+# id declared in a manifest but absent from that table is valid metadata,
+# surfaced as declared-but-unbound.
+INTEGRATION_CONTRIBUTION_POINTS: tuple[str, ...] = (
+    "integration.factor_backend",
+)
+
 RESERVED_CONTRIBUTION_POINTS: tuple[str, ...] = (
     "data.provider_adapter",
     "data.pit_resolver",
@@ -38,12 +47,15 @@ RESERVED_CONTRIBUTION_POINTS: tuple[str, ...] = (
     "lab.view",
 )
 
-ALL_CONTRIBUTION_POINTS: tuple[str, ...] = MVP_CONTRIBUTION_POINTS + RESERVED_CONTRIBUTION_POINTS
+ALL_CONTRIBUTION_POINTS: tuple[str, ...] = (
+    MVP_CONTRIBUTION_POINTS + INTEGRATION_CONTRIBUTION_POINTS + RESERVED_CONTRIBUTION_POINTS
+)
 
 EXTENSION_KINDS: tuple[str, ...] = (
     "data-extension",
     "docs-extension",
     "agent-extension",
+    "integration-extension",
     "mixed",
 )
 
