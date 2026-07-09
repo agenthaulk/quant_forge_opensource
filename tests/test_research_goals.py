@@ -263,6 +263,45 @@ def test_completion_reverifies_evidence_on_disk(tmp_path: Path) -> None:
     assert store.complete_goal(goal.goal_id, recorded_at=RECORDED_AT)["to_status"] == "complete"
 
 
+def test_all_na_required_criteria_cannot_complete(tmp_path: Path) -> None:
+    # FP-2 (softer vacuous-completion variant): a goal whose EVERY required
+    # criterion is not_applicable_user_accepted has zero on-disk evidence and
+    # must not complete, even though every latest result is completion-eligible.
+    store = _store(tmp_path)
+    goal = _create_goal(store)
+    store.append_audit(
+        goal.goal_id, criterion_id="c1", result="not_applicable_user_accepted", recorded_at=RECORDED_AT
+    )
+    store.append_audit(
+        goal.goal_id, criterion_id="c2", result="not_applicable_user_accepted", recorded_at=RECORDED_AT
+    )
+
+    with pytest.raises(GoalCompletionError, match="no required criterion is backed by existing evidence"):
+        store.complete_goal(goal.goal_id, recorded_at=RECORDED_AT)
+
+    # The blocked attempt transitioned nothing.
+    assert store.effective_status(goal.goal_id) == "active"
+
+
+def test_one_evidence_backed_required_plus_na_completes(tmp_path: Path) -> None:
+    # A single required criterion backed by existing evidence is enough for the
+    # goal to complete even when the other required criterion is
+    # not_applicable_user_accepted.
+    store = _store(tmp_path)
+    goal = _create_goal(store)
+    rel = _evidence(store)
+    store.append_audit(
+        goal.goal_id, criterion_id="c1", result="satisfied", evidence_refs=(rel,), recorded_at=RECORDED_AT
+    )
+    store.append_audit(
+        goal.goal_id, criterion_id="c2", result="not_applicable_user_accepted", recorded_at=RECORDED_AT
+    )
+
+    row = store.complete_goal(goal.goal_id, recorded_at=RECORDED_AT)
+    assert row["to_status"] == "complete"
+    assert store.effective_status(goal.goal_id) == "complete"
+
+
 # ---------------------------------------------------------------------------
 # Redaction and free-text safety
 # ---------------------------------------------------------------------------

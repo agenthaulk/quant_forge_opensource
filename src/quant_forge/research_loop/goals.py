@@ -339,6 +339,7 @@ class ResearchGoalStore:
             # all-optional goal must never complete vacuously).
             raise GoalCompletionError(f"goal {goal_id} has no required criteria and cannot complete")
         failures: list[str] = []
+        evidence_backed = 0
         latest_rows = self._latest_criterion_rows(goal_id)
         for criterion in goal.criteria:
             if not criterion.required:
@@ -353,11 +354,24 @@ class ResearchGoalStore:
                 continue
             if result in EVIDENCE_REQUIRED_RESULTS:
                 refs = [str(ref) for ref in row.get("evidence_refs") or []]
-                if not any(self._evidence_exists(ref) for ref in refs):
+                if any(self._evidence_exists(ref) for ref in refs):
+                    # FP-2: at least one required criterion is backed by
+                    # on-disk evidence, so completion is not vacuous.
+                    evidence_backed += 1
+                else:
                     failures.append(
                         f"required criterion {criterion.criterion_id} cites no evidence ref "
                         "that exists under artifact_root"
                     )
+        if not failures and evidence_backed == 0:
+            # FP-2 (softer vacuous-completion variant): every required
+            # criterion is not_applicable_user_accepted, so the goal would
+            # complete with zero on-disk evidence. Require at least one
+            # required criterion to be backed by existing evidence.
+            failures.append(
+                "no required criterion is backed by existing evidence "
+                "(every required criterion is not_applicable_user_accepted)"
+            )
         if failures:
             raise GoalCompletionError(f"goal {goal_id} cannot complete: " + "; ".join(failures))
         return self._append_status_row(
