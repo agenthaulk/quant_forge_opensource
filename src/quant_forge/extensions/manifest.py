@@ -213,11 +213,13 @@ def _external_url_issues(payload: dict) -> list[ManifestIssue]:
     issues: list[ManifestIssue] = []
 
     def _contains_url(text: str) -> bool:
-        # URL schemes are case-insensitive, so the rejected-outright contract
-        # (module docstring) must catch HTTPS:// the same as https://; the
-        # scheme separator keeps names like "httpx" from over-matching.
+        # The rejected-outright contract (module docstring) is scheme-general:
+        # ANY URL scheme (http, https, ftp, s3, ws, ...) is caught, not just
+        # http(s). Schemes are case-insensitive, so match against the folded
+        # text; requiring the "://" separator keeps bare names like "httpx"
+        # from over-matching.
         folded = text.casefold()
-        return "http://" in folded or "https://" in folded
+        return re.search(r"[a-z][a-z0-9+.\-]*://", folded) is not None
 
     def _walk(node: object, locator: str) -> None:
         if isinstance(node, str):

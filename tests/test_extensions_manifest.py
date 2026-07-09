@@ -277,6 +277,26 @@ def test_external_url_rejected_case_insensitively() -> None:
     assert _codes(_manifest(description="shttp is mentioned without a scheme")) == []
 
 
+def test_external_url_rejected_for_non_http_schemes() -> None:
+    # The rejected-outright contract is scheme-general (D7 endpoints-via-env
+    # only): ftp://, s3://, ws://, and any other scheme reject just like
+    # http(s)://, so a contribution cannot smuggle a non-http endpoint in.
+    issues = validate_extension_manifest(
+        _manifest(
+            contributes=[
+                {"id": "c_one", "point": "docs.pack", "config": {"src": "ftp://host/x"}}
+            ]
+        )
+    )
+    assert issues == [ManifestIssue("external_url_rejected", "contributes[0].config.src")]
+    for scheme_value in ("s3://bucket/x", "ws://host/socket", "gopher://host/x"):
+        assert _codes(_manifest(description=f"see {scheme_value}")) == [
+            "external_url_rejected"
+        ], scheme_value
+    # A bare package name with no scheme separator still does not over-match.
+    assert _codes(_manifest(description="uses the httpx client naming")) == []
+
+
 def test_redactable_value_rejected_for_paths_and_secret_pairs() -> None:
     home_path = str(Path.home() / "marker_cache")
     issues = validate_extension_manifest(_manifest(description=f"cache under {home_path}"))
