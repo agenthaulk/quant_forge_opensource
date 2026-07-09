@@ -15,6 +15,7 @@ from __future__ import annotations
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -80,7 +81,23 @@ def _static_asset(url_path: str) -> tuple[bytes, str]:
     content_type = STATIC_CONTENT_TYPES.get(candidate.suffix)
     if content_type is None or not candidate.is_file():
         raise KeyError(f"unknown static asset: {url_path}")
-    return candidate.read_bytes(), content_type
+    # Authorize-then-open guard (same pattern as _read_bench_artifact /
+    # _docs_document_payload in api.py): O_NOFOLLOW fails the open (ELOOP ->
+    # OSError) if the final path component was swapped for a symlink after the
+    # resolve()-based containment check above, closing the TOCTOU that a plain
+    # read_bytes() would leave open. Any OSError -- the symlink race, or the
+    # file disappearing after the is_file() check -- maps to the same "unknown
+    # static asset" KeyError (HTTP 404) the missing/invalid cases already use.
+    try:
+        fd = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        raise KeyError(f"unknown static asset: {url_path}") from None
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            body = handle.read()
+    except OSError:
+        raise KeyError(f"unknown static asset: {url_path}") from None
+    return body, content_type
 
 
 def create_local_web_server(

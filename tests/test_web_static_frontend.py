@@ -20,11 +20,14 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import threading
 import urllib.request
+from pathlib import Path
 
 import pytest
 
+import quant_forge.apps.web.routing as web_routing
 import quant_forge.apps.web.server as web_server
 from quant_forge.apps.web.server import create_local_web_server
 from quant_forge.config import QuantForgeConfig, WebSettings
@@ -349,3 +352,72 @@ def test_metric_renderer_helpers_defined_once_in_metric_module(web_app) -> None:
 def test_server_module_re_exports_static_frontend_names() -> None:
     for name in ("STATIC_ROOT", "STATIC_URL_PREFIX", "STATIC_CONTENT_TYPES", "_static_asset", "_page_config_json"):
         assert hasattr(web_server, name), f"missing re-export: {name}"
+
+
+def test_static_asset_rejects_symlink_escape_and_serves_real_module(monkeypatch, tmp_path) -> None:
+    """D8 containment: a symlink inside ``static/`` that points OUTSIDE the
+    root is rejected (its target's bytes are never served), while a real
+    whitelisted module beside it is still served.
+
+    This locks in the end-to-end containment contract and mirrors the sibling
+    guards' symlink-escape tests (``_read_bench_artifact``,
+    ``_docs_document_payload``). The ``resolve()``+``is_relative_to``
+    pre-check already rejects a *statically present* escape symlink, so this
+    case holds both before and after the O_NOFOLLOW hardening; the race-window
+    regression is pinned separately in
+    ``test_static_asset_rejects_symlink_swapped_after_containment_check``.
+    """
+
+    static_root = tmp_path / "static"
+    static_root.mkdir()
+    (static_root / "app.js").write_bytes(b"export const ok = 1;\n")
+    secret = tmp_path / "secret.js"
+    secret.write_bytes(b"export const SECRET = 'leak';\n")
+    (static_root / "evil.js").symlink_to(secret)
+    monkeypatch.setattr(web_routing, "STATIC_ROOT", static_root)
+
+    body, content_type = web_routing._static_asset("/static/app.js")
+    assert body == b"export const ok = 1;\n"
+    assert content_type == JS_CONTENT_TYPE
+
+    with pytest.raises(KeyError):
+        web_routing._static_asset("/static/evil.js")
+
+
+def test_static_asset_rejects_symlink_swapped_after_containment_check(monkeypatch, tmp_path) -> None:
+    """TOCTOU regression: if the final path component is swapped for a symlink
+    AFTER the ``resolve()``+``is_relative_to`` containment check, the
+    O_NOFOLLOW open guard must refuse it instead of following the link and
+    leaking a file outside the static root.
+
+    The pre-hardening code called ``candidate.read_bytes()``, which follows a
+    freshly-planted symlink; against that code this test would *return the
+    outside file's bytes* (no exception) and so fail the ``pytest.raises``
+    below. With the O_NOFOLLOW open the swapped symlink maps to the same
+    ``KeyError`` (HTTP 404) as a missing asset. The race is made deterministic
+    by swapping the file during the ``is_file()`` check --- the last step
+    before the read --- reproducing the swap without a concurrent attacker.
+    """
+
+    static_root = tmp_path / "static"
+    static_root.mkdir()
+    (static_root / "race.js").write_bytes(b"export const real = 1;\n")
+    secret = tmp_path / "secret.js"
+    secret.write_bytes(b"export const SECRET = 'leak';\n")
+    monkeypatch.setattr(web_routing, "STATIC_ROOT", static_root)
+
+    real_is_file = Path.is_file
+
+    def racing_is_file(self):
+        result = real_is_file(self)
+        # Swap the just-validated regular file for a symlink pointing outside
+        # the static root, exactly once, at the last check before the read.
+        if self.name == "race.js" and not self.is_symlink():
+            os.unlink(self)
+            os.symlink(secret, self)
+        return result
+
+    monkeypatch.setattr(Path, "is_file", racing_is_file)
+
+    with pytest.raises(KeyError):
+        web_routing._static_asset("/static/race.js")
