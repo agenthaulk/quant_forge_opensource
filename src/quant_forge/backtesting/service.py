@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
 
@@ -44,6 +45,28 @@ PARTIAL_FINAL_PERIOD = "PARTIAL_FINAL_PERIOD"
 FINAL_PARTIAL_PERIOD_EXCLUDED = "FINAL_PARTIAL_PERIOD_EXCLUDED"
 SEGMENT_BOUNDARY_PURGED = "SEGMENT_BOUNDARY_PURGED"
 POSITIONS_LOST_BEFORE_EXIT = "POSITIONS_LOST_BEFORE_EXIT"
+REBALANCE_SKIPPED_NO_COVERAGE = "REBALANCE_SKIPPED_NO_COVERAGE"
+REBALANCE_SKIPPED_THIN = "REBALANCE_SKIPPED_THIN"
+
+
+def rebalance_indices(
+    dates: Sequence[object],
+    *,
+    delay: int,
+    holding: int,
+    start_signal_index: int,
+) -> list[int]:
+    """Signal-date indices of the non-overlapping rebalance grid (RB-5).
+
+    Single source of truth for the schedule grid: the engine loop iterates this
+    helper, and any consumer that must align with the traded grid (for example
+    a fitted-weight estimator) calls the same helper instead of deriving a
+    schedule independently. Returns exactly
+    ``list(range(start_signal_index, len(dates) - delay - 1, holding))`` —
+    the engine's historical inline expression, unchanged.
+    """
+
+    return list(range(start_signal_index, len(dates) - delay - 1, holding))
 
 
 def run_factor_backtest(
@@ -121,6 +144,12 @@ def run_factor_backtest(
     close = working_panel[["trade_date", "instrument", "close"]].copy()
     dates = sorted(working_panel["trade_date"].drop_duplicates())
     rows: list[dict[str, object]] = []
+    # Chronological schedule events: every traded period row plus every skipped
+    # rebalance stub (RB-7). Only `rows` drives the metric series; the events
+    # list only feeds resolved_schedule / rebalance_ledger visibility.
+    ledger_events: list[dict[str, object]] = []
+    skipped_no_coverage = 0
+    skipped_thin = 0
     grouped_returns: dict[str, list[float]] = {}
     previous_long: set[str] | None = None
     previous_short: set[str] | None = None
@@ -138,7 +167,9 @@ def run_factor_backtest(
     partial_periods = 0
     excluded_final_partial_period = False
     lost_positions_total = 0
-    for signal_index in range(start_signal_index, len(dates) - delay - 1, holding):
+    for signal_index in rebalance_indices(
+        dates, delay=delay, holding=holding, start_signal_index=start_signal_index
+    ):
         signal_date = dates[signal_index]
         entry_date = dates[signal_index + delay]
         scheduled_exit_index = signal_index + delay + holding
@@ -159,7 +190,25 @@ def run_factor_backtest(
         exit_date = dates[actual_exit_index]
         trading_days_held = int(actual_exit_index - (signal_index + delay))
         signal = scores[scores["trade_date"] == signal_date].dropna(subset=["score"])
+        scheduled_exit_label = (
+            dates[scheduled_exit_index].date().isoformat() if scheduled_exit_index < len(dates) else None
+        )
         if signal.empty:
+            # RB-7: a scheduled rebalance with no scored cross-section must stay
+            # visible as an explicit flat ledger stub instead of silently
+            # vanishing from the schedule. previous_* state is intentionally
+            # left untouched so the prior book remains the turnover reference
+            # for the next traded period.
+            ledger_events.append(
+                _skipped_rebalance_stub(
+                    signal_date=signal_date,
+                    entry_date=entry_date,
+                    scheduled_exit_date=scheduled_exit_label,
+                    exit_date=exit_date,
+                    skip_reason=REBALANCE_SKIPPED_NO_COVERAGE,
+                )
+            )
+            skipped_no_coverage += 1
             continue
         merged = signal.merge(
             _with_period_return(close, entry_date, exit_date),
@@ -167,9 +216,25 @@ def run_factor_backtest(
             how="inner",
         ).dropna(subset=["period_return"])
         if len(merged) < max(4, group_count):
+            # RB-7: same stub treatment when the matched cross-section is too
+            # thin to split into long/short/groups; flagged, never silent.
+            ledger_events.append(
+                _skipped_rebalance_stub(
+                    signal_date=signal_date,
+                    entry_date=entry_date,
+                    scheduled_exit_date=scheduled_exit_label,
+                    exit_date=exit_date,
+                    skip_reason=REBALANCE_SKIPPED_THIN,
+                )
+            )
+            skipped_thin += 1
             continue
         count = max(1, int(len(merged) * top_quantile))
-        ordered = merged.sort_values("score").reset_index(drop=True)
+        # RB-3: stable mergesort with an explicit instrument tie-break so tied
+        # scores yield a reproducible ordering (long/short membership and
+        # quantile groups) regardless of incoming row order. _group_returns
+        # consumes this same ordering.
+        ordered = merged.sort_values(["score", "instrument"], kind="mergesort").reset_index(drop=True)
         short_leg = ordered.head(count)
         long_leg = ordered.tail(count)
         short_return = float(short_leg["period_return"].mean())
@@ -279,7 +344,9 @@ def run_factor_backtest(
                 "daily_nav": period_nav,
             }
         )
+        ledger_events.append(rows[-1])
 
+    skipped_rebalances = skipped_no_coverage + skipped_thin
     gross_returns = np.array([float(row["gross_period_return"]) for row in rows], dtype=float)
     net_returns = np.array([float(row["net_period_return"]) for row in rows], dtype=float)
     # Exclude any partial final period from vol/Sharpe: those metrics scale by a
@@ -349,6 +416,22 @@ def run_factor_backtest(
                 (*warnings, "positions lost before scheduled exit realize at last available close")
             )
         )
+    if skipped_no_coverage:
+        warning_code_items.append(REBALANCE_SKIPPED_NO_COVERAGE)
+    if skipped_thin:
+        warning_code_items.append(REBALANCE_SKIPPED_THIN)
+    if skipped_rebalances:
+        warnings = tuple(
+            dict.fromkeys(
+                (
+                    *warnings,
+                    "scheduled rebalances without a tradable cross-section are kept as "
+                    "flat ledger stubs (zero return, no positions) and excluded from "
+                    "period-return statistics; the prior book remains the turnover "
+                    "reference for the next traded period",
+                )
+            )
+        )
     warning_codes = tuple(dict.fromkeys(warning_code_items))
     metrics = {
         "annualized_return": gross_summary["metrics"]["annualized_return"],
@@ -402,8 +485,10 @@ def run_factor_backtest(
         else None
     )
     tracking_error, information_ratio = _active_risk_metrics(daily_ledger)
-    resolved_schedule = tuple(_schedule_row(row) for row in rows)
-    rebalance_ledger = tuple(_rebalance_row(row) for row in rows)
+    # RB-7: schedule/ledger visibility covers every scheduled slot, including
+    # skipped stubs, in chronological order; metric series above use `rows` only.
+    resolved_schedule = tuple(_schedule_row(event) for event in ledger_events)
+    rebalance_ledger = tuple(_rebalance_row(event) for event in ledger_events)
     request_snapshot = {
         "factor_id": factor_id,
         "sample_role": sample_role,
@@ -470,6 +555,10 @@ def run_factor_backtest(
             "periods": len(rows),
             "completed_periods": completed_periods,
             "partial_periods": partial_periods,
+            "skipped_rebalances": skipped_rebalances,
+            "skipped_rebalance_dates": [
+                str(event["signal_date"]) for event in ledger_events if event.get("skipped")
+            ],
             "lost_positions": lost_positions_total,
             "exposure_days": exposure_days,
             "calendar_days": _calendar_days(rows),
@@ -563,6 +652,7 @@ def run_factor_backtest(
         return_series_kind="scheduled_horizon_daily_mark_to_market",
         completed_periods=completed_periods,
         partial_periods=partial_periods,
+        skipped_rebalances=skipped_rebalances,
         lost_positions=lost_positions_total,
         exposure_days=exposure_days,
         calendar_days=_calendar_days(rows),
@@ -869,6 +959,48 @@ def _active_risk_metrics(daily_ledger: list[dict[str, object]]) -> tuple[float |
     return tracking_error, information_ratio
 
 
+def _skipped_rebalance_stub(
+    *,
+    signal_date: pd.Timestamp,
+    entry_date: pd.Timestamp,
+    scheduled_exit_date: str | None,
+    exit_date: pd.Timestamp,
+    skip_reason: str,
+) -> dict[str, object]:
+    """Ledger stub for a scheduled rebalance that could not trade (RB-7).
+
+    The slot stays visible in the resolved schedule / rebalance ledger as an
+    explicitly flat period — zero gross/net period return, no positions, zero
+    executed turnover and cost — instead of silently vanishing. Stub rows never
+    enter the period-return series, completed-period counts, exposure days, or
+    NAV compounding; the previous book carries forward unchanged as the
+    turnover reference for the next traded period.
+    """
+
+    return {
+        "period_id": None,
+        "signal_date": signal_date.date().isoformat(),
+        "entry_date": entry_date.date().isoformat(),
+        "scheduled_exit_date": scheduled_exit_date,
+        "actual_exit_or_rebalance_date": exit_date.date().isoformat(),
+        "exit_date": exit_date.date().isoformat(),
+        "is_complete_period": False,
+        "is_partial_final_period": False,
+        "skipped": True,
+        "skip_reason": skip_reason,
+        "trading_days_held": 0,
+        "long_count": 0,
+        "short_count": 0,
+        "gross_period_return": 0.0,
+        "net_period_return": 0.0,
+        "transaction_cost": 0.0,
+        "turnover_rate": 0.0,
+        "initial_build_turnover": None,
+        "rebalance_turnover": None,
+        "replacement_rate": None,
+    }
+
+
 def _schedule_row(row: dict[str, object]) -> dict[str, object]:
     return {
         "period_id": row["period_id"],
@@ -879,6 +1011,9 @@ def _schedule_row(row: dict[str, object]) -> dict[str, object]:
         "is_complete_period": row["is_complete_period"],
         "is_partial_final_period": row["is_partial_final_period"],
         "trading_days_held": row["trading_days_held"],
+        # RB-7: skipped slots stay visible with an explicit marking.
+        "skipped": bool(row.get("skipped", False)),
+        "skip_reason": row.get("skip_reason"),
     }
 
 
@@ -894,6 +1029,11 @@ def _rebalance_row(row: dict[str, object]) -> dict[str, object]:
         "rebalance_turnover": row["rebalance_turnover"],
         "replacement_rate": row["replacement_rate"],
         "transaction_cost": row["transaction_cost"],
+        # RB-7: the ledger shows the flat stub (zero returns) explicitly.
+        "gross_period_return": row["gross_period_return"],
+        "net_period_return": row["net_period_return"],
+        "skipped": bool(row.get("skipped", False)),
+        "skip_reason": row.get("skip_reason"),
     }
 
 

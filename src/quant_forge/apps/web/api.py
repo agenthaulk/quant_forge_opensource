@@ -1122,6 +1122,7 @@ def _backtest_payload(backtest: BacktestResult) -> dict[str, Any]:
         "return_series_kind": backtest.return_series_kind,
         "completed_periods": backtest.completed_periods,
         "partial_periods": backtest.partial_periods,
+        "skipped_rebalances": backtest.skipped_rebalances,
         "lost_positions": backtest.lost_positions,
         "exposure_days": backtest.exposure_days,
         "calendar_days": backtest.calendar_days,

@@ -339,6 +339,10 @@ class BacktestResult:
     daily_ledger: tuple[dict[str, object], ...] = field(default_factory=tuple)
     resolved_schedule: tuple[dict[str, object], ...] = field(default_factory=tuple)
     rebalance_ledger: tuple[dict[str, object], ...] = field(default_factory=tuple)
+    # RB-7: scheduled rebalances skipped for an empty/thin cross-section. They
+    # appear as flat stubs in resolved_schedule/rebalance_ledger but are
+    # excluded from `periods`, completed/partial counts, and metric series.
+    skipped_rebalances: int = 0
     request_snapshot: dict[str, object] = field(default_factory=dict)
 
 
