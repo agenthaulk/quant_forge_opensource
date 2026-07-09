@@ -70,13 +70,16 @@ def test_index_page_hosts_data_and_registry_tabs_and_panels(web_config) -> None:
         "因子目录加载后，定义详情与关联运行记录会展示在这里。",
     ):
         assert marker in html, marker
-    # Appended after the CP6-2 tabs so existing tab indices stay stable.
-    assert html.index('id="lab-tab-bench"') < html.index('id="lab-tab-data"')
+    # Tab order after the CP9-2 IA consolidation: workbench, history, data,
+    # registry, docs, extensions. The bench mount now precedes the history
+    # panel from inside the workbench panel's single-factor module.
+    assert html.index('id="lab-tab-history"') < html.index('id="lab-tab-data"')
     assert html.index('id="lab-tab-data"') < html.index('id="lab-tab-registry"')
-    assert html.index('id="bench-result"') < html.index('id="lab-panel-data"')
+    assert html.index('id="bench-result"') < html.index('id="lab-panel-history"')
     assert html.index('id="lab-panel-data"') < html.index('id="data-result"')
     assert html.index('id="data-result"') < html.index('id="lab-panel-registry"')
     assert html.index('id="lab-panel-registry"') < html.index('id="registry-result"')
+    # 6 top-level tabs + 2 workbench module tabs; 6 + 2 tabpanels.
     assert html.count('role="tab"') == 8
     assert html.count('role="tabpanel"') == 8
 
@@ -265,6 +268,9 @@ def test_registry_kind_filter_mirrors_run_kinds() -> None:
 def test_registry_metric_cells_render_only_via_metric_helpers() -> None:
     registry_js = _static_module_text("views/registry.js")
     assert "import { esc, metricCellHtml, metricStatusSuffix, valueOr } from '../metric.js';" in registry_js
+    # CP9-2: the detail-card formula highlighter arrives on its own import
+    # line — the pinned metric.js import stays byte-identical.
+    assert "import { formulaHtml } from './dsl.js';" in registry_js
     # The value part renders only when metric.js itself would render a
     # number (available/legacy); otherwise metricStatusSuffix carries the
     # single status label — never the same label twice in one pill.
@@ -337,10 +343,11 @@ def test_new_modules_never_format_or_zero_fill_metrics() -> None:
 
 def test_lab_module_adds_only_tab_ids_and_registry_hash_prefix() -> None:
     lab_js = _static_module_text("views/lab.js")
-    # Appended, not inserted: the CP6-2/CP6-3 id order stays byte-identical;
-    # CP6-4 appends the docs/extensions ids after the registry id.
-    assert "'lab-tab-factor', 'lab-tab-rd', 'lab-tab-history', 'lab-tab-bench'," in lab_js
-    assert "'lab-tab-data', 'lab-tab-registry', 'lab-tab-docs', 'lab-tab-extensions'" in lab_js
+    # CP9-2 TAB_IDS literal: six top-level tabs, workbench (kept id
+    # lab-tab-factor) first; the RD/Benchmark ids left the tab strip and
+    # survive only as LEGACY_HASH_ALIASES keys.
+    assert "'lab-tab-factor', 'lab-tab-history', 'lab-tab-data'," in lab_js
+    assert "'lab-tab-registry', 'lab-tab-docs', 'lab-tab-extensions'" in lab_js
     # The hash rules pin each entity charset client-side and keep the
     # anchor in the URL (same discipline as #report-* links). lab.js only
     # activates the owning tab; the view modules own selection.
@@ -376,8 +383,10 @@ def test_app_module_wires_data_and_registry_lazy_panels() -> None:
     assert "from './views/registry.js'" in app_js
     assert "const dataPanel = trackedPanelRefresh(refreshDataPanel);" in app_js
     assert "const registryPanel = trackedPanelRefresh(refreshRegistryPanel);" in app_js
-    assert "'lab-tab-data': dataPanel" in app_js
-    assert "'lab-tab-registry': registryPanel" in app_js
+    # CP9-2: lazyPanelsByTab values are arrays so one tab can own several
+    # lazy panels (the workbench tab owns the absorbed bench panel).
+    assert "'lab-tab-data': [dataPanel]" in app_js
+    assert "'lab-tab-registry': [registryPanel]" in app_js
     # Storing the control token refreshes all four token-gated panels.
     token_block_start = app_js.index("onControlTokenStored(")
     token_block = app_js[token_block_start : app_js.index("llmProviderSelect.addEventListener", token_block_start)]

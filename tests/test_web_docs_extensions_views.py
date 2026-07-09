@@ -74,6 +74,7 @@ def test_index_page_hosts_docs_and_extensions_tabs_and_panels(web_config) -> Non
     assert html.index('id="lab-panel-docs"') < html.index('id="docs-result"')
     assert html.index('id="docs-result"') < html.index('id="lab-panel-extensions"')
     assert html.index('id="lab-panel-extensions"') < html.index('id="extensions-result"')
+    # 6 top-level tabs + 2 workbench module tabs (CP9-2 IA consolidation).
     assert html.count('role="tab"') == 8
     assert html.count('role="tabpanel"') == 8
 
@@ -281,8 +282,10 @@ def test_app_module_wires_docs_and_extensions_lazy_panels() -> None:
     assert "from './views/extensions.js'" in app_js
     assert "const docsPanel = trackedPanelRefresh(refreshDocsPanel);" in app_js
     assert "const extensionsPanel = trackedPanelRefresh(refreshExtensionsPanel);" in app_js
-    assert "'lab-tab-docs': docsPanel" in app_js
-    assert "'lab-tab-extensions': extensionsPanel" in app_js
+    # CP9-2: lazyPanelsByTab values are arrays so one tab can own several
+    # lazy panels (the workbench tab owns the absorbed bench panel).
+    assert "'lab-tab-docs': [docsPanel]" in app_js
+    assert "'lab-tab-extensions': [extensionsPanel]" in app_js
     # Storing the control token refreshes all six token-gated panels.
     token_block_start = app_js.index("onControlTokenStored(")
     token_block = app_js[token_block_start : app_js.index("llmProviderSelect.addEventListener", token_block_start)]

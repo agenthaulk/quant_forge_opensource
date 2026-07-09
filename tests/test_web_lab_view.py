@@ -70,17 +70,15 @@ def _get(base_url: str, path: str) -> tuple[int, str, bytes]:
 
 def test_index_page_hosts_mounts_inside_lab_tab_panels(web_config) -> None:
     html = web_server._index_html(web_config)
-    # Tablist wiring: eight tabs (CP6-2 four + CP6-3 data/registry + CP6-4
-    # docs/extensions appended so existing tab indices stay stable), factor
-    # selected, panels labelled by tabs. The tablist spans non-Lab views
-    # since CP6-3, hence the label.
+    # Tablist wiring (CP9-2 IA consolidation): six top-level tabs — the
+    # workbench tab (kept id lab-tab-factor, relabelled LLM 因子工作台)
+    # absorbs the former RD 循环 / Benchmark tabs — plus the two workbench
+    # module tabs, so the page-wide role="tab" count stays 8.
     assert 'role="tablist"' in html
     assert 'aria-label="工作台视图"' in html
     for tab, panel in (
         ("lab-tab-factor", "lab-panel-factor"),
-        ("lab-tab-rd", "lab-panel-rd"),
         ("lab-tab-history", "lab-panel-history"),
-        ("lab-tab-bench", "lab-panel-bench"),
         ("lab-tab-data", "lab-panel-data"),
         ("lab-tab-registry", "lab-panel-registry"),
         ("lab-tab-docs", "lab-panel-docs"),
@@ -88,35 +86,49 @@ def test_index_page_hosts_mounts_inside_lab_tab_panels(web_config) -> None:
     ):
         assert f'id="{tab}" aria-controls="{panel}"' in html
         assert f'id="{panel}" aria-labelledby="{tab}"' in html
+    # 6 top-level + 2 workbench module tabs; 6 lab-panel-* + 2
+    # lab-module-panel-* tabpanels.
     assert html.count('role="tab"') == 8
     assert html.count('role="tabpanel"') == 8
-    tablist = html[html.index('role="tablist"') : html.index('id="error"')]
-    assert tablist.count('aria-selected="true"') == 1
-    assert tablist.count('aria-selected="false"') == 7
-    # Non-default panels start hidden; the default factor panel does not.
+    top_tablist = html[html.index('aria-label="工作台视图"') : html.index('aria-label="工作台模块"')]
+    assert top_tablist.count('role="tab"') == 6
+    assert top_tablist.count('aria-selected="true"') == 1
+    assert top_tablist.count('aria-selected="false"') == 5
+    module_nav = html[html.index('aria-label="工作台模块"') : html.index('id="lab-module-panel-single"')]
+    assert module_nav.count('role="tab"') == 2
+    assert module_nav.count('aria-selected="true"') == 1
+    # Non-default panels start hidden; the default factor panel and its
+    # default single-factor module panel do not; the reserved multi-factor
+    # module panel does.
     for panel in (
-        "lab-panel-rd",
         "lab-panel-history",
-        "lab-panel-bench",
         "lab-panel-data",
         "lab-panel-registry",
         "lab-panel-docs",
         "lab-panel-extensions",
+        "lab-module-panel-multi",
     ):
         start = html.index(f'id="{panel}"')
         assert "hidden" in html[start : html.index(">", start)], panel
-    factor_start = html.index('id="lab-panel-factor"')
-    assert "hidden" not in html[factor_start : html.index(">", factor_start)]
-    # Mount ids survive re-parenting: each mount sits inside its panel.
-    assert html.index('id="lab-panel-factor"') < html.index('id="result"')
+    for panel in ("lab-panel-factor", "lab-module-panel-single"):
+        start = html.index(f'id="{panel}"')
+        assert "hidden" not in html[start : html.index(">", start)], panel
+    # Mount ids survive re-parenting: each mount sits inside its panel; the
+    # absorbed bench comparison (#report-comparison) and RD stage
+    # (#workbench-rd) live inside the single-factor module.
+    assert html.index('id="lab-panel-factor"') < html.index('id="lab-module-single"')
+    assert html.index('id="lab-module-single"') < html.index('id="lab-module-panel-single"')
+    assert html.index('id="lab-module-panel-single"') < html.index('id="result"')
     assert html.index('id="result"') < html.index('id="staggered-result"')
-    assert html.index('id="staggered-result"') < html.index('id="lab-panel-rd"')
-    assert html.index('id="lab-panel-rd"') < html.index('id="rd-result"')
-    assert html.index('id="rd-result"') < html.index('id="lab-panel-history"')
+    assert html.index('id="staggered-result"') < html.index('id="report-comparison"')
+    assert html.index('id="report-comparison"') < html.index('id="bench-result"')
+    assert html.index('id="bench-result"') < html.index('id="workbench-rd"')
+    assert html.index('id="workbench-rd"') < html.index('id="rd-result"')
+    assert html.index('id="rd-result"') < html.index('id="lab-module-panel-multi"')
+    assert html.index('id="lab-module-panel-multi"') < html.index('id="multi-result"')
+    assert html.index('id="multi-result"') < html.index('id="lab-panel-history"')
     assert html.index('id="lab-panel-history"') < html.index('id="history-result"')
-    assert html.index('id="history-result"') < html.index('id="lab-panel-bench"')
-    assert html.index('id="lab-panel-bench"') < html.index('id="bench-result"')
-    assert html.index('id="bench-result"') < html.index('id="lab-panel-data"')
+    assert html.index('id="history-result"') < html.index('id="lab-panel-data"')
     assert html.index('id="lab-panel-data"') < html.index('id="data-result"')
     assert html.index('id="data-result"') < html.index('id="lab-panel-registry"')
     assert html.index('id="lab-panel-registry"') < html.index('id="registry-result"')
@@ -172,11 +184,20 @@ def test_lab_module_is_a_pure_client_side_controller() -> None:
     for marker in (
         "export function initLabTabs(",
         "export function activateTab(",
+        "export function activateModule(",
         "export function setTabDot(",
         "export function setStep(",
-        "'lab-tab-factor', 'lab-tab-rd', 'lab-tab-history', 'lab-tab-bench'",
+        # CP9-2 TAB_IDS literal: six top-level tabs, workbench first.
+        "'lab-tab-factor', 'lab-tab-history', 'lab-tab-data',",
+        "'lab-tab-registry', 'lab-tab-docs', 'lab-tab-extensions'",
+        "const MODULE_IDS = ['lab-module-single', 'lab-module-multi'];",
         "'report-hero'",
         "'report-staggered'",
+        "'report-comparison'",
+        "'workbench-rd'",
+        # Legacy hash migration: removed RD/Benchmark tab hashes map to
+        # their workbench anchors, never dead-ending.
+        "const LEGACY_HASH_ALIASES = { 'lab-tab-rd': 'workbench-rd', 'lab-tab-bench': 'report-comparison' };",
         "hashchange",
         "'ArrowRight'",
         "'ArrowLeft'",
@@ -221,16 +242,31 @@ def test_app_module_activates_tabs_from_existing_handlers_only() -> None:
     app_js = _static_module_text("app.js")
     assert "from './views/lab.js'" in app_js
     assert "initLabTabs({" in app_js
-    # Parse / validate / staggered flows land on the factor tab before the
-    # submit; RD flows land on the RD tab.
+    # Every job flow lands on the workbench tab AND forces the single-factor
+    # module active before the submit (CP9-2: results must never render into
+    # a hidden module panel). RD flows land on the absorbed #workbench-rd
+    # stage inside the same module.
     parse_click = app_js.index("button.addEventListener('click', async () => {")
     parse_activate = app_js.index("activateTab('lab-tab-factor');", parse_click)
     parse_submit = app_js.index("const payload = await submitParse(parserMode);", parse_click)
     assert parse_activate < parse_submit
+    assert app_js.index("activateModule('lab-module-single');", parse_click) < parse_submit
+    validate_click = app_js.index("validateButton.addEventListener('click', async () => {")
+    validate_submit = app_js.index("const payload = await submitValidation();", validate_click)
+    assert app_js.index("activateTab('lab-tab-factor');", validate_click) < validate_submit
+    assert app_js.index("activateModule('lab-module-single');", validate_click) < validate_submit
+    staggered_click = app_js.index("staggeredButton.addEventListener('click', async () => {")
+    staggered_submit = app_js.index("const payload = await submitStaggeredEntry();", staggered_click)
+    assert app_js.index("activateTab('lab-tab-factor');", staggered_click) < staggered_submit
+    assert app_js.index("activateModule('lab-module-single');", staggered_click) < staggered_submit
     rd_click = app_js.index("rdRun.addEventListener('click', async () => {")
-    rd_activate = app_js.index("activateTab('lab-tab-rd');", rd_click)
+    rd_activate = app_js.index("activateTab('lab-tab-factor');", rd_click)
     rd_submit = app_js.index("const job = await postJson('/api/jobs/research-run-once', rdPayload());", rd_click)
     assert rd_activate < rd_submit
+    assert app_js.index("activateModule('lab-module-single');", rd_click) < rd_submit
+    # RD run brings the absorbed RD stage into view (a result event; the
+    # schedule-start handler activates without scrolling).
+    assert app_js.index("getElementById('workbench-rd')", rd_click) < rd_submit
     # Staggered completion returns the user to the robustness section.
     assert "getElementById('report-staggered')" in app_js
 
@@ -264,9 +300,11 @@ def test_tab_activation_lazy_refresh_wiring_lives_in_app_module() -> None:
     lab_js = _static_module_text("views/lab.js")
     assert "initLabTabs({" in app_js
     assert "onActivate" in app_js
-    assert "'lab-tab-history': historyPanel" in app_js
-    assert "'lab-tab-bench': benchPanel" in app_js
-    assert "if (panel && (panel.isStale() || !panel.hasLoaded())) panel.refresh();" in app_js
+    # CP9-2: values are arrays so one tab can own several lazy panels — the
+    # workbench tab owns the absorbed bench comparison panel.
+    assert "'lab-tab-history': [historyPanel]" in app_js
+    assert "'lab-tab-factor': [benchPanel]" in app_js
+    assert "if (panel.isStale() || !panel.hasLoaded()) panel.refresh();" in app_js
     # lab.js purity is preserved: no requests, no panel refreshers.
     assert "fetch(" not in lab_js
     assert "/api/" not in lab_js
@@ -309,10 +347,12 @@ def test_job_completion_invalidates_dependent_panels() -> None:
     assert app_js.index("inFlight = null;", refresh_start) < app_js.index(
         settle_recheck, refresh_start
     )
-    assert (
-        "const JOB_DEPENDENT_PANEL_TABS = ['lab-tab-history', 'lab-tab-bench', 'lab-tab-registry'];"
-        in app_js
-    )
+    # CP9-2: tab/panel pairs — the bench panel moved onto the workbench tab
+    # with the absorbed comparison section, so the pairing is explicit.
+    assert "const JOB_DEPENDENT_PANELS = [" in app_js
+    assert "['lab-tab-history', historyPanel]" in app_js
+    assert "['lab-tab-factor', benchPanel]" in app_js
+    assert "['lab-tab-registry', registryPanel]" in app_js
     # Immediate refresh when the dependent tab is already active: the user
     # is looking at the stale panel at the moment the job completes.
     assert "if (tab && tab.getAttribute('aria-selected') === 'true') panel.refresh();" in app_js
@@ -379,15 +419,20 @@ def test_job_failure_branches_surface_error_and_replace_stale_placeholders() -> 
 
 
 def test_report_anchor_deep_link_keeps_the_report_fragment() -> None:
-    # A #report-* hash activates the factor tab without rewriting the URL
-    # fragment, so reload / back / copy-link keep the section anchor.
+    # A workbench anchor hash (#report-* / #workbench-rd) activates the
+    # factor tab AND forces the single-factor module active without
+    # rewriting the URL fragment, so reload / back / copy-link keep the
+    # section anchor (CP9-2: the anchor branch spans WORKBENCH_ANCHOR_IDS =
+    # report sections + the absorbed RD stage).
     lab_js = _static_module_text("views/lab.js")
     assert "const updateHash = !(options && options.updateHash === false);" in lab_js
     assert "if (updateHash && window.location.hash !== `#${tabId}`)" in lab_js
-    anchor_branch = lab_js.index("REPORT_SECTION_IDS.includes(target)")
+    assert "const WORKBENCH_ANCHOR_IDS = [...REPORT_SECTION_IDS, 'workbench-rd'];" in lab_js
+    anchor_branch = lab_js.index("WORKBENCH_ANCHOR_IDS.includes(target)")
     activate = lab_js.index("activateTab('lab-tab-factor', { updateHash: false });", anchor_branch)
+    module = lab_js.index("activateModule('lab-module-single', { updateHash: false });", anchor_branch)
     scroll = lab_js.index("scrollToReportSection(target);", anchor_branch)
-    assert activate < scroll
+    assert activate < module < scroll
 
 
 def test_missing_split_weighted_icir_renders_na_not_zero() -> None:
@@ -424,6 +469,12 @@ def test_factor_report_is_componentized_under_stable_section_ids() -> None:
         # CP9-1: the staggered #report-staggered NAV row is now an honest
         # inline-SVG line chart (charts.js) instead of the spark sparkline.
         "lineChart(",
+        # CP9-2: the report hero formula renders through the structural DSL
+        # highlighter, and the anchor nav reaches the absorbed bench
+        # comparison section.
+        "from './dsl.js'",
+        "formulaHtml(factor.formula)",
+        "'report-comparison', label: 'Benchmark 对比'",
     ):
         assert marker in factor_js, marker
     assert "from './charts.js'" in factor_js
@@ -444,3 +495,108 @@ def test_research_gate_markers_carry_text_labels() -> None:
     # The old color-only gate markers are gone from candidate cards.
     assert '<span class="ok">candidate</span>' not in research_js
     assert '<span class="err">draft</span>' not in research_js
+
+
+# ---------------------------------------------------------------------------
+# CP9-2 IA consolidation: legacy hash migration, module nav, DSL highlighting
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_tab_hashes_migrate_to_workbench_anchors() -> None:
+    # The removed RD 循环 / Benchmark tab hashes must never dead-end: the
+    # alias map rewrites them to their workbench anchors and normalizes the
+    # URL (replaceState) BEFORE the TAB_IDS branch, so the migrated target
+    # then routes through the workbench-anchor branch.
+    lab_js = _static_module_text("views/lab.js")
+    alias_map = lab_js.index(
+        "const LEGACY_HASH_ALIASES = { 'lab-tab-rd': 'workbench-rd', 'lab-tab-bench': 'report-comparison' };"
+    )
+    apply_hash = lab_js.index("function applyHash(hash) {")
+    assert alias_map < apply_hash
+    alias_lookup = lab_js.index("const alias = LEGACY_HASH_ALIASES[target];", apply_hash)
+    normalize = lab_js.index("window.history.replaceState(null, '', `#${alias}`);", apply_hash)
+    retarget = lab_js.index("target = alias;", apply_hash)
+    tab_branch = lab_js.index("if (TAB_IDS.includes(target))", apply_hash)
+    module_branch = lab_js.index("if (MODULE_IDS.includes(target))", apply_hash)
+    anchor_branch = lab_js.index("if (WORKBENCH_ANCHOR_IDS.includes(target))", apply_hash)
+    assert alias_lookup < normalize < retarget < tab_branch < module_branch < anchor_branch
+    # #lab-module-* hashes activate the workbench tab plus that module while
+    # keeping the fragment; activateModule owns the canonical hash (the
+    # default single module maps back to the workbench tab hash).
+    assert "activateModule(target, { updateHash: false });" in lab_js
+    assert (
+        "const canonical = moduleId === 'lab-module-single' ? '#lab-tab-factor' : `#${moduleId}`;"
+        in lab_js
+    )
+
+
+def test_index_page_hosts_the_workbench_module_nav(web_config) -> None:
+    html = web_server._index_html(web_config)
+    # Exact module-nav markup (CP9-2 §1.2): tablist semantics over the two
+    # workbench modules; the multi module is a reserved CP10 slot with an
+    # explicit placeholder, never silently absent.
+    for marker in (
+        '<div class="lab-module-nav" role="tablist" aria-label="工作台模块">',
+        '<button class="lab-module-tab" role="tab" id="lab-module-single" aria-controls="lab-module-panel-single" aria-selected="true">单因子研究</button>',
+        '<button class="lab-module-tab" role="tab" id="lab-module-multi" aria-controls="lab-module-panel-multi" aria-selected="false" tabindex="-1">多因子策略回测 <span class="pill muted">即将上线</span></button>',
+        'id="lab-module-panel-single" aria-labelledby="lab-module-single" tabindex="0"',
+        'id="lab-module-panel-multi" aria-labelledby="lab-module-multi" tabindex="0" hidden',
+        # CP10 claims this mount and the lab-module-multi nav hook.
+        "CP10 mount: the multi-factor module claims #multi-result",
+        'id="multi-result"',
+        "即将上线",
+        "多因子策略合成与回测模块将在后续版本提供；当前版本聚焦单因子研究流程。",
+    ):
+        assert marker in html, marker
+    # The absorbed sections carry report-section anchors inside the single
+    # module so sticky-strip scroll clearance applies unchanged.
+    assert '<section class="report-section" id="report-comparison">' in html
+    assert '<section class="report-section" id="workbench-rd">' in html
+    # Module-nav CSS ships with token-referencing declarations only.
+    for rule in (".lab-module-nav", ".lab-module-tab", ".lab-module-panel"):
+        assert rule in html, rule
+    module_css_start = html.index("/* CP9-2 workbench module nav")
+    module_css = html[module_css_start : html.index(".anchor-nav", module_css_start)]
+    assert "#" not in module_css
+    assert "var(--" in module_css
+    # DSL formula-highlight CSS ships too, token-referencing only, so both
+    # themes come from the variables.
+    dsl_css_start = html.index("/* CP9-2 DSL formula highlighting")
+    dsl_css = html[dsl_css_start : html.index(".evidence-grid", dsl_css_start)]
+    for rule in (".dsl-fn", ".dsl-id", ".dsl-num", ".dsl-str", ".dsl-op", ".dsl-punct"):
+        assert rule in dsl_css, rule
+    assert "#" not in dsl_css
+    assert "var(--" in dsl_css
+
+
+def test_dsl_module_is_a_pure_structural_tokenizer() -> None:
+    dsl_js = _static_module_text("views/dsl.js")
+    for marker in (
+        "export function tokenizeFormula(",
+        "export function formulaHtml(",
+        # FP-4 single-renderer rule: dsl.js imports esc, never defines it.
+        "import { esc } from '../metric.js';",
+        "'dsl-fn'",
+        "'dsl-id'",
+        "'dsl-num'",
+        "'dsl-str'",
+        "'dsl-op'",
+        "'dsl-punct'",
+    ):
+        assert marker in dsl_js, marker
+    # Structural and pure: no operator-catalog coupling, no dynamic code
+    # evaluation, no requests.
+    assert "eval(" not in dsl_js
+    assert "new Function" not in dsl_js
+    assert "fetch(" not in dsl_js
+    assert "/api/" not in dsl_js
+    assert "function esc(" not in dsl_js
+    # Application sites: exactly the report hero and the registry detail
+    # card highlight; the precomputed key and the ellipsized list rows stay
+    # esc()-only (a key is not an expression).
+    registry_js = _static_module_text("views/registry.js")
+    assert "from './dsl.js'" in registry_js
+    assert '`<div class="formula">${formulaHtml(formula)}</div>`' in registry_js
+    assert "${esc(formula.slice(PRECOMPUTED_PREFIX.length))}" in registry_js
+    assert '<span class="registry-row-formula">${esc(text)}</span>' in registry_js
+    assert "formulaHtml" not in _static_module_text("views/research.js")

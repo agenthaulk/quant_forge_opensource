@@ -5,6 +5,7 @@
 
 import { esc, metricNum, metricPill, num, pct, valueOr } from '../metric.js';
 import { barChart, lineChart } from './charts.js';
+import { formulaHtml } from './dsl.js';
 
 /* Status-aware chart value: a metric whose status is not available/legacy is
  * mapped to null (an "n/a" tick), never a fabricated 0 — the FP-4 rule that
@@ -80,7 +81,7 @@ export function renderReportHero(factor, parser, hero) {
       <div>
         <p class="eyebrow">Factor Report</p>
         <h3>${esc(factor.factor_id)} · ${esc(parser.source)} / ${esc(parser.provider)} / ${esc(parser.model)}</h3>
-        <div class="formula">${esc(factor.formula)}</div>
+        <div class="formula">${formulaHtml(factor.formula)}</div>
         <p>${esc(factor.description || '')}</p>
         ${metaLines}
         <p class="meta">研究口径，不是生产交易口径。</p>
@@ -329,7 +330,8 @@ export function render(payload) {
     { id: 'report-oos', label: '样本外评测' },
     { id: 'report-diagnostics', label: '诊断' },
     { id: 'report-evidence', label: '研究证据' },
-    { id: 'report-artifacts', label: 'Artifacts' }
+    { id: 'report-artifacts', label: 'Artifacts' },
+    { id: 'report-comparison', label: 'Benchmark 对比' }
   ];
   resultEl.innerHTML = renderAnchorNav(anchorSections)
     + renderReportHero(factor, payload.parser, {

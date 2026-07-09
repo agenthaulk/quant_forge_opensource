@@ -487,6 +487,13 @@ def _index_html(
       font-size: 11px;
       text-align: right;
     }}
+    /* CP9-2 DSL formula highlighting: token-referencing declarations only. */
+    .formula .dsl-fn    {{ color: var(--accent-2); }}
+    .formula .dsl-id    {{ color: var(--ink); }}
+    .formula .dsl-num   {{ color: var(--blue); }}
+    .formula .dsl-str   {{ color: var(--warn); }}
+    .formula .dsl-op,
+    .formula .dsl-punct {{ color: var(--muted); }}
     .evidence-grid {{
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -560,6 +567,25 @@ def _index_html(
     .lab-tab-dot.is-error   {{ background: var(--bad); }}
     .lab-tabpanel {{ min-width: 0; }}
     .lab-tabpanel:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 4px; }}
+    /* CP9-2 workbench module nav (Studio segmentedControl affordance,
+       token-referencing declarations only). */
+    .lab-module-nav {{ display: inline-flex; flex-wrap: wrap; max-width: 100%;
+      gap: 4px; margin: 0 0 16px; padding: 4px;
+      border: 1px solid var(--line); border-radius: 10px; background: var(--wash); }}
+    .lab-module-tab {{ width: auto; margin: 0; padding: 8px 14px; border: 1px solid transparent;
+      border-radius: 7px; background: transparent; color: var(--muted);
+      font-size: 13px; font-weight: 800; cursor: pointer; }}
+    .lab-module-tab:hover {{ color: var(--ink); }}
+    /* Active-segment border uses the accent token so the selected state
+       reads at >=3:1 against the nav wash in both themes (WCAG 1.4.11) —
+       line-strong only reached 1.65:1 / 1.88:1 there. Same aria-current
+       accent-border language as .registry-row / .docs-row / .ext-card. */
+    .lab-module-tab[aria-selected="true"] {{ background: var(--panel); border-color: var(--accent); color: var(--accent); }}
+    .lab-module-tab[aria-selected="true"]:hover {{ color: var(--accent); }}
+    .lab-module-tab:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .lab-module-tab .pill {{ margin-left: 6px; }}
+    .lab-module-panel {{ min-width: 0; }}
+    .lab-module-panel:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 4px; }}
     .anchor-nav {{ display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }}
     .anchor-nav a {{ padding: 4px 9px; border: 1px solid var(--line); border-radius: 6px;
       background: var(--panel); color: var(--muted); font-size: 11px; font-weight: 800;
@@ -831,10 +857,8 @@ def _index_html(
       </ol>
     </nav>
     <div class="lab-tabs" role="tablist" aria-label="工作台视图">
-      <button class="lab-tab" role="tab" id="lab-tab-factor" aria-controls="lab-panel-factor" aria-selected="true">因子工作台 <span class="lab-tab-dot" hidden></span></button>
-      <button class="lab-tab" role="tab" id="lab-tab-rd" aria-controls="lab-panel-rd" aria-selected="false" tabindex="-1">RD 循环 <span class="lab-tab-dot" hidden></span></button>
+      <button class="lab-tab" role="tab" id="lab-tab-factor" aria-controls="lab-panel-factor" aria-selected="true">LLM 因子工作台 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-history" aria-controls="lab-panel-history" aria-selected="false" tabindex="-1">研究历史 <span class="lab-tab-dot" hidden></span></button>
-      <button class="lab-tab" role="tab" id="lab-tab-bench" aria-controls="lab-panel-bench" aria-selected="false" tabindex="-1">Benchmark <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-data" aria-controls="lab-panel-data" aria-selected="false" tabindex="-1">数据 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-registry" aria-controls="lab-panel-registry" aria-selected="false" tabindex="-1">注册表 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-docs" aria-controls="lab-panel-docs" aria-selected="false" tabindex="-1">文档 <span class="lab-tab-dot" hidden></span></button>
@@ -842,27 +866,58 @@ def _index_html(
     </div>
     <div id="error" class="err"></div>
     <section class="lab-tabpanel" role="tabpanel" id="lab-panel-factor" aria-labelledby="lab-tab-factor" tabindex="0">
-      <div class="section-title">
-        <h2>Factor Tape</h2>
-        <p>解析、评价、回测集中展示</p>
+      <div class="lab-module-nav" role="tablist" aria-label="工作台模块">
+        <button class="lab-module-tab" role="tab" id="lab-module-single" aria-controls="lab-module-panel-single" aria-selected="true">单因子研究</button>
+        <button class="lab-module-tab" role="tab" id="lab-module-multi" aria-controls="lab-module-panel-multi" aria-selected="false" tabindex="-1">多因子策略回测 <span class="pill muted">即将上线</span></button>
       </div>
-      <div id="result">
-        <div class="panel empty-state">
-          <h3>等待输入</h3>
-          <p class="meta">输入因子观点后运行，公式、IC、回测收益、缓存路径会在这里展开。</p>
+      <div class="lab-module-panel" role="tabpanel" id="lab-module-panel-single" aria-labelledby="lab-module-single" tabindex="0">
+        <div class="section-title">
+          <h2>Factor Tape</h2>
+          <p>解析、评价、回测集中展示</p>
         </div>
+        <div id="result">
+          <div class="panel empty-state">
+            <h3>等待输入</h3>
+            <p class="meta">输入因子观点后运行，公式、IC、回测收益、缓存路径会在这里展开。</p>
+          </div>
+        </div>
+        <div id="staggered-result"></div>
+        <section class="report-section" id="report-comparison">
+          <div class="section-title">
+            <h2>Benchmark</h2>
+            <p>qf factor bench 多因子横向对比（并入因子报告的对比区）</p>
+          </div>
+          <div id="bench-result">
+            <div class="panel empty-state">
+              <h3>暂无 bench 结果</h3>
+              <p class="meta">运行 qf factor bench 后，多因子指标状态表会展示在这里。</p>
+            </div>
+          </div>
+        </section>
+        <section class="report-section" id="workbench-rd">
+          <div class="section-title">
+            <h2>RD Loop</h2>
+            <p>候选因子与研究证据</p>
+          </div>
+          <div id="rd-result">
+            <div class="panel empty-state">
+              <h3>等待运行</h3>
+              <p class="meta">RD 候选、gate、report path 和分段证据会展示在这里。</p>
+            </div>
+          </div>
+        </section>
       </div>
-      <div id="staggered-result"></div>
-    </section>
-    <section class="lab-tabpanel" role="tabpanel" id="lab-panel-rd" aria-labelledby="lab-tab-rd" tabindex="0" hidden>
-      <div class="section-title">
-        <h2>RD Loop</h2>
-        <p>候选因子与研究证据</p>
-      </div>
-      <div id="rd-result">
-        <div class="panel empty-state">
-          <h3>等待运行</h3>
-          <p class="meta">RD 候选、gate、report path 和分段证据会展示在这里。</p>
+      <div class="lab-module-panel" role="tabpanel" id="lab-module-panel-multi" aria-labelledby="lab-module-multi" tabindex="0" hidden>
+        <div class="section-title">
+          <h2>多因子策略回测</h2>
+          <p>组合层多因子策略合成与回测</p>
+        </div>
+        <!-- CP10 mount: the multi-factor module claims #multi-result and the lab-module-multi nav hook; do not rename. -->
+        <div id="multi-result">
+          <div class="panel empty-state">
+            <h3>即将上线</h3>
+            <p class="meta">多因子策略合成与回测模块将在后续版本提供；当前版本聚焦单因子研究流程。</p>
+          </div>
         </div>
       </div>
     </section>
@@ -875,18 +930,6 @@ def _index_html(
         <div class="panel empty-state">
           <h3>暂无研究历史</h3>
           <p class="meta">评价、回测、bench、RD 运行记录到 run index 后会展示在这里。</p>
-        </div>
-      </div>
-    </section>
-    <section class="lab-tabpanel" role="tabpanel" id="lab-panel-bench" aria-labelledby="lab-tab-bench" tabindex="0" hidden>
-      <div class="section-title">
-        <h2>Benchmark</h2>
-        <p>qf factor bench 多因子横向对比</p>
-      </div>
-      <div id="bench-result">
-        <div class="panel empty-state">
-          <h3>暂无 bench 结果</h3>
-          <p class="meta">运行 qf factor bench 后，多因子指标状态表会展示在这里。</p>
         </div>
       </div>
     </section>

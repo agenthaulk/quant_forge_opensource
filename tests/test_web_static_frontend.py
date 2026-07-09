@@ -50,6 +50,7 @@ EXPECTED_STATIC_MODULES = (
     "views/charts.js",
     "views/data.js",
     "views/docs.js",
+    "views/dsl.js",
     "views/extensions.js",
     "views/factor.js",
     "views/history.js",
@@ -164,7 +165,11 @@ def test_index_page_keeps_all_panel_sections_and_controls(web_app) -> None:
         "暂无 bench 结果",
     ):
         assert marker in html, marker
-    # CP6-2 Lab chrome: stepper, tablist, tab panels (mount ids re-hosted).
+    # CP6-2 Lab chrome (CP9-2 IA consolidation: the workbench tab keeps id
+    # lab-tab-factor under the LLM 因子工作台 label; the former RD 循环 /
+    # Benchmark tabs live on inside its 单因子研究 module as the
+    # #workbench-rd / #report-comparison sections; 多因子策略回测 is the
+    # reserved CP10 module slot).
     for marker in (
         'class="lab-stepper"',
         'data-step="idea"',
@@ -174,14 +179,21 @@ def test_index_page_keeps_all_panel_sections_and_controls(web_app) -> None:
         'data-step="rd"',
         'role="tablist"',
         'id="lab-tab-factor"',
-        'id="lab-tab-rd"',
         'id="lab-tab-history"',
-        'id="lab-tab-bench"',
         'id="lab-panel-factor"',
-        'id="lab-panel-rd"',
         'id="lab-panel-history"',
-        'id="lab-panel-bench"',
-        '因子工作台',
+        'id="lab-module-single"',
+        'id="lab-module-multi"',
+        'id="lab-module-panel-single"',
+        'id="lab-module-panel-multi"',
+        'id="multi-result"',
+        'id="report-comparison"',
+        'id="workbench-rd"',
+        'LLM 因子工作台',
+        '单因子研究',
+        '多因子策略回测',
+        '即将上线',
+        '工作台模块',
         'RD 循环',
         '研究流程',
     ):

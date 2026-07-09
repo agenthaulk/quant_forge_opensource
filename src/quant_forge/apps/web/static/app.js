@@ -29,7 +29,7 @@ import { refreshDataPanel } from './views/data.js';
 import { refreshRegistryPanel } from './views/registry.js';
 import { refreshDocsPanel } from './views/docs.js';
 import { refreshExtensionsPanel } from './views/extensions.js';
-import { activateTab, initLabTabs, setStep, setTabDot } from './views/lab.js';
+import { activateModule, activateTab, initLabTabs, setStep, setTabDot } from './views/lab.js';
 
 const pageConfig = JSON.parse(document.getElementById('qf-page-config').textContent || '{}');
 const controlTokenRequired = Boolean(pageConfig.controlTokenRequired);
@@ -361,25 +361,32 @@ const dataPanel = trackedPanelRefresh(refreshDataPanel);
 const registryPanel = trackedPanelRefresh(refreshRegistryPanel);
 const docsPanel = trackedPanelRefresh(refreshDocsPanel);
 const extensionsPanel = trackedPanelRefresh(refreshExtensionsPanel);
+// CP9-2 IA consolidation: values are arrays so one tab can own several
+// lazy panels — the workbench tab hosts the absorbed bench comparison
+// section (#report-comparison) alongside the factor tape.
 const lazyPanelsByTab = {
-  'lab-tab-history': historyPanel,
-  'lab-tab-bench': benchPanel,
-  'lab-tab-data': dataPanel,
-  'lab-tab-registry': registryPanel,
-  'lab-tab-docs': docsPanel,
-  'lab-tab-extensions': extensionsPanel
+  'lab-tab-factor': [benchPanel],
+  'lab-tab-history': [historyPanel],
+  'lab-tab-data': [dataPanel],
+  'lab-tab-registry': [registryPanel],
+  'lab-tab-docs': [docsPanel],
+  'lab-tab-extensions': [extensionsPanel]
 };
 // Panels whose endpoints a successfully completed job can change (F-008):
 // validate/staggered/RD append run-index records (history, bench filters
 // the same index) and save factor definitions (registry); parse completes
 // through the same handlers, so it invalidates uniformly rather than
 // encoding per-job server knowledge here. The data console reads only the
-// local data root, which no job mutates, so it is not invalidated.
-const JOB_DEPENDENT_PANEL_TABS = ['lab-tab-history', 'lab-tab-bench', 'lab-tab-registry'];
+// local data root, which no job mutates, so it is not invalidated. The
+// bench panel now lives on the workbench tab, so jobs that finish with
+// the workbench active refresh the comparison section immediately.
+const JOB_DEPENDENT_PANELS = [
+  ['lab-tab-history', historyPanel],
+  ['lab-tab-factor', benchPanel],
+  ['lab-tab-registry', registryPanel]
+];
 function invalidateJobDependentPanels() {
-  JOB_DEPENDENT_PANEL_TABS.forEach(tabId => {
-    const panel = lazyPanelsByTab[tabId];
-    if (!panel) return;
+  JOB_DEPENDENT_PANELS.forEach(([tabId, panel]) => {
     panel.invalidate();
     const tab = document.getElementById(tabId);
     // If the dependent tab is already active the user is looking at the
@@ -395,8 +402,9 @@ initLabTabs({
   // (F-008). The refresh never switches tabs; it only fills the
   // already-active panel.
   onActivate: tabId => {
-    const panel = lazyPanelsByTab[tabId];
-    if (panel && (panel.isStale() || !panel.hasLoaded())) panel.refresh();
+    (lazyPanelsByTab[tabId] || []).forEach(panel => {
+      if (panel.isStale() || !panel.hasLoaded()) panel.refresh();
+    });
   }
 });
 onControlTokenStored(() => {
@@ -423,6 +431,7 @@ button.addEventListener('click', async () => {
   validateButton.disabled = true;
   cancelButton.disabled = true;
   activateTab('lab-tab-factor');
+  activateModule('lab-module-single');
   setTabDot('lab-tab-factor', 'running');
   setStep('parse', 'active');
   setStep('validate', 'pending');
@@ -496,6 +505,7 @@ validateButton.addEventListener('click', async () => {
   button.disabled = true;
   cancelButton.disabled = true;
   activateTab('lab-tab-factor');
+  activateModule('lab-module-single');
   setTabDot('lab-tab-factor', 'running');
   setStep('validate', 'active');
   clearGlobalError();
@@ -545,6 +555,7 @@ staggeredButton.addEventListener('click', async () => {
   button.disabled = true;
   cancelButton.disabled = true;
   activateTab('lab-tab-factor');
+  activateModule('lab-module-single');
   setTabDot('lab-tab-factor', 'running');
   clearGlobalError();
   renderStaggeredRunning();
@@ -593,8 +604,11 @@ cancelButton.addEventListener('click', async () => {
 rdRun.addEventListener('click', async () => {
   rdRun.disabled = true;
   rdCancel.disabled = true;
-  activateTab('lab-tab-rd');
-  setTabDot('lab-tab-rd', 'running');
+  activateTab('lab-tab-factor');
+  activateModule('lab-module-single');
+  const rdSection = document.getElementById('workbench-rd');
+  if (rdSection) rdSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  setTabDot('lab-tab-factor', 'running');
   setStep('rd', 'active');
   clearGlobalError();
   resetRdResult('RD 运行中', 'RD 候选、gate、report path 和分段证据会在本次运行完成后刷新。');
@@ -611,20 +625,20 @@ rdRun.addEventListener('click', async () => {
     );
     renderResearch(payload);
     setStep('rd', 'done');
-    setTabDot('lab-tab-rd', 'done');
+    setTabDot('lab-tab-factor', 'done');
     invalidateJobDependentPanels();
     clearGlobalError();
     rdStatusEl.innerHTML = '<span class="ok">RD 完成</span>';
   } catch (error) {
     if (error.message === '运行已中断') {
       setStep('rd', 'pending');
-      setTabDot('lab-tab-rd', 'clear');
+      setTabDot('lab-tab-factor', 'clear');
       resetRdResult('RD 已中断', '本次 RD 已取消，未产生新的候选结果。');
       rdStatusEl.textContent = 'RD 已中断';
     } else {
       const reason = jobFailureReason(error);
       setStep('rd', 'pending');
-      setTabDot('lab-tab-rd', 'error');
+      setTabDot('lab-tab-factor', 'error');
       showJobFailureNotice('rd-result', reason);
       rdStatusEl.innerHTML = `<span class="err">${esc(reason)}</span>`;
     }
@@ -650,7 +664,8 @@ rdCancel.addEventListener('click', async () => {
 });
 rdStart.addEventListener('click', async () => {
   rdStart.disabled = true;
-  activateTab('lab-tab-rd');
+  activateTab('lab-tab-factor');
+  activateModule('lab-module-single');
   clearGlobalError();
   resetRdResult('调度启动中', '调度开启后，最近一次 RD 结果会在这里刷新。');
   rdStatusEl.textContent = '调度启动中...';
