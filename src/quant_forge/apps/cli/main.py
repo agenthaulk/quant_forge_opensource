@@ -30,6 +30,18 @@ from quant_forge.factor_library.repository import (
     normalize_factor_root_layout,
     parse_idea_to_definition,
 )
+from quant_forge.integrations.contracts import (
+    BACKEND_NOT_CONFIGURED,
+    SUBMIT_NOT_CONFIRMED,
+    SimulationRequest,
+    SubmitRequest,
+)
+from quant_forge.integrations.dry_run import (
+    DryRunOutcome,
+    run_translate_prescreen,
+    warning_hint,
+)
+from quant_forge.integrations.registry import list_backends
 from quant_forge.lineage.store import (
     LineageStore,
     RUN_KINDS,
@@ -169,6 +181,38 @@ def build_parser() -> argparse.ArgumentParser:
     _add_runtime_roots(bench)
     bench.add_argument("--rd-config", type=Path, default=DEFAULT_RD_CONFIG_PATH)
     bench.set_defaults(handler=_cmd_factor_bench)
+    submit = factor_subcommands.add_parser(
+        "submit",
+        help="translate + prescreen a factor for an external backend (dry run by default)",
+    )
+    submit.add_argument("factor_id")
+    submit.add_argument(
+        "--target",
+        required=True,
+        dest="target_backend",
+        help="backend id from `qf backends list`",
+    )
+    _add_config_options(submit)
+    submit.add_argument("--factor-root", type=Path)
+    submit.add_argument("--artifact-root", type=Path)
+    submit.add_argument(
+        "--data-region",
+        help="region of the local data the backtest ran on (reported to prescreen)",
+    )
+    submit.add_argument(
+        "--target-region",
+        help="target platform region (defaults to the backend's first declared region)",
+    )
+    submit.add_argument(
+        "--confirm-submit",
+        action="store_true",
+        help=(
+            "actually submit after translate + prescreen; without this flag the "
+            "flow is a dry run and no outward submission is attempted"
+        ),
+    )
+    submit.add_argument("--json", action="store_true", dest="as_json")
+    submit.set_defaults(handler=_cmd_factor_submit)
 
     idea = subcommands.add_parser("idea-to-factor", help="parse an idea into a draft factor")
     idea.add_argument("--text", required=True)
@@ -305,6 +349,16 @@ def build_parser() -> argparse.ArgumentParser:
     goal_complete.add_argument("--artifact-root", type=Path)
     goal_complete.set_defaults(handler=_cmd_goal_complete)
     # -------------------------- end Lane G ----------------------------
+
+    backends = subcommands.add_parser(
+        "backends", help="external factor-backend status commands"
+    )
+    backends_subcommands = backends.add_subparsers(dest="backends_command", required=True)
+    backends_list = backends_subcommands.add_parser(
+        "list", help="list every reviewed backend id with its availability status"
+    )
+    backends_list.add_argument("--json", action="store_true", dest="as_json")
+    backends_list.set_defaults(handler=_cmd_backends_list)
 
     web = subcommands.add_parser("web", help="run local web adapter")
     web.add_argument("--config", type=Path)
@@ -721,6 +775,254 @@ def _print_bench_table(factor_rows: list[dict[str, Any]]) -> None:
         cells.append(str(row.get("warnings_count")))
         table.append(cells)
     _print_text_table(headers, table)
+
+
+# ---------------------------------------------------------------------------
+# External factor-backend commands (CP3). Honest degradation: every state
+# renders its closed warning code verbatim plus a one-line hint; the submit
+# flow is dry (translate + prescreen) unless --confirm-submit is passed, and
+# the backend layer's own gates still decide whether a submission happens
+# (FP-D: outward submission stays explicit and human-gated).
+# ---------------------------------------------------------------------------
+
+
+def _cmd_backends_list(args: argparse.Namespace) -> int:
+    rows = list_backends()
+    if args.as_json:
+        _print_json(rows)
+        return 0
+    headers = [
+        "backend_id",
+        "status",
+        "warning_code",
+        "enable_env_var",
+        "module",
+        "label",
+        "regions",
+        "capabilities",
+    ]
+    table = [
+        [
+            str(row.get("backend_id", "")),
+            str(row.get("status", "")),
+            str(row.get("warning_code") or "-"),
+            str(row.get("enable_env_var") or "-"),
+            str(row.get("module") or "-"),
+            str(row.get("label") or "-"),
+            ",".join(row.get("regions") or []) or "-",
+            ",".join(row.get("capabilities") or []) or "-",
+        ]
+        for row in rows
+    ]
+    _print_text_table(headers, table)
+    return 0
+
+
+def _cmd_factor_submit(args: argparse.Namespace) -> int:
+    paths = _runtime_paths(args)
+    outcome = run_translate_prescreen(
+        args.target_backend,
+        args.factor_id,
+        factor_root=paths.factor_root,
+        artifact_root=paths.artifact_root,
+        data_region=args.data_region,
+        target_region=args.target_region,
+    )
+    payload = dict(outcome.payload)
+    payload["mode"] = "submit" if args.confirm_submit else "dry_run"
+    payload["submission"] = None
+    exit_code = 0 if outcome.ok else 2
+    if args.confirm_submit and outcome.ok:
+        payload["submission"], exit_code = _perform_backend_submission(outcome)
+    if args.as_json:
+        _print_json(payload)
+        return exit_code
+    _render_submit_flow_text(payload)
+    return exit_code
+
+
+def _perform_backend_submission(outcome: DryRunOutcome) -> tuple[dict[str, Any], int]:
+    """Run the confirmed submission stage; the adapter's own gates rule.
+
+    The receipt is reported verbatim. A ``refused`` status or a
+    ``SUBMIT_NOT_CONFIRMED`` / ``BACKEND_NOT_CONFIGURED`` warning on the
+    receipt is a blocked submission (non-zero exit), never papered over.
+    """
+
+    resolution = outcome.resolution
+    factor = outcome.factor
+    translation = outcome.translation
+    assert resolution is not None and resolution.port is not None
+    assert factor is not None and translation is not None
+    port = resolution.port
+    descriptor = port.describe()
+    if not descriptor.supports("submit"):
+        return (
+            {
+                "status": "unsupported",
+                "error": (
+                    f"backend '{descriptor.backend_id}' does not declare the submit capability"
+                ),
+            },
+            2,
+        )
+    backend_ref = translation.expression
+    simulation_payload: dict[str, Any] | None = None
+    if descriptor.supports("simulate"):
+        simulation = port.simulate(
+            SimulationRequest(
+                factor_id=factor.factor_id,
+                expression=translation.expression,
+                settings=translation.target_settings,
+            )
+        )
+        simulation_payload = {
+            "backend_ref": simulation.backend_ref,
+            "metrics": dict(simulation.metrics),
+            "warnings": list(simulation.warnings),
+            "notes": list(simulation.notes),
+        }
+        backend_ref = simulation.backend_ref
+    receipt = port.submit(
+        SubmitRequest(
+            factor_id=factor.factor_id,
+            backend_ref=backend_ref,
+            confirm=True,
+            provenance=factor.provenance,
+        )
+    )
+    receipt_payload = {
+        "submission_ref": receipt.submission_ref,
+        "status": receipt.status,
+        "warnings": list(receipt.warnings),
+        "notes": list(receipt.notes),
+        "provenance_carried": receipt.provenance is not None,
+    }
+    blocked = receipt.status == "refused" or any(
+        code in receipt.warnings for code in (SUBMIT_NOT_CONFIRMED, BACKEND_NOT_CONFIGURED)
+    )
+    return ({"simulation": simulation_payload, "receipt": receipt_payload}, 2 if blocked else 0)
+
+
+def _render_submit_flow_text(payload: dict[str, Any]) -> None:
+    resolution = payload.get("resolution") or {}
+    print(f"backend: {payload.get('backend_id')}  status: {resolution.get('status')}")
+    descriptor = resolution.get("descriptor")
+    if descriptor:
+        regions = ", ".join(descriptor.get("regions") or []) or "-"
+        capabilities = ", ".join(descriptor.get("capabilities") or []) or "-"
+        print(
+            f"  label: {descriptor.get('label')}  regions: {regions}  "
+            f"capabilities: {capabilities}"
+        )
+    if resolution.get("warning_code"):
+        print(f"  {resolution['warning_code']} — {resolution.get('hint') or ''}")
+    factor = payload.get("factor")
+    if factor is not None:
+        if "error" in factor:
+            print(f"factor: {payload.get('factor_id')}")
+            print(f"  error: {factor['error']}")
+        else:
+            print(
+                f"factor: {factor.get('factor_id')} ({factor.get('kind')})  "
+                f"horizon_days: {factor.get('horizon_days')}"
+            )
+            print(f"  formula: {factor.get('formula')}")
+            if factor.get("report_artifact_rel"):
+                print(f"  report artifact: {factor['report_artifact_rel']}")
+            for note in factor.get("notes") or []:
+                print(f"  note: {note}")
+    translation = payload.get("translation")
+    if translation is not None:
+        print("translation:")
+        if translation.get("supported") is False:
+            print("  capability not declared by this backend")
+        else:
+            print(f"  expression: {translation.get('expression')}")
+            settings = translation.get("target_settings") or {}
+            if settings:
+                print(
+                    "  target_settings: "
+                    + json.dumps(_json_safe(settings), ensure_ascii=False, sort_keys=True)
+                )
+            for code in translation.get("warnings") or []:
+                print(f"  {code} — {_backend_flow_hint(code, resolution)}")
+            for note in translation.get("notes") or []:
+                print(f"  note: {note}")
+    prescreen = payload.get("prescreen")
+    if prescreen is not None:
+        print("prescreen:")
+        if prescreen.get("supported") is False:
+            print("  capability not declared by this backend")
+        else:
+            print(
+                f"  data_region: {prescreen.get('data_region')}  "
+                f"target_region: {prescreen.get('target_region')}  "
+                f"region_alignment: {prescreen.get('region_alignment')}"
+            )
+            for code in prescreen.get("warning_codes") or []:
+                print(f"  {code} — {_backend_flow_hint(code, resolution)}")
+            checks = prescreen.get("checks") or []
+            if checks:
+                _print_text_table(
+                    ["check", "value", "threshold", "status", "passed"],
+                    [
+                        [
+                            str(check.get("name", "")),
+                            _format_check_number(check.get("value")),
+                            _format_check_number(check.get("threshold")),
+                            str(check.get("status", "")),
+                            "-" if check.get("passed") is None else str(check["passed"]).lower(),
+                        ]
+                        for check in checks
+                    ],
+                )
+    for note in payload.get("notes") or []:
+        print(f"note: {note}")
+    if payload.get("mode") == "dry_run":
+        if payload.get("ok"):
+            print(
+                "mode: dry run (translate + prescreen only); pass --confirm-submit to "
+                "request an actual submission"
+            )
+        return
+    print("submission:")
+    submission = payload.get("submission")
+    if submission is None:
+        print("  not attempted (the flow did not reach a submittable state)")
+        return
+    if "error" in submission:
+        print(f"  {submission['error']}")
+        return
+    simulation = submission.get("simulation")
+    if simulation:
+        print(f"  simulate backend_ref: {simulation.get('backend_ref')}")
+        for code in simulation.get("warnings") or []:
+            print(f"  {code} — {_backend_flow_hint(code, resolution)}")
+        for note in simulation.get("notes") or []:
+            print(f"  note: {note}")
+    receipt = submission.get("receipt") or {}
+    print(
+        f"  status: {receipt.get('status')}  submission_ref: {receipt.get('submission_ref')}"
+    )
+    for code in receipt.get("warnings") or []:
+        print(f"  {code} — {_backend_flow_hint(code, resolution)}")
+    for note in receipt.get("notes") or []:
+        print(f"  note: {note}")
+
+
+def _backend_flow_hint(code: str, resolution: dict[str, Any]) -> str:
+    return warning_hint(
+        code,
+        enable_env_var=resolution.get("enable_env_var"),
+        module=resolution.get("module"),
+    )
+
+
+def _format_check_number(value: Any) -> str:
+    if value is None:
+        return "-"
+    return f"{float(value):.6g}"
 
 
 def _cmd_runs_list(args: argparse.Namespace) -> int:
