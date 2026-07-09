@@ -144,6 +144,17 @@ DEGENERATE_CROSS_SECTION = "DEGENERATE_CROSS_SECTION"
 WINDOW_TOO_SHORT = "WINDOW_TOO_SHORT"
 UNIVERSE_MISMATCH = "UNIVERSE_MISMATCH"
 GRID_FIDELITY_MISMATCH = "GRID_FIDELITY_MISMATCH"
+# RB-1 disclosure codes (design §1/§6): cadence == lifetime, so every run is a
+# non-overlapping K=1 cohort sample of ~len/holding independent periods and is
+# start-phase sensitive. Emitted on every composite run, with the realized
+# period count carried in provenance and in a human-readable warning line.
+NON_OVERLAPPING_COHORTS = "NON_OVERLAPPING_COHORTS"
+PHASE_SENSITIVE_SMALL_SAMPLE = "PHASE_SENSITIVE_SMALL_SAMPLE"
+# FP-2 degrade code: the same-window evaluation diagnostics slot could not be
+# filled because the backtest window is shorter than the evaluation layer's
+# 126-trading-day display floor (`MIN_DISPLAY_TRADING_DAYS`); the backtest
+# itself still runs (its real gate is max(2, holding+delay+1), RF-4).
+EVALUATION_WINDOW_TOO_SHORT = "EVALUATION_WINDOW_TOO_SHORT"
 
 COMPOSITE_ID_PREFIX = "COMPOSITE_"
 # RB-10: id = COMPOSITE_ + first 12 hex of a stable sha256 over ALL inputs.
@@ -1401,6 +1412,31 @@ def _existing_definition(repository: FactorRepository, factor_id: str) -> Factor
         return repository.get(factor_id)
     except FileNotFoundError:
         return None
+
+
+def cleanup_composite_artifacts(
+    factor_root: Path,
+    *,
+    composite_id: str,
+    previous_definition: FactorDefinition | None,
+    overlay_root: Path,
+) -> None:
+    """Public failure-cleanup entry point for workflow layers (P5).
+
+    :func:`run_composite_backtest` cleans up after failures inside its own
+    scope, but the web workflow keeps working with the materialized artifacts
+    afterwards (same-window evaluation, payload assembly). When one of those
+    later steps fails, the workflow calls this to apply the identical
+    definition-restore + per-run-overlay removal so a failed run never leaves
+    a half-registered composite behind.
+    """
+
+    _cleanup_composite_artifacts(
+        FactorRepository(factor_root),
+        composite_id=composite_id,
+        previous_definition=previous_definition,
+        overlay_root=overlay_root,
+    )
 
 
 def _cleanup_composite_artifacts(
