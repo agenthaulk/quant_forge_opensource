@@ -27,6 +27,59 @@ Owner: the project owner. Recorded by Fable.
 | --- | --- | --- | --- |
 | D8 | CP6 frontend technology | **Static ES-module app served by the existing stdlib server — no build step, no npm, zero runtime deps, zero external resources.** First-principles grounds: honest-metric rendering is the product, local-first security posture ranks toolchain surface with the no-exec rule, native ES modules make a build chain unnecessary for Studio-style multi-view UX. Studio's React app is UX reference only. Escape hatch documented (opt-in separate dir, never a kernel prerequisite). | Plan + sub-phases CP6-1..4 in docs/coordination/CP6_FRONTEND_PLAN.md; CP6-1 skeleton (extract html.py inline JS into modules + containment-checked static handler, characterization tests first) precedes all other sub-phases |
 
+## 2026-07-09 — Phase D frontend design-parity + multi-factor synthesis (recorded by Fable)
+
+| # | Decision | Ruling | Implementation |
+| --- | --- | --- | --- |
+| D9 | Open-source frontend stack after a Studio-vs-OSS comparison, and the shape of the CP10 multi-factor module | **Design-parity, not stack-parity: D8 upheld.** Adopt Studio's DESIGN and IA — time-series charts, the module information architecture, and the visual polish. Decline Studio's STACK — React + Vite + npm + Monaco + ECharts. The open-source frontend stays a no-build static ES-module app served by the stdlib server; source is exactly what ships. | Charts CP9-1 `src/quant_forge/apps/web/static/views/charts.js`; IA CP9-2 `.../static/views/lab.js` + `.../apps/web/html.py`; synthesis backend `src/quant_forge/synthesis/`; synthesis frontend `.../static/views/synthesis.js`. Auditability enforced by `scripts/release_safety_scan.py` + `tests/test_web_static_frontend.py` |
+
+**Rationale (the load-bearing axioms).** (1) Local-first with a minimal
+dependency surface: a build chain is toolchain surface the no-exec, local-first
+posture does not want. (2) Source == shipped auditability: the release scan and
+the static-frontend characterization test cover exactly the bytes served, with
+no bundler step in between (`scripts/release_safety_scan.py`,
+`tests/test_web_static_frontend.py`). (3) Contributor fit for the target
+audience — quant/Python practitioners, not frontend specialists (axiom A3): a
+contributor edits a served ES module and reloads, with no npm/bundler to learn.
+(4) The commercial boundary: Studio's heaviest surfaces — agent orchestration,
+governance workflow, and data-plane operations — are commercial (D6/D7a) and
+out of scope here, so the stack that carries them is not needed. (5) Studio's
+Lab is a Monaco IDE that executes user code, which is incompatible with the
+open-source no-exec posture. The only genuine capability gap was time-series
+charts, and it was closed D8-compliantly in CP9-1 with an inline-SVG module
+(Studio itself only draws line charts).
+
+**Escape hatch (documented, unexercised).** Reaffirms D8: if a build-step
+frontend is ever truly required, it lives in a separate opt-in directory and is
+never a prerequisite for the kernel or the default UI. This branch does not
+exercise it.
+
+**IA (CP9-2).** The primary view is 「LLM 因子工作台」 — it occupies Studio's
+primary-surface slot but is never named "Agent" (boundary integrity, D6). It
+hosts two modules: 单因子研究 and 多因子策略回测. The former RD 循环 and
+Benchmark top-level tabs fold into 单因子研究 sections; legacy hashes migrate,
+so no deep link dead-ends (`lab.js` `TAB_IDS` / `LEGACY_HASH_ALIASES`).
+
+**CP10 multi-factor synthesis rulings.** The module is open-source SIMPLE
+synthesis — it produces a composite SIGNAL, not an optimized portfolio.
+(1) Three a-priori methods: `equal_weight`, `custom_weight` (raw declared
+weights, used as declared — the downstream ranking is scale-invariant),
+`rank_average` (pins `cross_sectional_rank` standardization). (2) `ic_weighted`
+is reserved as a non-runnable schema stub (`available=False`): its weights are
+data-driven from past-only IC history and deferred; the open-source build ships
+no implementation. (3) PER-ROLE composite computation (FP-5): each per-factor
+score is byte-identical to the single-factor path for that role — a union
+window would shift decay/warmup scores. (4) Complete-case coverage (FP-4):
+missing values are never imputed to 0; a `(trade_date, instrument)` row enters
+the composite only when every declared factor is present. (5) Weights are
+a-priori declared (`is_fitted=false`, enforced), surfaced through a validity
+banner. (6) Schema-driven param validation is the single enforcement source:
+`validate_params_against_schema` runs before any method's own
+`validate_params`, and the same `ParamSpec` schema drives both backend
+validation and the frontend dynamic form — a new method registers one
+implementation, with zero pipeline or form changes. (7) The commercial boundary
+holds: no optimizer, no covariance, no risk model (D6).
+
 ## Standing inputs adopted
 
 - `docs/research_platform_optimization_from_vibe_quantgpt.md` (Codex memo)

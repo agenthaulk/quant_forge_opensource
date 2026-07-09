@@ -245,3 +245,67 @@ pytest -q` + `python3 scripts/release_safety_scan.py` + CLI `--help` +
 - Remaining for CP8 closure: Phase C PR (stacked on PR #14) after the
   sensitive-info leak sweep; WORKING_STATE migration into
   docs/coordination/; final cross-review at merge time.
+
+## Phase D — frontend design-parity + multi-factor synthesis — 🔶 CONVERGED (pre-PR)
+- Framing = decision D9 (docs/coordination/DECISIONS.md): design-parity, not
+  stack-parity — adopt Studio's charts / module IA / polish, keep D8 (no build
+  step, static ES modules, zero external resources). Sub-lanes CP9-1 charts,
+  CP9-2 IA, CP10 backend + frontend, then convergence. Branch
+  `fable/phase-d-converged` carries all of Phase D on the Phase C tip
+  (`81ed4cf`, PR #15 merge).
+- **CP9-1 charts ✅** (`1035eb8`): honest inline-SVG charting module
+  `static/views/charts.js` (line/area/bar; "spark.js grown up" — pure
+  string-returning functions, no DOM builder, no state). FP-4 is the whole
+  point: a missing/null/non-finite point is a GAP in the path, never plotted
+  as 0 (each contiguous finite run is its own subpath); a fully-absent series
+  renders an explicit empty-state box, never a flat line at 0; bars are always
+  zero-based. Colors come only from existing CSS vars (both themes); each chart
+  is a role="img" SVG with a11y disclosure of the missing-data count. Eight
+  charts wired over the EXISTING payloads (factor/research/bench), no new
+  endpoints. Gate: **912 passed**.
+- **CP9-2 IA ✅** (`a5671a5`): consolidated 8→6 top tabs into the
+  「LLM 因子工作台」 primary view (`static/views/lab.js` + `html.py`). The
+  workbench tab keeps id `lab-tab-factor`; the former RD 循环 and Benchmark
+  tabs fold into its 单因子研究 module as the `#workbench-rd` /
+  `#report-comparison` sections; 多因子策略回测 is the reserved CP10 module
+  slot. Legacy `#lab-tab-rd` / `#lab-tab-bench` hashes migrate through
+  `LEGACY_HASH_ALIASES` (no deep-link dead-ends); structural DSL formula
+  highlighting added (`static/views/dsl.js`). Gate: **915 passed**. Its
+  adversarial-Opus review fixes (tab hover contrast MAJOR; single-dot priority
+  error>running>done; hash fidelity so reload/copy-link carry the canonical
+  fragment) landed folded into the CP10-FE commit (see below).
+- **CP10 backend ✅** (`da07e69`): synthesis package `src/quant_forge/synthesis/`
+  (contracts, methods, registry, standardizers, alignment, orchestrator). SIMPLE
+  a-priori synthesis — a composite SIGNAL, not an optimized portfolio: three
+  runnable methods (`equal_weight`, `custom_weight`, `rank_average`),
+  `ic_weighted` reserved as a non-runnable schema stub. PER-ROLE composite
+  keeps every per-factor score byte-identical to the single-factor path (FP-5);
+  complete-case coverage (FP-4: missing never imputed to 0);
+  `is_fitted` pinned False and enforced; deterministic `MFC_` composite id.
+  Schema-driven validation (`validate_params_against_schema`) is the single
+  enforcement source for both the backend and the frontend form. Three
+  endpoints: GET /api/synthesis/methods, POST /api/multi-factor-backtest
+  (sync), POST /api/jobs/multi-factor-backtest (async). No optimizer/
+  covariance/risk model (D6). Gate: **1010 passed**.
+- **CP10 frontend ✅** (`4dee08a`): 多因子策略回测 module `static/views/synthesis.js`
+  filling the reserved `#multi-result` slot — schema-driven dynamic params form
+  (rendered PURELY from the chosen method's `ParamSpec` list, zero per-method
+  hardcoding, so a new method needs no frontend edit), honest degraded state
+  when the methods catalog is absent, and a provenance / validity / coverage
+  report (raw a-priori weights echoed unnormalized, coverage null→n/a never 0,
+  is_fitted surfaced only as the 先验声明 label). Landed together with the
+  CP9-2 IA review fixes at **931 passed**.
+- **Convergence 🔶** (merge `1999b53`, parents `4dee08a` frontend-parity line +
+  `da07e69` CP10 backend): the CP10 backend was merged into the CP9-1→CP9-2→
+  CP10-FE frontend-parity line on `fable/phase-d-converged`. Combined barrier
+  **1037 passed**, release scan 216 files, CLI OK, diff-check clean. The FIRST
+  real end-to-end multi-factor backtest was verified live: a composite `MFC_`
+  id, raw declared weights 0.6/0.4 echoed unnormalized, per-role coverage
+  reported for both engine roles, a-priori validity banner (is_fitted=false),
+  and FP-4 coverage caveats surfaced rather than papered over.
+- Review posture (recorded honestly): the CP9-2 and CP10-FE strict reviews ran
+  on Opus (adversarial, fresh-context) during a Codex quota embargo. A Codex
+  confirmation pass is deferred to post-embargo / pre-PR; it is a known
+  remaining gate, not a skipped one.
+- Verify: `git log --oneline 1035eb8 a5671a5 da07e69 4dee08a 1999b53` exist;
+  suite green; `python3 scripts/release_safety_scan.py` passes.
