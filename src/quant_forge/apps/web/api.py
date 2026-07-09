@@ -21,7 +21,6 @@ from urllib.parse import parse_qs, unquote
 
 from quant_forge.apps.web.jobs import _IdeaValidationSettings, _WebJobCancelled, _client_error_message
 from quant_forge.apps.web.markdown import extract_markdown_title, render_markdown_html
-from quant_forge.backtesting.service import run_staggered_entry_backtest
 from quant_forge.config import QuantForgeConfig, simulation_profile_from_mapping, validate_llm_runtime
 from quant_forge.core.contracts import (
     BacktestResult,
@@ -275,7 +274,7 @@ def run_staggered_entry_workflow(
     research_config = rd_config or load_research_loop_config(_server.DEFAULT_RD_CONFIG_PATH, config.research, config.simulation)
     factor = FactorRepository(config.paths.factor_root).get(factor_id)
     settings = _idea_validation_settings(factor, parameters, research_config)
-    result = run_staggered_entry_backtest(
+    result = _server.run_staggered_entry_backtest(
         factor.factor_id,
         factor_root=config.paths.factor_root,
         data_root=config.paths.data_root,
