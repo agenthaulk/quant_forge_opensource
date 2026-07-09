@@ -164,6 +164,7 @@ from quant_forge.apps.web.api import (
     _simulation_parameter_overrides as _simulation_parameter_overrides,
     _simulation_profile_payload as _simulation_profile_payload,
     _simulation_profile_period_text as _simulation_profile_period_text,
+    _synthesis_methods_payload as _synthesis_methods_payload,
     _test_period_override as _test_period_override,
     _transaction_costs_payload as _transaction_costs_payload,
     _validate_factor_workflow as _validate_factor_workflow,

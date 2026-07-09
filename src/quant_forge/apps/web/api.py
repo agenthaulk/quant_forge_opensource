@@ -49,6 +49,7 @@ from quant_forge.research_loop.config import (
 )
 from quant_forge.research_loop.llm import LLMHypothesisGenerator, LLMResearchReviewGenerator
 from quant_forge.research_loop.service import ResearchLoopResult, ResearchLoopService
+from quant_forge.synthesis.methods import method_catalog_payload
 
 
 MAX_RD_ITERATIONS = 5
@@ -1767,6 +1768,28 @@ def _data_status_payload(config: QuantForgeConfig) -> dict[str, Any]:
         ],
     }
     return _server._web_public_json(_redact_web_text(payload))
+
+
+def _synthesis_methods_payload(config: QuantForgeConfig) -> dict[str, Any]:
+    """Method + standardization catalog for the synthesis workbench (design §9).
+
+    Wraps the one authoritative catalog in
+    :mod:`quant_forge.synthesis.methods` (the same constants that drive
+    server-side parameter re-validation) instead of duplicating the JSON
+    here, so the advertised form schema and the enforced schema cannot
+    drift. Fitted methods ship ``available: false`` (reserved 预留) until
+    the fitted implementation phase lands; the frontend renders reserved
+    methods as disabled options generically, keeping the capability surface
+    honest without special-casing any method name.
+
+    ``config`` is unused today; the uniform builder signature keeps the
+    routing dispatch and monkeypatch seam identical across GET builders.
+    """
+
+    del config
+    from quant_forge.apps.web import server as _server
+
+    return _server._web_public_json(_redact_web_text(method_catalog_payload()))
 
 
 def _factor_research_tags_by_id(config: QuantForgeConfig) -> dict[str, dict[str, Any]]:

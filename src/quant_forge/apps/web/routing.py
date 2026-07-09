@@ -175,6 +175,9 @@ def create_local_web_server(
                     # path detail, so they keep the generic mapping below.
                     self._require_control_token()
                     self._json(_server._data_status_payload(config))
+                elif path == "/api/synthesis/methods":
+                    self._require_control_token()
+                    self._json(_server._synthesis_methods_payload(config))
                 elif path == "/api/registry/factors":
                     self._require_control_token()
                     self._json(_server._registry_factors_payload(config))
