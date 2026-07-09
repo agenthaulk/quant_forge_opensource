@@ -309,3 +309,29 @@ pytest -q` + `python3 scripts/release_safety_scan.py` + CLI `--help` +
   remaining gate, not a skipped one.
 - Verify: `git log --oneline 1035eb8 a5671a5 da07e69 4dee08a 1999b53` exist;
   suite green; `python3 scripts/release_safety_scan.py` passes.
+
+## Phase D (revised 2026-07-09) — synthesis backend per the authoritative design (workorder CP0)
+
+- **Supersession (CP0 / D-0):** the `da07e69` in-memory synthesis backend and
+  the `fable/phase-d-converged` line are **superseded** by
+  `docs/design/multi_factor_portfolio_backtest.md` (materialize the composite as
+  a colon-free `COMPOSITE_<hash>` `precomputed:` factor; drive the unchanged
+  `run_factor_backtest` by id; two additive engine honesty fixes RB-3/RB-7 plus
+  the shared `rebalance_indices` helper RB-5). Full adjudication set D-0,
+  D-i..D-ix in `docs/coordination/DECISIONS.md` (CP0 section).
+- **New Phase D PR candidate:** `fable/phase-d-synthesis-backend`
+  (fork `4dee08a` → `8eabc05` D-ix backtest-only FE patch → cherry-picked docs
+  `575ede4`/`ab950d0` → CP0 docs → P1..P6 atomic commits, this section updated
+  per phase).
+- **Plan (design §14):** P1 catalog endpoint (fitted rows reserved) → P2
+  additive engine fixes (deterministic mergesort tie-break, skip-ledger stub,
+  `rebalance_indices`) → P3 a-priori composite core → P4 materialization +
+  engine drive (`decay_days=0` pin, per-run overlay, all-input hash id) → P5
+  job endpoint + §8 payload (same-window evaluation diagnostics, FP-2) → P6
+  fitted PIT IC/ICIR (embargo `idx(s)+delay+holding ≤ idx(d)`, honest
+  downgrades). Workflow B (`fable/phase-e-external-backends` from `main`):
+  CP1 public port/manifest/registry seam → CP2 WorldQuant adapter (local-only
+  `worldquant/adapter/`, D-i) + public gate evaluator → CP3 CLI wiring
+  (`qf backends list`, `qf factor submit --target`) → CP4 adversarial reviews.
+  Then CP-INT per `docs/full_integration_test_prompt.md` over a local merge of
+  both branches.
