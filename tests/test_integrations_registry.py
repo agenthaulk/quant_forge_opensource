@@ -100,7 +100,15 @@ def test_warning_codes_closed_set_is_pinned() -> None:
 def test_capability_and_status_closed_sets_are_pinned() -> None:
     assert CAPABILITIES == frozenset(("translate", "prescreen", "simulate", "submit"))
     assert BACKEND_STATUSES == ("available", "not_enabled", "not_installed", "unknown")
-    assert PRESCREEN_CHECK_STATUSES == ("passed", "failed", "not_evaluable")
+    # "not_configured" joined the closed set in CP2 (D-iii optional
+    # thresholds): a spec-skipped check is reported explicitly, never
+    # silently omitted and never coerced into a verdict.
+    assert PRESCREEN_CHECK_STATUSES == (
+        "passed",
+        "failed",
+        "not_evaluable",
+        "not_configured",
+    )
     assert REGION_ALIGNMENTS == ("aligned", "mismatched", "unknown")
 
 

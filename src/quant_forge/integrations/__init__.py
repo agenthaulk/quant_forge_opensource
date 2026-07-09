@@ -1,11 +1,13 @@
 """Provider-neutral seam for external factor backends (CP0 D-i/D-ii/D-iv).
 
 This package is the public pluggability boundary: typed contracts in
-:mod:`quant_forge.integrations.contracts` and the reviewed static binding
-registry in :mod:`quant_forge.integrations.registry`. Concrete adapters live
-in separately installed packages and are bound only through the registry's
-reviewed import table behind an explicit ``QF_ENABLE_BACKEND_<ID>`` opt-in;
-this package itself never imports any concrete backend at module load.
+:mod:`quant_forge.integrations.contracts`, the reviewed static binding
+registry in :mod:`quant_forge.integrations.registry`, and the pure-local
+submission-gate evaluator in :mod:`quant_forge.integrations.gate` (D-iii).
+Concrete adapters live in separately installed packages and are bound only
+through the registry's reviewed import table behind an explicit
+``QF_ENABLE_BACKEND_<ID>`` opt-in; this package itself never imports any
+concrete backend at module load.
 """
 
 from quant_forge.integrations.contracts import (
@@ -37,6 +39,11 @@ from quant_forge.integrations.contracts import (
     TranslationRequest,
     TranslationResult,
 )
+from quant_forge.integrations.gate import (
+    GATE_CHECK_NAMES,
+    SubmissionGateSpec,
+    evaluate_submission_gate,
+)
 from quant_forge.integrations.registry import (
     BACKEND_STATUSES,
     KNOWN_FACTOR_BACKENDS,
@@ -53,6 +60,7 @@ __all__ = [
     "BACKEND_NOT_INSTALLED",
     "BACKEND_STATUSES",
     "CAPABILITIES",
+    "GATE_CHECK_NAMES",
     "KNOWN_FACTOR_BACKENDS",
     "MEMBER_FORMULA_DRIFT",
     "NOT_TRANSLATABLE",
@@ -74,11 +82,13 @@ __all__ = [
     "PrescreenRequest",
     "SimulationRequest",
     "SimulationResult",
+    "SubmissionGateSpec",
     "SubmitReceipt",
     "SubmitRequest",
     "TranslationRequest",
     "TranslationResult",
     "enable_env_var",
+    "evaluate_submission_gate",
     "is_known_backend",
     "list_backends",
     "resolve_backend",

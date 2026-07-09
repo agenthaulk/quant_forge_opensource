@@ -177,12 +177,18 @@ class TranslationResult:
 # Prescreen (D-iii honesty: local proxy, never a predicted pass-rate)
 # ---------------------------------------------------------------------------
 
-PRESCREEN_CHECK_STATUSES: tuple[str, ...] = ("passed", "failed", "not_evaluable")
+PRESCREEN_CHECK_STATUSES: tuple[str, ...] = (
+    "passed",
+    "failed",
+    "not_evaluable",
+    "not_configured",
+)
 
 _CHECK_STATUS_TO_PASSED: dict[str, bool | None] = {
     "passed": True,
     "failed": False,
     "not_evaluable": None,
+    "not_configured": None,
 }
 
 REGION_ALIGNMENTS: tuple[str, ...] = ("aligned", "mismatched", "unknown")
@@ -195,7 +201,9 @@ class PrescreenCheck:
     ``status`` is authoritative and closed-set; ``passed`` is derived when
     omitted and validated for agreement when supplied, so the two can never
     drift. ``not_evaluable`` maps to ``passed=None`` — a check that could not
-    run is never defaulted to a failure or a pass (FP-4).
+    run is never defaulted to a failure or a pass (FP-4). ``not_configured``
+    also maps to ``passed=None``: it marks a check the gate spec left
+    unconfigured (D-iii optional thresholds), which is a skip, not a verdict.
     """
 
     name: str
