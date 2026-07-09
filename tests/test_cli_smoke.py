@@ -623,3 +623,63 @@ transaction_costs:
     assert overridden["top_quantile"] == 0.4
     assert overridden["simulation_profile"]["decay_days"] == 2
     assert overridden["transaction_costs"]["slippage_bps"] == 3.0
+
+
+def test_research_run_once_rd_config_disables_strategy_selector(tmp_path: Path) -> None:
+    # F1: the strategy-selector kill switch must reach the service through the
+    # real CLI entry point, not just the config loader.
+    workspace = tmp_path / "rd_selector_demo"
+    run_cli("init", "--workspace", str(workspace))
+    rd_config = workspace / "rd.yaml"
+    rd_config.write_text("strategy_selector_enabled: false\n", encoding="utf-8")
+
+    payload = run_cli(
+        "research",
+        "run-once",
+        "FTR_DEMO_SMALL_CAP",
+        "--workspace",
+        str(workspace),
+        "--rd-config",
+        str(rd_config),
+        "--max-candidates",
+        "1",
+    )
+
+    assert payload["strategy_decision"] is None
+    assert payload["strategy_trail"] == []
+    trace_files = list((workspace / "artifacts" / "research_loop" / "runs").glob("*/trace.jsonl"))
+    assert trace_files
+    for trace_file in trace_files:
+        assert "strategy_decision" not in trace_file.read_text(encoding="utf-8")
+
+
+def test_run_backtest_include_partial_final_period_flag(tmp_path: Path) -> None:
+    # F4: the CLI opt-in flag reaches the kernel; the tail period is included
+    # marked to market and flagged with the legacy PARTIAL_FINAL_PERIOD code.
+    workspace = tmp_path / "backtest_tail_demo"
+    run_cli("init", "--workspace", str(workspace))
+
+    default = run_cli(
+        "run-backtest",
+        "FTR_DEMO_SMALL_CAP",
+        "--workspace",
+        str(workspace),
+        "--holding-days",
+        "80",
+    )
+    opted = run_cli(
+        "run-backtest",
+        "FTR_DEMO_SMALL_CAP",
+        "--workspace",
+        str(workspace),
+        "--holding-days",
+        "80",
+        "--include-partial-final-period",
+    )
+
+    assert default["periods"] == 1
+    assert "FINAL_PARTIAL_PERIOD_EXCLUDED" in default["warning_codes"]
+    assert "PARTIAL_FINAL_PERIOD" not in default["warning_codes"]
+    assert opted["periods"] == 2
+    assert "PARTIAL_FINAL_PERIOD" in opted["warning_codes"]
+    assert "FINAL_PARTIAL_PERIOD_EXCLUDED" not in opted["warning_codes"]

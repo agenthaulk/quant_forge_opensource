@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 import json
 import math
 import os
 from pathlib import Path
 from typing import Any
+import uuid
 
 import yaml
 
@@ -44,7 +46,30 @@ def write_text(path: Path, text: str) -> None:
 
 
 def _atomic_write(path: Path, text: str) -> None:
+    """Atomically publish ``text`` at ``path``; safe under concurrent writers.
+
+    Each writer stages its payload in a private, uniquely named temp file
+    (``.{name}.{unique}.tmp``, same directory so the rename stays within one
+    filesystem) and then atomically renames it over ``path`` via
+    ``os.replace``. Semantics:
+
+    - Readers only ever observe a complete payload from exactly one writer,
+      never a partial or interleaved file.
+    - Concurrent writers to the same path are safe; the surviving content is
+      that of the writer whose rename lands last (last-writer-wins).
+    - A writer killed between staging and rename may leave its private temp
+      file behind; it is never visible at ``path`` and never corrupts it.
+    """
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        # "x" (exclusive create) guards the never-expected temp-name collision:
+        # failing closed beats silently sharing a staging file again.
+        with open(tmp, "x", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        with suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise

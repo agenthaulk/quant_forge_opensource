@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import warnings
 from typing import Any
 
@@ -187,6 +188,10 @@ def _hypothesis_messages(
     )
     effective_ideas = list(context.effective_ideas)[:10] if context is not None else []
     next_hints = list(context.next_focus_hints)[:10] if context is not None else []
+    # Durable research memory (already redacted and bounded upstream): only
+    # statement + observation_count reach the prompt, max 5 items per tier.
+    memory_failures = _memory_items_for_prompt(context.recent_failures) if context is not None else []
+    memory_findings = _memory_items_for_prompt(context.recent_successes) if context is not None else []
     mechanism_guidance = _mechanism_guidance_for_prompt(seed)
     system = (
         "You are Quant Forge's RD hypothesis generator. Return one JSON object only. "
@@ -217,6 +222,8 @@ def _hypothesis_messages(
         f"Available operators: {json.dumps(operator_catalog, ensure_ascii=False)}\n"
         f"Effective ideas: {json.dumps(effective_ideas, ensure_ascii=False)}\n"
         f"Recent failure hints: {json.dumps(next_hints, ensure_ascii=False)}\n"
+        f"Research memory failures (avoid repeating): {json.dumps(memory_failures, ensure_ascii=False)}\n"
+        f"Research memory findings (build on if relevant): {json.dumps(memory_findings, ensure_ascii=False)}\n"
         f"Mechanism guidance: {json.dumps(mechanism_guidance, ensure_ascii=False)}\n"
         f"Generate up to {max_candidates} distinct hypotheses. "
         "Each rationale must include: economic mechanism, formula transformation, expected failure mode, "
@@ -301,6 +308,69 @@ def _repair_messages(
         ensure_ascii=False,
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+_MEMORY_PROMPT_ITEM_LIMIT = 5
+# The service writes durable memory statements in exactly two fully-structured
+# shapes (service._record_memory_observations):
+#   "accepted candidate formula family {fp} passed the research gate"
+#   "gate blocked candidate formula family {fp}: {families}"
+# where {fp} is the leading 12 chars of an UPPERCASE SHA-1 hex fingerprint
+# (service._hash_parts -> hashlib.sha1(...).hexdigest()[:16].upper()) and
+# {families} is a comma-space-joined, sorted list of value-free gate-reason
+# families (service._gate_reason_families): each is the leading word of a gate
+# reason and, for every reason the shipped gate emits, is drawn from the
+# [A-Za-z0-9_] identifier charset (metric names, INSUFFICIENT_* constants, and
+# IS/OOS* split names). The prompt-side read gate authenticates the WHOLE
+# collapsed statement against these anchored shapes, not merely an opening
+# prefix, so a conforming prefix followed by an appended free-text payload is
+# dropped instead of steering prompts (P1).
+_MEMORY_FINGERPRINT_PATTERN = r"[0-9A-F]{12}"
+_MEMORY_FAMILY_PATTERN = r"[A-Za-z0-9_]+"
+_MEMORY_STATEMENT_PATTERNS = (
+    re.compile(rf"^accepted candidate formula family {_MEMORY_FINGERPRINT_PATTERN} passed the research gate$"),
+    re.compile(
+        rf"^gate blocked candidate formula family {_MEMORY_FINGERPRINT_PATTERN}: "
+        rf"{_MEMORY_FAMILY_PATTERN}(?:, {_MEMORY_FAMILY_PATTERN})*$"
+    ),
+)
+# Defense-in-depth secondary bound only; the anchored templates above are the
+# primary gate. Legitimate statements are far shorter than this.
+_MEMORY_STATEMENT_MAX_CHARS = 300
+
+
+def _memory_items_for_prompt(items: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Bounded research-memory items for the hypothesis prompt.
+
+    Only rows marked ``source == "research_memory"`` qualify (trace entries in
+    the same tuples keep their existing prompt channels), and only the
+    already-redacted statement plus observation_count are forwarded. Disk is
+    not trusted at read time: after collapsing the statement to a single line it
+    must FULLY match one of the two service statement templates
+    (``_MEMORY_STATEMENT_PATTERNS``). A conforming prefix followed by an
+    appended payload does not match and is dropped, so free text written by any
+    other same-host writer cannot steer prompts. ``_MEMORY_STATEMENT_MAX_CHARS``
+    is a secondary defense-in-depth length bound, not the primary gate.
+    """
+
+    bounded: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("source") != "research_memory":
+            continue
+        statement = " ".join(str(item.get("statement") or "").split())
+        if len(statement) > _MEMORY_STATEMENT_MAX_CHARS:
+            continue
+        if not any(pattern.match(statement) for pattern in _MEMORY_STATEMENT_PATTERNS):
+            continue
+        bounded.append(
+            {
+                "statement": statement,
+                "observation_count": int(item.get("observation_count") or 0),
+            }
+        )
+        if len(bounded) >= _MEMORY_PROMPT_ITEM_LIMIT:
+            break
+    return bounded
 
 
 def _catalog_for_prompt(items: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> list[dict[str, str]]:

@@ -20,6 +20,10 @@ MetricStatus = Literal[
     "invalid",
 ]
 METRICS_SCHEMA_VERSION = "qf.metrics.v2"
+# Upper bound on factor horizons (P5 robustness): ~3 trading years, far above
+# every legitimate configured horizon (repo maximum is 140), mirroring the
+# formula-window bound in factor_engine.formula_parser.MAX_WINDOW_ROWS.
+MAX_HORIZON_DAYS = 750
 
 
 @dataclass(frozen=True)
@@ -59,6 +63,8 @@ class FactorDefinition:
             raise ValueError("factor_id must start with a letter and contain only letters, digits, underscores, =, or -")
         if self.horizon_days < 1:
             raise ValueError("horizon_days must be positive")
+        if self.horizon_days > MAX_HORIZON_DAYS:
+            raise ValueError(f"horizon_days must be <= {MAX_HORIZON_DAYS}")
 
 
 @dataclass(frozen=True)

@@ -2219,3 +2219,351 @@ def test_hypothesis_generator_temperature_defaults_to_zero(monkeypatch) -> None:
     explicit = rd_llm.LLMHypothesisGenerator(settings, hypothesis_temperature=0.2)
     explicit.generate_with_context(seed, context=None, objective="balanced", max_candidates=1)
     assert seen["temperature"] == 0.2
+
+
+def _trace_rows_for(trace_root: Path) -> list[dict]:
+    return [
+        json.loads(line)
+        for line in (trace_root / "trace.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def test_research_loop_records_strategy_decision_and_rd_run_history(tmp_path: Path) -> None:
+    from quant_forge.lineage.store import RunIndex
+    from quant_forge.research_loop.strategy_selector import STRATEGY_VOCABULARY
+
+    paths = create_demo_workspace(tmp_path / "demo")
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+    )
+
+    first = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+    second = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    # Round 0: no prior evidence exists, so the selector must explore (R1) —
+    # any other pick would fabricate evidence about an incumbent (FP-2).
+    assert first.strategy_decision is not None
+    assert first.strategy_decision["schema_version"] == "qf.rd.strategy.v1"
+    assert first.strategy_decision["strategy"] == "explore"
+    assert str(first.strategy_decision["reason"]).startswith("R1")
+    assert first.strategy_trail
+    assert first.strategy_trail[-1]["strategy"] == "explore"
+
+    assert first.trace_root is not None
+    assert second.trace_root is not None
+    first_rows = _trace_rows_for(first.trace_root)
+    decision_rows = [row for row in first_rows if row["phase"] == "strategy_decision"]
+    assert len(decision_rows) == 1
+    assert decision_rows[0]["schema_version"] == "qf.research_loop.trace.v1"
+    assert decision_rows[0]["strategy_decision"]["strategy"] == "explore"
+    assert decision_rows[0]["strategy_context"]["round_index"] == 0
+
+    # The per-round summary is persisted run history for the next selector.
+    summary_rows = [row for row in first_rows if row["phase"] == "round_summary"]
+    assert len(summary_rows) == 1
+    assert summary_rows[0]["round_summary"]["candidate_count"] == len(first.candidates)
+    assert 0.0 <= summary_rows[0]["round_summary"]["duplicate_rate"] <= 1.0
+
+    # Candidate results carry the additive OOS decay evidence key; the value
+    # may be null (unknown), never a fabricated number.
+    result_rows = [row for row in first_rows if row["phase"] == "experiment_result"]
+    assert result_rows
+    assert "oos_net_return_decay" in result_rows[0]["backtest_summary"]
+
+    # Strategy hints reach the persisted prompt context as structured hints.
+    context_payload = json.loads((first.trace_root / "context.json").read_text(encoding="utf-8"))
+    assert any(str(hint).startswith("strategy_selector:") for hint in context_payload["next_focus_hints"])
+
+    # Round 1 sees exactly one prior round and records its own decision.
+    second_rows = _trace_rows_for(second.trace_root)
+    second_decisions = [row for row in second_rows if row["phase"] == "strategy_decision"]
+    assert len(second_decisions) == 1
+    assert second_decisions[0]["strategy_context"]["round_index"] == 1
+    assert second_decisions[0]["strategy_context"]["candidate_count"] >= 1
+    assert second_decisions[0]["strategy_decision"]["strategy"] in STRATEGY_VOCABULARY
+    assert len(second.strategy_trail) == 2
+
+    # The report renders the compact per-round strategy trail.
+    assert second.report_path is not None
+    report_text = second.report_path.read_text(encoding="utf-8")
+    assert "## Strategy Trail" in report_text
+    assert str(second.strategy_trail[-1]["strategy"]) in report_text
+
+    # Both RD runs appended one honest run-history row of kind "rd".
+    rd_rows = [row for row in RunIndex(paths["artifact_root"]).read_rows() if row["kind"] == "rd"]
+    assert len(rd_rows) == 2
+    assert rd_rows[0]["run_id"] == first.trace_root.name
+    assert rd_rows[1]["run_id"] == second.trace_root.name
+    for row in rd_rows:
+        assert "FTR_DEMO_SMALL_CAP" in row["factor_ids"]
+        assert len(row["config_fingerprint"]) == 64
+        assert row["artifact_paths_rel"]
+        for path_rel in row["artifact_paths_rel"]:
+            assert not Path(path_rel).is_absolute()
+            assert ".." not in Path(path_rel).parts
+        assert row["data_window"]["status"] in {"available", "unavailable"}
+        if row["data_window"]["status"] == "unavailable":
+            assert row["data_window"]["start_date"] is None
+            assert row["data_window"]["end_date"] is None
+        for highlight in row["metric_highlights"].values():
+            if highlight["status"] == "available":
+                assert highlight["value"] is not None
+            else:
+                assert highlight["value"] is None
+        assert row["warnings_count"] >= 0
+
+
+def test_research_loop_strategy_selector_disabled_removes_decision(tmp_path: Path) -> None:
+    from quant_forge.lineage.store import RunIndex
+
+    paths = create_demo_workspace(tmp_path / "demo")
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        strategy_selector_enabled=False,
+    )
+
+    result = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+
+    assert result.strategy_decision is None
+    assert result.strategy_trail == ()
+    assert result.trace_root is not None
+    trace_text = (result.trace_root / "trace.jsonl").read_text(encoding="utf-8")
+    assert "strategy_decision" not in trace_text
+    context_text = (result.trace_root / "context.json").read_text(encoding="utf-8")
+    assert "strategy_selector:" not in context_text
+    snapshot = json.loads((result.trace_root / "config_snapshot.json").read_text(encoding="utf-8"))
+    assert snapshot["strategy_selector_enabled"] is False
+    assert result.report_path is not None
+    assert "Strategy Trail" not in result.report_path.read_text(encoding="utf-8")
+
+    # Run history is independent of the selector: the rd row is still written.
+    rd_rows = [row for row in RunIndex(paths["artifact_root"]).read_rows() if row["kind"] == "rd"]
+    assert len(rd_rows) == 1
+    rows = _trace_rows_for(result.trace_root)
+    assert [row["phase"] for row in rows if row["phase"] == "round_summary"] == ["round_summary"]
+
+
+def test_rd_config_maps_strategy_selector_flag(tmp_path: Path) -> None:
+    from quant_forge.research_loop.config import ResearchLoopConfig, load_research_loop_config
+
+    assert ResearchLoopConfig().strategy_selector_enabled is True
+    config_path = tmp_path / "rd.yaml"
+    config_path.write_text("strategy_selector_enabled: false\n", encoding="utf-8")
+    assert load_research_loop_config(config_path).strategy_selector_enabled is False
+
+
+def test_strategy_context_is_scoped_to_the_current_seed_run_chain(tmp_path: Path) -> None:
+    # F3: two sequential runs with DIFFERENT seeds must produce independent
+    # strategy contexts — run 1's rounds, gate reasons, round summaries, and
+    # fingerprints must not leak into run 2's context.
+    paths = create_demo_workspace(tmp_path / "demo")
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+    )
+
+    first = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+    second = service.run_once("FTR_DEMO_MOMENTUM", max_candidates=1)
+
+    assert first.trace_root is not None
+    assert second.trace_root is not None
+    first_rows = _trace_rows_for(first.trace_root)
+    second_rows = _trace_rows_for(second.trace_root)
+    first_context = next(row for row in first_rows if row["phase"] == "strategy_decision")["strategy_context"]
+    second_context = next(row for row in second_rows if row["phase"] == "strategy_decision")["strategy_context"]
+
+    # Run 2 is round 0 of its OWN seed chain despite run 1's persisted trace.
+    assert first_context["round_index"] == 0
+    assert second_context["round_index"] == 0
+    assert second_context["candidate_count"] == 0
+    assert second_context["gate_blocking_reasons"] == []
+    assert second_context["successful_mechanisms"] == []
+    assert second_context["recent_fingerprints"] == []
+    assert second.strategy_decision is not None
+    assert str(second.strategy_decision["reason"]).startswith("R1")
+    # The decision trail is per-seed as well: run 2 shows only its own round.
+    assert len(second.strategy_trail) == 1
+
+    # Same-seed continuation still works: a third run on seed 1 sees exactly
+    # one prior round of that seed, not two runs pooled across seeds.
+    third = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
+    assert third.trace_root is not None
+    third_rows = _trace_rows_for(third.trace_root)
+    third_context = next(row for row in third_rows if row["phase"] == "strategy_decision")["strategy_context"]
+    assert third_context["round_index"] == 1
+    assert third_context["candidate_count"] >= 1
+
+
+def test_strategy_context_duplicate_rate_uses_attempted_plan_denominator() -> None:
+    # F8: without a round summary the fallback duplicate rate must divide
+    # duplicate-blocked plans by ALL attempted plans (results + failures +
+    # blocked), not by the planner-call count that repair retries inflate.
+    from quant_forge.research_loop.service import _strategy_context_from_trace_entries
+
+    def _plan_row(phase: str, status: str = "ready") -> dict:
+        return {
+            "run_id": "rd_FTR_SEED_20240101T000000000000Z_00000000",
+            "phase": phase,
+            "experiment_plan": {"status": status, "metadata": {}},
+        }
+
+    entries = [
+        # One lane: initial plan + two repair retries, all traced as plans,
+        # ending duplicate-blocked.
+        _plan_row("experiment_plan"),
+        _plan_row("experiment_plan"),
+        _plan_row("experiment_plan"),
+        _plan_row("plan_blocked", status="blocked_duplicate_formula"),
+        # Second lane: ready plan that ran to a result.
+        _plan_row("experiment_plan"),
+        {
+            "run_id": "rd_FTR_SEED_20240101T000000000000Z_00000000",
+            "phase": "experiment_result",
+            "gate_decision": {"accepted": False, "blocking_reasons": []},
+            "backtest_summary": {},
+            "artifact_refs": {},
+        },
+    ]
+
+    context = _strategy_context_from_trace_entries(entries)
+    # 1 duplicate out of 2 attempted plans; the old planner-call denominator
+    # (4 experiment_plan rows) would have reported 0.25.
+    assert context.duplicate_rate == pytest.approx(0.5)
+
+
+def test_strategy_context_uses_round_winner_not_last_traced_result() -> None:
+    # C1: candidates are traced in EVALUATION order while the round is sorted
+    # afterwards, so a losing candidate traced last must never drive the next
+    # round's selector. Rounds persisted after the fix carry the WINNER's
+    # decay/gate reasons in the round summary; the selector prefers those.
+    from quant_forge.research_loop.service import _strategy_context_from_trace_entries
+
+    run_id = "rd_FTR_SEED_20240101T000000000000Z_00000000"
+    winner_row = {
+        "run_id": run_id,
+        "phase": "experiment_result",
+        "gate_decision": {"accepted": True, "blocking_reasons": []},
+        "backtest_summary": {"oos_net_return_decay": 0.1},
+        "artifact_refs": {},
+    }
+    loser_row_traced_last = {
+        "run_id": run_id,
+        "phase": "experiment_result",
+        "gate_decision": {
+            "accepted": False,
+            "blocking_reasons": ["OOS net return decay exceeds 0.500000", "turnover_rate 2.000000 > 1.500000"],
+        },
+        "backtest_summary": {"oos_net_return_decay": 0.9},
+        "artifact_refs": {},
+    }
+    summary_payload = {
+        "seed_factor_id": "FTR_SEED",
+        "round_index": 0,
+        "planned_count": 2,
+        "candidate_count": 2,
+        "duplicate_count": 0,
+        "duplicate_rate": 0.0,
+        "seed_score": 0.5,
+        "best_score": 1.0,
+        "best_score_delta_vs_seed": 0.5,
+        "accepted_candidate_ids": ["FTR_WINNER"],
+        "winner_candidate_ref": "FTR_WINNER",
+        "winner_oos_net_return_decay": 0.1,
+        "winner_gate_blocking_reasons": [],
+    }
+    entries = [
+        winner_row,
+        loser_row_traced_last,
+        {"run_id": run_id, "phase": "round_summary", "round_summary": summary_payload},
+    ]
+
+    context = _strategy_context_from_trace_entries(entries)
+    # The WINNER's evidence, not the last-traced loser's.
+    assert context.oos_net_return_decay == pytest.approx(0.1)
+    assert context.gate_blocking_reasons == ()
+    assert context.turnover_breach is False
+    assert context.best_score_delta_vs_seed == pytest.approx(0.5)
+
+    # Legacy traces (round summaries written BEFORE the winner-evidence keys)
+    # keep the old best-effort fallback to the last-traced experiment_result.
+    legacy_payload = {
+        key: value for key, value in summary_payload.items() if not key.startswith("winner_")
+    }
+    legacy = _strategy_context_from_trace_entries(
+        [winner_row, loser_row_traced_last, {"run_id": run_id, "phase": "round_summary", "round_summary": legacy_payload}]
+    )
+    assert legacy.oos_net_return_decay == pytest.approx(0.9)
+    assert legacy.turnover_breach is True
+
+
+def test_round_summary_persists_winner_evidence_for_next_round(tmp_path: Path) -> None:
+    # C1 end-to-end: the persisted round summary names the round winner
+    # (results[0] after sorting) and carries the winner's own decay evidence.
+    from quant_forge.research_loop.service import _oos_net_return_decay_value
+
+    paths = create_demo_workspace(tmp_path / "demo")
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+    )
+    result = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=2)
+
+    assert result.trace_root is not None
+    assert result.candidates
+    rows = _trace_rows_for(result.trace_root)
+    summary_rows = [row for row in rows if row["phase"] == "round_summary"]
+    assert len(summary_rows) == 1
+    summary = summary_rows[0]["round_summary"]
+    winner = result.candidates[0]
+    assert summary["winner_candidate_ref"] == winner.factor.factor_id
+    expected_decay = _oos_net_return_decay_value(winner.backtest)
+    if expected_decay is None:
+        assert summary["winner_oos_net_return_decay"] is None
+    else:
+        assert summary["winner_oos_net_return_decay"] == pytest.approx(expected_decay)
+    assert isinstance(summary["winner_gate_blocking_reasons"], list)
+    if winner.gate_passed:
+        assert summary["winner_gate_blocking_reasons"] == []
+
+
+def test_read_recent_entries_seed_scoping_survives_other_seed_floods(tmp_path: Path) -> None:
+    # C2: seed-chain scoping must happen BEFORE the read window limit. One
+    # same-seed entry followed by 200+ other-seed entries used to erase the
+    # seed's entire history from the selector context.
+    import os
+
+    from quant_forge.research_loop.service import _run_id_in_seed_chain
+
+    store = ResearchTraceStore(tmp_path / "rd_trace")
+    same_seed_run = "rd_FTR_SEED_20240101T000000000000Z_00000000"
+    other_seed_run = "rd_FTR_OTHER_20240102T000000000000Z_00000001"
+    store.append_trace({"run_id": same_seed_run, "phase": "round_summary", "round_summary": {"round_index": 0}})
+    for index in range(205):
+        store.append_trace({"run_id": other_seed_run, "phase": "experiment_plan", "lane_id": f"lane-{index}"})
+    # Pin the same-seed trace file older so the unfiltered control below is
+    # deterministic under mtime-ordered reads.
+    same_seed_path = store.run_dir(same_seed_run) / "trace.jsonl"
+    stat = same_seed_path.stat()
+    os.utime(same_seed_path, (stat.st_atime - 3600, stat.st_mtime - 3600))
+
+    def seed_filter(run_id: str) -> bool:
+        return _run_id_in_seed_chain(
+            run_id,
+            seed_factor_id="FTR_SEED",
+            current_run_id="rd_FTR_SEED_20240103T000000000000Z_00000002",
+        )
+
+    # Control (old behavior): the global window is saturated by the other seed.
+    unfiltered = store.read_recent_entries(limit=200)
+    assert all(entry["run_id"] == other_seed_run for entry in unfiltered)
+
+    scoped = store.read_recent_entries(limit=200, run_id_filter=seed_filter)
+    assert [entry["run_id"] for entry in scoped] == [same_seed_run]
+    assert scoped[0]["round_summary"]["round_index"] == 0

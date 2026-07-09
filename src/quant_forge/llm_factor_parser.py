@@ -15,6 +15,37 @@ from quant_forge.llm_client import extract_json_object, generate_chat_text
 from quant_forge.mcp.read_models import list_available_fields, list_available_operators
 from quant_forge.operator_registry.resolver import resolve_formula_operators
 
+# Single source of truth for the generic-fallback warning contract lives in
+# specs/nl_flow.py ("a fallback parse must never look like a confident one").
+# Reuse it here instead of defining a parallel copy so the web parse path and
+# the spec flow can never drift apart.
+from quant_forge.specs.nl_flow import (  # noqa: E402  (grouped with the contract note above)
+    _FALLBACK_WARNING as GENERIC_FALLBACK_WARNING,
+    _GENERIC_FALLBACK_FORMULA as GENERIC_FALLBACK_FORMULA,
+)
+
+# Shape limits for persisted factor free text (P4). Applied on both factor
+# ingestion paths — this LLM parser and the web edited-draft path
+# (apps/web/api._factor_from_request) — before anything reaches factor_root.
+FACTOR_DESCRIPTION_MAX_CHARS = 500
+UNIVERSE_FILTER_MAX_CHARS = 120
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def sanitize_factor_text(value: str, max_chars: int) -> str:
+    """Single-line, control-character-free, length-capped factor free text."""
+
+    cleaned = _CONTROL_CHARS_RE.sub(" ", value)
+    return " ".join(cleaned.split())[:max_chars]
+
+
+def slugify_factor_name(value: str) -> str:
+    """Reduce a factor name to the shared ``[a-z0-9_]`` slug charset."""
+
+    slug = re.sub(r"[^a-zA-Z0-9_]+", "_", value.strip().lower())
+    return slug.strip("_") or "llm_factor"
+
 
 @dataclass(frozen=True)
 class ParsedFactor:
@@ -23,6 +54,24 @@ class ParsedFactor:
     provider: str
     model: str
     raw_response: str = ""
+    # Honest-fallback contract: non-empty whenever the parse landed on the
+    # generic catch-all formula, so no caller can present a fallback parse as
+    # a confident one (no-silent-fallback principle).
+    warnings: tuple[str, ...] = ()
+
+
+def generic_fallback_warnings(formula: str) -> tuple[str, ...]:
+    """Warnings a parse result must carry when it landed on the generic formula.
+
+    Both parse modes are covered identically: the deterministic rule parser
+    only ever emits ``rank(close)`` from its catch-all branch, and an LLM
+    ``rank(close)`` answer cannot be distinguished from a guess, so either way
+    the result is flagged for review rather than presented as confident.
+    """
+
+    if formula == GENERIC_FALLBACK_FORMULA:
+        return (GENERIC_FALLBACK_WARNING,)
+    return ()
 
 
 def parse_factor_idea(text: str, llm: LLMSettings, *, mode: str = "llm") -> ParsedFactor:
@@ -30,7 +79,13 @@ def parse_factor_idea(text: str, llm: LLMSettings, *, mode: str = "llm") -> Pars
 
     if mode == "rule":
         factor = parse_idea_to_definition(text)
-        return ParsedFactor(factor=factor, source="rule", provider="rule", model="deterministic")
+        return ParsedFactor(
+            factor=factor,
+            source="rule",
+            provider="rule",
+            model="deterministic",
+            warnings=generic_fallback_warnings(factor.formula),
+        )
     if mode != "llm":
         raise ValueError(f"unsupported parser mode: {mode}")
     selected_llm = llm.select_provider()
@@ -48,6 +103,7 @@ def _parse_with_configured_llm(text: str, llm: LLMSettings) -> ParsedFactor:
         provider=result.provider,
         model=result.model,
         raw_response=result.content,
+        warnings=generic_fallback_warnings(factor.formula),
     )
 
 
@@ -90,12 +146,12 @@ def _factor_from_llm_json(payload: dict[str, Any], text: str) -> FactorDefinitio
         details = json.dumps(resolution.to_dict(), ensure_ascii=False, sort_keys=True)
         raise RuntimeError(f"LLM formula failed operator registry gate: {details}")
     formula = resolution.canonical_formula
-    description = str(payload.get("description", "")).strip()
+    description = sanitize_factor_text(str(payload.get("description", "")), FACTOR_DESCRIPTION_MAX_CHARS)
     horizon_days = _normalize_horizon_days(int(payload.get("horizon_days", 5)), text)
     filters_raw = payload.get("universe_filters", [])
     if not isinstance(filters_raw, list):
         raise RuntimeError("LLM field universe_filters must be a list")
-    filters = tuple(str(item) for item in filters_raw)
+    filters = tuple(sanitize_factor_text(str(item), UNIVERSE_FILTER_MAX_CHARS) for item in filters_raw)
     digest = hashlib.sha1(f"{name}:{formula}:{horizon_days}:{filters}:{text}".encode("utf-8")).hexdigest()[:8].upper()
     return FactorDefinition(
         factor_id=f"FTR_LLM_{digest}",
@@ -120,5 +176,4 @@ def _normalize_horizon_days(horizon_days: int, text: str) -> int:
 
 
 def _slug(value: str) -> str:
-    value = re.sub(r"[^a-zA-Z0-9_]+", "_", value.strip().lower())
-    return value.strip("_") or "llm_factor"
+    return slugify_factor_name(value)

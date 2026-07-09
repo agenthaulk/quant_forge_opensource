@@ -41,6 +41,7 @@ INSUFFICIENT_SHARPE_OBSERVATIONS = "INSUFFICIENT_SHARPE_OBSERVATIONS"
 DAILY_NAV_UNAVAILABLE = "DAILY_NAV_UNAVAILABLE"
 NO_REBALANCE_OBSERVATIONS = "NO_REBALANCE_OBSERVATIONS"
 PARTIAL_FINAL_PERIOD = "PARTIAL_FINAL_PERIOD"
+FINAL_PARTIAL_PERIOD_EXCLUDED = "FINAL_PARTIAL_PERIOD_EXCLUDED"
 SEGMENT_BOUNDARY_PURGED = "SEGMENT_BOUNDARY_PURGED"
 POSITIONS_LOST_BEFORE_EXIT = "POSITIONS_LOST_BEFORE_EXIT"
 
@@ -62,8 +63,17 @@ def run_factor_backtest(
     factor_values_manifest_root: Path | None = None,
     sample_role: str = EXTERNAL_OOS_ROLE,
     first_signal_date: str | None = None,
-    include_partial_final_period: bool = True,
+    include_partial_final_period: bool = False,
 ) -> BacktestResult:
+    """Run the next-day execution factor backtest.
+
+    By default the final incomplete holding period is excluded from the
+    schedule (owner decision D3) and the result carries the
+    ``FINAL_PARTIAL_PERIOD_EXCLUDED`` warning code so the exclusion is never
+    silent. Pass ``include_partial_final_period=True`` to mark the tail period
+    to market instead (flagged via ``PARTIAL_FINAL_PERIOD``).
+    """
+
     profile = simulation_profile or SimulationProfile()
     costs = transaction_costs or TransactionCostModel()
     if top_quantile is not None:
@@ -126,6 +136,7 @@ def run_factor_backtest(
     start_signal_index = _resolve_start_signal_index(dates, first_signal_date)
     completed_periods = 0
     partial_periods = 0
+    excluded_final_partial_period = False
     lost_positions_total = 0
     for signal_index in range(start_signal_index, len(dates) - delay - 1, holding):
         signal_date = dates[signal_index]
@@ -137,6 +148,11 @@ def run_factor_backtest(
         elif include_partial_final_period:
             actual_exit_index = len(dates) - 1
         else:
+            # Owner decision D3: the default drops the scheduled tail period
+            # whose exit falls beyond the data window instead of marking it to
+            # market. The exclusion is surfaced via FINAL_PARTIAL_PERIOD_EXCLUDED
+            # so it is never silent (FP-2).
+            excluded_final_partial_period = True
             break
         if actual_exit_index <= signal_index + delay:
             break
@@ -314,6 +330,18 @@ def run_factor_backtest(
         warning_code_items.append(NO_REBALANCE_OBSERVATIONS)
     if partial_periods:
         warning_code_items.append(PARTIAL_FINAL_PERIOD)
+    if excluded_final_partial_period:
+        warning_code_items.append(FINAL_PARTIAL_PERIOD_EXCLUDED)
+        warnings = tuple(
+            dict.fromkeys(
+                (
+                    *warnings,
+                    "final incomplete holding period excluded from the schedule "
+                    "(owner decision D3); pass include_partial_final_period=True "
+                    "to include it marked to market at the window end",
+                )
+            )
+        )
     if lost_positions_total:
         warning_code_items.append(POSITIONS_LOST_BEFORE_EXIT)
         warnings = tuple(
@@ -385,7 +413,9 @@ def run_factor_backtest(
         "execution_delay_days": delay,
         "execution_price": "close",
         "first_entry_policy": "first_signal_inside_window_then_next_day_entry",
-        "final_period_policy": "mark_to_market_partial_final",
+        "final_period_policy": (
+            "mark_to_market_partial_final" if include_partial_final_period else "exclude_partial_final"
+        ),
         "portfolio_mode": "long_short",
         "top_quantile": top_quantile,
         "benchmark": benchmark,
@@ -634,6 +664,7 @@ def run_staggered_entry_backtest(
                 "daily_nav": list(cohort_result.daily_nav),
                 "completed_periods": cohort_result.completed_periods,
                 "partial_periods": cohort_result.partial_periods,
+                "warning_codes": list(cohort_result.warning_codes),
             }
         )
     aggregate_nav = _aggregate_staggered_nav(dates, cohorts)
@@ -657,7 +688,10 @@ def run_staggered_entry_backtest(
         "relative_wealth_excess_return": terminal_nav / benchmark_terminal - 1.0 if benchmark_terminal else None,
         "daily_nav": aggregate_nav,
         "cohorts": cohorts,
-        "warning_codes": [],
+        # Aggregate-level codes are the distinct union of cohort codes so a
+        # cohort-level exclusion (e.g. FINAL_PARTIAL_PERIOD_EXCLUDED under D3)
+        # is never silent at the staggered surface (FP-2).
+        "warning_codes": sorted({str(code) for cohort in cohorts for code in cohort["warning_codes"]}),
     }
     artifact_path = artifact_root.expanduser() / "staggered_backtests" / f"{factor_id}{simulation_profile_suffix(profile)}.json"
     write_json(artifact_path, result)
@@ -1006,7 +1040,10 @@ def _return_summary(
                 value=annualized_volatility,
                 unit="return_volatility",
                 status="available" if annualized_volatility is not None else "insufficient_sample",
-                observation_count=periods,
+                # COR-6 honesty: when volatility_returns is the complete-only
+                # subset, the observation count must describe that subset, not
+                # the full period count including the excluded partial tail.
+                observation_count=len(vol_returns),
                 minimum_required=2,
                 method="period_return_std_scaled",
                 source_series="non_overlapping_period_returns",
@@ -1017,7 +1054,7 @@ def _return_summary(
                 value=long_short_sharpe,
                 unit="ratio",
                 status="available" if long_short_sharpe is not None else "insufficient_sample",
-                observation_count=periods,
+                observation_count=len(vol_returns),
                 minimum_required=2,
                 method="period_return_mean_over_std_scaled",
                 source_series="non_overlapping_period_returns",
@@ -1152,8 +1189,50 @@ def _segment_metrics(
     for spec, segment, purged_count in zip(split_specs, split_rows, purged_counts, strict=True):
         gross_returns = np.array([float(row["gross_period_return"]) for row in segment], dtype=float)
         net_returns = np.array([float(row["net_period_return"]) for row in segment], dtype=float)
-        gross = _return_summary(gross_returns, holding_days, sample_role=sample_role)
-        net = _return_summary(net_returns, holding_days, sample_role=sample_role)
+        # Mirror the top-level COR-6 handling inside each segment: a partial
+        # tail row (included via the D3 opt-in) must not be scaled as a full
+        # holding period by segment vol/Sharpe, and segment annualization uses
+        # the segment's ACTUAL exposure (sum of trading_days_held), not
+        # periods * holding_days.
+        complete_gross_returns = np.array(
+            [float(row["gross_period_return"]) for row in segment if bool(row.get("is_complete_period", True))],
+            dtype=float,
+        )
+        complete_net_returns = np.array(
+            [float(row["net_period_return"]) for row in segment if bool(row.get("is_complete_period", True))],
+            dtype=float,
+        )
+        segment_exposure_days = int(sum(int(row.get("trading_days_held", holding_days)) for row in segment))
+        gross = _return_summary(
+            gross_returns,
+            holding_days,
+            exposure_days=segment_exposure_days,
+            sample_role=sample_role,
+            volatility_returns=complete_gross_returns,
+        )
+        net = _return_summary(
+            net_returns,
+            holding_days,
+            exposure_days=segment_exposure_days,
+            sample_role=sample_role,
+            volatility_returns=complete_net_returns,
+        )
+        # F-6 (Phase A residual register): persist the boundary-purge COUNT,
+        # not only the SEGMENT_BOUNDARY_PURGED code, so the magnitude of the
+        # exclusion survives into the artifact and lineage (FP-7: a statistic
+        # carries its own validity context). The count is always observed —
+        # the boundary rule ran — so zero is a true zero, never a placeholder.
+        purge_metric = MetricValue(
+            value=float(purged_count),
+            unit="count",
+            status="available",
+            observation_count=len(segment) + purged_count,
+            method="segment_boundary_purge_count",
+            source_series="period_rows",
+            sample_role=sample_role,
+            segment=spec.name,
+            warning_codes=(SEGMENT_BOUNDARY_PURGED,) if purged_count else (),
+        )
         metrics.append(
             BacktestSegmentMetric(
                 name=spec.name,
@@ -1169,6 +1248,7 @@ def _segment_metrics(
                 net_long_short_sharpe=net["long_short_sharpe"],
                 net_max_drawdown=net["max_drawdown"],
                 sample_role=sample_role,
+                metrics={"purged_period_count": purge_metric},
                 warning_codes=(SEGMENT_BOUNDARY_PURGED,) if purged_count else (),
             )
         )

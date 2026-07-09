@@ -169,6 +169,88 @@ def test_formula_lookback_rows_tracks_nested_time_series_requirements() -> None:
     assert formula_lookback_rows("ts_mean(delta(close, 2), 3)") == 4
 
 
+def test_formula_window_arguments_capped_at_named_bound() -> None:
+    # P5: boundary accepted, boundary+1 rejected with a clear ValueError.
+    assert formula_lookback_rows("ts_mean(close, 750)") == 749
+    with pytest.raises(ValueError, match="750"):
+        formula_lookback_rows("ts_mean(close, 751)")
+    with pytest.raises(ValueError, match="750"):
+        formula_lookback_rows("correlation(close, volume, 999999999)")
+    with pytest.raises(ValueError, match="750"):
+        formula_lookback_rows("rank(delay(close, 100000))")
+
+
+def test_formula_inspection_reports_window_bound_violation() -> None:
+    from quant_forge.factor_engine.formula_parser import SUPPORTED_OPERATORS, inspect_formula
+
+    within = inspect_formula("ts_mean(close, 750)", known_operators=SUPPORTED_OPERATORS)
+    assert within.is_valid
+
+    beyond = inspect_formula("ts_mean(close, 751)", known_operators=SUPPORTED_OPERATORS)
+    assert not beyond.is_valid
+    assert any("750" in error for error in beyond.errors)
+
+
+def test_wq_min_max_scalar_window_capped_at_named_bound() -> None:
+    # FIX 2 / P5: wq_min/wq_max take EITHER a scalar rolling window
+    # (wq_max(x, 20) -> ts_max) OR a series (wq_max(x, volume) -> pairwise max).
+    # The scalar-window form must honor MAX_WINDOW_ROWS at the resolver/inspect
+    # gate (resolve_formula_operators / inspect_formula), matching the lookback
+    # path; the pairwise (series) form carries no window and must stay valid.
+    from quant_forge.factor_engine.formula_parser import (
+        MAX_WINDOW_ROWS,
+        SUPPORTED_OPERATORS,
+        inspect_formula,
+    )
+    from quant_forge.operator_registry.resolver import (
+        resolve_executable_formula,
+        resolve_formula_operators,
+    )
+
+    assert MAX_WINDOW_ROWS == 750
+
+    for operator in ("wq_max", "wq_min"):
+        # Oversized scalar window: rejected by the resolver gate with a clear
+        # named-bound error.
+        oversized = resolve_formula_operators(f"{operator}(close, 999999999)")
+        assert not oversized.executable
+        assert any("750" in reason for reason in oversized.blocking_errors)
+
+        # Boundary accepted, boundary+1 rejected.
+        assert resolve_formula_operators(f"{operator}(close, {MAX_WINDOW_ROWS})").executable
+        assert not resolve_formula_operators(f"{operator}(close, {MAX_WINDOW_ROWS + 1})").executable
+
+        # Legitimate small scalar window and the pairwise series form still resolve.
+        assert resolve_formula_operators(f"{operator}(close, 20)").executable
+        assert resolve_formula_operators(f"{operator}(close, volume)").executable
+
+        # inspect_formula (used by the resolver) reports the same bound violation.
+        beyond = inspect_formula(f"{operator}(close, {MAX_WINDOW_ROWS + 1})", known_operators=SUPPORTED_OPERATORS)
+        assert not beyond.is_valid
+        assert any("750" in error for error in beyond.errors)
+        assert inspect_formula(f"{operator}(close, {MAX_WINDOW_ROWS})", known_operators=SUPPORTED_OPERATORS).is_valid
+        assert inspect_formula(f"{operator}(close, volume)", known_operators=SUPPORTED_OPERATORS).is_valid
+
+    # End-to-end resolver gate (resolve_executable_formula) raises for the
+    # oversized form and passes the legitimate scalar-window form through.
+    with pytest.raises(ValueError, match="750"):
+        resolve_executable_formula("wq_max(close, 999999999)")
+    assert resolve_executable_formula("wq_min(close, 20)")
+
+
+def test_formula_length_capped_at_named_bound() -> None:
+    # P5: 2000-char boundary parses; one char more is rejected.
+    prefix, suffix = "rank(close + 0.", ")"
+    boundary = prefix + "1" * (2000 - len(prefix) - len(suffix)) + suffix
+    assert len(boundary) == 2000
+    assert formula_lookback_rows(boundary) == 0
+
+    beyond = prefix + "1" * (2001 - len(prefix) - len(suffix)) + suffix
+    assert len(beyond) == 2001
+    with pytest.raises(ValueError, match="2000"):
+        formula_lookback_rows(beyond)
+
+
 def test_execute_factor_formula_supports_worldquant_style_transforms() -> None:
     panel = pd.DataFrame(
         {

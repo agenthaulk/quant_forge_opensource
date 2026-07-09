@@ -69,6 +69,9 @@ gate:
   max_turnover_rate: null
   min_net_return_retention: null
   max_oos_net_return_decay: null
+  # When false, missing OOS/net-return gate evidence downgrades from a
+  # blocking reason to a warning; threshold violations always block (F-5).
+  missing_oos_evidence_blocks: true
 transaction_costs:
   commission_bps: 0.0
   slippage_bps: 0.0

@@ -259,7 +259,9 @@ def test_research_gate_detects_oos_decay_from_losing_is_baseline(tmp_path: Path)
     passed, reasons = apply_gate(evaluation, backtest, 0.1, ResearchGate(max_oos_net_return_decay=0.5))
 
     assert passed is False
-    assert "OOS net return decay exceeds 0.500000" in reasons
+    # F-2: one clause definition and one message format (:.6g) shared with the
+    # structured candidate gate via candidate_gate.max_oos_decay_reasons.
+    assert "OOS net return decay exceeds 0.5" in reasons
 
 
 def test_research_loop_can_score_profile_variants(tmp_path: Path) -> None:
@@ -412,12 +414,20 @@ def test_research_loop_single_round_performed_flags_remain_compatible(tmp_path: 
 
 def test_research_loop_emits_seed_and_candidate_assessment_bundle(tmp_path: Path) -> None:
     paths = create_demo_workspace(tmp_path / "demo")
+    # The in-sample window must keep >= 126 exposure days of COMPLETE holding
+    # periods under the D3 default (final partial period excluded) for the
+    # derived-field candidate formulas too. Since F-4 the demo panel no longer
+    # fabricates warmup zeros, so return_5d only exists from the 6th bar:
+    # 137 trading days through 2024-07-10 -> 132 usable signal days -> 26
+    # complete 5-day periods -> 130 exposure days. The previous 2024-07-03
+    # boundary (132 trading days) only cleared the annualization floor when
+    # warmup rows carried fabricated 0.0 returns.
     loop = ResearchLoopService(
         factor_root=paths["factor_root"],
         data_root=paths["data_root"],
         artifact_root=paths["artifact_root"],
-        evaluation_simulation_profile=SimulationProfile(test_period_end="2024-07-01"),
-        backtest_simulation_profile=SimulationProfile(test_period_start="2024-07-02"),
+        evaluation_simulation_profile=SimulationProfile(test_period_end="2024-07-10"),
+        backtest_simulation_profile=SimulationProfile(test_period_start="2024-07-11"),
     )
 
     result = loop.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1)
@@ -671,3 +681,31 @@ def test_research_report_renders_metric_status_instead_of_placeholder_zero(tmp_p
     assert "- Rank ICIR: 0.0000" not in report
     assert "- Rank IC t-stat: 0.0000" not in report
     assert "| insufficient_sample | insufficient_sample " in report
+
+
+def test_workbench_run_backtest_partial_final_period_opt_in(tmp_path: Path) -> None:
+    # F4: the D3 opt-in must pass through the typed workbench service; opting
+    # in includes the tail marked to market and emits the legacy
+    # PARTIAL_FINAL_PERIOD code instead of the exclusion code.
+    from quant_forge.backtesting.service import FINAL_PARTIAL_PERIOD_EXCLUDED, PARTIAL_FINAL_PERIOD
+
+    paths = create_demo_workspace(tmp_path / "demo")
+    workbench = WorkbenchService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+    )
+
+    default = workbench.run_backtest("FTR_DEMO_SMALL_CAP", holding_days=80)
+    opted = workbench.run_backtest(
+        "FTR_DEMO_SMALL_CAP", holding_days=80, include_partial_final_period=True
+    )
+
+    assert default.periods == 1
+    assert FINAL_PARTIAL_PERIOD_EXCLUDED in default.warning_codes
+    assert PARTIAL_FINAL_PERIOD not in default.warning_codes
+    assert opted.periods == 2
+    assert PARTIAL_FINAL_PERIOD in opted.warning_codes
+    assert FINAL_PARTIAL_PERIOD_EXCLUDED not in opted.warning_codes
+    payload = json.loads(opted.artifact_path.read_text(encoding="utf-8"))
+    assert payload["request"]["final_period_policy"] == "mark_to_market_partial_final"

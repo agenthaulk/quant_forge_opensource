@@ -190,6 +190,27 @@ def test_snapshot_derived_warmup_rows_stay_nan_and_drop_under_nan_policy(tmp_pat
     assert len(usable) == len(dates[5:]) * len(instruments)
 
 
+def test_demo_panel_warmup_rows_stay_nan_instead_of_fabricated_zeros(tmp_path: Path) -> None:
+    """F-4 (quantitative_core_audit.md §5): `_build_demo_panel` must not fill
+    warmup rows of derived columns with 0.0 — fabricated observations would
+    enter cross-sectional ranks as real data (FP-4). Mirrors the snapshot-path
+    warmup semantics pinned above."""
+
+    paths = create_demo_workspace(tmp_path / "demo")
+    panel = LocalPanelDataProvider(paths["data_root"]).load_panel()
+
+    for _, rows in panel.groupby("instrument"):
+        rows = rows.sort_values("trade_date")
+        assert pd.isna(rows["return_1d"].iloc[0])
+        assert rows["return_1d"].iloc[1:].notna().all()
+        assert rows["return_5d"].iloc[:5].isna().all()
+        assert rows["return_5d"].iloc[5:].notna().all()
+        # volatility_5d = rolling(5, min_periods=2).std() over return_1d:
+        # undefined until two daily returns exist.
+        assert rows["volatility_5d"].iloc[:2].isna().all()
+        assert rows["volatility_5d"].iloc[2:].notna().all()
+
+
 def test_snapshot_conflicting_duplicate_keys_are_rejected(tmp_path: Path) -> None:
     price = pd.DataFrame(
         {

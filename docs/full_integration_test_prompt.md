@@ -7,6 +7,8 @@
 - 模拟一个全新的使用者，不复用当前工作区源码。
 - 从 GitHub 重新 clone `main` 分支到干净临时目录。
 - 使用新的 Docker 容器或 Docker compose 环境完成安装、配置、启动、前端使用和 RD 联调。
+- 容器基线优先使用仓库根目录的参考 `Dockerfile`（`python:3.12-slim` +
+  `constraints.txt`，与 README 安装章节一致）；如需自定义容器，保持同一基线。
 - 不修改远端 `main`，不提交任何 API key、挂载盘绝对私密路径或私有数据样本。
 - DeepSeek key 只能从本机环境变量或 ignored local env 文件继承，不得写入 git tracked 文件。
 - A 股数据源、因子库、因子值库、artifact/result 路径可参考挂载盘，但只能写入 local/ignored 配置或 Docker runtime env。

@@ -41,6 +41,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "quant_forge.operator_registry.data" = ["*.yaml", "*.json"]
+"quant_forge.apps.web" = ["static/*.js", "static/views/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

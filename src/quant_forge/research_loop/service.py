@@ -8,7 +8,7 @@ import re
 from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
-from math import ceil
+from math import ceil, isfinite
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
@@ -16,7 +16,6 @@ from uuid import uuid4
 from quant_forge.backtesting.service import EXTERNAL_OOS_ROLE, IN_SAMPLE_ROLE, run_factor_backtest
 from quant_forge.core.contracts import (
     BacktestResult,
-    BacktestSegmentMetric,
     EvaluationResult,
     FactorAssessmentBundle,
     FactorDefinition,
@@ -29,7 +28,22 @@ from quant_forge.evaluation.service import evaluate_factor
 from quant_forge.factor_engine.formula_parser import SUPPORTED_OPERATORS, inspect_formula
 from quant_forge.factor_library.catalog import FactorCatalog, is_precomputed_formula
 from quant_forge.factor_library.repository import FactorRepository, parse_idea_to_definition
-from quant_forge.research_loop.candidate_gate import INSUFFICIENT_OOS_EVIDENCE
+from quant_forge.lineage.store import (
+    RunIndex,
+    canonical_fingerprint,
+    metric_highlight,
+    relative_artifact_path,
+)
+from quant_forge.research_loop.candidate_gate import (
+    SegmentEvidence,
+    max_oos_decay_reasons,
+    min_net_return_retention_reasons,
+    min_oos_return_reasons,
+    net_return_retention_value,
+    oos_net_decay_exceeded,
+    oos_return_evidence,
+    turnover_reasons,
+)
 from quant_forge.research_loop.candidate_gate import evaluate_candidate as evaluate_structured_candidate
 from quant_forge.research_loop.context_builder import ResearchContextBuilder
 from quant_forge.research_loop.contracts import (
@@ -41,14 +55,31 @@ from quant_forge.research_loop.contracts import (
 )
 from quant_forge.research_loop.experiment_planner import ExperimentPlanner
 from quant_forge.research_loop.feedback_builder import build_feedback
+from quant_forge.research_loop.memory import ResearchMemoryStore
 from quant_forge.research_loop.operator_drafts import write_operator_draft_artifacts
+from quant_forge.research_loop.strategy_selector import (
+    StrategyContext,
+    StrategyDecision,
+    select_strategy,
+)
 from quant_forge.research_loop.trace_store import ResearchTraceStore, utc_timestamp
+from quant_forge.workbench.service import evaluation_data_window
 
 
 DEFAULT_QUICK_HORIZON_DAYS = (5, 21)
 DEFAULT_QUICK_SAMPLE_SPLITS = (SampleSplitSpec(name="IS", fraction=1.0, score_weight=1.0),)
 DEFAULT_LLM_FORMULA_REPAIR_ATTEMPTS = 2
 RD_RESEARCH_STAGE = "research"
+RD_RUN_INDEX_KIND = "rd"
+RD_RUN_HIGHLIGHT_METRICS = ("rank_ic_mean", "rank_icir", "rank_ic_t_stat")
+# Bounded evidence window the strategy selector reads from the trace store.
+# Decoupled from deduplication.recent_trace_limit so disabling result-signature
+# dedup does not silently blind the selector.
+STRATEGY_CONTEXT_TRACE_LIMIT = 200
+_STRATEGY_TRAIL_LIMIT = 10
+_STRATEGY_MECHANISM_LIMIT = 10
+_STRATEGY_FINGERPRINT_LIMIT = 20
+_DUPLICATE_PLAN_STATUSES = frozenset({"blocked_duplicate_formula", "blocked_candidate_diversity"})
 
 
 @dataclass(frozen=True)
@@ -84,8 +115,18 @@ class ResearchGate:
     max_turnover_rate: float | None = None
     min_net_return_retention: float | None = None
     max_oos_net_return_decay: float | None = None
+    # F-5: when False, missing-evidence findings for the OOS/net-return
+    # clauses downgrade from blocking reasons to warnings (candidate-gate
+    # parity). Threshold violations always block. Default True preserves the
+    # pre-existing fail-closed behavior.
+    missing_oos_evidence_blocks: bool = True
 
     def __post_init__(self) -> None:
+        # Loader parity (F-5): a truthy non-bool (e.g. the string "false")
+        # must not silently flip the missing-evidence channel when the gate
+        # is constructed directly instead of via the strict YAML loader.
+        if not isinstance(self.missing_oos_evidence_blocks, bool):
+            raise ValueError("missing_oos_evidence_blocks must be a boolean")
         if self.min_ic_days < 0:
             raise ValueError("min_ic_days must be non-negative")
         if not 0 <= self.min_coverage <= 1:
@@ -272,7 +313,7 @@ class LocalSelfReviewGenerator:
         if _oos_decay(evaluation):
             risks.append("OOS2 ICIR decays versus IS")
             next_hypotheses.append(f"test a simpler or more robust variant of {candidate.name}")
-        if _oos_net_decay(backtest):
+        if oos_net_decay_exceeded(_segment_gate_evidence(backtest), 0.5):
             risks.append("OOS net return decays versus IS")
             next_hypotheses.append(f"validate {candidate.name} on a later OOS period")
         if not next_hypotheses:
@@ -316,6 +357,10 @@ class ResearchCandidateResult:
     gate_passed: bool
     gate_reasons: tuple[str, ...]
     self_review: ResearchSelfReview
+    # Warn-mode gate findings (e.g. INSUFFICIENT_OOS_EVIDENCE with
+    # missing_oos_evidence_blocks=False). A separate channel from
+    # ``gate_reasons`` so a warning can never read as a blocker downstream.
+    gate_warnings: tuple[str, ...] = ()
     transitioned_to_candidate: bool = False
     formula_fingerprint: str = ""
     result_signature: str = ""
@@ -358,6 +403,10 @@ class ResearchLoopResult:
     deduplication: dict[str, object] = field(default_factory=dict)
     optimization_performed: bool = False
     no_optimization_performed: bool = False
+    # Strategy selector observability: the current round's decision (None when
+    # the selector is disabled) and the bounded per-round decision trail.
+    strategy_decision: dict[str, object] | None = None
+    strategy_trail: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -435,6 +484,8 @@ class ResearchLoopService:
         experiment_planner: ExperimentPlanner | None = None,
         deduplication: ResearchDeduplicationConfig | None = None,
         llm_formula_repair_attempts: int = DEFAULT_LLM_FORMULA_REPAIR_ATTEMPTS,
+        strategy_selector_enabled: bool = True,
+        research_memory_enabled: bool = True,
         cancel_event: Any | None = None,
     ) -> None:
         self.factor_root = factor_root
@@ -494,6 +545,11 @@ class ResearchLoopService:
         if not 0 <= llm_formula_repair_attempts <= 3:
             raise ValueError("llm_formula_repair_attempts must be between 0 and 3")
         self.llm_formula_repair_attempts = llm_formula_repair_attempts
+        self.strategy_selector_enabled = strategy_selector_enabled
+        self.research_memory_enabled = research_memory_enabled
+        # Durable cross-run memory (observations + promoted knowledge rows)
+        # rooted at artifact_root; None when disabled so nothing is written.
+        self.memory_store = ResearchMemoryStore(self.artifact_root) if research_memory_enabled else None
         self.cancel_event = cancel_event
         self._active_run_id: str | None = None
         self._cancel_written = False
@@ -536,7 +592,59 @@ class ResearchLoopService:
             factor_values_root=self.factor_values_root,
             factor_values_manifest_root=self.factor_values_manifest_root,
             trace_store=self.trace_store,
+            memory_store=self.memory_store,
         ).build(objective=objective, seed_factor_ids=(seed_factor_id,))
+        # Strategy selection happens BEFORE candidate generation and reads only
+        # evidence already persisted by prior rounds (trace/dedup/gate state);
+        # it never peeks at this round's evaluation data (FP-6).
+        strategy_round_index: int | None = None
+        strategy_decision_payload: dict[str, Any] | None = None
+        strategy_trail: tuple[dict[str, Any], ...] = ()
+        if self.strategy_selector_enabled:
+            # F3: the selector's evidence is scoped to THIS seed's run chain
+            # (run ids embed the seed id). Rounds of other seeds must never
+            # leak gate reasons, round summaries, duplicate counts, or
+            # fingerprints into this run's context; same-seed history is the
+            # legitimate "prior rounds" evidence (and the fingerprint dedup
+            # memory) the selector was designed to consume. The filter runs
+            # INSIDE read_recent_entries, before its window limit, so heavy
+            # other-seed traffic cannot erase this seed's history (C2).
+            recent_strategy_entries = self.trace_store.read_recent_entries(
+                limit=STRATEGY_CONTEXT_TRACE_LIMIT,
+                run_id_filter=lambda candidate_run_id: _run_id_in_seed_chain(
+                    candidate_run_id, seed_factor_id=seed_factor_id, current_run_id=run_id
+                ),
+            )
+            strategy_context = _strategy_context_from_trace_entries(recent_strategy_entries)
+            strategy_decision = select_strategy(strategy_context)
+            strategy_round_index = strategy_context.round_index
+            strategy_decision_payload = strategy_decision.to_dict()
+            strategy_trail = (
+                *_strategy_trail_from_trace_entries(recent_strategy_entries),
+                {
+                    "round_index": strategy_context.round_index,
+                    "strategy": strategy_decision.strategy,
+                    "reason": strategy_decision.reason,
+                },
+            )
+            self.trace_store.append_trace(
+                {
+                    "run_id": run_id,
+                    "lane_id": "strategy_selector",
+                    "phase": "strategy_decision",
+                    "timestamp": utc_timestamp(),
+                    "schema_version": "qf.research_loop.trace.v1",
+                    "strategy_context": strategy_context.to_dict(),
+                    "strategy_decision": strategy_decision_payload,
+                }
+            )
+            context = replace(
+                context,
+                next_focus_hints=(
+                    *context.next_focus_hints,
+                    *_strategy_prompt_hints(strategy_decision),
+                ),
+            )
         self.trace_store.write_context(run_id, context)
         self._raise_if_cancelled()
         planned = hypotheses or _generate_hypotheses(
@@ -557,27 +665,27 @@ class ResearchLoopService:
             )
         else:
             generation = _hypothesis_generator_metadata(self.hypothesis_generator)
-        self.trace_store.write_config_snapshot(
-            run_id,
-            {
-                "objective": objective,
-                "max_candidates": max_candidates,
-                "generation": _generation_snapshot(generation),
-                "llm_formula_repair_attempts": self.llm_formula_repair_attempts,
-                "parameter_search_enabled": self.parameter_search_enabled,
-                "parameter_search_method": self.parameter_search_method,
-                "simulation_profile": asdict(self.simulation_profile),
-                "evaluation_profile": asdict(self.evaluation_simulation_profile),
-                "backtest_profile": asdict(self.backtest_simulation_profile),
-                "trial_simulation_overlays": [
-                    _trial_simulation_overlay_snapshot(overlay) for overlay in self.trial_simulation_overlays
-                ],
-                "effective_trial_configs": [
-                    _effective_trial_config_snapshot(config) for config in self.effective_trial_configs
-                ],
-                "deduplication": _deduplication_snapshot(self.deduplication),
-            },
-        )
+        config_snapshot: dict[str, Any] = {
+            "objective": objective,
+            "max_candidates": max_candidates,
+            "generation": _generation_snapshot(generation),
+            "llm_formula_repair_attempts": self.llm_formula_repair_attempts,
+            "parameter_search_enabled": self.parameter_search_enabled,
+            "parameter_search_method": self.parameter_search_method,
+            "simulation_profile": asdict(self.simulation_profile),
+            "evaluation_profile": asdict(self.evaluation_simulation_profile),
+            "backtest_profile": asdict(self.backtest_simulation_profile),
+            "trial_simulation_overlays": [
+                _trial_simulation_overlay_snapshot(overlay) for overlay in self.trial_simulation_overlays
+            ],
+            "effective_trial_configs": [
+                _effective_trial_config_snapshot(config) for config in self.effective_trial_configs
+            ],
+            "deduplication": _deduplication_snapshot(self.deduplication),
+            "strategy_selector_enabled": self.strategy_selector_enabled,
+            "research_memory_enabled": self.research_memory_enabled,
+        }
+        self.trace_store.write_config_snapshot(run_id, config_snapshot)
         seed_assessment = self._assess_factor(
             seed,
             role="seed",
@@ -762,6 +870,7 @@ class ResearchLoopService:
         for failed in failed_quick_results:
             self._trace_structured_result(run_id, failed, phase="experiment_failed")
         results: list[ResearchCandidateResult] = []
+        structured_by_result: dict[int, StructuredFactorExperimentResult] = {}
         for trial in final_trials:
             self._raise_if_cancelled()
             try:
@@ -783,8 +892,23 @@ class ResearchLoopService:
             if any(reason.startswith("duplicate result signature") for reason in candidate_result.gate_reasons):
                 dedup_summary["result_duplicates"] = int(dedup_summary["result_duplicates"]) + 1
             results.append(candidate_result)
-            self._trace_candidate_result(run_id, candidate_result, trial.plan)
+            structured_by_result[id(candidate_result)] = self._trace_candidate_result(
+                run_id, candidate_result, trial.plan
+            )
         results = sorted(results, key=lambda result: result.score, reverse=True)
+        # C1: the round WINNER's evidence (post-sort), not whichever candidate
+        # happened to be traced last in evaluation order. Persisted with the
+        # round summary so the next round's selector reads the winner's decay
+        # and gate reasons alongside best_score_delta_vs_seed.
+        winner = results[0] if results else None
+        winner_structured = structured_by_result.get(id(winner)) if winner is not None else None
+        winner_gate_blocking_reasons: tuple[str, ...] = ()
+        if winner_structured is not None and winner_structured.gate_decision is not None:
+            winner_gate_blocking_reasons = tuple(
+                str(reason) for reason in winner_structured.gate_decision.blocking_reasons
+            )
+        elif winner is not None and not winner.gate_passed:
+            winner_gate_blocking_reasons = tuple(str(reason) for reason in winner.gate_reasons)
         accepted = tuple(
             dict.fromkeys(
                 result.factor.factor_id
@@ -794,6 +918,32 @@ class ResearchLoopService:
             )
         )
         optimization_performed = _optimization_performed(results, seed, self.evaluation_simulation_profile)
+        # Persist compact per-round evidence so the NEXT round's strategy
+        # selector can consume duplicate rate and score deltas from the trace
+        # (run history), not from in-memory state that dies with this call.
+        self.trace_store.append_trace(
+            {
+                "run_id": run_id,
+                "lane_id": "run_history",
+                "phase": "round_summary",
+                "timestamp": utc_timestamp(),
+                "schema_version": "qf.research_loop.trace.v1",
+                "round_summary": _round_summary_payload(
+                    seed_factor_id=seed_factor_id,
+                    round_index=strategy_round_index,
+                    planned_count=len(planned[:max_candidates]),
+                    results=results,
+                    seed_score=seed_assessment.selection_score,
+                    dedup_summary=dedup_summary,
+                    accepted_candidate_ids=accepted,
+                    winner_candidate_ref=winner.factor.factor_id if winner is not None else None,
+                    winner_oos_net_return_decay=(
+                        _oos_net_return_decay_value(winner.backtest) if winner is not None else None
+                    ),
+                    winner_gate_blocking_reasons=winner_gate_blocking_reasons,
+                ),
+            }
+        )
         result = ResearchLoopResult(
             rd_stage=RD_RESEARCH_STAGE,
             seed_factor_id=seed_factor_id,
@@ -818,6 +968,8 @@ class ResearchLoopService:
             deduplication=dedup_summary,
             optimization_performed=optimization_performed,
             no_optimization_performed=not optimization_performed,
+            strategy_decision=strategy_decision_payload,
+            strategy_trail=strategy_trail,
         )
         from quant_forge.research_loop.reporting import write_research_report
 
@@ -842,9 +994,60 @@ class ResearchLoopService:
                 "report_path": result.report_path,
             },
         )
+        self._append_rd_run_index_row(
+            run_id=run_id,
+            seed_factor_id=seed_factor_id,
+            result=result,
+            seed_assessment=seed_assessment,
+            config_snapshot=config_snapshot,
+        )
+        self._record_memory_observations(run_id, results)
         self._created_factor_ids.clear()
         self._promoted_factor_snapshots.clear()
         return result
+
+    def _record_memory_observations(self, run_id: str, results: list[ResearchCandidateResult]) -> None:
+        """Record this run's candidate outcomes as durable memory observations.
+
+        Gate-blocked candidates become failure-class observations; accepted
+        candidates become finding-class observations. Statements are compact
+        redacted summaries (formula fingerprint family + gate reason
+        families) — no raw data, no paths, no free text. ``promote_pending``
+        runs once at completion so repeated signatures across runs can
+        promote deterministically.
+        """
+
+        if self.memory_store is None:
+            return
+        for result in results:
+            fingerprint = result.formula_fingerprint or factor_formula_fingerprint(result.factor)
+            window = _memory_data_window(result.evaluation)
+            if result.gate_passed:
+                self.memory_store.record_observation(
+                    signature=f"rd_accepted:{fingerprint}",
+                    statement=(
+                        f"accepted candidate formula family {fingerprint[:12]} passed the research gate"
+                    ),
+                    run_id=run_id,
+                    data_window=window,
+                )
+            else:
+                families = _gate_reason_families(result.gate_reasons)
+                # P2: the durable statement carries only the value-free reason
+                # families; full gate reasons stay in trace/report artifacts so
+                # provider-channel or repair-exception free text never reaches
+                # durable memory.
+                self.memory_store.record_observation(
+                    signature="rd_gate_blocked:" + fingerprint + ":" + ",".join(families),
+                    statement=(
+                        f"gate blocked candidate formula family {fingerprint[:12]}: "
+                        + ", ".join(families)
+                    ),
+                    run_id=run_id,
+                    data_window=window,
+                    failure_class="gate_blocked",
+                )
+        self.memory_store.promote_pending()
 
     def _raise_if_cancelled(self) -> None:
         if self.cancel_event is not None and self.cancel_event.is_set():
@@ -1171,9 +1374,10 @@ class ResearchLoopService:
         run_id: str,
         candidate: ResearchCandidateResult,
         plan: FactorExperimentPlan | None,
-    ) -> None:
+    ) -> StructuredFactorExperimentResult:
         structured = _structured_result_from_candidate(candidate, plan)
         self._trace_structured_result(run_id, structured, phase="experiment_result")
+        return structured
 
     def _select_final_trials(
         self, trials: list[_ResearchTrial], objective_weights: ResearchObjectiveWeights
@@ -1307,12 +1511,20 @@ class ResearchLoopService:
             sample_splits=self.sample_splits,
             include_external_oos=True,
         )
-        gate_passed, gate_reasons = apply_gate(
+        gate_passed, gate_blocking, gate_warnings = apply_gate_detailed(
             scored.evaluation,
             scored.backtest,
             scored.score,
             candidate_gate,
             oos_backtest=scored.external_oos_backtest,
+        )
+        # gate_reasons is the blocking-facing channel: on a pass it carries the
+        # pass marker plus visible warn-mode findings (FP-7); on a failure it
+        # carries ONLY blockers — warnings ride gate_warnings separately.
+        gate_reasons = (
+            tuple(dict.fromkeys(("passed smoke research gate", *gate_warnings)))
+            if gate_passed
+            else gate_blocking
         )
         result_signature = (
             _result_signature_from_scored(scored, precision=self.deduplication.result_precision)
@@ -1323,8 +1535,11 @@ class ResearchLoopService:
             existing_factor_id = result_signature_index.get(result_signature)
             if existing_factor_id and existing_factor_id != trial.factor.factor_id:
                 gate_passed = False
+                # Rebuild from the blocking channel so warn-mode findings do
+                # not leak into blocking reasons when a pass flips to a
+                # duplicate rejection.
                 gate_reasons = (
-                    *tuple(reason for reason in gate_reasons if reason != "passed smoke research gate"),
+                    *gate_blocking,
                     f"duplicate result signature matches {existing_factor_id}",
                 )
             else:
@@ -1391,6 +1606,7 @@ class ResearchLoopService:
             gate_passed=gate_passed,
             gate_reasons=gate_reasons,
             self_review=self_review,
+            gate_warnings=gate_warnings,
             transitioned_to_candidate=transitioned_to_candidate,
             formula_fingerprint=factor_formula_fingerprint(candidate),
             result_signature=result_signature,
@@ -1469,6 +1685,51 @@ class ResearchLoopService:
             gate_passed=gate_passed,
             gate_reasons=gate_reasons,
             parent_seed_factor_id=parent_seed_factor_id,
+        )
+
+    def _append_rd_run_index_row(
+        self,
+        *,
+        run_id: str,
+        seed_factor_id: str,
+        result: ResearchLoopResult,
+        seed_assessment: FactorAssessmentBundle,
+        config_snapshot: dict[str, Any],
+    ) -> None:
+        """Append one honest run-history row (kind "rd") at run completion.
+
+        Artifact paths are stored relative to ``artifact_root`` (or dropped
+        when outside it); metric highlights keep their MetricValue statuses so
+        an unavailable metric is never rendered as a number (FP-2/FP-4).
+        """
+        created_at = datetime.now(UTC)
+        best = result.candidates[0] if result.candidates else None
+        highlight_source = (best.evaluation if best is not None else seed_assessment.evaluation).metrics
+        highlights = {
+            name: metric_highlight(highlight_source[name])
+            for name in RD_RUN_HIGHLIGHT_METRICS
+            if name in highlight_source
+        }
+        artifact_paths_rel = [
+            path_rel
+            for path_rel in (
+                relative_artifact_path(self.artifact_root, result.report_path),
+                relative_artifact_path(self.artifact_root, result.trace_root),
+            )
+            if path_rel
+        ]
+        RunIndex(self.artifact_root).append_run(
+            run_id=run_id,
+            kind=RD_RUN_INDEX_KIND,
+            factor_ids=tuple(dict.fromkeys((seed_factor_id, *result.accepted_candidate_ids))),
+            created_at=created_at.isoformat(),
+            data_window=evaluation_data_window(seed_assessment.evaluation),
+            config_fingerprint=canonical_fingerprint(
+                {"kind": RD_RUN_INDEX_KIND, "seed_factor_id": seed_factor_id, "config": config_snapshot}
+            ),
+            metric_highlights=highlights,
+            artifact_paths_rel=artifact_paths_rel,
+            warnings_count=_rd_warnings_count(seed_assessment, result.candidates),
         )
 
 
@@ -1596,57 +1857,103 @@ def apply_gate(
     *,
     oos_backtest: BacktestResult | None = None,
 ) -> tuple[bool, tuple[str, ...]]:
+    """Research smoke gate; clause definitions shared with candidate_gate (F-2, FP-5).
+
+    Compatibility surface over ``apply_gate_detailed``: on a pass the reasons
+    tuple keeps warn-mode findings visible next to the pass marker (FP-7); on
+    a failure it carries ONLY blocking reasons — warn-mode messages ride the
+    separate warnings channel and must never read as blockers.
+    """
+
+    passed, blocking, warnings = apply_gate_detailed(
+        evaluation, backtest, score, gate, oos_backtest=oos_backtest
+    )
+    if passed:
+        return True, tuple(dict.fromkeys(("passed smoke research gate", *warnings)))
+    return False, blocking
+
+
+def apply_gate_detailed(
+    evaluation: EvaluationResult,
+    backtest: BacktestResult,
+    score: float,
+    gate: ResearchGate,
+    *,
+    oos_backtest: BacktestResult | None = None,
+) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
+    """Research smoke gate returning ``(passed, blocking, warnings)``.
+
+    The warn-mode channel (missing OOS/net-return evidence with
+    ``missing_oos_evidence_blocks=False``) stays separate from the blocking
+    payload so downstream consumers (memory failure statements, structured
+    gate decisions) can never mistake a warning for a blocker.
+    """
+
     # The OOS-specific gate clauses must judge the external out-of-sample
     # backtest when a distinct holdout window is configured; when no external
     # OOS backtest is supplied we fall back to the in-sample backtest so the
     # default (evaluation_profile == backtest_profile) behavior is unchanged.
     oos = oos_backtest if oos_backtest is not None else backtest
-    reasons: list[str] = []
+    blocking: list[str] = []
+    warnings: list[str] = []
     if evaluation.ic_days < gate.min_ic_days:
-        reasons.append(f"ic_days {evaluation.ic_days} < {gate.min_ic_days}")
+        blocking.append(f"ic_days {evaluation.ic_days} < {gate.min_ic_days}")
     if evaluation.coverage < gate.min_coverage:
-        reasons.append(f"coverage {evaluation.coverage:.4f} < {gate.min_coverage:.4f}")
+        blocking.append(f"coverage {evaluation.coverage:.4f} < {gate.min_coverage:.4f}")
     if backtest.periods < gate.min_backtest_periods:
-        reasons.append(f"backtest_periods {backtest.periods} < {gate.min_backtest_periods}")
+        blocking.append(f"backtest_periods {backtest.periods} < {gate.min_backtest_periods}")
     if score < gate.min_score:
-        reasons.append(f"score {score:.6f} < {gate.min_score:.6f}")
+        blocking.append(f"score {score:.6f} < {gate.min_score:.6f}")
+    segments = _segment_gate_evidence(oos)
     if gate.min_oos_net_annualized_return is not None:
-        oos_segments = _oos_segments(oos)
-        if not oos_segments:
-            reasons.append(
-                f"{INSUFFICIENT_OOS_EVIDENCE}: min_oos_net_annualized_return is configured "
-                "but the backtest reports no OOS segments"
-            )
-        for metric in oos_segments:
-            if metric.net_annualized_return is None:
-                reasons.append(f"{metric.name} net_annualized_return unavailable")
-            elif metric.net_annualized_return < gate.min_oos_net_annualized_return:
-                reasons.append(
-                    f"{metric.name} net_annualized_return {metric.net_annualized_return:.6f} "
-                    f"< {gate.min_oos_net_annualized_return:.6f}"
-                )
-    if gate.max_rebalance_rate is not None and backtest.rebalance_rate is not None and backtest.rebalance_rate > gate.max_rebalance_rate:
-        reasons.append(
-            f"rebalance_rate {backtest.rebalance_rate:.6f} "
-            f"> {gate.max_rebalance_rate:.6f}"
+        clause_blocking, clause_warnings = min_oos_return_reasons(
+            oos_return_evidence(segments),
+            gate.min_oos_net_annualized_return,
+            missing_blocks=gate.missing_oos_evidence_blocks,
         )
-    if gate.max_turnover_rate is not None and backtest.turnover_rate is not None and backtest.turnover_rate > gate.max_turnover_rate:
-        reasons.append(f"turnover_rate {backtest.turnover_rate:.6f} > {gate.max_turnover_rate:.6f}")
+        blocking.extend(clause_blocking)
+        warnings.extend(clause_warnings)
+    # FP-5 completion: the turnover-family clauses consume the same shared
+    # helper as the structured candidate gate (one definition, one message
+    # format). The research gate has no turnover warn channel, so findings
+    # always block here.
+    blocking.extend(
+        turnover_reasons(
+            {"rebalance_rate": backtest.rebalance_rate, "turnover_rate": backtest.turnover_rate},
+            max_rebalance_rate=gate.max_rebalance_rate,
+            max_turnover_rate=gate.max_turnover_rate,
+        )
+    )
     if gate.min_net_return_retention is not None:
-        retention = _net_return_retention(oos)
-        if retention < gate.min_net_return_retention:
-            reasons.append(f"net_return_retention {retention:.6f} < {gate.min_net_return_retention:.6f}")
+        clause_blocking, clause_warnings = min_net_return_retention_reasons(
+            net_return_retention_value(oos.net_annualized_return, oos.annualized_return),
+            gate.min_net_return_retention,
+            missing_blocks=gate.missing_oos_evidence_blocks,
+        )
+        blocking.extend(clause_blocking)
+        warnings.extend(clause_warnings)
     if gate.max_oos_net_return_decay is not None:
-        if _oos_net_decay(oos, gate.max_oos_net_return_decay):
-            reasons.append(f"OOS net return decay exceeds {gate.max_oos_net_return_decay:.6f}")
-        elif not _oos_decay_evidence_available(oos):
-            reasons.append(
-                f"{INSUFFICIENT_OOS_EVIDENCE}: max_oos_net_return_decay is configured "
-                "but IS/OOS net_annualized_return evidence is missing"
-            )
-    if not reasons:
-        reasons.append("passed smoke research gate")
-    return len(reasons) == 1 and reasons[0] == "passed smoke research gate", tuple(reasons)
+        clause_blocking, clause_warnings = max_oos_decay_reasons(
+            segments,
+            gate.max_oos_net_return_decay,
+            missing_blocks=gate.missing_oos_evidence_blocks,
+        )
+        blocking.extend(clause_blocking)
+        warnings.extend(clause_warnings)
+    blocking_out = tuple(dict.fromkeys(blocking))
+    warnings_out = tuple(dict.fromkeys(warnings))
+    return not blocking_out, blocking_out, warnings_out
+
+
+def _segment_gate_evidence(backtest: BacktestResult) -> tuple[SegmentEvidence, ...]:
+    return tuple(
+        SegmentEvidence(
+            name=metric.name,
+            net_annualized_return=metric.net_annualized_return,
+            periods=metric.periods,
+        )
+        for metric in backtest.segment_metrics
+    )
 
 
 def _validate_search_settings(
@@ -1883,7 +2190,7 @@ def _recent_result_signature_index(
     limit: int,
 ) -> dict[str, str]:
     index: dict[str, str] = {}
-    for entry in trace_store.read_recent_entries(limit=limit):
+    for entry in trace_store.read_recent_entries(limit=limit, phases={"experiment_result"}):
         if str(entry.get("phase") or "") != "experiment_result":
             continue
         signature = _result_signature_from_trace_entry(entry, precision=precision)
@@ -2292,6 +2599,12 @@ def _structured_result_from_candidate(
         universe_filters=candidate.factor.universe_filters,
         expected_direction="positive",
     )
+    backtest_metrics = _backtest_metrics(selection_backtest)
+    # Additive trace evidence for the next round's strategy selector: worst
+    # OOS-vs-IS net-return decay from the same backtest the gate audited
+    # (external OOS when configured, else the selection backtest). None, never
+    # a fabricated number, when segment evidence is missing (FP-2/FP-4).
+    backtest_metrics["oos_net_return_decay"] = _oos_net_return_decay_value(candidate.backtest)
     decision = evaluate_structured_candidate(
         StructuredFactorExperimentResult(
             plan=experiment_plan,
@@ -2299,10 +2612,14 @@ def _structured_result_from_candidate(
             evaluation_status="completed",
             evaluation_metrics=_evaluation_metrics(candidate.evaluation),
             backtest_status="completed",
-            backtest_metrics=_backtest_metrics(selection_backtest),
+            backtest_metrics=backtest_metrics,
             artifact_refs=_artifact_refs(candidate),
         )
     )
+    # Warn-mode smoke-gate findings ride the decision's warnings channel on
+    # both branches — never blocking_reasons — so a downgraded
+    # INSUFFICIENT_OOS_EVIDENCE message stays distinguishable from a blocker.
+    merged_warnings = tuple(dict.fromkeys((*decision.warnings, *candidate.gate_warnings)))
     if candidate.gate_passed:
         decision = replace(
             decision,
@@ -2310,6 +2627,7 @@ def _structured_result_from_candidate(
             transition_reason=decision.transition_reason
             if candidate.transitioned_to_candidate
             else "Candidate passed research gates without a new status transition.",
+            warnings=merged_warnings,
         )
     else:
         decision = replace(
@@ -2317,6 +2635,7 @@ def _structured_result_from_candidate(
             status="blocked",
             accepted=False,
             blocking_reasons=tuple(dict.fromkeys((*decision.blocking_reasons, *candidate.gate_reasons))),
+            warnings=merged_warnings,
             should_transition_to_candidate=False,
             transition_reason="",
         )
@@ -2326,7 +2645,7 @@ def _structured_result_from_candidate(
         evaluation_status="completed",
         evaluation_metrics=_evaluation_metrics(candidate.evaluation),
         backtest_status="completed",
-        backtest_metrics=_backtest_metrics(selection_backtest),
+        backtest_metrics=backtest_metrics,
         artifact_refs=_artifact_refs(candidate),
         gate_decision=decision,
     )
@@ -2359,6 +2678,11 @@ def _backtest_metrics(backtest: BacktestResult) -> dict[str, object]:
         "net_long_short_sharpe": backtest.net_long_short_sharpe,
         "rebalance_rate": backtest.rebalance_rate,
         "turnover_rate": backtest.turnover_rate,
+        # F-3: propagate segment evidence so externally configured OOS clauses
+        # on the structured candidate gate judge real segments instead of
+        # fail-closing on absent evidence (FP-2); the gate reads these via
+        # candidate_gate._segments.
+        "segment_metrics": [asdict(metric) for metric in backtest.segment_metrics],
         "score_source": backtest.score_source,
         "score_cached_rows": backtest.score_cached_rows,
         "score_computed_rows": backtest.score_computed_rows,
@@ -2416,47 +2740,325 @@ def _oos_decay(evaluation: EvaluationResult) -> bool:
     return oos2_metric.rank_icir < is_metric.rank_icir * 0.5
 
 
-def _oos_segments(backtest: BacktestResult) -> tuple[BacktestSegmentMetric, ...]:
-    return tuple(metric for metric in backtest.segment_metrics if metric.name.upper().startswith("OOS"))
-
-
 def _cost_sensitive(backtest: BacktestResult) -> bool:
     if backtest.annualized_return is None or backtest.net_annualized_return is None:
         return False
     return backtest.annualized_return > 0 and backtest.net_annualized_return < backtest.annualized_return * 0.5
 
 
-def _net_return_retention(backtest: BacktestResult) -> float:
-    if backtest.annualized_return is None or backtest.net_annualized_return is None:
-        return 1.0
-    if backtest.annualized_return <= 0:
-        return 1.0 if backtest.net_annualized_return >= backtest.annualized_return else 0.0
-    return float(backtest.net_annualized_return / backtest.annualized_return)
+def _oos_net_return_decay_value(backtest: BacktestResult) -> float | None:
+    """Worst OOS-vs-IS net-return decay, ``1 - min(OOS/IS)``, from segments.
 
+    Returns None — never a fabricated number (FP-2/FP-4) — when the IS
+    baseline or every OOS segment lacks ``net_annualized_return`` evidence,
+    or when the IS baseline is non-positive so the ratio is undefined. At the
+    selector's 0.5 threshold this matches the shared gate definition
+    ``candidate_gate.oos_net_decay_exceeded`` (F-2, FP-5): ``1 - ratio > 0.5``
+    if and only if ``ratio < 0.5``.
+    """
 
-def _oos_decay_evidence_available(backtest: BacktestResult) -> bool:
-    split_by_name = {metric.name.upper(): metric for metric in backtest.segment_metrics}
-    is_metric = split_by_name.get("IS")
-    if is_metric is None or is_metric.net_annualized_return is None:
-        return False
-    return any(
-        name.startswith("OOS") and metric.net_annualized_return is not None
-        for name, metric in split_by_name.items()
-    )
-
-
-def _oos_net_decay(backtest: BacktestResult, max_decay: float = 0.5) -> bool:
     split_by_name = {metric.name.upper(): metric for metric in backtest.segment_metrics}
     is_metric = split_by_name.get("IS")
     if is_metric is None or is_metric.periods == 0 or is_metric.net_annualized_return is None:
+        return None
+    if is_metric.net_annualized_return <= 0:
+        return None
+    ratios = [
+        metric.net_annualized_return / is_metric.net_annualized_return
+        for name, metric in split_by_name.items()
+        if name.startswith("OOS") and metric.periods > 0 and metric.net_annualized_return is not None
+    ]
+    if not ratios:
+        return None
+    decay = 1.0 - min(ratios)
+    return float(decay) if isfinite(decay) else None
+
+
+def _finite_float_or_none(value: Any) -> float | None:
+    """A finite float, or None for missing/non-numeric/NaN/inf evidence."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if isfinite(number) else None
+
+
+def _memory_data_window(evaluation: EvaluationResult) -> str:
+    """``start:end`` from the run's evaluation window, or "" when unknown (FP-4)."""
+
+    window = evaluation_data_window(evaluation)
+    if str(window.get("status")) != "available":
+        return ""
+    return f"{window.get('start_date')}:{window.get('end_date')}"
+
+
+def _gate_reason_families(reasons: tuple[str, ...]) -> tuple[str, ...]:
+    """Stable, value-free gate-reason families for memory signatures.
+
+    Gate reasons embed run-specific numbers ("score 0.0123 < 0.5"); the
+    signature must be identical when the SAME kind of failure recurs across
+    runs, so only the leading reason word (metric/clause name) is kept.
+    """
+
+    families: list[str] = []
+    for reason in reasons:
+        family = str(reason).split(":", 1)[0].split(" ", 1)[0].strip()
+        if family:
+            families.append(family)
+    return tuple(sorted(dict.fromkeys(families)))
+
+
+_RUN_ID_SUFFIX_RE = re.compile(r"\d{8}T\d{12}Z_[0-9a-f]{8}")
+
+
+def _run_id_in_seed_chain(
+    run_id: str,
+    *,
+    seed_factor_id: str,
+    current_run_id: str,
+) -> bool:
+    """True when ``run_id`` is the current run or a prior run of the SAME seed.
+
+    Run ids are structural (``rd_<safe_seed>_<UTC timestamp>_<hex8>``, see
+    :func:`_research_run_id`), so the seed chain is recognized without reading
+    entry payloads. The timestamp/uuid suffix match prevents one seed id that
+    is a prefix of another (``FTR_A`` vs ``FTR_A_X``) from matching the wrong
+    chain. Passed to ``ResearchTraceStore.read_recent_entries`` as its
+    ``run_id_filter`` so seed scoping happens BEFORE the window limit (C2).
+    """
+
+    if not run_id:
         return False
-    for name, metric in split_by_name.items():
-        if name.startswith("OOS") and metric.periods > 0 and metric.net_annualized_return is not None:
-            if is_metric.net_annualized_return <= 0:
-                if metric.net_annualized_return < is_metric.net_annualized_return:
-                    return True
-                continue
-            ratio = metric.net_annualized_return / is_metric.net_annualized_return
-            if ratio < max_decay:
-                return True
-    return False
+    if run_id == current_run_id:
+        return True
+    prefix = f"rd_{_safe_id(seed_factor_id)}_"
+    if not run_id.startswith(prefix):
+        return False
+    return _RUN_ID_SUFFIX_RE.fullmatch(run_id[len(prefix) :]) is not None
+
+
+def _strategy_context_from_trace_entries(entries: list[dict[str, Any]]) -> StrategyContext:
+    """Build the selector's evidence snapshot from persisted trace state only.
+
+    ``entries`` must already be scoped to the current seed's run chain (F3:
+    no cross-seed contamination; ``round_index`` counts prior rounds of this
+    seed, and ``recent_fingerprints`` aggregate only across runs of the same
+    seed). Every input is derived from prior rounds' recorded evidence
+    (duplicate counters via round summaries or plan statuses, OOS decay via
+    the segment decay value traced with each result, gate reasons from the
+    last gate decision). Missing evidence stays None/empty — never a
+    fabricated value.
+    """
+
+    run_ids: set[str] = set()
+    candidate_count = 0
+    blocked_plan_count = 0
+    failed_plan_count = 0
+    duplicate_plan_count = 0
+    last_round_summary: dict[str, Any] | None = None
+    last_result_entry: dict[str, Any] | None = None
+    mechanisms: list[str] = []
+    fingerprints: list[str] = []
+    for entry in entries:
+        run_id = str(entry.get("run_id") or "")
+        if run_id:
+            run_ids.add(run_id)
+        phase = str(entry.get("phase") or "")
+        if phase == "experiment_failed":
+            failed_plan_count += 1
+        elif phase == "plan_blocked":
+            blocked_plan_count += 1
+            plan = entry.get("experiment_plan")
+            if isinstance(plan, dict):
+                if str(plan.get("status") or "") in _DUPLICATE_PLAN_STATUSES:
+                    duplicate_plan_count += 1
+                metadata = plan.get("metadata")
+                if isinstance(metadata, dict):
+                    fingerprint = str(metadata.get("formula_fingerprint") or "")
+                    if fingerprint:
+                        fingerprints.append(fingerprint)
+        elif phase == "experiment_result":
+            candidate_count += 1
+            last_result_entry = entry
+            decision = entry.get("gate_decision")
+            formula = str(entry.get("formula_dsl") or "")
+            if isinstance(decision, dict) and bool(decision.get("accepted")) and formula:
+                mechanisms.append(formula)
+            refs = entry.get("artifact_refs")
+            if isinstance(refs, dict):
+                fingerprint = str(refs.get("formula_fingerprint") or "")
+                if fingerprint:
+                    fingerprints.append(fingerprint)
+        elif phase == "round_summary":
+            summary = entry.get("round_summary")
+            if isinstance(summary, dict):
+                last_round_summary = summary
+
+    duplicate_rate = None
+    best_objective_score = None
+    best_score_delta_vs_seed = None
+    if last_round_summary is not None:
+        duplicate_rate = _finite_float_or_none(last_round_summary.get("duplicate_rate"))
+        best_objective_score = _finite_float_or_none(last_round_summary.get("best_score"))
+        best_score_delta_vs_seed = _finite_float_or_none(last_round_summary.get("best_score_delta_vs_seed"))
+    if duplicate_rate is None:
+        # F8: the denominator is every ATTEMPTED plan (ready plans that ran to
+        # a result or failed, plus blocked plans) — not the count of planner
+        # calls, which repair retries inflate and which would dilute the rate.
+        attempted_plan_count = candidate_count + failed_plan_count + blocked_plan_count
+        duplicate_rate = (
+            min(1.0, duplicate_plan_count / attempted_plan_count) if attempted_plan_count > 0 else 0.0
+        )
+    duplicate_rate = min(1.0, max(0.0, duplicate_rate))
+
+    gate_blocking_reasons: tuple[str, ...] = ()
+    oos_net_return_decay = None
+    if last_round_summary is not None and "winner_candidate_ref" in last_round_summary:
+        # C1: rounds completed after the winner-evidence fix persist the round
+        # WINNER's decay and gate reasons in the round summary; consume those
+        # so the evidence matches best_score_delta_vs_seed. Null/empty values
+        # are honest (a round with no candidates has no winner evidence).
+        gate_blocking_reasons = tuple(
+            str(reason) for reason in (last_round_summary.get("winner_gate_blocking_reasons") or ())
+        )
+        oos_net_return_decay = _finite_float_or_none(last_round_summary.get("winner_oos_net_return_decay"))
+    elif last_result_entry is not None:
+        # Fallback for traces written BEFORE the winner-evidence round summary
+        # existed: best effort from the last-traced experiment_result (which
+        # may be a losing candidate — exactly the bias the new rows remove).
+        decision = last_result_entry.get("gate_decision")
+        if isinstance(decision, dict):
+            gate_blocking_reasons = tuple(
+                str(reason) for reason in (decision.get("blocking_reasons") or ())
+            )
+        backtest_summary = last_result_entry.get("backtest_summary")
+        if isinstance(backtest_summary, dict):
+            oos_net_return_decay = _finite_float_or_none(backtest_summary.get("oos_net_return_decay"))
+    turnover_breach = any(reason.startswith("turnover_rate") for reason in gate_blocking_reasons)
+
+    return StrategyContext(
+        round_index=len(run_ids),
+        candidate_count=candidate_count,
+        best_objective_score=best_objective_score,
+        best_score_delta_vs_seed=best_score_delta_vs_seed,
+        duplicate_rate=duplicate_rate,
+        oos_net_return_decay=oos_net_return_decay,
+        gate_blocking_reasons=gate_blocking_reasons,
+        turnover_breach=turnover_breach,
+        successful_mechanisms=tuple(dict.fromkeys(mechanisms))[:_STRATEGY_MECHANISM_LIMIT],
+        recent_fingerprints=tuple(dict.fromkeys(fingerprints))[-_STRATEGY_FINGERPRINT_LIMIT:],
+    )
+
+
+def _strategy_trail_from_trace_entries(entries: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    trail: list[dict[str, Any]] = []
+    for entry in entries:
+        if str(entry.get("phase") or "") != "strategy_decision":
+            continue
+        decision = entry.get("strategy_decision")
+        if not isinstance(decision, dict):
+            continue
+        strategy_context = entry.get("strategy_context")
+        round_index = strategy_context.get("round_index") if isinstance(strategy_context, dict) else None
+        trail.append(
+            {
+                "round_index": round_index if isinstance(round_index, int) and not isinstance(round_index, bool) else None,
+                "strategy": str(decision.get("strategy") or ""),
+                "reason": str(decision.get("reason") or ""),
+            }
+        )
+    return tuple(trail[-(_STRATEGY_TRAIL_LIMIT - 1):])
+
+
+def _strategy_prompt_hints(decision: StrategyDecision) -> tuple[str, ...]:
+    """Additional structured hints for the existing prompt-context channel.
+
+    These append to ``ResearchContext.next_focus_hints`` only; the prompt
+    structure itself is not changed.
+    """
+
+    hints = [f"strategy_selector: strategy={decision.strategy}; reason={decision.reason}"]
+    if decision.allowed_formula_transformations:
+        hints.append(
+            "strategy_selector: allowed_formula_transformations="
+            + ", ".join(decision.allowed_formula_transformations)
+        )
+    if decision.forbidden_patterns:
+        hints.append(
+            "strategy_selector: forbidden_formula_fingerprints="
+            + ", ".join(decision.forbidden_patterns[:_STRATEGY_TRAIL_LIMIT])
+        )
+    return tuple(hints)
+
+
+def _round_summary_payload(
+    *,
+    seed_factor_id: str,
+    round_index: int | None,
+    planned_count: int,
+    results: list[ResearchCandidateResult],
+    seed_score: float,
+    dedup_summary: dict[str, object],
+    accepted_candidate_ids: tuple[str, ...],
+    winner_candidate_ref: str | None = None,
+    winner_oos_net_return_decay: float | None = None,
+    winner_gate_blocking_reasons: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    best_score = _finite_float_or_none(results[0].score) if results else None
+    seed_score_value = _finite_float_or_none(seed_score)
+    delta = (
+        _finite_float_or_none(best_score - seed_score_value)
+        if best_score is not None and seed_score_value is not None
+        else None
+    )
+    duplicate_count = (
+        int(dedup_summary.get("formula_skipped") or 0)
+        + int(dedup_summary.get("diversity_skipped") or 0)
+        + int(dedup_summary.get("result_duplicates") or 0)
+    )
+    duplicate_rate = min(1.0, duplicate_count / planned_count) if planned_count > 0 else 0.0
+    return {
+        "seed_factor_id": seed_factor_id,
+        "round_index": round_index,
+        "planned_count": planned_count,
+        "candidate_count": len(results),
+        "duplicate_count": duplicate_count,
+        "duplicate_rate": duplicate_rate,
+        "seed_score": seed_score_value,
+        "best_score": best_score,
+        "best_score_delta_vs_seed": delta,
+        "accepted_candidate_ids": list(accepted_candidate_ids),
+        # C1: winner-specific evidence, persisted at round completion so the
+        # NEXT round's selector context reads the same candidate that produced
+        # best_score / best_score_delta_vs_seed — never a losing candidate
+        # that merely happened to be traced last. None/empty when the round
+        # produced no candidates (missing evidence is never fabricated).
+        "winner_candidate_ref": winner_candidate_ref,
+        "winner_oos_net_return_decay": _finite_float_or_none(winner_oos_net_return_decay),
+        "winner_gate_blocking_reasons": [str(reason) for reason in winner_gate_blocking_reasons],
+    }
+
+
+def _rd_warnings_count(
+    seed_assessment: FactorAssessmentBundle,
+    candidates: tuple[ResearchCandidateResult, ...],
+) -> int:
+    """Distinct warning messages plus distinct warning codes across the run."""
+
+    sources: list[Any] = [
+        seed_assessment.evaluation,
+        seed_assessment.selection_backtest,
+        seed_assessment.external_oos_backtest,
+    ]
+    for candidate in candidates:
+        sources.extend((candidate.evaluation, candidate.backtest))
+        if candidate.selection_backtest is not None:
+            sources.append(candidate.selection_backtest)
+        if candidate.external_oos_backtest is not None:
+            sources.append(candidate.external_oos_backtest)
+    messages: set[str] = set()
+    codes: set[str] = set()
+    for source in sources:
+        messages.update(str(item) for item in getattr(source, "warnings", ()) or ())
+        codes.update(str(item) for item in getattr(source, "warning_codes", ()) or ())
+    return len(messages) + len(codes)

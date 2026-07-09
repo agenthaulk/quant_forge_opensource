@@ -53,6 +53,9 @@ def render_research_report(result: ResearchLoopResult, *, generated_at: datetime
         "",
     ]
     lines.extend(_deduplication_lines(result))
+    if result.strategy_trail:
+        lines.extend(["## Strategy Trail", ""])
+        lines.extend(_strategy_trail_lines(result))
     lines.extend(["## Successive Halving Trace", ""])
     lines.extend(_search_trace_lines(result))
     lines.extend(["## SOTA / Best Candidate", ""])
@@ -169,6 +172,27 @@ def _deduplication_lines(result: ResearchLoopResult) -> list[str]:
     ]
 
 
+def _strategy_trail_lines(result: ResearchLoopResult) -> list[str]:
+    """Compact per-round strategy decisions; omitted when the selector is off."""
+
+    lines = [
+        "| Round | Strategy | Reason |",
+        "| ---: | --- | --- |",
+    ]
+    for entry in result.strategy_trail:
+        round_index = entry.get("round_index")
+        round_label = (
+            str(round_index)
+            if isinstance(round_index, int) and not isinstance(round_index, bool)
+            else "-"
+        )
+        strategy = str(entry.get("strategy") or "-")
+        reason = str(entry.get("reason") or "-").replace("|", "\\|")
+        lines.append(f"| {round_label} | {strategy} | {reason} |")
+    lines.append("")
+    return lines
+
+
 def _search_trace_lines(result: ResearchLoopResult) -> list[str]:
     if not result.search_trace:
         return ["No successive-halving trace was recorded for this run.", ""]
@@ -272,13 +296,15 @@ def _candidate_detail(candidate: ResearchCandidateResult) -> list[str]:
             "",
             "#### Backtest Segments",
             "",
-            "| Segment | Dates | Periods | Gross Return | Net Return | Gross Sharpe | Net Sharpe | Net Drawdown |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Segment | Dates | Periods | Purged Periods | Gross Return | Net Return "
+            "| Gross Sharpe | Net Sharpe | Net Drawdown |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for metric in candidate.backtest.segment_metrics:
         lines.append(
             f"| {metric.name} | {metric.start_date} to {metric.end_date} | {metric.periods} "
+            f"| {_fmt_count_metric(metric, 'purged_period_count')} "
             f"| {_pct(metric.gross_annualized_return)} | {_pct(metric.net_annualized_return)} "
             f"| {_fmt(metric.gross_long_short_sharpe)} | {_fmt(metric.net_long_short_sharpe)} "
             f"| {_pct(metric.net_max_drawdown)} |"
@@ -373,6 +399,23 @@ def _fmt_metric(record: Any, key: str) -> str:
     if metric.status != "available":
         return metric.status
     return _fmt(metric.value)
+
+
+def _fmt_count_metric(record: Any, key: str) -> str:
+    """Format an integer-count MetricValue from a metrics map, honestly.
+
+    Records without the map entry (old artifacts, minimal fakes) render
+    "n/a"; a non-"available" status renders the status marker instead of a
+    fabricated number (FP-4).
+    """
+
+    metrics = getattr(record, "metrics", None) or {}
+    metric = metrics.get(key) if isinstance(metrics, dict) else None
+    if metric is None:
+        return "n/a"
+    if metric.status != "available" or metric.value is None:
+        return metric.status
+    return str(int(metric.value))
 
 
 def _fmt(value: float | None) -> str:

@@ -156,6 +156,8 @@ class ResearchLoopConfig:
     transaction_costs: TransactionCostModel = field(default_factory=TransactionCostModel)
     llm: ResearchLLMConfig = field(default_factory=ResearchLLMConfig)
     deduplication: ResearchDeduplicationConfig = field(default_factory=ResearchDeduplicationConfig)
+    strategy_selector_enabled: bool = True
+    research_memory_enabled: bool = True
 
     def __post_init__(self) -> None:
         if self.default_max_candidates < 1 or self.default_max_candidates > 10:
@@ -277,6 +279,18 @@ def load_research_loop_config(
             max_oos_net_return_decay=_optional_float(
                 _nested(loaded, "gate", "max_oos_net_return_decay", base.gate.max_oos_net_return_decay)
             ),
+            # F-5: rd.yaml knob for the missing-OOS-evidence channel. Strictly
+            # boolean so a quoted "false" cannot silently enable blocking (or
+            # vice versa); the default (True) preserves fail-closed behavior.
+            missing_oos_evidence_blocks=_strict_bool(
+                _nested(
+                    loaded,
+                    "gate",
+                    "missing_oos_evidence_blocks",
+                    base.gate.missing_oos_evidence_blocks,
+                ),
+                "gate.missing_oos_evidence_blocks",
+            ),
         ),
         weights=_load_weights(loaded.get("weights"), default_weights),
         weight_profiles=_load_weight_profiles(loaded.get("weight_profiles"), base.weight_profiles),
@@ -284,6 +298,12 @@ def load_research_loop_config(
         transaction_costs=_load_transaction_costs(loaded.get("transaction_costs"), base.transaction_costs),
         llm=_load_rd_llm_config(loaded.get("llm"), base.llm),
         deduplication=_load_deduplication(loaded.get("deduplication"), base.deduplication),
+        strategy_selector_enabled=bool(
+            loaded.get("strategy_selector_enabled", base.strategy_selector_enabled)
+        ),
+        research_memory_enabled=bool(
+            loaded.get("research_memory_enabled", base.research_memory_enabled)
+        ),
     )
 
 
@@ -310,6 +330,12 @@ def _optional_float(value: Any) -> float | None:
     if value is None:
         return None
     return float(value)
+
+
+def _strict_bool(value: Any, key: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"RD config {key} must be a boolean")
+    return value
 
 
 def _load_role_simulation_profile(raw: dict[str, Any], section: str, base: SimulationProfile) -> SimulationProfile:

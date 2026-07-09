@@ -7,6 +7,12 @@ from dataclasses import dataclass
 import math
 from typing import Callable
 
+# Robustness bounds for model-supplied formulas (P5): windows above three
+# trading years or degenerate formula sizes are rejected at the parse gate
+# before they can drive lookback/rolling-window memory blowups.
+MAX_WINDOW_ROWS = 750
+MAX_FORMULA_CHARS = 2000
+
 SUPPORTED_OPERATORS = {
     "abs",
     "correlation",
@@ -47,6 +53,8 @@ def parse_formula_node(formula: str) -> ast.AST:
     expression = formula.strip()
     if not expression:
         raise FormulaParseError("empty expression")
+    if len(expression) > MAX_FORMULA_CHARS:
+        raise FormulaParseError(f"formula length {len(expression)} exceeds the {MAX_FORMULA_CHARS}-character limit")
     if "precomputed:" in expression.lower():
         raise FormulaParseError("precomputed formulas can only be used as whole seed factors")
     try:
@@ -236,7 +244,10 @@ def _positive_int_arg(node: ast.AST) -> int:
     value = numeric_constant(node)
     if value is None:
         return 1
-    return max(int(math.floor(value)), 1)
+    window = max(int(math.floor(value)), 1)
+    if window > MAX_WINDOW_ROWS:
+        raise FormulaParseError(f"window argument {window} exceeds the {MAX_WINDOW_ROWS}-row limit")
+    return window
 
 
 def _validate_operator_signature(
@@ -251,16 +262,26 @@ def _validate_operator_signature(
     if operator in {"rank", "zscore", "abs", "log", "sign"}:
         return _expect_arity(operator, args, 1, errors)
     if operator in {"delay", "delta", "ts_sum", "ts_mean", "ts_min", "ts_max", "stddev", "ts_rank", "decay_linear"}:
-        return _expect_arity(operator, args, 2, errors) and _expect_number_arg(operator, args, 1, errors)
+        return _expect_arity(operator, args, 2, errors) and _expect_window_arg(operator, args, 1, errors)
     if operator in {"correlation", "covariance"}:
-        return _expect_arity(operator, args, 3, errors) and _expect_number_arg(operator, args, 2, errors)
+        return _expect_arity(operator, args, 3, errors) and _expect_window_arg(operator, args, 2, errors)
     if operator == "scale":
         if len(args) not in {1, 2}:
             errors.append("scale expects 1 or 2 arguments")
             return False
         return len(args) == 1 or _expect_number_arg(operator, args, 1, errors)
     if operator in {"signedpower", "wq_min", "wq_max"}:
-        return _expect_arity(operator, args, 2, errors)
+        if not _expect_arity(operator, args, 2, errors):
+            return False
+        # wq_min/wq_max accept EITHER a scalar rolling window (wq_max(x, 20) ->
+        # ts_max) OR a series (wq_max(x, volume) -> pairwise max); only the
+        # scalar-window form carries a window to bound. Match _node_lookback_rows
+        # and the executor, which treat arg[1] as a window exactly when it is a
+        # numeric constant, so the resolver/inspect gate rejects oversized
+        # windows for these operators too (P5) without touching the pairwise form.
+        if operator in {"wq_min", "wq_max"} and numeric_constant(args[1]) is not None:
+            return _expect_window_arg(operator, args, 1, errors)
+        return True
     return True
 
 
@@ -276,3 +297,13 @@ def _expect_number_arg(operator: str, args: list[ast.AST], index: int, errors: l
         return True
     errors.append(f"{operator} argument {index + 1} must be a number")
     return False
+
+
+def _expect_window_arg(operator: str, args: list[ast.AST], index: int, errors: list[str]) -> bool:
+    if not _expect_number_arg(operator, args, index, errors):
+        return False
+    value = numeric_constant(args[index])
+    if value is not None and math.floor(value) > MAX_WINDOW_ROWS:
+        errors.append(f"{operator} argument {index + 1} must be <= {MAX_WINDOW_ROWS}")
+        return False
+    return True

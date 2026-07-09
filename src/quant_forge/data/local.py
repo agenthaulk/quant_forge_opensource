@@ -1,20 +1,239 @@
-"""Local parquet data provider and demo data generation."""
+"""Local parquet data provider, data catalog, and demo data generation.
+
+Data catalog (CP5-1, owner decision D2)
+---------------------------------------
+``PANEL_FIELD_CATALOG`` is the single authoritative definition of the panel
+schema this provider loads (FP-5). Everything else derives from it: the
+required/optional column sets used by validation, the field surface advertised
+by ``quant_forge.mcp.read_models.list_available_fields`` (and therefore what
+the specs ValidationGate accepts), and the research metadata tags (CP5-2).
+
+Field expansion path (CP5-3)
+----------------------------
+To add a new catalog field:
+
+1. Append one ``CatalogField`` entry to ``PANEL_FIELD_CATALOG`` (declarative
+   extension manifests may feed this the same way later, decision D7).
+2. Nothing else is edited by hand: validation, the advertised MCP/LLM field
+   surface, and the ValidationGate all consult the catalog at call time.
+3. Provide the data: either the column exists in ``panel.parquet`` /
+   the source snapshot, or — for loader-derived fields such as ``return_5d``
+   — extend the loader derivation in this module.
+4. Verify declared-vs-actually-available with
+   ``catalog_field_availability(provider.validate())``: every declared field
+   reports ``available``, ``missing`` or ``synthesized`` (statuses, never
+   silent booleans — FP-7). ``undeclared_panel_columns`` covers the reverse
+   direction (data carries a column the catalog does not declare).
+
+Tests: ``tests/test_data_catalog_port.py``,
+``tests/test_data_catalog_expansion.py``.
+"""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
 from quant_forge.core.contracts import DataValidationResult, FactorDefinition
 from quant_forge.factor_library.repository import FactorRepository
+from quant_forge.factor_library.research_tags import ResearchTags
 
 PANEL_FILE = "panel.parquet"
-REQUIRED_COLUMNS = ("trade_date", "instrument", "close", "market_cap", "is_st")
-OPTIONAL_COLUMNS = ("volume", "return_1d", "return_5d", "volatility_5d")
+
+
+@dataclass(frozen=True)
+class CatalogField:
+    """One declared panel field: schema role plus research metadata tags."""
+
+    name: str
+    description: str
+    role: str  # "key" | "required" | "optional"
+    tags: ResearchTags
+
+    def __post_init__(self) -> None:
+        if self.role not in ("key", "required", "optional"):
+            raise ValueError(f"invalid catalog field role: {self.role}")
+        if self.tags.subject_id != self.name or self.tags.subject_kind != "field":
+            raise ValueError(f"catalog field tags must describe the field itself: {self.name}")
+
+
+def _field_tags(
+    name: str,
+    *,
+    themes: tuple[str, ...] = (),
+    columns_required: tuple[str, ...] = (),
+    min_warmup_bars: int | None = None,
+    notes: str | None = None,
+) -> ResearchTags:
+    return ResearchTags(
+        subject_kind="field",
+        subject_id=name,
+        themes=themes,
+        columns_required=columns_required,
+        frequency="daily",
+        min_warmup_bars=min_warmup_bars,
+        notes=notes,
+        provenance="catalog",
+    )
+
+
+# The one authoritative panel field catalog (FP-5). Warmup bars are facts of
+# the loader derivations below (pct_change / rolling windows), not estimates.
+PANEL_FIELD_CATALOG: tuple[CatalogField, ...] = (
+    CatalogField(
+        name="trade_date",
+        description="Trading date key column.",
+        role="key",
+        tags=_field_tags("trade_date", min_warmup_bars=1),
+    ),
+    CatalogField(
+        name="instrument",
+        description="Instrument identifier key column.",
+        role="key",
+        tags=_field_tags("instrument", min_warmup_bars=1),
+    ),
+    CatalogField(
+        name="close",
+        description="Adjusted close or close-like local demo price.",
+        role="required",
+        tags=_field_tags("close", themes=("price",), min_warmup_bars=1),
+    ),
+    CatalogField(
+        name="market_cap",
+        description="Point-in-time market capitalization supplied by local data.",
+        role="required",
+        tags=_field_tags("market_cap", themes=("size",), min_warmup_bars=1),
+    ),
+    CatalogField(
+        name="is_st",
+        description="Boolean risk flag; use as a universe filter, not a numeric factor field.",
+        role="required",
+        tags=_field_tags(
+            "is_st",
+            themes=("risk_flag",),
+            min_warmup_bars=1,
+            notes="Universe-filter flag; not a numeric factor input.",
+        ),
+    ),
+    CatalogField(
+        name="volume",
+        description="Local demo trading volume.",
+        role="optional",
+        tags=_field_tags("volume", themes=("liquidity",), min_warmup_bars=1),
+    ),
+    CatalogField(
+        name="return_1d",
+        description="One-day trailing return derived from local close data.",
+        role="optional",
+        tags=_field_tags(
+            "return_1d",
+            themes=("returns",),
+            columns_required=("close",),
+            min_warmup_bars=2,
+        ),
+    ),
+    CatalogField(
+        name="return_5d",
+        description="Five-day trailing return derived from local close data.",
+        role="optional",
+        tags=_field_tags(
+            "return_5d",
+            themes=("returns", "momentum"),
+            columns_required=("close",),
+            min_warmup_bars=6,
+        ),
+    ),
+    CatalogField(
+        name="volatility_5d",
+        description="Five-day trailing return volatility.",
+        role="optional",
+        tags=_field_tags(
+            "volatility_5d",
+            themes=("volatility",),
+            columns_required=("close",),
+            min_warmup_bars=3,
+        ),
+    ),
+)
+
+
+def data_field_catalog() -> tuple[CatalogField, ...]:
+    """The authoritative field catalog, read at call time (CP5-1).
+
+    Callers (validation below, ``mcp.read_models``, the specs ValidationGate
+    behind it) must go through this accessor so a catalog extension is visible
+    everywhere at once and the advertised surface cannot drift from what the
+    provider actually loads (FP-5).
+    """
+
+    return PANEL_FIELD_CATALOG
+
+
+def _required_column_names() -> tuple[str, ...]:
+    return tuple(item.name for item in data_field_catalog() if item.role in ("key", "required"))
+
+
+def _optional_column_names() -> tuple[str, ...]:
+    return tuple(item.name for item in data_field_catalog() if item.role == "optional")
+
+
+# Import-time snapshots kept for external readers; the provider itself uses
+# the call-time accessors above.
+REQUIRED_COLUMNS = _required_column_names()
+OPTIONAL_COLUMNS = _optional_column_names()
 SOURCE_PRICE_COLUMNS = ("ts_code", "trade_date", "close", "vol")
 SOURCE_DAILY_BASIC_COLUMNS = ("ts_code", "trade_date", "total_mv", "circ_mv")
+
+FIELD_AVAILABLE = "available"
+FIELD_MISSING = "missing"
+FIELD_SYNTHESIZED = "synthesized"
+
+
+@dataclass(frozen=True)
+class FieldAvailability:
+    """Declared catalog field vs what the data root actually provides (FP-7)."""
+
+    name: str
+    role: str
+    status: str  # FIELD_AVAILABLE | FIELD_MISSING | FIELD_SYNTHESIZED
+
+
+def catalog_field_availability(validation: DataValidationResult) -> tuple[FieldAvailability, ...]:
+    """Compare declared non-key catalog fields against a validation result.
+
+    ``synthesized`` means the loader fills the column without full source
+    backing (see ``DataValidationResult.synthesized_columns``); ``missing``
+    means the declared field is not provided at all. Availability is about
+    presence — data-quality problems are already carried by
+    ``DataValidationResult.ok`` / ``missing_columns`` tokens.
+    """
+
+    availability: list[FieldAvailability] = []
+    synthesized = set(validation.synthesized_columns)
+    missing = set(validation.missing_columns)
+    optional_present = set(validation.optional_columns)
+    for item in data_field_catalog():
+        if item.role == "key":
+            continue
+        if item.name in synthesized:
+            status = FIELD_SYNTHESIZED
+        elif item.role == "required":
+            status = FIELD_MISSING if item.name in missing or validation.rows == 0 else FIELD_AVAILABLE
+        else:
+            status = FIELD_AVAILABLE if item.name in optional_present else FIELD_MISSING
+        availability.append(FieldAvailability(name=item.name, role=item.role, status=status))
+    return tuple(availability)
+
+
+def undeclared_panel_columns(columns: Iterable[str]) -> tuple[str, ...]:
+    """Columns present in the data but not declared by the catalog (CP5-3)."""
+
+    declared = {item.name for item in data_field_catalog()}
+    return tuple(sorted(set(columns) - declared))
 
 
 class LocalPanelDataProvider:
@@ -38,11 +257,11 @@ class LocalPanelDataProvider:
                 rows=0,
                 instruments=0,
                 date_count=0,
-                missing_columns=REQUIRED_COLUMNS,
+                missing_columns=_required_column_names(),
                 panel_path=self.panel_path,
             )
         panel = pd.read_parquet(self.panel_path)
-        missing = tuple(column for column in REQUIRED_COLUMNS if column not in panel.columns)
+        missing = tuple(column for column in _required_column_names() if column not in panel.columns)
         dates = pd.to_datetime(panel["trade_date"]) if "trade_date" in panel.columns and not panel.empty else None
         problems = _panel_quality_problems(panel) if not missing and not panel.empty else ()
         return DataValidationResult(
@@ -55,7 +274,7 @@ class LocalPanelDataProvider:
             panel_path=self.panel_path,
             start_date=dates.min().date().isoformat() if dates is not None else "",
             end_date=dates.max().date().isoformat() if dates is not None else "",
-            optional_columns=tuple(column for column in OPTIONAL_COLUMNS if column in panel.columns),
+            optional_columns=tuple(column for column in _optional_column_names() if column in panel.columns),
         )
 
     def load_panel(self) -> pd.DataFrame:
@@ -92,7 +311,7 @@ def _panel_quality_problems(panel: pd.DataFrame) -> tuple[str, ...]:
             problems.append("duplicate_keys")
     except Exception:  # pragma: no cover - defensive
         pass
-    for column in REQUIRED_COLUMNS:
+    for column in _required_column_names():
         try:
             if panel[column].isna().any():
                 problems.append(f"null:{column}")
@@ -382,13 +601,15 @@ def _build_demo_panel() -> pd.DataFrame:
             )
     panel = pd.DataFrame(rows)
     panel = panel.sort_values(["instrument", "trade_date"])
-    panel["return_1d"] = panel.groupby("instrument")["close"].pct_change().fillna(0.0)
-    panel["return_5d"] = panel.groupby("instrument")["close"].pct_change(5).fillna(0.0)
+    # F-4: warmup rows stay NaN. Filling 0.0 would fabricate observations that
+    # enter cross-sectional ranks as real data (FP-4); nan_policy=drop already
+    # handles missing values downstream, matching the source-snapshot loader.
+    panel["return_1d"] = panel.groupby("instrument")["close"].pct_change()
+    panel["return_5d"] = panel.groupby("instrument")["close"].pct_change(5)
     panel["volatility_5d"] = (
         panel.groupby("instrument")["return_1d"]
         .rolling(5, min_periods=2)
         .std()
         .reset_index(level=0, drop=True)
-        .fillna(0.0)
     )
     return panel.sort_values(["trade_date", "instrument"]).reset_index(drop=True)

@@ -34,10 +34,21 @@ data, factors, and artifacts under the workspace you pass with `--workspace`.
 
 ## 2. Installation / 安装
 
+Supported Python is 3.11 or newer; the reference tested baseline is Python
+3.12 with the exact pins in `constraints.txt`. A reference `Dockerfile` on the
+`python:3.12-slim` baseline ships at the repository root (see the README
+Docker Quickstart).
+
+支持 Python 3.11 及以上；参考测试基线为 Python 3.12，配合 `constraints.txt`
+的精确 pin。仓库根目录提供基于 `python:3.12-slim` 的参考 `Dockerfile`（见
+README 的 Docker 快速开始）。
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -e ".[dev]"
+# Reproduce the reference baseline exactly instead / 精确复现参考基线：
+# python3 -m pip install -e ".[dev]" -c constraints.txt
 ```
 
 If `qf` is not on your PATH, use:
