@@ -426,7 +426,15 @@ def test_report_anchor_deep_link_keeps_the_report_fragment() -> None:
     # report sections + the absorbed RD stage).
     lab_js = _static_module_text("views/lab.js")
     assert "const updateHash = !(options && options.updateHash === false);" in lab_js
-    assert "if (updateHash && window.location.hash !== `#${tabId}`)" in lab_js
+    # A-MINOR-3: the workbench tab's canonical fragment reflects the ACTIVE
+    # module, so returning to the workbench with the multi module selected
+    # writes #lab-module-multi (copy-link fidelity) instead of always
+    # #lab-tab-factor; every other tab still uses its own id, and the anchor
+    # deep-link path below still passes {updateHash: false} to keep its
+    # section fragment.
+    assert "const canonical = tabId === 'lab-tab-factor' ? workbenchCanonicalHash() : `#${tabId}`;" in lab_js
+    assert "if (window.location.hash !== canonical) {" in lab_js
+    assert "return activeModuleId() === 'lab-module-multi' ? '#lab-module-multi' : '#lab-tab-factor';" in lab_js
     assert "const WORKBENCH_ANCHOR_IDS = [...REPORT_SECTION_IDS, 'workbench-rd'];" in lab_js
     anchor_branch = lab_js.index("WORKBENCH_ANCHOR_IDS.includes(target)")
     activate = lab_js.index("activateTab('lab-tab-factor', { updateHash: false });", anchor_branch)
@@ -533,19 +541,25 @@ def test_legacy_tab_hashes_migrate_to_workbench_anchors() -> None:
 def test_index_page_hosts_the_workbench_module_nav(web_config) -> None:
     html = web_server._index_html(web_config)
     # Exact module-nav markup (CP9-2 §1.2): tablist semantics over the two
-    # workbench modules; the multi module is a reserved CP10 slot with an
-    # explicit placeholder, never silently absent.
+    # workbench modules. CP10 filled the reserved multi slot: the 即将上线
+    # pill and placeholder card were replaced by the module's
+    # server-rendered skeleton (the mount id and nav hook stayed EXACTLY as
+    # reserved; only the placeholder content moved).
     for marker in (
         '<div class="lab-module-nav" role="tablist" aria-label="工作台模块">',
         '<button class="lab-module-tab" role="tab" id="lab-module-single" aria-controls="lab-module-panel-single" aria-selected="true">单因子研究</button>',
-        '<button class="lab-module-tab" role="tab" id="lab-module-multi" aria-controls="lab-module-panel-multi" aria-selected="false" tabindex="-1">多因子策略回测 <span class="pill muted">即将上线</span></button>',
+        '<button class="lab-module-tab" role="tab" id="lab-module-multi" aria-controls="lab-module-panel-multi" aria-selected="false" tabindex="-1">多因子策略回测</button>',
         'id="lab-module-panel-single" aria-labelledby="lab-module-single" tabindex="0"',
         'id="lab-module-panel-multi" aria-labelledby="lab-module-multi" tabindex="0" hidden',
         # CP10 claims this mount and the lab-module-multi nav hook.
         "CP10 mount: the multi-factor module claims #multi-result",
         'id="multi-result"',
-        "即将上线",
-        "多因子策略合成与回测模块将在后续版本提供；当前版本聚焦单因子研究流程。",
+        # CP10 skeleton: form regions + result mount inside #multi-result.
+        "合成配置",
+        'id="synth-factors"',
+        'id="synth-method-mount"',
+        'id="synth-report"',
+        "合成回测完成后，评价、样本内回测、外部样本外评测与合成 provenance 会展示在这里。",
     ):
         assert marker in html, marker
     # The absorbed sections carry report-section anchors inside the single
@@ -600,3 +614,58 @@ def test_dsl_module_is_a_pure_structural_tokenizer() -> None:
     assert "${esc(formula.slice(PRECOMPUTED_PREFIX.length))}" in registry_js
     assert '<span class="registry-row-formula">${esc(text)}</span>' in registry_js
     assert "formulaHtml" not in _static_module_text("views/research.js")
+
+
+# ---------------------------------------------------------------------------
+# CP9-2 follow-up regression pins (A-MINOR-1 dot priority, A-MINOR-2 nav)
+# ---------------------------------------------------------------------------
+
+
+def test_module_nav_click_and_keyboard_wiring_is_pinned() -> None:
+    # A-MINOR-2: the workbench module-nav BEHAVIOR (click-to-activate +
+    # roving-tabindex keyboard nav) was unpinned — markup/exports were pinned
+    # but deleting the module click handler or the onModuleNavKeydown wiring
+    # would still pass. Pin the string contract, consistent with the tablist
+    # wiring pins.
+    lab_js = _static_module_text("views/lab.js")
+    # Click handler: a .lab-module-tab click activates that module.
+    assert "const moduleNav = document.querySelector('.lab-module-nav');" in lab_js
+    module_nav = lab_js.index("const moduleNav = document.querySelector('.lab-module-nav');")
+    click_bind = lab_js.index("moduleNav.addEventListener('click'", module_nav)
+    keydown_bind = lab_js.index("moduleNav.addEventListener('keydown', onModuleNavKeydown);", module_nav)
+    assert "const tab = event.target.closest('.lab-module-tab');" in lab_js[click_bind:keydown_bind]
+    assert lab_js.index("if (tab) activateModule(tab.id);", click_bind) < keydown_bind
+    # Keydown routes to onModuleNavKeydown, which mirrors the tablist roving
+    # tabindex over MODULE_IDS (Arrow / Home / End -> activateModule).
+    assert "function onModuleNavKeydown(event) {" in lab_js
+    keydown_fn = lab_js.index("function onModuleNavKeydown(event) {")
+    body = lab_js[keydown_fn : lab_js.index("function syncIdeaStep(", keydown_fn)]
+    assert "event.target.closest('.lab-module-tab')" in body
+    for key in ("'ArrowRight'", "'ArrowLeft'", "'Home'", "'End'"):
+        assert key in body, key
+    assert "focusModuleByOffset(" in body
+
+
+def test_workbench_dot_reflects_job_family_priority_not_last_writer() -> None:
+    # A-MINOR-1: the idea lane (parse/validate/staggered on activeIdeaJobId)
+    # and the RD lane (activeRdJobId) run concurrently but share ONE workbench
+    # dot. A completing job must not downgrade or clear a still-active family,
+    # so the dot shows the highest-priority active state across both families
+    # (error > running > done > idle) instead of last-writer-wins.
+    app_js = _static_module_text("app.js")
+    assert "const WORKBENCH_DOT_PRIORITY = { error: 3, running: 2, done: 1 };" in app_js
+    assert "const workbenchDotState = { idea: null, rd: null };" in app_js
+    assert "function setWorkbenchDot(family, state) {" in app_js
+    # Per-family state is tracked; a state outside the priority map (e.g.
+    # 'clear' on cancel) zeroes only that family, never the other lane.
+    assert "workbenchDotState[family] = WORKBENCH_DOT_PRIORITY[state] ? state : null;" in app_js
+    # Exactly one visible dot: the consolidated setter is the ONLY writer of
+    # the workbench tab dot — no handler calls setTabDot('lab-tab-factor', ...)
+    # directly any more (that was the last-writer-wins regression).
+    assert app_js.count("setTabDot('lab-tab-factor',") == 1
+    assert "setTabDot('lab-tab-factor', winner || 'clear');" in app_js
+    # Both lanes route through the priority setter; the RD lane is the sole
+    # 'rd' family user (run start / done / cancel / error), the idea lane
+    # owns parse + validate + staggered.
+    assert app_js.count("setWorkbenchDot('rd', ") == 4
+    assert app_js.count("setWorkbenchDot('idea', ") == 14

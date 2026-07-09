@@ -83,6 +83,21 @@ function tabBaseLabel(tab) {
   return tab.dataset.baseLabel;
 }
 
+// The active workbench module decides the workbench tab's canonical hash:
+// the multi module keeps its own #lab-module-multi fragment (mirroring
+// activateModule's canonical mapping) so reload / copy-link return to it;
+// the single module (the default) maps back to the tab id.
+function activeModuleId() {
+  return MODULE_IDS.find(id => {
+    const moduleTab = document.getElementById(id);
+    return moduleTab && moduleTab.getAttribute('aria-selected') === 'true';
+  }) || 'lab-module-single';
+}
+
+function workbenchCanonicalHash() {
+  return activeModuleId() === 'lab-module-multi' ? '#lab-module-multi' : '#lab-tab-factor';
+}
+
 export function activateTab(tabId, options) {
   const target = tabElement(tabId);
   if (!target) return;
@@ -103,8 +118,17 @@ export function activateTab(tabId, options) {
   // that activates the factor tab but keeps its section anchor in the
   // URL for reload / back / copy-link.
   const updateHash = !(options && options.updateHash === false);
-  if (updateHash && window.location.hash !== `#${tabId}`) {
-    window.history.replaceState(null, '', `#${tabId}`);
+  if (updateHash) {
+    // The workbench tab's canonical fragment reflects the ACTIVE module
+    // (A-MINOR-3): module state persists across top-tab switches, so
+    // returning to the workbench while the multi module is showing must
+    // write #lab-module-multi — its canonical form — instead of always
+    // #lab-tab-factor, or reload / copy-link would land on the single
+    // module. Every other tab keeps its own id.
+    const canonical = tabId === 'lab-tab-factor' ? workbenchCanonicalHash() : `#${tabId}`;
+    if (window.location.hash !== canonical) {
+      window.history.replaceState(null, '', canonical);
+    }
   }
   if (onTabActivate) onTabActivate(tabId);
 }

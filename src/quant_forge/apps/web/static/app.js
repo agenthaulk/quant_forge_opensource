@@ -30,6 +30,7 @@ import { refreshRegistryPanel } from './views/registry.js';
 import { refreshDocsPanel } from './views/docs.js';
 import { refreshExtensionsPanel } from './views/extensions.js';
 import { activateModule, activateTab, initLabTabs, setStep, setTabDot } from './views/lab.js';
+import { initSynthesisModule, refreshSynthesisPanel } from './views/synthesis.js';
 
 const pageConfig = JSON.parse(document.getElementById('qf-page-config').textContent || '{}');
 const controlTokenRequired = Boolean(pageConfig.controlTokenRequired);
@@ -68,6 +69,30 @@ let activeIdeaJobId = null;
 let activeRdJobId = null;
 let parsedIdea = null;
 let validatedFactorId = null;
+
+// The workbench tab hosts two concurrent job families that share one status
+// dot: the idea lane (parse / validate / staggered, all on activeIdeaJobId)
+// and the RD lane (activeRdJobId). A completing job in one family must never
+// downgrade or clear the other still-active family (A-MINOR-1: the earlier
+// consolidation regressed to last-writer-wins). Each family tracks its own
+// current state and the single dot shows the highest-priority active state
+// across both — error > running > done > idle. Any state outside the
+// priority map (e.g. 'clear' on cancel) means that family has no active
+// state, so the dot falls back to the other family or hides.
+const WORKBENCH_DOT_PRIORITY = { error: 3, running: 2, done: 1 };
+const workbenchDotState = { idea: null, rd: null };
+function setWorkbenchDot(family, state) {
+  workbenchDotState[family] = WORKBENCH_DOT_PRIORITY[state] ? state : null;
+  const winner = [workbenchDotState.idea, workbenchDotState.rd].reduce(
+    (best, current) =>
+      current && (!best || WORKBENCH_DOT_PRIORITY[current] > WORKBENCH_DOT_PRIORITY[best])
+        ? current
+        : best,
+    null
+  );
+  // One visible dot only; setTabDot mirrors the shown state into aria-label.
+  setTabDot('lab-tab-factor', winner || 'clear');
+}
 
 function clearGlobalError() {
   errorEl.textContent = '';
@@ -361,6 +386,28 @@ const dataPanel = trackedPanelRefresh(refreshDataPanel);
 const registryPanel = trackedPanelRefresh(refreshRegistryPanel);
 const docsPanel = trackedPanelRefresh(refreshDocsPanel);
 const extensionsPanel = trackedPanelRefresh(refreshExtensionsPanel);
+// CP10 multi-factor module: fetch/render wiring lives in views/synthesis.js;
+// app.js owns activation and job-dependent invalidation. lab.js stays
+// fetch-free and gains no module callback, so activation is observed
+// through the reserved module panel's `hidden` attribute — one signal that
+// covers nav clicks, keyboard activation, and #lab-module-multi deep links
+// uniformly. The refresh stays lazy: nothing fetches while the multi module
+// panel is hidden. That gate is the panel's `hidden` attribute, which tracks
+// module SELECTION, not true parent-tab visibility — a selected module can
+// prefetch while its parent workbench tab is hidden. The prefetch is
+// harmless (it fetches exactly what the module will show), so the gate is
+// "module-panel not hidden", not "the module is actually visible".
+const synthesisPanel = trackedPanelRefresh(refreshSynthesisPanel);
+initSynthesisModule({ onJobComplete: invalidateJobDependentPanels });
+const multiModulePanel = document.getElementById('lab-module-panel-multi');
+function refreshSynthesisPanelIfDue() {
+  if (!multiModulePanel || multiModulePanel.hidden) return;
+  if (synthesisPanel.isStale() || !synthesisPanel.hasLoaded()) synthesisPanel.refresh();
+}
+if (multiModulePanel) {
+  new MutationObserver(refreshSynthesisPanelIfDue)
+    .observe(multiModulePanel, { attributes: true, attributeFilter: ['hidden'] });
+}
 // CP9-2 IA consolidation: values are arrays so one tab can own several
 // lazy panels — the workbench tab hosts the absorbed bench comparison
 // section (#report-comparison) alongside the factor tape.
@@ -394,6 +441,11 @@ function invalidateJobDependentPanels() {
     // waiting for the next activation.
     if (tab && tab.getAttribute('aria-selected') === 'true') panel.refresh();
   });
+  // CP10: the multi-factor picker lists the registry catalog, which a
+  // completed validate/RD job can extend. Same stale rule, but gated on
+  // module visibility instead of tab selection.
+  synthesisPanel.invalidate();
+  refreshSynthesisPanelIfDue();
 }
 initLabTabs({
   // Lazy refresh on tab activation: a panel refreshes when it has never
@@ -405,6 +457,11 @@ initLabTabs({
     (lazyPanelsByTab[tabId] || []).forEach(panel => {
       if (panel.isStale() || !panel.hasLoaded()) panel.refresh();
     });
+    // CP10: returning to the workbench tab with the multi module still
+    // selected must retry its lazy load — the module panel's hidden
+    // attribute does not change on tab switches, so the attribute
+    // observer alone cannot see this path.
+    if (tabId === 'lab-tab-factor') refreshSynthesisPanelIfDue();
   }
 });
 onControlTokenStored(() => {
@@ -415,6 +472,9 @@ onControlTokenStored(() => {
   registryPanel.refresh();
   docsPanel.refresh();
   extensionsPanel.refresh();
+  // CP10 stays lazy even on token arrival: only fetch when the multi module
+  // panel is not hidden; otherwise the next activation retries.
+  refreshSynthesisPanelIfDue();
 });
 llmProviderSelect.addEventListener('change', syncLlmApiKeyControls);
 llmApiKeyMode.addEventListener('change', syncLlmApiKeyControls);
@@ -432,7 +492,7 @@ button.addEventListener('click', async () => {
   cancelButton.disabled = true;
   activateTab('lab-tab-factor');
   activateModule('lab-module-single');
-  setTabDot('lab-tab-factor', 'running');
+  setWorkbenchDot('idea', 'running');
   setStep('parse', 'active');
   setStep('validate', 'pending');
   setStep('report', 'pending');
@@ -453,13 +513,13 @@ button.addEventListener('click', async () => {
     setValidationInputsEnabled(true);
     renderParsed(payload);
     setStep('parse', 'done');
-    setTabDot('lab-tab-factor', 'done');
+    setWorkbenchDot('idea', 'done');
     invalidateJobDependentPanels();
     statusEl.innerHTML = '<span class="ok">解析完成，等待确认参数</span>';
   } catch (error) {
     if (error.message === '运行已中断') {
       setStep('parse', 'pending');
-      setTabDot('lab-tab-factor', 'clear');
+      setWorkbenchDot('idea', 'clear');
       statusEl.innerHTML = '<span class="warn">运行已中断</span>';
       return;
     }
@@ -473,14 +533,14 @@ button.addEventListener('click', async () => {
           setValidationInputsEnabled(true);
           renderParsed(payload);
           setStep('parse', 'done');
-          setTabDot('lab-tab-factor', 'done');
+          setWorkbenchDot('idea', 'done');
           invalidateJobDependentPanels();
           statusEl.innerHTML = '<span class="ok">已使用本地规则解析，等待确认参数</span>';
           return;
         } catch (fallbackError) {
           const reason = jobFailureReason(fallbackError);
           setStep('parse', 'pending');
-          setTabDot('lab-tab-factor', 'error');
+          setWorkbenchDot('idea', 'error');
           showJobFailureNotice('result', reason);
           errorEl.textContent = reason;
           statusEl.textContent = '运行失败';
@@ -490,7 +550,7 @@ button.addEventListener('click', async () => {
     }
     const reason = jobFailureReason(error);
     setStep('parse', 'pending');
-    setTabDot('lab-tab-factor', 'error');
+    setWorkbenchDot('idea', 'error');
     showJobFailureNotice('result', reason);
     errorEl.textContent = reason;
     statusEl.textContent = '运行失败';
@@ -506,7 +566,7 @@ validateButton.addEventListener('click', async () => {
   cancelButton.disabled = true;
   activateTab('lab-tab-factor');
   activateModule('lab-module-single');
-  setTabDot('lab-tab-factor', 'running');
+  setWorkbenchDot('idea', 'running');
   setStep('validate', 'active');
   clearGlobalError();
   resetIdeaResult('验证与评测中', '评测完成后，IC、回测收益和 artifact 路径会在这里刷新。');
@@ -525,19 +585,19 @@ validateButton.addEventListener('click', async () => {
     setStaggeredEnabled(true);
     setStep('validate', 'done');
     setStep('report', 'done');
-    setTabDot('lab-tab-factor', 'done');
+    setWorkbenchDot('idea', 'done');
     invalidateJobDependentPanels();
     statusEl.innerHTML = '<span class="ok">验证完成</span>';
   } catch (error) {
     if (error.message === '运行已中断') {
       setStep('validate', 'pending');
-      setTabDot('lab-tab-factor', 'clear');
+      setWorkbenchDot('idea', 'clear');
       statusEl.innerHTML = '<span class="warn">运行已中断</span>';
       return;
     }
     const reason = jobFailureReason(error);
     setStep('validate', 'pending');
-    setTabDot('lab-tab-factor', 'error');
+    setWorkbenchDot('idea', 'error');
     showJobFailureNotice('result', reason);
     errorEl.textContent = reason;
     statusEl.textContent = '验证失败';
@@ -556,26 +616,26 @@ staggeredButton.addEventListener('click', async () => {
   cancelButton.disabled = true;
   activateTab('lab-tab-factor');
   activateModule('lab-module-single');
-  setTabDot('lab-tab-factor', 'running');
+  setWorkbenchDot('idea', 'running');
   clearGlobalError();
   renderStaggeredRunning();
   statusEl.textContent = '首月逐日建仓稳健性回测中...';
   try {
     const payload = await submitStaggeredEntry();
     renderStaggered(payload);
-    setTabDot('lab-tab-factor', 'done');
+    setWorkbenchDot('idea', 'done');
     invalidateJobDependentPanels();
     const staggeredSection = document.getElementById('report-staggered');
     if (staggeredSection) staggeredSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
     statusEl.innerHTML = '<span class="ok">首月逐日建仓稳健性回测完成</span>';
   } catch (error) {
     if (error.message === '运行已中断') {
-      setTabDot('lab-tab-factor', 'clear');
+      setWorkbenchDot('idea', 'clear');
       statusEl.innerHTML = '<span class="warn">运行已中断</span>';
       return;
     }
     const reason = jobFailureReason(error);
-    setTabDot('lab-tab-factor', 'error');
+    setWorkbenchDot('idea', 'error');
     showJobFailureNotice('staggered-result', reason);
     errorEl.textContent = reason;
     statusEl.textContent = '稳健性回测失败';
@@ -608,7 +668,7 @@ rdRun.addEventListener('click', async () => {
   activateModule('lab-module-single');
   const rdSection = document.getElementById('workbench-rd');
   if (rdSection) rdSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  setTabDot('lab-tab-factor', 'running');
+  setWorkbenchDot('rd', 'running');
   setStep('rd', 'active');
   clearGlobalError();
   resetRdResult('RD 运行中', 'RD 候选、gate、report path 和分段证据会在本次运行完成后刷新。');
@@ -625,20 +685,20 @@ rdRun.addEventListener('click', async () => {
     );
     renderResearch(payload);
     setStep('rd', 'done');
-    setTabDot('lab-tab-factor', 'done');
+    setWorkbenchDot('rd', 'done');
     invalidateJobDependentPanels();
     clearGlobalError();
     rdStatusEl.innerHTML = '<span class="ok">RD 完成</span>';
   } catch (error) {
     if (error.message === '运行已中断') {
       setStep('rd', 'pending');
-      setTabDot('lab-tab-factor', 'clear');
+      setWorkbenchDot('rd', 'clear');
       resetRdResult('RD 已中断', '本次 RD 已取消，未产生新的候选结果。');
       rdStatusEl.textContent = 'RD 已中断';
     } else {
       const reason = jobFailureReason(error);
       setStep('rd', 'pending');
-      setTabDot('lab-tab-factor', 'error');
+      setWorkbenchDot('rd', 'error');
       showJobFailureNotice('rd-result', reason);
       rdStatusEl.innerHTML = `<span class="err">${esc(reason)}</span>`;
     }

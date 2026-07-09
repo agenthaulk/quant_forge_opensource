@@ -39,9 +39,9 @@ HTML_CONTENT_TYPE = "text/html; charset=utf-8"
 JS_CONTENT_TYPE = "text/javascript; charset=utf-8"
 
 # The complete CP6-1 module set (+ CP6-2 Lab chrome + CP6-3 data/registry
-# views + CP6-4 docs/extensions views). A new module must be added here so
-# the no-external-resources and single-renderer sweeps keep covering
-# everything.
+# views + CP6-4 docs/extensions views + CP10 synthesis module). A new module
+# must be added here so the no-external-resources and single-renderer sweeps
+# keep covering everything.
 EXPECTED_STATIC_MODULES = (
     "api.js",
     "app.js",
@@ -58,6 +58,7 @@ EXPECTED_STATIC_MODULES = (
     "views/registry.js",
     "views/research.js",
     "views/spark.js",
+    "views/synthesis.js",
     "views/tags.js",
 )
 
@@ -187,12 +188,15 @@ def test_index_page_keeps_all_panel_sections_and_controls(web_app) -> None:
         'id="lab-module-panel-single"',
         'id="lab-module-panel-multi"',
         'id="multi-result"',
+        # CP10 filled the reserved multi slot with the module skeleton.
+        'id="synth-report"',
+        'id="synth-run"',
+        '合成配置',
         'id="report-comparison"',
         'id="workbench-rd"',
         'LLM 因子工作台',
         '单因子研究',
         '多因子策略回测',
-        '即将上线',
         '工作台模块',
         'RD 循环',
         '研究流程',
