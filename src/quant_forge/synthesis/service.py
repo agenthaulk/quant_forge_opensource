@@ -1033,6 +1033,9 @@ def fitted_weights_by_rebalance(
         # The §4.4 embargo, measured on the SAME grid the engine trades: a
         # period closing exactly AT d is eligible (<=); one closing at d+1
         # is not. Non-closed tail periods never appear in ic_by_period.
+        # The `s >= start_signal_index` clause is structurally redundant
+        # (`grid` already starts there) and is kept only to mirror the §4.4
+        # eligibility expression verbatim.
         eligible = [
             s
             for s in grid

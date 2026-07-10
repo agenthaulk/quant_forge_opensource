@@ -827,9 +827,10 @@ def run_multi_factor_backtest_workflow(
             dates=plan.dates,
             delay=delay,
             holding=plan.settings.holding_days,
-            ic_min_periods=int(
-                plan.method_params.get("ic_min_periods", DEFAULT_IC_MIN_PERIODS)
-            ),
+            # apply_param_defaults guarantees the key; the catalog default is
+            # the single source of truth (a service-side fallback here would
+            # read as if a second constant could govern).
+            ic_min_periods=int(plan.method_params["ic_min_periods"]),
         )
     else:
         composite = build_apriori_composite(
