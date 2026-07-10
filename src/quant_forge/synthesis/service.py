@@ -225,6 +225,14 @@ FITTED_METHODS: tuple[str, ...] = ("ic_weighted", "icir_weighted")
 # literal), so this constant only backs direct library callers.
 DEFAULT_IC_MIN_PERIODS = 6
 
+# RB-6 / Codex A-1: the cn_a formation default applied when NO member declares
+# a universe — an empty pin would run every member fetch unfiltered and let an
+# ST name scored by all members enter the book. Filters are predicate strings
+# over panel columns (the same vocabulary FactorDefinition.universe_filters
+# uses); a minimum-listing-age filter is not expressible on the current panel
+# schema (no listing-date column) and is documented as such in the design doc.
+DEFAULT_PINNED_UNIVERSE: tuple[str, ...] = ("is_st == false",)
+
 SCAN_STATUS_OK = "ok"
 SCAN_STATUS_EMPTY = "empty"
 SCAN_STATUS_THIN = "thin"
@@ -477,7 +485,23 @@ def _standardize_rank(matrix: pd.DataFrame) -> StandardizationOutcome:
     # orderings. NaN stays NaN and is excluded from the pct denominator.
     ranks = matrix.groupby(level="trade_date").rank(pct=True, method="first")
     standardized = 2.0 * ranks - 1.0
-    degenerate_dates = {str(column): () for column in matrix.columns}
+    # §4.2 no-dispersion symmetry with zscore: an all-tied cross-section has
+    # no ordering information, and method='first' would otherwise fabricate a
+    # deterministic instrument-ordered ladder the engine happily trades. Such
+    # dates contribute 0.0 for every observed name (matching the zscore
+    # convention) and are recorded as degenerate for the factor; if every
+    # member degenerates, the combined cross-section is zero-variance and
+    # RB-9 skips the date with DEGENERATE_CROSS_SECTION.
+    grouped = matrix.groupby(level="trade_date")
+    finite_counts = grouped.count()
+    per_date_nunique = grouped.transform("nunique")
+    no_dispersion = (per_date_nunique <= 1) & matrix.notna()
+    standardized = standardized.mask(no_dispersion, 0.0)
+    degenerate = (finite_counts >= 1) & (grouped.nunique() <= 1)
+    degenerate_dates = {
+        str(column): tuple(degenerate.index[degenerate[column]])
+        for column in matrix.columns
+    }
     return StandardizationOutcome(matrix=standardized, degenerate_dates_by_factor=degenerate_dates)
 
 
@@ -1644,13 +1668,18 @@ def derive_composite_id(
     coverage_rule: str,
     min_factor_coverage: int | None,
     universe_filters: Sequence[str],
+    holding_days: int,
 ) -> str:
     """Derive the ``COMPOSITE_<hash>`` id from ALL run inputs (RB-10, RF-1).
 
     The digest covers every §11 input: the ORDERED ``(factor_id, direction)``
     list (member order is identity-bearing), method, method_params,
     standardization, the backtest window, decay, delay, top_quantile,
-    coverage rule, min_factor_coverage, and the pinned universe. Any single
+    coverage rule, min_factor_coverage, the pinned universe, and
+    ``holding_days`` — the last is a CP0-review addition to the §11 list:
+    fitted composite VALUES depend on holding via the rebalance grid, and the
+    persisted definition's ``horizon_days`` mirrors it, so two runs differing
+    only in holding must never share one registered identity. Any single
     change mints a fresh id, which — together with the per-run overlay — is
     what prevents ``_merge_score_updates`` from blending stale prior-run
     rows into a new run's read. The canonical JSON uses sorted keys, so
@@ -1704,6 +1733,7 @@ def derive_composite_id(
         "coverage_rule": str(coverage_rule),
         "min_factor_coverage": min_factor_coverage,
         "universe_filters": [str(item) for item in universe_filters],
+        "holding_days": _validated_holding_for_digest(holding_days),
     }
     try:
         raw = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
@@ -1975,7 +2005,15 @@ def run_composite_backtest(
     if overlay_root is None:
         run_overlay = create_composite_overlay_root(artifact_root, composite_id)
     else:
+        # RB-10 hardening: a caller-supplied overlay must be fresh. Reusing a
+        # populated directory would let _merge_score_updates retain prior-run
+        # rows for dates absent from this run — a silent stale blend.
         run_overlay = Path(overlay_root).expanduser()
+        if run_overlay.exists() and any(run_overlay.iterdir()):
+            raise ValueError(
+                "overlay_root must be a fresh (empty or nonexistent) directory; "
+                "reusing a populated overlay can blend stale prior-run rows (RB-10)"
+            )
         run_overlay.mkdir(parents=True, exist_ok=True)
     _require_disjoint_overlay(run_overlay, factor_root=factor_root, data_root=data_root)
 
@@ -2054,6 +2092,12 @@ def _require_holding_days(value: object) -> int:
             "composite backtest; there is no horizon_days fallback (RF-5)"
         )
     return value
+
+
+def _validated_holding_for_digest(value: object) -> int:
+    """Digest-side holding validation (same RF-5 rule, ValueError wording kept)."""
+
+    return _require_holding_days(value)
 
 
 def _require_disjoint_overlay(overlay_root: Path, *, factor_root: Path, data_root: Path) -> None:

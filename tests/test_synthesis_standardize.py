@@ -217,3 +217,26 @@ def test_build_score_matrix_masks_non_finite_scores() -> None:
     assert pd.isna(matrix.loc[(D1, "A"), "f1"])
     assert pd.isna(matrix.loc[(D1, "B"), "f1"])
     assert float(matrix.loc[(D1, "C"), "f1"]) == 2.0
+
+
+def test_rank_all_tied_cross_section_contributes_zero_and_flags_degenerate() -> None:
+    # Codex A-2: an all-tied cross-section carries no ordering information;
+    # method='first' alone would fabricate an instrument-ordered ladder the
+    # engine trades on tie-break noise. The convention now mirrors zscore's
+    # no-dispersion rule: observed names contribute 0.0 and the date is
+    # recorded degenerate for the factor (composite-level RB-9 then skips the
+    # date when every member degenerates).
+    matrix = build_score_matrix(
+        {
+            "tied": tidy([(D1, "A", 1.0), (D1, "B", 1.0), (D1, "C", 1.0)]),
+            "live": tidy([(D1, "A", 1.0), (D1, "B", 2.0), (D1, "C", 3.0)]),
+        }
+    )
+    outcome = standardize_matrix(matrix, standardization="rank")
+    tied_col = outcome.matrix["tied"]
+    assert set(tied_col.dropna().unique()) == {0.0}
+    assert outcome.degenerate_dates_by_factor["tied"] == (D1,)
+    # The dispersive member keeps its real ordering (no over-blanking).
+    live_col = outcome.matrix["live"]
+    assert float(live_col.loc[(D1, "C")]) > float(live_col.loc[(D1, "A")])
+    assert outcome.degenerate_dates_by_factor["live"] == ()

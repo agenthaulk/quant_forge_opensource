@@ -89,6 +89,7 @@ def test_realized_engine_schedule_equals_shared_grid(
         coverage_rule="all_factors",
         min_factor_coverage=None,
         universe_filters=UNIVERSE,
+        holding_days=holding,
     )
 
     run = run_composite_backtest(

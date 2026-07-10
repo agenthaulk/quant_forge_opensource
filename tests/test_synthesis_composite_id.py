@@ -33,12 +33,13 @@ BASE: dict[str, object] = {
     "coverage_rule": "all_factors",
     "min_factor_coverage": None,
     "universe_filters": ("is_st == false",),
+    "holding_days": 5,
 }
 
 # Golden literal: any accidental change to the canonical-JSON recipe (key set,
 # ordering rules, digest, prefix, casing) re-mints every id and must be a
 # loud, reviewed change — exactly the RB-10 stability guarantee.
-GOLDEN_BASE_ID = "COMPOSITE_7E32508F6356"
+GOLDEN_BASE_ID = "COMPOSITE_6C843B794231"
 
 
 def _make(**overrides: object) -> str:
@@ -91,6 +92,7 @@ def test_changing_any_single_input_changes_the_id() -> None:
         {"coverage_rule": "min_factor_coverage", "min_factor_coverage": 1},
         {"min_factor_coverage": 2},
         {"universe_filters": ()},
+        {"holding_days": 20},
     ]
     ids = [_make()] + [_make(**variant) for variant in variants]
     assert len(set(ids)) == len(ids), "every single-input change must mint a fresh id"

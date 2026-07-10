@@ -71,6 +71,7 @@ from quant_forge.synthesis.methods import (
 from quant_forge.synthesis.service import (
     COVERAGE_RULE_ALL_FACTORS,
     DEFAULT_IC_MIN_PERIODS,
+    DEFAULT_PINNED_UNIVERSE,
     EVALUATION_WINDOW_TOO_SHORT,
     NON_OVERLAPPING_COHORTS,
     PHASE_SENSITIVE_SMALL_SAMPLE,
@@ -681,7 +682,12 @@ def _prepare_multi_factor_backtest(
             members.append(repository.get(factor_id))
         except FileNotFoundError:
             raise ValueError(f"unknown factor: {factor_id}") from None
-    universe_filters = resolve_pinned_universe(members)
+    # RB-6 + Codex A-1: when no member declares a universe, the pin falls back
+    # to the cn_a formation default instead of an empty (unfiltered) set — an
+    # empty pin would let ST names scored by every member enter the book.
+    universe_filters = resolve_pinned_universe(
+        members, default=DEFAULT_PINNED_UNIVERSE
+    )
     directions = {ref["factor_id"]: ref["direction"] for ref in refs}
     member_plan = build_member_fetch_plan(
         members, directions=directions, universe_filters=universe_filters
@@ -709,6 +715,7 @@ def _prepare_multi_factor_backtest(
         coverage_rule=COVERAGE_RULE_ALL_FACTORS,
         min_factor_coverage=None,
         universe_filters=universe_filters,
+        holding_days=settings.holding_days,
     )
     return _MultiFactorBacktestPlan(
         factor_refs=tuple((ref["factor_id"], ref["direction"]) for ref in refs),

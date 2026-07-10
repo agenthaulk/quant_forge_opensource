@@ -412,6 +412,39 @@ def test_rejects_conflicting_member_universes(web_config, web_app) -> None:
     _assert_rejected(web_app, request, needle=UNIVERSE_MISMATCH)
 
 
+def test_undeclared_member_universes_pin_the_cn_a_default(web_config, web_app) -> None:
+    # RB-6 hardening (Codex A-1): when NO member declares a universe the pin
+    # must fall back to the cn_a formation default — never the empty
+    # (unfiltered) set that would let ST names into the book.
+    repo = FactorRepository(web_config.paths.factor_root)
+    for factor_id, formula in (
+        ("FTR_NOUNI_A", "rank(close)"),
+        ("FTR_NOUNI_B", "rank(volume)"),
+    ):
+        repo.save(
+            FactorDefinition(
+                factor_id=factor_id,
+                name=factor_id.lower(),
+                formula=formula,
+                status="candidate",
+                horizon_days=5,
+                universe_filters=(),
+                source="demo",
+            )
+        )
+    request = _valid_request()
+    request["factor_refs"] = [
+        {"factor_id": "FTR_NOUNI_A", "direction": 1},
+        {"factor_id": "FTR_NOUNI_B", "direction": 1},
+    ]
+    status, job = _post_run(web_app, request)
+    assert status == 202
+    finished = _wait_for_job(web_app, job["job_id"])
+    assert finished["status"] == "completed", finished.get("error")
+    provenance = finished["result"]["synthesis_provenance"]
+    assert provenance["universe_filters"] == ["is_st == false"]
+
+
 # ---------------------------------------------------------------------------
 # Endpoint happy path — 202 job lifecycle over the demo fixture
 # ---------------------------------------------------------------------------

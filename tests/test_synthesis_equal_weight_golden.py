@@ -31,7 +31,7 @@ DELAY = 1
 # Golden id for the fixed inputs below — must match tests/test_synthesis_
 # composite_id.py's GOLDEN_BASE_ID; a change means the RB-10 canonical-JSON
 # recipe changed and every existing id would be re-minted.
-GOLDEN_COMPOSITE_ID = "COMPOSITE_7E32508F6356"
+GOLDEN_COMPOSITE_ID = "COMPOSITE_6C843B794231"
 
 _SANE_STATUSES = {"available", "insufficient_sample", "not_applicable"}
 _METRIC_KEYS = (
@@ -109,6 +109,7 @@ def test_equal_weight_golden_end_to_end(tmp_path: Path) -> None:
         "coverage_rule": "all_factors",
         "min_factor_coverage": None,
         "universe_filters": UNIVERSE,
+        "holding_days": HOLDING_DAYS,
     }
     composite_id = derive_composite_id(**id_inputs)  # type: ignore[arg-type]
     # Stable, colon-free composite id (RB-10 / RF-1 golden).

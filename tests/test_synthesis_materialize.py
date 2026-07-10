@@ -78,6 +78,7 @@ def _composite_id(**overrides: object) -> str:
         "coverage_rule": "all_factors",
         "min_factor_coverage": None,
         "universe_filters": UNIVERSE,
+        "holding_days": 5,
     }
     return derive_composite_id(**{**base, **overrides})  # type: ignore[arg-type]
 

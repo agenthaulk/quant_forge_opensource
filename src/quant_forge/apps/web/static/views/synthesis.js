@@ -292,14 +292,18 @@ export function runReadinessHintText(state) {
 
 /* Validity banner: the a-priori discipline statement plus server caveats
  * (coverage drops, pinned-standardization override notes). */
-export function renderValidityBannerHtml(validity) {
+export function renderValidityBannerHtml(validity, isFitted) {
   if (!validity) return '';
   const caveats = (validity.caveats || []).map(item =>
     `<div class="notice warn"><span class="status-pill status-pill--running">注意</span> ${esc(item)}</div>`
   ).join('');
+  /* The pill states the weight regime truthfully: a fitted run (is_fitted
+   * true in provenance) must not wear the a-priori badge. Absent provenance
+   * keeps neutral research-basis wording rather than guessing. */
+  const pill = isFitted === true ? '拟合权重（时变）' : (isFitted === false ? '先验声明' : '研究口径');
   return `
     <div class="notice" id="synth-validity">
-      <span class="status-pill status-pill--neutral">先验声明</span> ${esc(validity.message || '')}
+      <span class="status-pill status-pill--neutral">${esc(pill)}</span> ${esc(validity.message || '')}
       <br><span class="meta">basis: ${esc(validity.basis || 'n/a')}</span>
     </div>` + caveats;
 }
@@ -455,7 +459,7 @@ export function renderSynthesisReportHtml(payload) {
   const backtestProfile = profileOf(backtest);
   const profile = Object.keys(backtestProfile).length ? backtestProfile : evaluationProfile;
   const coverage = evaluation.coverage_lineage || {};
-  return renderValidityBannerHtml(payload.validity)
+  return renderValidityBannerHtml(payload.validity, provenance ? provenance.is_fitted === true : undefined)
     + synthesisHeroHtml(factor, provenance)
     + (provenance ? renderProvenanceCardHtml(provenance) : '')
     + rehostSectionId(

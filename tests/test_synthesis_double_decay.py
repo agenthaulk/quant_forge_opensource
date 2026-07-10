@@ -87,6 +87,7 @@ def test_composite_values_are_not_decayed_a_second_time(tmp_path: Path) -> None:
         coverage_rule="all_factors",
         min_factor_coverage=None,
         universe_filters=UNIVERSE,
+        holding_days=5,
     )
 
     run = run_composite_backtest(
