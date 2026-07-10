@@ -36,3 +36,7 @@ docs/backtest_rebuild/
 docs/rd_evaluation_rebuild/
 docs/*_repair_ledger_*.md
 docs/first_principles_review_*.md
+
+# Local-only third-party-derived capture (BRAIN bridge, D-i/D-v); never ships
+worldquant/
+.claude/skills/worldquant-brain/

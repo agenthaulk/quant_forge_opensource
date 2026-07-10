@@ -8,7 +8,7 @@ the server module namespace keep taking effect.
 
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date, datetime
 import json
 import math
@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, unquote
 
 from quant_forge.apps.web.jobs import _IdeaValidationSettings, _WebJobCancelled, _client_error_message
 from quant_forge.apps.web.markdown import extract_markdown_title, render_markdown_html
+from quant_forge.backtesting.service import EXTERNAL_OOS_ROLE
 from quant_forge.config import QuantForgeConfig, simulation_profile_from_mapping, validate_llm_runtime
 from quant_forge.core.contracts import (
     BacktestResult,
@@ -29,8 +30,18 @@ from quant_forge.core.contracts import (
     SimulationProfile,
     TransactionCostModel,
 )
-from quant_forge.data.local import catalog_field_availability, data_field_catalog, validate_data_root
+from quant_forge.data.local import (
+    LocalPanelDataProvider,
+    catalog_field_availability,
+    data_field_catalog,
+    validate_data_root,
+)
 from quant_forge.extensions.registry import contribution_points_payload, scan_extensions
+from quant_forge.factor_engine.signal_processing import (
+    MIN_DISPLAY_TRADING_DAYS,
+    apply_test_period,
+    prepare_factor_scores_result,
+)
 from quant_forge.factor_library.catalog import FactorCatalog
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.lineage.store import RUN_KINDS, RunIndex, redact_free_text
@@ -49,6 +60,38 @@ from quant_forge.research_loop.config import (
 )
 from quant_forge.research_loop.llm import LLMHypothesisGenerator, LLMResearchReviewGenerator
 from quant_forge.research_loop.service import ResearchLoopResult, ResearchLoopService
+from quant_forge.synthesis.methods import (
+    STANDARDIZATIONS,
+    SYNTHESIS_METHODS,
+    MethodSpec,
+    apply_param_defaults,
+    method_catalog_payload,
+    validate_params_against_schema,
+)
+from quant_forge.synthesis.service import (
+    COVERAGE_RULE_ALL_FACTORS,
+    DEFAULT_IC_MIN_PERIODS,
+    DEFAULT_PINNED_UNIVERSE,
+    EVALUATION_WINDOW_TOO_SHORT,
+    NON_OVERLAPPING_COHORTS,
+    PHASE_SENSITIVE_SMALL_SAMPLE,
+    CompositeBacktestRun,
+    CompositeResult,
+    CoverageAccounting,
+    FittedCompositeResult,
+    MemberFetchSpec,
+    RebalancePrescan,
+    build_apriori_composite,
+    build_fitted_composite,
+    build_member_fetch_plan,
+    cleanup_composite_artifacts,
+    derive_composite_id,
+    member_rank_ic_redundancy,
+    prescan_rebalance_coverage,
+    require_backtest_window,
+    resolve_pinned_universe,
+    run_composite_backtest,
+)
 
 
 MAX_RD_ITERATIONS = 5
@@ -316,6 +359,859 @@ def run_research_once_workflow(
         iterations=iterations if iterations is not None else 1,
         cancel_event=cancel_event,
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-factor composite backtest (design §8/§10, P5)
+# ---------------------------------------------------------------------------
+#
+# `run_multi_factor_backtest_workflow` mirrors `_validate_factor_workflow`:
+# validate -> run -> assemble payload -> clean up on failure. The composite
+# core (standardize/direction/combine/coverage/pre-scan, materialization,
+# engine drive with decay pinned to 0) lives in `quant_forge.synthesis.
+# service`; this layer owns request re-validation, settings mapping, the
+# same-window evaluation slot, and the exact §8 JSON contract the shipped
+# frontend renderers consume. Placement note: design §10 sketches the
+# orchestrator inside `synthesis/service.py`, but the `evaluate_factor`
+# monkeypatch seam and the web-config/rd-config types live in this layer, and
+# a core module importing `apps.web.server` would invert the adapter
+# boundary — so the orchestrator lands here, next to its template.
+
+
+@dataclass(frozen=True)
+class _MultiFactorBacktestSettings:
+    """Composite analog of ``_IdeaValidationSettings`` (design §10 step 2).
+
+    One profile only — the module is backtest-only (owner directive), so
+    there is no evaluation interval; the same-window diagnostics reuse the
+    backtest profile. ``parameters`` is the §8 response echo (flat keys plus
+    the nested ``backtest`` / ``transaction_costs`` blocks; deliberately NO
+    ``evaluation_start`` / ``evaluation_end`` / nested ``evaluation``).
+    """
+
+    holding_days: int
+    profile: SimulationProfile
+    transaction_costs: TransactionCostModel
+    include_partial_final_period: bool
+    parameters: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _MultiFactorBacktestPlan:
+    """Fully validated run plan produced by ``_prepare_multi_factor_backtest``.
+
+    Everything data-independent AND data-dependent has been re-validated by
+    the time this exists: the routing layer runs the same preparation
+    synchronously (``preflight_multi_factor_backtest``) so every rejection in
+    design §13's request matrix is a clean 4xx, and the job re-runs it so the
+    workflow stays safe when invoked directly.
+    """
+
+    factor_refs: tuple[tuple[str, int], ...]
+    directions: dict[str, int]
+    method: MethodSpec
+    method_params: dict[str, Any]
+    weights: dict[str, Any] | None
+    standardization: str
+    standardization_pinned: bool
+    settings: _MultiFactorBacktestSettings
+    member_plan: tuple[MemberFetchSpec, ...]
+    universe_filters: tuple[str, ...]
+    composite_id: str
+    period_count: int
+    in_window_date_count: int
+    panel: Any
+    dates: tuple[Any, ...]
+    previous_definition: FactorDefinition | None
+
+
+def _synthesis_factor_refs(value: Any) -> list[dict[str, Any]]:
+    """Validate the request ``factor_refs`` shape (client guard re-assertion).
+
+    Mirrors ``buildRunRequest`` (synthesis.js:495-501): at least 2 refs, each
+    with a non-empty ``factor_id`` and a strict integer direction of +1 or -1
+    (never a float, never a bool), and no duplicate factor ids.
+    """
+
+    if not isinstance(value, list) or not value:
+        raise ValueError("factor_refs must be a non-empty JSON array")
+    refs: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("factor_refs entries must be JSON objects with factor_id and direction")
+        factor_id = str(item.get("factor_id", "")).strip()
+        if not factor_id:
+            raise ValueError("factor_refs[].factor_id is required")
+        direction = item.get("direction")
+        if isinstance(direction, bool) or not isinstance(direction, int) or direction not in (1, -1):
+            raise ValueError(f"direction must be the integer +1 or -1 for factor: {factor_id}")
+        refs.append({"factor_id": factor_id, "direction": direction})
+    if len(refs) < 2:
+        raise ValueError("a multi-factor backtest requires at least 2 factor_refs")
+    factor_ids = [ref["factor_id"] for ref in refs]
+    if len(set(factor_ids)) != len(factor_ids):
+        raise ValueError("factor_refs must not repeat a factor_id")
+    return refs
+
+
+def _synthesis_block(value: Any) -> dict[str, Any]:
+    """Validate the request ``synthesis`` block shape: {method, params}."""
+
+    if not isinstance(value, dict):
+        raise ValueError("synthesis must be a JSON object with method and params")
+    method = str(value.get("method", "")).strip()
+    if not method:
+        raise ValueError("synthesis.method is required")
+    params = value.get("params")
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        raise ValueError("synthesis.params must be a JSON object")
+    return {"method": method, "params": params}
+
+
+def _optional_standardization(value: Any) -> dict[str, Any] | None:
+    """Validate the optional ``standardization`` block shape.
+
+    The frontend omits the block entirely when the chosen method pins its own
+    standardization (B3 deviation #6), so absence is legal here; whether it is
+    REQUIRED for the chosen method is decided against the catalog in
+    ``_resolve_synthesis_standardization``.
+    """
+
+    if value is None or value == "":
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("standardization must be a JSON object with method and params")
+    method = str(value.get("method", "")).strip()
+    if not method:
+        raise ValueError("standardization.method is required")
+    params = value.get("params")
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        raise ValueError("standardization.params must be a JSON object")
+    return {"method": method, "params": params}
+
+
+def _synthesis_method_spec(name: str) -> MethodSpec:
+    """Resolve a catalog method; unknown AND reserved names are rejected.
+
+    Reserved (``available: false``) methods are advertised in the catalog as
+    预留 options but are not runnable; the frontend never submits them
+    (buildRunRequest checks ``method.available === true``), and the server
+    re-asserts that guard here.
+    """
+
+    by_name = {spec.name: spec for spec in SYNTHESIS_METHODS}
+    spec = by_name.get(name)
+    if spec is None:
+        raise ValueError(f"unknown synthesis method: {name}; expected one of {sorted(by_name)}")
+    if not spec.available:
+        raise ValueError(f"synthesis method is reserved and not runnable yet: {name}")
+    return spec
+
+
+def _synthesis_weights_for_members(
+    method: MethodSpec, method_params: dict[str, Any], factor_ids: list[str]
+) -> dict[str, Any] | None:
+    """Cross-field weights guard: keys must cover EXACTLY the selected set.
+
+    Schema-driven like the frontend form — any ``weights``-type ParamSpec is
+    checked, with zero per-method hardcoding. ``validate_params_against_
+    schema`` already enforced the value types/finiteness; this layer owns the
+    request-context rule (key set == checked factor set) plus the all-zero
+    rejection the combine step would otherwise only raise inside the job.
+    """
+
+    weights_value: dict[str, Any] | None = None
+    for spec in method.params:
+        if spec.type != "weights" or spec.name not in method_params:
+            continue
+        declared = {str(key): value for key, value in method_params[spec.name].items()}
+        missing = sorted(set(factor_ids) - set(declared))
+        extra = sorted(set(declared) - set(factor_ids))
+        if missing or extra:
+            raise ValueError(
+                f"synthesis.params.{spec.name} must provide exactly one weight per selected "
+                f"factor; missing: {missing}; unknown: {extra}"
+            )
+        if all(float(value) == 0.0 for value in declared.values()):
+            raise ValueError(f"synthesis.params.{spec.name} must not be all zero")
+        weights_value = declared
+    return weights_value
+
+
+def _resolve_synthesis_standardization(
+    method: MethodSpec, block: dict[str, Any] | None
+) -> tuple[str, bool]:
+    """Resolve the effective standardization name + pinned flag.
+
+    A method that pins its own standardization wins (a conflicting explicit
+    block is rejected, never silently overridden); otherwise the block is
+    REQUIRED and must name a catalog standardization, with its params
+    validated against the declared (currently empty) schema.
+    """
+
+    pinned = method.required_standardization
+    if pinned:
+        if block is not None and block["method"] != pinned:
+            raise ValueError(
+                f"method {method.name} pins standardization {pinned}; got: {block['method']}"
+            )
+        return str(pinned), True
+    if block is None:
+        raise ValueError("standardization is required: send {\"method\": ..., \"params\": {}}")
+    by_name = {spec.name: spec for spec in STANDARDIZATIONS}
+    spec = by_name.get(block["method"])
+    if spec is None:
+        raise ValueError(
+            f"unknown standardization: {block['method']}; expected one of {sorted(by_name)}"
+        )
+    validate_params_against_schema(spec.params, block["params"], owner="standardization.params")
+    return spec.name, False
+
+
+def _multi_factor_backtest_settings(
+    raw_parameters: dict[str, Any] | None,
+    rd_config: ResearchLoopConfig,
+) -> _MultiFactorBacktestSettings:
+    """Map the flat §8.2 request parameters onto profile + cost settings.
+
+    Composite analog of ``_idea_validation_settings`` with one deliberate
+    difference (RF-5): ``holding_days`` is REQUIRED and this function RAISES
+    when it is absent — a composite has no single-factor ``horizon_days`` to
+    fall back to, and a silent default would misstate both cadence and
+    lifetime. Accepted keys are exactly what ``buildRunRequest`` sends:
+    ``holding_days`` plus optional ``decay_days`` / ``top_quantile`` /
+    ``execution_delay_days`` / ``backtest_start`` / ``backtest_end`` / cost
+    fields / ``include_partial_final_period``; omitted values fall back to
+    the RD backtest profile, never to frontend-invented numbers.
+    """
+
+    raw = raw_parameters or {}
+    if not isinstance(raw, dict):
+        raise ValueError("parameters must be a JSON object")
+    holding_value = raw.get("holding_days")
+    if holding_value is None or holding_value == "":
+        raise ValueError(
+            "parameters.holding_days is required for a multi-factor backtest; a composite "
+            "has no single-factor horizon_days fallback (RF-5)"
+        )
+    holding_days = _positive_int_parameter(holding_value, "holding_days")
+    include_partial_final_period = _bool_parameter(
+        raw.get("include_partial_final_period", False), "include_partial_final_period"
+    )
+    overrides = _flat_backtest_profile_overrides(raw)
+    overrides.update(_test_period_override("backtest", raw))
+    profile = simulation_profile_from_mapping(overrides, rd_config.backtest_profile)
+    cost_payload = _cost_parameters(raw, _transaction_costs_payload(rd_config.transaction_costs))
+    transaction_costs = TransactionCostModel(
+        commission_bps=_nonnegative_float_parameter(cost_payload["commission_bps"], "commission_bps"),
+        slippage_bps=_nonnegative_float_parameter(cost_payload["slippage_bps"], "slippage_bps"),
+        short_borrow_bps_annual=_nonnegative_float_parameter(
+            cost_payload["short_borrow_bps_annual"], "short_borrow_bps_annual"
+        ),
+    )
+    parameters = {
+        "holding_days": holding_days,
+        "backtest_start": profile.test_period_start,
+        "backtest_end": profile.test_period_end,
+        "top_quantile": profile.top_quantile,
+        "decay_days": profile.decay_days,
+        "execution_delay_days": profile.execution_delay_days,
+        "commission_bps": transaction_costs.commission_bps,
+        "slippage_bps": transaction_costs.slippage_bps,
+        "short_borrow_bps_annual": transaction_costs.short_borrow_bps_annual,
+        "include_partial_final_period": include_partial_final_period,
+        "backtest": _simulation_profile_payload(profile),
+        "transaction_costs": _transaction_costs_payload(transaction_costs),
+    }
+    return _MultiFactorBacktestSettings(
+        holding_days=holding_days,
+        profile=profile,
+        transaction_costs=transaction_costs,
+        include_partial_final_period=include_partial_final_period,
+        parameters=parameters,
+    )
+
+
+def _prepare_multi_factor_backtest(
+    config: QuantForgeConfig,
+    *,
+    factor_refs: Any,
+    synthesis: Any,
+    standardization: Any,
+    parameters: Any,
+    rd_config: ResearchLoopConfig,
+) -> _MultiFactorBacktestPlan:
+    """Re-validate EVERY client guard server-side and resolve the run plan.
+
+    Design §10 step 1-2 in one pass: request shape (>=2 refs, ±1 directions,
+    known+available method, schema-validated params, weights covering exactly
+    the checked set, required standardization, REQUIRED holding_days),
+    member resolution (unknown factor -> clean error), the ONE pinned
+    universe (RB-6, ``UNIVERSE_MISMATCH``), and the RB-2 window precondition
+    (``WINDOW_TOO_SHORT``). Every failure raises ``ValueError`` (or a typed
+    subclass), which both the synchronous preflight route and the job error
+    mapping surface as a client error, never a 500.
+    """
+
+    refs = _synthesis_factor_refs(factor_refs)
+    synthesis_request = _synthesis_block(synthesis)
+    standardization_request = _optional_standardization(standardization)
+    method = _synthesis_method_spec(synthesis_request["method"])
+    method_params = validate_params_against_schema(
+        method.params, synthesis_request["params"], owner="synthesis.params"
+    )
+    # Schema-declared defaults resolve here so provenance echoes and the
+    # composite-id digest carry the values the run ACTUALLY used (a fitted
+    # request without ic_min_periods truthfully reports the catalog default).
+    method_params = apply_param_defaults(method.params, method_params)
+    factor_ids = [ref["factor_id"] for ref in refs]
+    weights = _synthesis_weights_for_members(method, method_params, factor_ids)
+    standardization_name, standardization_pinned = _resolve_synthesis_standardization(
+        method, standardization_request
+    )
+    settings = _multi_factor_backtest_settings(parameters, rd_config)
+
+    repository = FactorRepository(config.paths.factor_root)
+    members: list[FactorDefinition] = []
+    for factor_id in factor_ids:
+        try:
+            members.append(repository.get(factor_id))
+        except FileNotFoundError:
+            raise ValueError(f"unknown factor: {factor_id}") from None
+    # RB-6 + Codex A-1: when no member declares a universe, the pin falls back
+    # to the cn_a formation default instead of an empty (unfiltered) set — an
+    # empty pin would let ST names scored by every member enter the book.
+    universe_filters = resolve_pinned_universe(
+        members, default=DEFAULT_PINNED_UNIVERSE
+    )
+    directions = {ref["factor_id"]: ref["direction"] for ref in refs}
+    member_plan = build_member_fetch_plan(
+        members, directions=directions, universe_filters=universe_filters
+    )
+
+    panel = LocalPanelDataProvider(config.paths.data_root).load_panel()
+    working_panel = apply_test_period(panel, settings.profile)
+    dates = tuple(sorted(working_panel["trade_date"].drop_duplicates()))
+    period_count = require_backtest_window(
+        len(dates),
+        delay=settings.profile.execution_delay_days,
+        holding=settings.holding_days,
+    )
+
+    composite_id = derive_composite_id(
+        factor_refs=[(ref["factor_id"], ref["direction"]) for ref in refs],
+        method=method.name,
+        method_params=method_params,
+        standardization=standardization_name,
+        backtest_start=settings.profile.test_period_start,
+        backtest_end=settings.profile.test_period_end,
+        decay_days=settings.profile.decay_days,
+        execution_delay_days=settings.profile.execution_delay_days,
+        top_quantile=settings.profile.top_quantile,
+        coverage_rule=COVERAGE_RULE_ALL_FACTORS,
+        min_factor_coverage=None,
+        universe_filters=universe_filters,
+        holding_days=settings.holding_days,
+    )
+    return _MultiFactorBacktestPlan(
+        factor_refs=tuple((ref["factor_id"], ref["direction"]) for ref in refs),
+        directions=directions,
+        method=method,
+        method_params=method_params,
+        weights=weights,
+        standardization=standardization_name,
+        standardization_pinned=standardization_pinned,
+        settings=settings,
+        member_plan=member_plan,
+        universe_filters=universe_filters,
+        composite_id=composite_id,
+        period_count=period_count,
+        in_window_date_count=len(dates),
+        panel=panel,
+        dates=dates,
+        previous_definition=_existing_factor(repository, composite_id),
+    )
+
+
+def preflight_multi_factor_backtest(
+    config: QuantForgeConfig,
+    *,
+    factor_refs: Any,
+    synthesis: Any,
+    standardization: Any = None,
+    parameters: Any = None,
+    rd_config: ResearchLoopConfig,
+) -> None:
+    """Synchronous request validation for the POST route (clean 4xx contract).
+
+    Jobs run asynchronously, so a guard that only fired inside the job body
+    would surface as a failed job instead of a request rejection. The route
+    calls this BEFORE ``job_manager.start``: every §13 rejection — shape
+    guards, unknown/reserved method, missing ``holding_days``, weights
+    coverage, unknown factors, ``UNIVERSE_MISMATCH``, ``WINDOW_TOO_SHORT`` —
+    raises ``ValueError`` here and maps to HTTP 400. The window check needs
+    the real trade calendar, so this loads the panel once per request; the
+    job reloads it, an accepted cost for a local-first tool in exchange for
+    honest request semantics.
+    """
+
+    _prepare_multi_factor_backtest(
+        config,
+        factor_refs=factor_refs,
+        synthesis=synthesis,
+        standardization=standardization,
+        parameters=parameters,
+        rd_config=rd_config,
+    )
+
+
+def run_multi_factor_backtest_workflow(
+    config: QuantForgeConfig,
+    *,
+    factor_refs: Any,
+    synthesis: Any,
+    standardization: Any = None,
+    parameters: Any = None,
+    rd_config: ResearchLoopConfig,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    """Run the multi-factor composite backtest end-to-end (design §10 steps 1-6).
+
+    Mirrors ``_validate_factor_workflow``: validate, fetch member scores with
+    the ONE pinned universe, standardize/direction/combine — a-priori, or
+    the §4.4 point-in-time IC/ICIR fit on the shared ``rebalance_indices``
+    grid with ``_with_period_return`` forward returns (P6), with the
+    time-varying weights folded into the composite BEFORE materialization —
+    pre-scan the shared rebalance grid, materialize + drive the engine
+    (decay pinned to 0 on the engine profile — LA-1), fill the same-window
+    evaluation slot (FP-2), and assemble the §8 payload. Any failure after
+    materialization cleans up the synthetic definition and the per-run
+    overlay (the engine-drive step handles its own failures the same way).
+    """
+
+    _raise_if_cancelled(cancel_event)
+    plan = _prepare_multi_factor_backtest(
+        config,
+        factor_refs=factor_refs,
+        synthesis=synthesis,
+        standardization=standardization,
+        parameters=parameters,
+        rd_config=rd_config,
+    )
+    _raise_if_cancelled(cancel_event)
+    member_scores: dict[str, Any] = {}
+    for spec in plan.member_plan:
+        member_scores[spec.factor_id] = prepare_factor_scores_result(
+            plan.panel,
+            spec.formula,
+            spec.universe_filters,
+            profile=plan.settings.profile,
+            factor_id=spec.factor_id,
+            factor_name=spec.factor_name,
+            factor_values_root=config.paths.factor_values_root,
+            factor_values_overlay_root=config.paths.factor_values_overlay_root,
+        ).scores
+        _raise_if_cancelled(cancel_event)
+    # The working-panel close frame over the SAME in-window dates the engine
+    # trades: the RB-5 forward-return source for the fitted IC estimate and
+    # the advisory redundancy diagnostic.
+    working_close = apply_test_period(plan.panel, plan.settings.profile)[
+        ["trade_date", "instrument", "close"]
+    ].copy()
+    delay = plan.settings.profile.execution_delay_days
+    composite: CompositeResult | FittedCompositeResult
+    if plan.method.is_fitted:
+        composite = build_fitted_composite(
+            member_scores,
+            directions=plan.directions,
+            standardization=plan.standardization,
+            method=plan.method.name,
+            close=working_close,
+            dates=plan.dates,
+            delay=delay,
+            holding=plan.settings.holding_days,
+            # apply_param_defaults guarantees the key; the catalog default is
+            # the single source of truth (a service-side fallback here would
+            # read as if a second constant could govern).
+            ic_min_periods=int(plan.method_params["ic_min_periods"]),
+        )
+    else:
+        composite = build_apriori_composite(
+            member_scores,
+            directions=plan.directions,
+            standardization=plan.standardization,
+            method=plan.method.name,
+            weights=plan.weights,
+        )
+    _raise_if_cancelled(cancel_event)
+    redundancy = member_rank_ic_redundancy(
+        member_scores,
+        directions=plan.directions,
+        standardization=plan.standardization,
+        close=working_close,
+        dates=plan.dates,
+        delay=delay,
+        holding=plan.settings.holding_days,
+    )
+    prescan = prescan_rebalance_coverage(
+        composite.composite,
+        plan.dates,
+        delay=plan.settings.profile.execution_delay_days,
+        holding=plan.settings.holding_days,
+        include_partial_final_period=plan.settings.include_partial_final_period,
+    )
+    _raise_if_cancelled(cancel_event)
+    run = run_composite_backtest(
+        composite.composite,
+        composite_id=plan.composite_id,
+        factor_root=config.paths.factor_root,
+        data_root=config.paths.data_root,
+        artifact_root=config.paths.artifact_root,
+        holding_days=plan.settings.holding_days,
+        profile=plan.settings.profile,
+        universe_filters=plan.universe_filters,
+        transaction_costs=plan.settings.transaction_costs,
+        factor_values_root=config.paths.factor_values_root,
+        factor_values_manifest_root=config.paths.factor_values_manifest_root,
+        include_partial_final_period=plan.settings.include_partial_final_period,
+        panel=plan.panel,
+    )
+    try:
+        _raise_if_cancelled(cancel_event)
+        evaluation_payload = _same_window_evaluation(config, plan, run, rd_config)
+        _raise_if_cancelled(cancel_event)
+        return _multi_factor_backtest_payload(
+            plan, composite, prescan, run, evaluation_payload, redundancy
+        )
+    except Exception:
+        cleanup_composite_artifacts(
+            config.paths.factor_root,
+            composite_id=run.composite_id,
+            previous_definition=plan.previous_definition,
+            overlay_root=run.overlay_root,
+        )
+        raise
+
+
+def _same_window_evaluation_meta(run: CompositeBacktestRun, *, status: str) -> dict[str, Any]:
+    """FP-2 basis marker: the evaluation slot is same-window diagnostics.
+
+    The frontend's evaluation section title is hard-coded, so the honesty
+    signal lives here and in ``validity.caveats``; renderers ignore the extra
+    key (additive change).
+    """
+
+    return {
+        "basis": "same_window_diagnostics",
+        "status": status,
+        "test_period": {
+            "start": run.engine_profile.test_period_start,
+            "end": run.engine_profile.test_period_end,
+        },
+    }
+
+
+def _degraded_same_window_evaluation(
+    run: CompositeBacktestRun, plan: _MultiFactorBacktestPlan
+) -> dict[str, Any]:
+    """Honest degraded evaluation slot when the window is below the 126 floor.
+
+    Decision record (design task FP-2 note): a ``null`` slot renders without
+    crashing (`synthesis.js:448` maps it to ``{}``), but `factor.js:122`
+    interpolates ``esc(evaluation.ic_days)`` — a literal ``undefined`` tile —
+    and the warning surface disappears with the object. This degraded payload
+    instead carries FP-4-typed statuses (the tiles render
+    ``insufficient_sample`` labels), a genuine observed ``ic_days`` of 0, the
+    ``EVALUATION_WINDOW_TOO_SHORT`` code, and a plain-language warning. The
+    backtest itself is unaffected: its real gate is max(2, holding+delay+1)
+    (RF-4); the 126-day floor belongs to the evaluation layer only.
+    """
+
+    status = "insufficient_sample"
+    return {
+        "factor_id": run.composite_id,
+        "sample_role": "research_evaluation",
+        "observations": 0,
+        "coverage": None,
+        "rank_ic_mean": None,
+        "rank_ic_mean_status": status,
+        "rank_ic_std": None,
+        "rank_icir": None,
+        "rank_icir_status": status,
+        "rank_ic_t_stat": None,
+        "rank_ic_t_stat_status": status,
+        "ic_days": 0,
+        "split_metrics": [],
+        "horizon_metrics": [],
+        "metrics": {},
+        "warning_codes": [EVALUATION_WINDOW_TOO_SHORT],
+        "warnings": [
+            "同窗评价诊断不可用：回测窗口仅 "
+            f"{plan.in_window_date_count} 个交易日，少于评价所需的 "
+            f"{MIN_DISPLAY_TRADING_DAYS} 个交易日；组合回测本身不受此下限影响"
+        ],
+        "simulation_profile": _json_safe(run.engine_profile),
+        "coverage_lineage": {},
+        "artifact_path": None,
+        "meta": _same_window_evaluation_meta(run, status="unavailable"),
+    }
+
+
+def _same_window_evaluation(
+    config: QuantForgeConfig,
+    plan: _MultiFactorBacktestPlan,
+    run: CompositeBacktestRun,
+    rd_config: ResearchLoopConfig,
+) -> dict[str, Any]:
+    """Fill the ``evaluation`` slot from the SAME backtest window (FP-2).
+
+    Runs ``evaluate_factor`` over the materialized composite with the engine
+    profile (same test period, decay already 0), reading values from the
+    per-run overlay. ``evaluate_factor`` enforces the 126-trading-day display
+    floor; instead of string-matching its raise, the window length is checked
+    against the same constant up front and the slot degrades honestly.
+    """
+
+    from quant_forge.apps.web import server as _server
+
+    if plan.in_window_date_count < MIN_DISPLAY_TRADING_DAYS:
+        return _degraded_same_window_evaluation(run, plan)
+    evaluation = _server.evaluate_factor(
+        run.composite_id,
+        factor_root=config.paths.factor_root,
+        data_root=config.paths.data_root,
+        artifact_root=config.paths.artifact_root,
+        horizon_days=plan.settings.holding_days,
+        horizon_days_matrix=rd_config.horizon_days_matrix,
+        sample_splits=rd_config.sample_splits,
+        simulation_profile=run.engine_profile,
+        factor_values_root=config.paths.factor_values_root,
+        factor_values_overlay_root=run.overlay_root,
+        factor_values_manifest_root=config.paths.factor_values_manifest_root,
+    )
+    payload = _apply_metric_display(_json_safe(evaluation))
+    for nested_metric in [
+        *(payload.get("split_metrics") or []),
+        *(payload.get("horizon_metrics") or []),
+    ]:
+        if isinstance(nested_metric, dict):
+            _apply_metric_display(nested_metric)
+    payload["meta"] = _same_window_evaluation_meta(run, status="available")
+    return payload
+
+
+def _synthesis_validity_payload(period_count: int) -> dict[str, Any]:
+    """§8 validity block with the literal caveat list.
+
+    The RB-1 phase caveat carries the REALIZED non-overlapping period count
+    (§8 writes the placeholder ``N``; RB-1 requires the realized count in
+    plain language, so the number is substituted here).
+    """
+
+    return {
+        "message": "研究口径合成回测（非生产交易口径）",
+        "basis": EXTERNAL_OOS_ROLE,
+        "caveats": [
+            "先验/拟合已如实标注",
+            "调仓周期与持有期为同一参数（holding_days）：K=1 非重叠，指标基于约 "
+            f"{period_count} 个独立区间，对起始相位敏感",
+            "样本内评价为同窗诊断，非独立研究样本",
+            "成本以目标簿 L1 换手计，漂移回补交易未计成本（换手/成本偏低估）",
+            "is_st/上市过滤仅在建仓时点应用；持有期内转 ST/退市按最后成交价了结",
+        ],
+    }
+
+
+def _synthesis_provenance_payload(
+    *,
+    member_plan: tuple[MemberFetchSpec, ...],
+    method_name: str,
+    method_params: dict[str, Any],
+    standardization: str,
+    standardization_pinned: bool,
+    composite_id: str,
+    is_fitted: bool,
+    coverage: CoverageAccounting,
+    universe_filters: tuple[str, ...],
+    period_count: int,
+    skipped_rebalances: int,
+    degenerate_cross_sections: int,
+    weights_effective: dict[str, float] | None,
+    fitted: FittedCompositeResult | None = None,
+    rank_ic_redundancy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """§8 ``synthesis_provenance`` block (both FP-1 branches).
+
+    ``factors[]`` carries each member's formula PINNED at plan-build time
+    (CP0 amendment) so downstream consumers never depend on the live
+    registry. ``coverage_by_role`` carries the single backtest-only role;
+    ``coverage_ratio`` is a real ``null`` when unobservable (FP-4) — the
+    frontend renders it n/a, never 0 (synthesis.js:349).
+
+    FP-1 branch selection keys off the REQUESTED method family (``fitted``):
+    a-priori runs carry ``weights_effective`` RAW (equal_weight echoes its
+    uniform 1.0 claim) and NO fitted fields; fitted runs OMIT
+    ``weights_effective`` entirely — the frontend captions that field
+    unconditionally as an a-priori raw-declared claim (synthesis.js:386-388)
+    — and instead carry ``fitted_weights_latest`` (last GENUINELY fitted
+    vector, or ``null``), the per-signal-date ``fitted_weights_path``
+    diagnostic, ``fitted_period_fraction`` and ``warmup_period_count``.
+    ``is_fitted`` is the run-level REALIZED truth: a fitted request that
+    downgraded (``NO_FITTED_PERIODS``, §3 RB-8) reports ``false`` while
+    keeping the fitted diagnostic fields so the downgrade is auditable.
+    ``rank_ic_redundancy`` is the §4.5 advisory crowding matrix — attached
+    for both branches, never a gate.
+    """
+
+    directions = {spec.factor_id: spec.direction for spec in member_plan}
+    sources = {spec.factor_id: spec.source for spec in member_plan}
+    coverage_rows = [
+        {
+            "factor_id": row.factor_id,
+            "direction": directions.get(row.factor_id),
+            "source": sources.get(row.factor_id),
+            "rows_scored": row.rows_scored,
+            "rows_in_composite": row.rows_in_composite,
+            "coverage_ratio": row.coverage_ratio,
+        }
+        for row in coverage.per_factor
+    ]
+    payload: dict[str, Any] = {
+        "factors": [spec.provenance_entry() for spec in member_plan],
+        "directions": directions,
+        "method": method_name,
+        "method_params": dict(method_params),
+        "standardization": standardization,
+        "standardization_pinned_by_method": standardization_pinned,
+        "composite_id": composite_id,
+        "is_fitted": is_fitted,
+        "coverage_rule": coverage.coverage_rule,
+        "min_factor_coverage": coverage.min_factor_coverage,
+        "universe_filters": [str(item) for item in universe_filters],
+        "period_count": period_count,
+        "non_overlapping": True,
+        "rows_required": coverage.rows_required,
+        "rows_full_coverage": coverage.rows_full_coverage,
+        "skipped_rebalances": skipped_rebalances,
+        "degenerate_cross_sections": degenerate_cross_sections,
+        "coverage_by_role": {
+            EXTERNAL_OOS_ROLE: {
+                "coverage": coverage_rows,
+                "rows_required": coverage.rows_required,
+                "rows_full_coverage": coverage.rows_full_coverage,
+            }
+        },
+    }
+    if fitted is None and weights_effective is not None:
+        # A-priori branch only: the raw declared claim (FP-1). A fitted run
+        # never routes any vector through this field — not even a downgraded
+        # equal-weight fallback, which the user never declared.
+        payload["weights_effective"] = dict(weights_effective)
+    if fitted is not None:
+        payload["fitted_period_fraction"] = fitted.fitted_period_fraction
+        payload["warmup_period_count"] = fitted.warmup_period_count
+        payload["fitted_weights_latest"] = (
+            dict(fitted.fitted_weights_latest)
+            if fitted.fitted_weights_latest is not None
+            else None
+        )
+        payload["fitted_weights_path"] = [
+            {
+                "signal_date": entry.signal_date.date().isoformat(),
+                "weights": dict(entry.weights),
+                "eligible_period_count": entry.eligible_period_count,
+                "flag": entry.flag,
+            }
+            for entry in fitted.weights_path
+        ]
+    if rank_ic_redundancy is not None:
+        payload["rank_ic_redundancy"] = dict(rank_ic_redundancy)
+    return payload
+
+
+def _multi_factor_backtest_payload(
+    plan: _MultiFactorBacktestPlan,
+    composite: CompositeResult | FittedCompositeResult,
+    prescan: RebalancePrescan,
+    run: CompositeBacktestRun,
+    evaluation_payload: dict[str, Any],
+    redundancy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assemble the exact §8 response the shipped renderers consume.
+
+    ``backtest`` is ``_backtest_payload`` output VERBATIM (FP-3 — every
+    top-level scalar tile factor.js:136-176 reads), extended additively with
+    the synthesis disclosure codes: ``NON_OVERLAPPING_COHORTS`` +
+    ``PHASE_SENSITIVE_SMALL_SAMPLE`` (RB-1), the pre-scan skip codes (RB-7),
+    ``DEGENERATE_CROSS_SECTION`` (RB-9) and — on the fitted branch — the
+    §4.4 fit codes (``WARM_UP_IC_UNFITTED`` / ``IC_DEGENERATE_EQUAL_WEIGHT``
+    / ``NO_FITTED_PERIODS``) carried by ``composite.warning_codes``; the
+    engine's own codes — including the inherited
+    ``FINAL_PARTIAL_PERIOD_EXCLUDED`` handling — stay first and unchanged.
+    ``in_sample_backtest`` is ``null``: the module is backtest-only over ONE
+    window, a second same-window engine pass would duplicate ``backtest``
+    under a misleading in-sample label, and the renderer is null-safe
+    (synthesis.js:449 ``|| null``; factor.js:131 returns ``''``).
+    """
+
+    backtest_payload = _backtest_payload(run.result)
+    merged_codes = list(backtest_payload["warning_codes"])
+    for code in (
+        NON_OVERLAPPING_COHORTS,
+        PHASE_SENSITIVE_SMALL_SAMPLE,
+        *prescan.warning_codes,
+        *composite.warning_codes,
+    ):
+        if code not in merged_codes:
+            merged_codes.append(code)
+    backtest_payload["warning_codes"] = merged_codes
+    warnings = list(backtest_payload["warnings"])
+    warnings.append(
+        "非重叠持有期口径：holding_days 同时是调仓周期与持有期（K=1），窗口约含 "
+        f"{plan.period_count} 个独立持有期，指标对起始相位敏感"
+    )
+    backtest_payload["warnings"] = warnings
+
+    fitted_result = composite if isinstance(composite, FittedCompositeResult) else None
+    provenance = _synthesis_provenance_payload(
+        member_plan=plan.member_plan,
+        method_name=plan.method.name,
+        method_params=plan.method_params,
+        standardization=plan.standardization,
+        standardization_pinned=plan.standardization_pinned,
+        composite_id=run.composite_id,
+        # Run-level realized truth: a fitted request that produced zero
+        # genuinely fitted rebalances reports false (RB-8 downgrade);
+        # a-priori methods are false by nature.
+        is_fitted=(
+            fitted_result.is_fitted if fitted_result is not None else plan.method.is_fitted
+        ),
+        coverage=composite.coverage,
+        universe_filters=plan.universe_filters,
+        period_count=plan.period_count,
+        # Realized ledger count (the engine keeps skip stubs visible, RB-7);
+        # the pre-scan is a score-side lower bound and feeds warning codes.
+        skipped_rebalances=int(run.result.skipped_rebalances),
+        degenerate_cross_sections=len(composite.degenerate_dates),
+        weights_effective=(
+            None if fitted_result is not None else composite.weights_effective
+        ),
+        fitted=fitted_result,
+        rank_ic_redundancy=redundancy,
+    )
+    return {
+        "factor": _json_safe(run.materialized.definition),
+        "parameters": _json_safe(plan.settings.parameters),
+        "evaluation": evaluation_payload,
+        "in_sample_backtest": None,
+        "backtest": backtest_payload,
+        "validity": _synthesis_validity_payload(plan.period_count),
+        "synthesis_provenance": provenance,
+    }
 
 
 def _parse_payload(parsed: ParsedFactor, rd_config: ResearchLoopConfig) -> dict[str, Any]:
@@ -1121,6 +2017,7 @@ def _backtest_payload(backtest: BacktestResult) -> dict[str, Any]:
         "return_series_kind": backtest.return_series_kind,
         "completed_periods": backtest.completed_periods,
         "partial_periods": backtest.partial_periods,
+        "skipped_rebalances": backtest.skipped_rebalances,
         "lost_positions": backtest.lost_positions,
         "exposure_days": backtest.exposure_days,
         "calendar_days": backtest.calendar_days,
@@ -1767,6 +2664,28 @@ def _data_status_payload(config: QuantForgeConfig) -> dict[str, Any]:
         ],
     }
     return _server._web_public_json(_redact_web_text(payload))
+
+
+def _synthesis_methods_payload(config: QuantForgeConfig) -> dict[str, Any]:
+    """Method + standardization catalog for the synthesis workbench (design §9).
+
+    Wraps the one authoritative catalog in
+    :mod:`quant_forge.synthesis.methods` (the same constants that drive
+    server-side parameter re-validation) instead of duplicating the JSON
+    here, so the advertised form schema and the enforced schema cannot
+    drift. Fitted methods ship ``available: false`` (reserved 预留) until
+    the fitted implementation phase lands; the frontend renders reserved
+    methods as disabled options generically, keeping the capability surface
+    honest without special-casing any method name.
+
+    ``config`` is unused today; the uniform builder signature keeps the
+    routing dispatch and monkeypatch seam identical across GET builders.
+    """
+
+    del config
+    from quant_forge.apps.web import server as _server
+
+    return _server._web_public_json(_redact_web_text(method_catalog_payload()))
 
 
 def _factor_research_tags_by_id(config: QuantForgeConfig) -> dict[str, dict[str, Any]]:

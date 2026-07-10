@@ -27,6 +27,59 @@ Owner: the project owner. Recorded by Fable.
 | --- | --- | --- | --- |
 | D8 | CP6 frontend technology | **Static ES-module app served by the existing stdlib server — no build step, no npm, zero runtime deps, zero external resources.** First-principles grounds: honest-metric rendering is the product, local-first security posture ranks toolchain surface with the no-exec rule, native ES modules make a build chain unnecessary for Studio-style multi-view UX. Studio's React app is UX reference only. Escape hatch documented (opt-in separate dir, never a kernel prerequisite). | Plan + sub-phases CP6-1..4 in docs/coordination/CP6_FRONTEND_PLAN.md; CP6-1 skeleton (extract html.py inline JS into modules + containment-checked static handler, characterization tests first) precedes all other sub-phases |
 
+## 2026-07-09 — Phase D frontend design-parity + multi-factor synthesis (recorded by Fable)
+
+| # | Decision | Ruling | Implementation |
+| --- | --- | --- | --- |
+| D9 | Open-source frontend stack after a Studio-vs-OSS comparison, and the shape of the CP10 multi-factor module | **Design-parity, not stack-parity: D8 upheld.** Adopt Studio's DESIGN and IA — time-series charts, the module information architecture, and the visual polish. Decline Studio's STACK — React + Vite + npm + Monaco + ECharts. The open-source frontend stays a no-build static ES-module app served by the stdlib server; source is exactly what ships. | Charts CP9-1 `src/quant_forge/apps/web/static/views/charts.js`; IA CP9-2 `.../static/views/lab.js` + `.../apps/web/html.py`; synthesis backend `src/quant_forge/synthesis/`; synthesis frontend `.../static/views/synthesis.js`. Auditability enforced by `scripts/release_safety_scan.py` + `tests/test_web_static_frontend.py` |
+
+**Rationale (the load-bearing axioms).** (1) Local-first with a minimal
+dependency surface: a build chain is toolchain surface the no-exec, local-first
+posture does not want. (2) Source == shipped auditability: the release scan and
+the static-frontend characterization test cover exactly the bytes served, with
+no bundler step in between (`scripts/release_safety_scan.py`,
+`tests/test_web_static_frontend.py`). (3) Contributor fit for the target
+audience — quant/Python practitioners, not frontend specialists (axiom A3): a
+contributor edits a served ES module and reloads, with no npm/bundler to learn.
+(4) The commercial boundary: Studio's heaviest surfaces — agent orchestration,
+governance workflow, and data-plane operations — are commercial (D6/D7a) and
+out of scope here, so the stack that carries them is not needed. (5) Studio's
+Lab is a Monaco IDE that executes user code, which is incompatible with the
+open-source no-exec posture. The only genuine capability gap was time-series
+charts, and it was closed D8-compliantly in CP9-1 with an inline-SVG module
+(Studio itself only draws line charts).
+
+**Escape hatch (documented, unexercised).** Reaffirms D8: if a build-step
+frontend is ever truly required, it lives in a separate opt-in directory and is
+never a prerequisite for the kernel or the default UI. This branch does not
+exercise it.
+
+**IA (CP9-2).** The primary view is 「LLM 因子工作台」 — it occupies Studio's
+primary-surface slot but is never named "Agent" (boundary integrity, D6). It
+hosts two modules: 单因子研究 and 多因子策略回测. The former RD 循环 and
+Benchmark top-level tabs fold into 单因子研究 sections; legacy hashes migrate,
+so no deep link dead-ends (`lab.js` `TAB_IDS` / `LEGACY_HASH_ALIASES`).
+
+**CP10 multi-factor synthesis rulings.** The module is open-source SIMPLE
+synthesis — it produces a composite SIGNAL, not an optimized portfolio.
+(1) Three a-priori methods: `equal_weight`, `custom_weight` (raw declared
+weights, used as declared — the downstream ranking is scale-invariant),
+`rank_average` (pins `cross_sectional_rank` standardization). (2) `ic_weighted`
+is reserved as a non-runnable schema stub (`available=False`): its weights are
+data-driven from past-only IC history and deferred; the open-source build ships
+no implementation. (3) PER-ROLE composite computation (FP-5): each per-factor
+score is byte-identical to the single-factor path for that role — a union
+window would shift decay/warmup scores. (4) Complete-case coverage (FP-4):
+missing values are never imputed to 0; a `(trade_date, instrument)` row enters
+the composite only when every declared factor is present. (5) Weights are
+a-priori declared (`is_fitted=false`, enforced), surfaced through a validity
+banner. (6) Schema-driven param validation is the single enforcement source:
+`validate_params_against_schema` runs before any method's own
+`validate_params`, and the same `ParamSpec` schema drives both backend
+validation and the frontend dynamic form — a new method registers one
+implementation, with zero pipeline or form changes. (7) The commercial boundary
+holds: no optimizer, no covariance, no risk model (D6).
+
 ## Standing inputs adopted
 
 - `docs/research_platform_optimization_from_vibe_quantgpt.md` (Codex memo)
@@ -38,3 +91,81 @@ Owner: the project owner. Recorded by Fable.
 - Reference projects (read-only): Quant Forge Studio branch, QuantGPT,
   RD-Agent, Vibe-Trading (research components only; trading stack out of
   scope per the memo).
+
+## 2026-07-09 — CP0: multi-factor backtest backend × external factor backends (workorder adjudications, Fable)
+
+Context: the owner workorder (local `docs/design/WORKORDER_fable_multifactor_and_external_backends.md`)
+merges two file-scope-disjoint workflows: **(A)** the server side of the
+already-shipped multi-factor frontend, per the authoritative
+`docs/design/multi_factor_portfolio_backtest.md`; **(B)** a pluggable external
+factor-backend extension family with a WorldQuant BRAIN first adapter. These
+rulings extend D6/D7/D7a/D8; items with commercial/licensing weight are marked
+**owner-reviewable**.
+
+| # | Decision | Ruling (Fable) | Implementation |
+| --- | --- | --- | --- |
+| D-0 | Two backend architectures exist for the same shipped FE: the in-memory per-role composite landed at `da07e69` (`fable/phase-d-multifactor-synthesis`, merged into `fable/phase-d-converged`), and the adversarially-reviewed materialize-as-`COMPOSITE_<hash>`-precomputed-factor design | **The design doc is authoritative; the `da07e69` backend is superseded.** Grounds: (1) owner designation of the spec as authoritative; (2) strongest FP-F reuse — the composite drives `run_factor_backtest` **by id**, engine unchanged except two additive honesty fixes, so the composite inherits artifacts/history/registry/benchmark for free; (3) a materialized composite is a first-class registered factor — the natural submittable object for workflow B (D-viii); (4) the backtest-only ruling (D-ix) dissolves the two-window per-role divergence that motivated the in-memory design; (5) the design review's RB-3 (non-deterministic tie-break) and RB-7 (silent skipped rebalance) are engine-level honesty gaps that affected the superseded path too. The earlier CP10 backend rulings (per-role composite, `MFC_` ids, score-seam extraction) are superseded where they conflict; the seam extraction is re-deferred to design §14 P8. Salvage inputs (not contracts): ParamSpec schema validation, per-date standardizers, method-registry shape, FP-4 test patterns. | `fable/phase-d-converged` and `fable/phase-d-multifactor-synthesis` retained unmerged as archive; deletion needs owner approval. New Phase D PR candidate = `fable/phase-d-synthesis-backend`. |
+| D-i | Where does the external-backend adapter live (D6 commercial/agent layer vs public optional extra)? **owner-reviewable** | **Split by capability.** Public core (this repo): provider-neutral typed `FactorBackendPort` contracts, the `integration.factor_backend` contribution point, registry surfacing, CLI degradation paths, and the provider-neutral submission-gate evaluator (pure local math). The WorldQuant adapter (formula translator + BRAIN gate spec + REST client with auth/simulate/submit) is a **local-only package under the already-gitignored `worldquant/adapter/`** (installable via `pip install -e`), absent from the distribution: FP-E places credentialed outward submitters at the commercial/agent layer; D-v counsels caution while any third-party-derived surface is involved; and the split is reversible (publishing later is one decision — unpublishing is not). | Public: `src/quant_forge/integrations/` + extensions vocabulary. Local: `worldquant/adapter/` (covered by the existing ignore rule; zero `.gitignore` edits). |
+| D-ii | Port granularity | **One typed port, four declared capabilities.** `FactorBackendPort.describe() -> BackendDescriptor{backend_id, label, regions, capabilities ⊆ {translate, prescreen, simulate, submit}}` plus `translate/prescreen/simulate/submit` methods over typed request/result dataclasses; calling an undeclared capability raises `CapabilityNotSupported`. Closed-set warning codes: `BACKEND_NOT_INSTALLED`, `BACKEND_NOT_CONFIGURED`, `REGION_MISMATCH`, `NOT_TRANSLATABLE`, `SUBMIT_NOT_CONFIRMED`, `PRESCREEN_LOCAL_PROXY_ONLY`. | CP1 contracts module + tests. |
+| D-iii | Does the provider-neutral pre-screen enter the public kernel? | **Yes.** The gate evaluator (dollar-neutral weighting, Sharpe / fitness / turnover-band / sub-window-Sharpe / concentration / returns-floor arithmetic over **local** backtest outputs, parameterized by a `SubmissionGateSpec`) is pure math — no credentials, no network, no provider imports. Provider-specific spec **instances** (threshold values) ship with the adapter. FP-G honesty: when local data region ≠ target platform region, prescreen emits `REGION_MISMATCH` and must not claim a predicted pass-rate. | CP2 public half (`integrations/gate.py`) + regression tests incl. the ex-post-selection ban. |
+| D-iv | Pluggability mechanism | **Declarative manifest metadata + a static reviewed import table. No entry-point scanning, no path-based loading, no runtime exec (D7 unchanged).** The extensions vocabulary gains `integration.factor_backend` as a *declarative* contribution point (metadata only; executable contributions remain rejected unconditionally). Capability **binding** is a code-reviewed constant `{backend_id → fixed module name}` resolved by a literal `import` inside `try/except ImportError` — the D7a in-repo-adapter precedent extended to optional-install: package absent ⇒ capability does not exist ⇒ honest `BACKEND_NOT_INSTALLED`. Entry-point discovery was considered and **rejected**: it imports whatever installed distribution claims the group — a wider trust surface than a reviewed one-line table. | CP1 registry extension; adding a backend = one reviewed public PR line + an installable package. |
+| D-v | Copyright / captured-content hygiene | Captured BRAIN documentation **prose never enters tracked files or the distribution**. Only facts — operator names/signatures, field ids, numeric submission thresholds, endpoint shapes — may inform code, expressed originally. The local adapter package is kept prose-clean too; `worldquant/mapping/*.yaml` stay local-only inputs. | Release scan + adversarial review lane checks; CP-INT leak sweep. |
+| D-vi | Workflow A git strategy | Branch **`fable/phase-d-synthesis-backend`** forked from `4dee08a` (the shipped FE contract), worktree `.claude/worktrees/fable+phase-d-synth-backend`. First commit = the D-ix backtest-only FE patch; Phase D docs commits `575ede4`/`ab950d0` cherry-picked so the Phase D story travels with the PR. Atomic per-phase commits; no push/merge/delete without owner approval. | In effect (this commit). |
+| D-vii | Method-set phase boundary | **Confirmed: P1–P5 first** (a-priori `equal_weight` + `weighted` runnable end-to-end — resolves the dead 合成并回测 button), with `ic_weighted`/`icir_weighted` shipped `available:false` (reserved) in the catalog until **P6** flips them within this same workorder execution. End state = design §9. | P1 catalog ships reserved fitted rows; P6 enables them. |
+| D-viii | Composite factors as submittable objects (A→B seam) | **Yes, with an honesty boundary.** Materialized `COMPOSITE_<hash>` factors are first-class registry entries (`source="synthesis"`) and valid workflow-B targets. Translation reconstructs the symbolic expression from `synthesis_provenance` (member formulas × standardization × direction × a-priori weights) — possible only when **every member is formula-backed and the method is a-priori**. Fitted (time-varying-weight) composites are refused as `NOT_TRANSLATABLE`: a static expression would misrepresent the backtested strategy (FP-G/FP-I). Submission provenance carries `composite_id` + full synthesis provenance end-to-end. | CP2/CP3 translator honors the boundary; fixture-tested against the §8 provenance shape. |
+| D-ix | Uncommitted FE WIP (eval-interval removal) in the concurrent session's checkout | **Adopted by patch, not by committing in the other session's tree.** The 6-line backtest-only diff (`html.py` / `synthesis.js` / `test_web_synthesis_view.py`) was captured via `git diff` and committed as the first commit on the workflow-A branch; the concurrent session's working tree was left untouched. FE contract baseline = `4dee08a` + this patch. | Commit `8eabc05` on `fable/phase-d-synthesis-backend`. |
+
+Also recorded: during the owner's Codex quota embargo (until 2026-07-10 ~06:00Z)
+all lanes run fable/opus/sonnet; strict review = Opus adversarial now + the
+Codex auto-review at PR time (owner waived a separate pre-PR Codex pass).
+Workflow B branch: `fable/phase-e-external-backends`, forked from `main@81ed4cf`
+(PR-independent; file scopes disjoint from A; CP-INT merges both locally for the
+integration container only). Deferred question (recorded, not blocking):
+retention/GC policy for successful `COMPOSITE_*` registry entries.
+
+### CP0 amendments (same day, after the mandated Opus adversarial round)
+
+The adversarial review confirmed 7 rulings and required 3 revisions; adjudicated:
+
+1. **D-i ignore durability (accepted).** The `worldquant/` ignore rule existed
+   only as an *uncommitted* working-tree edit in the main checkout — one
+   `git checkout --`/`reset --hard` away from exposing third-party-derived
+   capture to a stray `git add -A`. Now: `worldquant/` and
+   `.claude/skills/worldquant-brain/` are **committed** ignore rules on this
+   branch and mirrored in the repo-local `.git/info/exclude` for immediate
+   effect across every worktree. D-i's "zero `.gitignore` edits" note is
+   corrected to "one committed ignore commit".
+2. **D-viii member-formula pinning (accepted).** `synthesis_provenance.factors[]`
+   additionally carries each member's **`formula` pinned at run time**. The
+   workflow-B translator consumes the **full report artifact** (so
+   `parameters.decay_days` is visible too), never resolves member formulas from
+   the live registry, and refuses on registry drift with closed code
+   `MEMBER_FORMULA_DRIFT`. This closes the hole where editing a member factor
+   after synthesis would let a submit target an expression that was never
+   backtested (FP-G/FP-I).
+3. **Merge order + coordination-doc ownership (accepted).** Branch A merges
+   before branch B. Branch B does **not** modify `docs/coordination/*` or
+   `docs/design/*`; B's decision/progress records are carried in this register
+   (branch A) and appended on B only at PR-rebase time after A lands.
+4. **D-iv anti-squatting opt-in (accepted, folded into CP1).** A backend
+   resolves only when (a) present in the reviewed static table, (b) explicitly
+   enabled via `QF_ENABLE_BACKEND_<ID>=1`, and (c) importable — new closed code
+   `BACKEND_NOT_ENABLED`. An unpublished module name alone can no longer be
+   activated by an unrelated installed package.
+5. **D9-supersession hygiene.** Of the D9-recorded CP10 rulings: **superseded**
+   — the `custom_weight`/`rank_average` method naming, "`ic_weighted` ships no
+   implementation" (P6 ships it), and the per-role composite byte-match;
+   **still binding** — FP-4 coverage honesty, truthful `is_fitted`,
+   schema-driven single-source param validation, and no optimizer / covariance
+   / risk model (D6).
+6. **Review-substitution scope (clarified).** The owner's waiver of pre-PR
+   Codex passes is a standing decision for this cycle (Codex auto-reviews the
+   PRs); the quota embargo (until 2026-07-10 ~06:00Z) independently forbids
+   Codex plugin calls. CP4-class strict review = Opus adversarial lenses
+   in-cycle + Codex on the PRs.
+7. **Evidence hygiene (folded into lane prompts).** RF-3's citation corrected
+   in the design doc (conclusion unchanged); P1's catalog source is the TASK
+   brief interim (fitted `available:false` until P6), not design §9 verbatim;
+   new `docs/design/` files require `git add -f` (blanket `design/` ignore
+   rule) or they silently escape both git and the release scan; public gate
+   tests use synthetic `SubmissionGateSpec` values only.

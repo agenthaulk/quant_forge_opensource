@@ -17,8 +17,15 @@ export function num(value, digits = 4) {
   if (value === undefined || value === null || Number.isNaN(Number(value))) return 'n/a';
   return Number(value).toFixed(digits);
 }
+/* A withheld metric (any status other than available/legacy) renders its
+ * status label, never a scalar (FP-4). The label is wrapped so a long token
+ * like "insufficient_sample" wraps inside a metric tile instead of overflowing
+ * it, and exposes the full token via the title attribute. */
+export function statusLabelHtml(status) {
+  return `<span class="metric-status" title="${esc(status)}">${esc(status)}</span>`;
+}
 export function metricNum(value, status, digits = 4) {
-  if (status && status !== 'available' && status !== 'legacy') return esc(status);
+  if (status && status !== 'available' && status !== 'legacy') return statusLabelHtml(status);
   return num(value, digits);
 }
 export function valueOr(value, fallback) {
@@ -69,5 +76,5 @@ export function metricCellHtml(entry, digits = 4) {
   const status = entry.status || 'unknown';
   if (status === 'available') return num(entry.value, digits);
   if (status === 'legacy') return `${num(entry.value, digits)} ${statusBadgeHtml(status)}`;
-  return `<span class="metric-blocked">${esc(status)}</span>`;
+  return `<span class="metric-blocked" title="${esc(status)}">${esc(status)}</span>`;
 }

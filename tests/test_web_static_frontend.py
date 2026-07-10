@@ -39,16 +39,18 @@ HTML_CONTENT_TYPE = "text/html; charset=utf-8"
 JS_CONTENT_TYPE = "text/javascript; charset=utf-8"
 
 # The complete CP6-1 module set (+ CP6-2 Lab chrome + CP6-3 data/registry
-# views + CP6-4 docs/extensions views). A new module must be added here so
-# the no-external-resources and single-renderer sweeps keep covering
-# everything.
+# views + CP6-4 docs/extensions views + CP10 synthesis module). A new module
+# must be added here so the no-external-resources and single-renderer sweeps
+# keep covering everything.
 EXPECTED_STATIC_MODULES = (
     "api.js",
     "app.js",
     "metric.js",
     "views/bench.js",
+    "views/charts.js",
     "views/data.js",
     "views/docs.js",
+    "views/dsl.js",
     "views/extensions.js",
     "views/factor.js",
     "views/history.js",
@@ -56,6 +58,7 @@ EXPECTED_STATIC_MODULES = (
     "views/registry.js",
     "views/research.js",
     "views/spark.js",
+    "views/synthesis.js",
     "views/tags.js",
 )
 
@@ -163,7 +166,11 @@ def test_index_page_keeps_all_panel_sections_and_controls(web_app) -> None:
         "暂无 bench 结果",
     ):
         assert marker in html, marker
-    # CP6-2 Lab chrome: stepper, tablist, tab panels (mount ids re-hosted).
+    # CP6-2 Lab chrome (CP9-2 IA consolidation: the workbench tab keeps id
+    # lab-tab-factor under the LLM 因子工作台 label; the former RD 循环 /
+    # Benchmark tabs live on inside its 单因子研究 module as the
+    # #workbench-rd / #report-comparison sections; 多因子策略回测 is the
+    # reserved CP10 module slot).
     for marker in (
         'class="lab-stepper"',
         'data-step="idea"',
@@ -173,14 +180,24 @@ def test_index_page_keeps_all_panel_sections_and_controls(web_app) -> None:
         'data-step="rd"',
         'role="tablist"',
         'id="lab-tab-factor"',
-        'id="lab-tab-rd"',
         'id="lab-tab-history"',
-        'id="lab-tab-bench"',
         'id="lab-panel-factor"',
-        'id="lab-panel-rd"',
         'id="lab-panel-history"',
-        'id="lab-panel-bench"',
-        '因子工作台',
+        'id="lab-module-single"',
+        'id="lab-module-multi"',
+        'id="lab-module-panel-single"',
+        'id="lab-module-panel-multi"',
+        'id="multi-result"',
+        # CP10 filled the reserved multi slot with the module skeleton.
+        'id="synth-report"',
+        'id="synth-run"',
+        '合成配置',
+        'id="report-comparison"',
+        'id="workbench-rd"',
+        'LLM 因子工作台',
+        '单因子研究',
+        '多因子策略回测',
+        '工作台模块',
         'RD 循环',
         '研究流程',
     ):
@@ -343,9 +360,12 @@ def test_metric_renderer_helpers_defined_once_in_metric_module(web_app) -> None:
         total = sum(text.count(definition) for text in served.values())
         assert total == 1, f"{definition} defined {total} times"
         assert definition in served["metric.js"]
-    # FP-4: the shared renderer keeps null-not-zero and status-over-scalar.
+    # FP-4: the shared renderer keeps null-not-zero and status-over-scalar. A
+    # withheld status now renders through statusLabelHtml (a titled span so long
+    # labels wrap inside a tile) — still its label, never a fabricated scalar.
     metric_js = served["metric.js"]
-    assert "if (status && status !== 'available' && status !== 'legacy') return esc(status);" in metric_js
+    assert "if (status && status !== 'available' && status !== 'legacy') return statusLabelHtml(status);" in metric_js
+    assert 'class="metric-status" title="${esc(status)}">${esc(status)}</span>' in metric_js
     assert "value === undefined || value === null" in metric_js
 
 

@@ -167,9 +167,33 @@ RD currently exposes the research workflow in the public workbench:
 - `research`: optimize or propose factors through bounded research ideas plus
   optional hyper-parameter/profile search.
 
-Factor synthesis is not part of the current public workbench. If it is added
-later, it should be designed as a separate workflow rather than mixed into
-ordinary idea optimization.
+Factor synthesis is a separate workflow (`quant_forge.synthesis`), not part of
+ordinary idea optimization. The multi-factor composite backtest combines two or
+more registered factors — per-date cross-sectional standardization (`zscore` or
+`rank`), explicit `+1`/`-1` directions locked at request time, an a-priori
+combination method with raw declared weights — then materializes the composite
+as a synthetic `precomputed:` factor (`COMPOSITE_<hash-of-all-inputs>`, values
+written into a per-run overlay through the value store's own path resolution)
+and drives the existing holding-period backtest engine by that factor id with
+`decay_days` pinned to 0 (members are decayed exactly once, before
+combination). The web adapter exposes it through two endpoints:
+
+- `GET /api/synthesis/methods`: the method + standardization catalog as
+  schema-driven `ParamSpec` JSON; fitted methods ship reserved
+  (`available: false`) until implemented, with `is_fitted` always truthful.
+- `POST /api/jobs/multi-factor-backtest`: a background job running
+  `run_multi_factor_backtest_workflow`. Every client guard is re-validated
+  server-side before the job starts (at least 2 factors, `±1` directions,
+  runnable method, weights covering exactly the selected set, REQUIRED
+  `holding_days` with no `horizon_days` fallback, one pinned universe across
+  members, minimum-window precondition), so bad requests are rejected as 4xx
+  JSON instead of failed jobs. The report payload reuses the single-factor
+  evaluation/backtest builders and adds `synthesis_provenance` (member
+  formulas pinned at run time, coverage by role with real-null ratios) plus a
+  `validity` block that states the structural caveats: same-window evaluation
+  diagnostics only, non-overlapping cohorts (rebalance cadence equals holding
+  period) with the realized period count, target-book cost accounting bias,
+  and formation-time-only universe filtering.
 
 One `research run-once` cycle:
 

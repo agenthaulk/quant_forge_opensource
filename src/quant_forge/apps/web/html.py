@@ -487,6 +487,13 @@ def _index_html(
       font-size: 11px;
       text-align: right;
     }}
+    /* CP9-2 DSL formula highlighting: token-referencing declarations only. */
+    .formula .dsl-fn    {{ color: var(--accent-2); }}
+    .formula .dsl-id    {{ color: var(--ink); }}
+    .formula .dsl-num   {{ color: var(--blue); }}
+    .formula .dsl-str   {{ color: var(--warn); }}
+    .formula .dsl-op,
+    .formula .dsl-punct {{ color: var(--muted); }}
     .evidence-grid {{
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -560,6 +567,30 @@ def _index_html(
     .lab-tab-dot.is-error   {{ background: var(--bad); }}
     .lab-tabpanel {{ min-width: 0; }}
     .lab-tabpanel:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 4px; }}
+    /* CP9-2 workbench module nav (Studio segmentedControl affordance,
+       token-referencing declarations only). */
+    .lab-module-nav {{ display: inline-flex; flex-wrap: wrap; max-width: 100%;
+      gap: 4px; margin: 0 0 16px; padding: 4px;
+      border: 1px solid var(--line); border-radius: 10px; background: var(--wash); }}
+    .lab-module-tab {{ width: auto; margin: 0; padding: 8px 14px; border: 1px solid transparent;
+      border-radius: 7px; background: transparent; color: var(--muted);
+      font-size: 13px; font-weight: 800; cursor: pointer; }}
+    /* Hover background parity with .lab-tab (A-MAJOR-1): the wash token, not
+       the primary-button hover fill (button:hover outranks the base
+       transparent bg), backs a hovered UNSELECTED segment so its ink text
+       keeps >=4.5:1 in both themes. The selected segment re-pins its own
+       panel bg below and stays legible. */
+    .lab-module-tab:hover {{ color: var(--ink); background: var(--wash); }}
+    /* Active-segment border uses the accent token so the selected state
+       reads at >=3:1 against the nav wash in both themes (WCAG 1.4.11) —
+       line-strong only reached 1.65:1 / 1.88:1 there. Same aria-current
+       accent-border language as .registry-row / .docs-row / .ext-card. */
+    .lab-module-tab[aria-selected="true"] {{ background: var(--panel); border-color: var(--accent); color: var(--accent); }}
+    .lab-module-tab[aria-selected="true"]:hover {{ color: var(--accent); }}
+    .lab-module-tab:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .lab-module-tab .pill {{ margin-left: 6px; }}
+    .lab-module-panel {{ min-width: 0; }}
+    .lab-module-panel:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 4px; }}
     .anchor-nav {{ display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }}
     .anchor-nav a {{ padding: 4px 9px; border: 1px solid var(--line); border-radius: 6px;
       background: var(--panel); color: var(--muted); font-size: 11px; font-weight: 800;
@@ -571,6 +602,14 @@ def _index_html(
       letter-spacing: .1em; text-transform: uppercase; }}
     .sparkline-row {{ margin: 0 0 10px; }}
     .sparkline {{ display: block; max-width: 100%; color: var(--accent-2); }}
+    /* CP9-1 inline-SVG charts (charts.js). SVG <text> inherits the app's
+       system sans (D8: no external font) instead of the SVG-default serif;
+       all colors come from the theme tokens the module references. */
+    .qf-chart {{ display: block; max-width: 100%; height: auto; color: var(--accent-2); }}
+    .qf-chart text {{ font-family: inherit; font-size: 11px; }}
+    .qf-chart .qf-note {{ font-size: 10px; }}
+    .qf-chart--empty text {{ font-size: 12px; }}
+    .qf-chart-row {{ margin: 0 0 12px; }}
     .status-pill {{ display: inline-block; padding: 3px 9px; border: 1px solid var(--line);
       border-radius: 999px; font-size: 10px; font-weight: 800; }}
     .status-pill--ok      {{ background: var(--ok-wash);   border-color: var(--ok-line);   color: var(--accent-2); }}
@@ -581,6 +620,16 @@ def _index_html(
       color: var(--warn); border-radius: 5px; padding: 1px 5px; font-size: 10px; font-weight: 800; }}
     .metric-blocked {{ color: var(--muted); font-weight: 400; }}
     .metric-missing {{ color: var(--faint); }}
+    /* Long status labels (e.g. insufficient_sample) never overflow their metric
+       cell: they wrap and expose the full token via the title attribute. Inside
+       a metric tile the status renders as a smaller muted label — a status is
+       not a number, so it sheds the big mono value type — keeping the FP-4
+       contract that a withheld metric shows its label, never a fabricated 0. */
+    .metric-status {{ overflow-wrap: anywhere; }}
+    .metric-blocked, .metric-missing {{ overflow-wrap: anywhere; }}
+    .tile b .metric-status, .tile b .metric-blocked, .tile b .metric-missing {{
+      display: block; font-family: inherit; font-size: 13px; font-weight: 700;
+      line-height: 1.25; letter-spacing: 0; color: var(--muted); }}
     .notice {{ border: 1px solid var(--line); border-left: 4px solid var(--muted);
       border-radius: 8px; padding: 10px 12px; margin: 0 0 10px; font-size: 13px; }}
     .notice.warn {{ border-left-color: var(--warn); background: var(--warn-wash); color: var(--ink); }}
@@ -660,6 +709,35 @@ def _index_html(
     /* Deep-link scrollIntoView targets need the same sticky-strip
        clearance as .report-section anchors. */
     .docs-detail, .ext-card {{ scroll-margin-top: 72px; }}
+    /* CP10 multi-factor synthesis module: token-referencing declarations
+       only (zero new color literals), so both themes come from the
+       variables. */
+    .synth-factor-list {{ display: grid; gap: 8px; max-height: 340px; overflow: auto; margin: 6px 0 4px; }}
+    .synth-factor-row {{ display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; align-items: center;
+      padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }}
+    .synth-factor-name {{ display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin: 0;
+      min-width: 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 800; color: var(--ink); }}
+    .synth-factor-name input {{ width: auto; margin: 0; }}
+    .synth-direction-label {{ display: inline-flex; align-items: center; gap: 6px; margin: 0; }}
+    .synth-direction-label select {{ width: auto; padding: 6px 8px; font-size: 12px; }}
+    .synth-factor-formula {{ grid-column: 1 / -1; color: var(--muted); font-family: var(--mono);
+      font-size: 11px; overflow-wrap: anywhere; }}
+    .synth-param {{ margin: 10px 0; }}
+    .synth-param label {{ margin: 0; }}
+    .synth-param .param-grid {{ margin-top: 6px; }}
+    .synth-check-label {{ display: inline-flex; align-items: center; gap: 8px; }}
+    .synth-check-label input {{ width: auto; }}
+    /* Weights inputs are labeled by factor NAME; the raw factor_id rides
+       along in mono, de-emphasized by weight/family (not by a lower-contrast
+       color: --muted stays >= 4.5:1 on --panel in both themes). */
+    .synth-weight-id {{ color: var(--muted); font-family: var(--mono); font-weight: 400; }}
+    /* Below tablet width the picker row stacks: the direction control drops
+       under the factor name instead of sharing its row, so long factor ids,
+       the status pill, and the ±1 select never overlap at 375px. */
+    @media (max-width: 640px) {{
+      .synth-factor-row {{ grid-template-columns: minmax(0, 1fr); }}
+      .synth-direction-label {{ justify-self: start; }}
+    }}
     @media (prefers-color-scheme: dark) {{
       :root {{
         --ink: #e6ece8; --muted: #9fb0a8; --faint: #7d8d86;
@@ -682,6 +760,8 @@ def _index_html(
       .empty-state {{ background: var(--surface-translucent); }}
       .lab-tab:hover {{ background: var(--wash); }}
       .lab-tab[aria-selected="true"]:hover {{ background: var(--accent); }}
+      .lab-module-tab:hover {{ background: var(--wash); }}
+      .lab-module-tab[aria-selected="true"]:hover {{ background: var(--panel); }}
     }}
     @media (max-width: 900px) {{
       .app-shell {{ grid-template-columns: 1fr; }}
@@ -813,10 +893,8 @@ def _index_html(
       </ol>
     </nav>
     <div class="lab-tabs" role="tablist" aria-label="工作台视图">
-      <button class="lab-tab" role="tab" id="lab-tab-factor" aria-controls="lab-panel-factor" aria-selected="true">因子工作台 <span class="lab-tab-dot" hidden></span></button>
-      <button class="lab-tab" role="tab" id="lab-tab-rd" aria-controls="lab-panel-rd" aria-selected="false" tabindex="-1">RD 循环 <span class="lab-tab-dot" hidden></span></button>
+      <button class="lab-tab" role="tab" id="lab-tab-factor" aria-controls="lab-panel-factor" aria-selected="true">LLM 因子工作台 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-history" aria-controls="lab-panel-history" aria-selected="false" tabindex="-1">研究历史 <span class="lab-tab-dot" hidden></span></button>
-      <button class="lab-tab" role="tab" id="lab-tab-bench" aria-controls="lab-panel-bench" aria-selected="false" tabindex="-1">Benchmark <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-data" aria-controls="lab-panel-data" aria-selected="false" tabindex="-1">数据 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-registry" aria-controls="lab-panel-registry" aria-selected="false" tabindex="-1">注册表 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-docs" aria-controls="lab-panel-docs" aria-selected="false" tabindex="-1">文档 <span class="lab-tab-dot" hidden></span></button>
@@ -824,27 +902,97 @@ def _index_html(
     </div>
     <div id="error" class="err"></div>
     <section class="lab-tabpanel" role="tabpanel" id="lab-panel-factor" aria-labelledby="lab-tab-factor" tabindex="0">
-      <div class="section-title">
-        <h2>Factor Tape</h2>
-        <p>解析、评价、回测集中展示</p>
+      <div class="lab-module-nav" role="tablist" aria-label="工作台模块">
+        <button class="lab-module-tab" role="tab" id="lab-module-single" aria-controls="lab-module-panel-single" aria-selected="true">单因子研究</button>
+        <button class="lab-module-tab" role="tab" id="lab-module-multi" aria-controls="lab-module-panel-multi" aria-selected="false" tabindex="-1">多因子策略回测</button>
       </div>
-      <div id="result">
-        <div class="panel empty-state">
-          <h3>等待输入</h3>
-          <p class="meta">输入因子观点后运行，公式、IC、回测收益、缓存路径会在这里展开。</p>
+      <div class="lab-module-panel" role="tabpanel" id="lab-module-panel-single" aria-labelledby="lab-module-single" tabindex="0">
+        <div class="section-title">
+          <h2>Factor Tape</h2>
+          <p>解析、评价、回测集中展示</p>
         </div>
+        <div id="result">
+          <div class="panel empty-state">
+            <h3>等待输入</h3>
+            <p class="meta">输入因子观点后运行，公式、IC、回测收益、缓存路径会在这里展开。</p>
+          </div>
+        </div>
+        <div id="staggered-result"></div>
+        <section class="report-section" id="report-comparison">
+          <div class="section-title">
+            <h2>Benchmark</h2>
+            <p>qf factor bench 多因子横向对比（并入因子报告的对比区）</p>
+          </div>
+          <div id="bench-result">
+            <div class="panel empty-state">
+              <h3>暂无 bench 结果</h3>
+              <p class="meta">运行 qf factor bench 后，多因子指标状态表会展示在这里。</p>
+            </div>
+          </div>
+        </section>
+        <section class="report-section" id="workbench-rd">
+          <div class="section-title">
+            <h2>RD Loop</h2>
+            <p>候选因子与研究证据</p>
+          </div>
+          <div id="rd-result">
+            <div class="panel empty-state">
+              <h3>等待运行</h3>
+              <p class="meta">RD 候选、gate、report path 和分段证据会展示在这里。</p>
+            </div>
+          </div>
+        </section>
       </div>
-      <div id="staggered-result"></div>
-    </section>
-    <section class="lab-tabpanel" role="tabpanel" id="lab-panel-rd" aria-labelledby="lab-tab-rd" tabindex="0" hidden>
-      <div class="section-title">
-        <h2>RD Loop</h2>
-        <p>候选因子与研究证据</p>
-      </div>
-      <div id="rd-result">
-        <div class="panel empty-state">
-          <h3>等待运行</h3>
-          <p class="meta">RD 候选、gate、report path 和分段证据会展示在这里。</p>
+      <div class="lab-module-panel" role="tabpanel" id="lab-module-panel-multi" aria-labelledby="lab-module-multi" tabindex="0" hidden>
+        <div class="section-title">
+          <h2>多因子策略回测</h2>
+          <p>组合层多因子策略合成与回测</p>
+        </div>
+        <!-- CP10 mount: the multi-factor module claims #multi-result and the lab-module-multi nav hook; do not rename. -->
+        <div id="multi-result">
+          <div class="panel" id="synth-form">
+            <h3>合成配置</h3>
+            <p class="meta">选择至少 2 个因子并显式设定方向；合成方法与参数由后端方法目录声明，权重与方法为先验声明（非拟合）。</p>
+            <label>因子选择</label>
+            <div id="synth-factors">
+              <div class="panel empty-state">
+                <h3>等待加载</h3>
+                <p class="meta">打开本模块后，注册表因子目录会加载到这里。</p>
+              </div>
+            </div>
+            <label>合成方法与标准化</label>
+            <div id="synth-method-mount">
+              <div class="panel empty-state">
+                <h3>等待加载</h3>
+                <p class="meta">方法目录加载后，合成方法、标准化与动态参数表单会展示在这里。</p>
+              </div>
+            </div>
+            <div id="synth-standardization-mount"></div>
+            <div id="synth-params"></div>
+            <label>回测参数</label>
+            <div class="param-grid" id="synth-backtest-params">
+              <label><span>持有期 / 天（必填）</span><input id="synth-param-holding-days" type="number" min="1" step="1" value="5"></label>
+              <label><span>Decay / 天</span><input id="synth-param-decay-days" type="number" min="0" step="1"></label>
+              <label><span>Top Quantile</span><input id="synth-param-top-quantile" type="number" min="0.01" max="0.5" step="0.01"></label>
+              <label><span>Delay / 天</span><input id="synth-param-delay-days" type="number" min="1" step="1"></label>
+              <label><span>回测开始</span><input id="synth-param-backtest-start" type="date"></label>
+              <label><span>回测结束</span><input id="synth-param-backtest-end" type="date"></label>
+              <label><span>手续费 bps</span><input id="synth-param-commission-bps" type="number" min="0" step="0.1"></label>
+              <label><span>滑点 bps</span><input id="synth-param-slippage-bps" type="number" min="0" step="0.1"></label>
+              <label><span>融券成本 bps/年</span><input id="synth-param-short-borrow-bps" type="number" min="0" step="1"></label>
+            </div>
+            <p class="meta">持有期为必填（预填 5 仅为建议值）；其余留空的参数由后端 profile 默认值决定。</p>
+            <p id="synth-run-hint" class="meta" aria-live="polite">已选 0 个因子，运行需至少勾选 2 个；方法目录尚未加载或不可用。</p>
+            <button id="synth-run" disabled aria-describedby="synth-run-hint">合成并回测</button>
+            <button id="synth-cancel" class="secondary danger" disabled>中断本次运行</button>
+            <p id="synth-status" class="meta" aria-live="polite"></p>
+          </div>
+          <div id="synth-report">
+            <div class="panel empty-state">
+              <h3>等待运行</h3>
+              <p class="meta">合成回测完成后，评价、样本内回测、外部样本外评测与合成 provenance 会展示在这里。</p>
+            </div>
+          </div>
         </div>
       </div>
     </section>
@@ -857,18 +1005,6 @@ def _index_html(
         <div class="panel empty-state">
           <h3>暂无研究历史</h3>
           <p class="meta">评价、回测、bench、RD 运行记录到 run index 后会展示在这里。</p>
-        </div>
-      </div>
-    </section>
-    <section class="lab-tabpanel" role="tabpanel" id="lab-panel-bench" aria-labelledby="lab-tab-bench" tabindex="0" hidden>
-      <div class="section-title">
-        <h2>Benchmark</h2>
-        <p>qf factor bench 多因子横向对比</p>
-      </div>
-      <div id="bench-result">
-        <div class="panel empty-state">
-          <h3>暂无 bench 结果</h3>
-          <p class="meta">运行 qf factor bench 后，多因子指标状态表会展示在这里。</p>
         </div>
       </div>
     </section>

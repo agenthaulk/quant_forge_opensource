@@ -4,7 +4,16 @@
  * re-hosted under stable section ids for the Lab anchor navigation). */
 
 import { esc, metricNum, metricPill, num, pct, valueOr } from '../metric.js';
-import { sparklineSvg } from './spark.js';
+import { barChart, lineChart } from './charts.js';
+import { formulaHtml } from './dsl.js';
+
+/* Status-aware chart value: a metric whose status is not available/legacy is
+ * mapped to null (an "n/a" tick), never a fabricated 0 — the FP-4 rule that
+ * metricNum enforces for scalar cells, applied to chart inputs. */
+function chartValue(value, status) {
+  if (status && status !== 'available' && status !== 'legacy') return null;
+  return value;
+}
 
 const resultEl = document.getElementById('result');
 const staggeredResultEl = document.getElementById('staggered-result');
@@ -72,7 +81,7 @@ export function renderReportHero(factor, parser, hero) {
       <div>
         <p class="eyebrow">Factor Report</p>
         <h3>${esc(factor.factor_id)} · ${esc(parser.source)} / ${esc(parser.provider)} / ${esc(parser.model)}</h3>
-        <div class="formula">${esc(factor.formula)}</div>
+        <div class="formula">${formulaHtml(factor.formula)}</div>
         <p>${esc(factor.description || '')}</p>
         ${metaLines}
         <p class="meta">研究口径，不是生产交易口径。</p>
@@ -206,19 +215,57 @@ export function renderEvidenceSection(evaluation, backtest) {
   ).join(' ');
   const warningRows = warningPills(evaluation, backtest);
   const cacheRows = cachePills(evaluation, backtest);
+  const splitData = evaluation.split_metrics || [];
+  const horizonData = evaluation.horizon_metrics || [];
+  const groupData = backtest.group_returns || [];
+  const segmentData = backtest.segment_metrics || [];
+  // C5: ICIR by split (status ≠ available/legacy ⇒ n/a tick, never 0).
+  const splitChart = splitData.length
+    ? `<div class="qf-chart-row">${barChart(
+        splitData.map(metric => ({ label: metric.name, value: chartValue(metric.rank_icir, metric.rank_icir_status) })),
+        { ariaLabel: '三段验证 ICIR', yFormat: value => num(value, 2), emptyMessage: '暂无三段 ICIR' }
+      )}</div>`
+    : '';
+  // C6: segment net annualized return (single-period segments are unreportable
+  // ⇒ null ⇒ n/a tick); 0-based.
+  const segmentChart = segmentData.length
+    ? `<div class="qf-chart-row">${barChart(
+        segmentData.map(metric => ({ label: metric.name, value: metric.net_annualized_return })),
+        { ariaLabel: '回测分段净年化收益', yFormat: value => pct(value), emptyMessage: '暂无分段收益' }
+      )}</div>`
+    : '';
+  // C4: Rank IC by horizon (status-aware n/a).
+  const horizonChart = horizonData.length
+    ? `<div class="qf-chart-row">${barChart(
+        horizonData.map(metric => ({ label: `${metric.horizon_days}日`, value: chartValue(metric.rank_ic_mean, metric.rank_ic_mean_status) })),
+        { ariaLabel: '多周期 Rank IC', yFormat: value => num(value, 4), emptyMessage: '暂无多周期 IC' }
+      )}</div>`
+    : '';
+  // C3: quantile bucket mean return (null/non-finite ⇒ n/a tick, never a 0
+  // bar); negatives grow downward from the zero line.
+  const groupChart = groupData.length
+    ? `<div class="qf-chart-row">${barChart(
+        groupData.map(metric => ({ label: metric.group, value: metric.mean_return })),
+        { ariaLabel: '分组收益（分位桶平均收益）', yFormat: value => pct(value), emptyMessage: '暂无分组收益' }
+      )}</div>`
+    : '';
   return `
     <div class="evidence-grid report-section" id="report-evidence">
       <div class="panel">
         <h3>三段验证</h3>
         <p>${splitRows || '<span class="pill">暂无</span>'}</p>
+        ${splitChart}
         <h3>回测分段</h3>
         <p>${segmentRows || '<span class="pill">暂无</span>'}</p>
+        ${segmentChart}
         <h3>多周期评价</h3>
         <p>${horizonRows || '<span class="pill">暂无</span>'}</p>
+        ${horizonChart}
       </div>
       <div class="panel">
         <h3>分组收益</h3>
         <p>${groupRows || '<span class="pill">暂无</span>'}</p>
+        ${groupChart}
         <h3>风险提示</h3>
         <p>${warningRows || '<span class="pill">研究口径，不是生产交易口径</span>'}</p>
         <h3>口径说明</h3>
@@ -283,7 +330,8 @@ export function render(payload) {
     { id: 'report-oos', label: '样本外评测' },
     { id: 'report-diagnostics', label: '诊断' },
     { id: 'report-evidence', label: '研究证据' },
-    { id: 'report-artifacts', label: 'Artifacts' }
+    { id: 'report-artifacts', label: 'Artifacts' },
+    { id: 'report-comparison', label: 'Benchmark 对比' }
   ];
   resultEl.innerHTML = renderAnchorNav(anchorSections)
     + renderReportHero(factor, payload.parser, {
@@ -314,12 +362,29 @@ export function renderStaggeredRunning() {
 }
 
 export function renderStaggered(payload) {
-  const terminal = (payload.daily_nav || []).slice(-1)[0] || {};
+  const days = payload.daily_nav || [];
+  const terminal = days.slice(-1)[0] || {};
   const cohortRows = (payload.cohorts || []).map(cohort =>
     `<span class="pill">${esc(cohort.signal_date)} · weight ${pct(cohort.capital_weight)} · net ${pct(cohort.net_cumulative_return)}</span>`
   ).join(' ');
-  const navValues = (payload.daily_nav || []).map(day => day.net_nav);
-  const spark = sparklineSvg(navValues, { label: `Staggered NAV · N=${navValues.length}` });
+  // C1: staggered net NAV vs cash benchmark. net_nav nulls (non-finite marks
+  // nulled server-side) break the path; the cash benchmark is a genuine flat
+  // line (honest, not a gap); an empty daily_nav renders the empty-state.
+  const navDates = days.map(day => day.date);
+  const navChart = lineChart(
+    [
+      { name: 'strategy net NAV', values: days.map(day => day.net_nav), color: 'var(--accent)' },
+      { name: 'cash benchmark', values: days.map(day => day.benchmark_nav), color: 'var(--blue)' }
+    ],
+    { x: navDates, ariaLabel: 'Staggered NAV vs benchmark', yFormat: value => num(value, 4), emptyMessage: '暂无日频净值序列' }
+  );
+  // C2: relative NAV (net / benchmark). relative_nav is null whenever the
+  // benchmark is 0 — that null becomes a gap, never 0; the auto (non-zero)
+  // baseline is labeled as truncated.
+  const relChart = lineChart(
+    [{ name: 'relative NAV (net/benchmark)', values: days.map(day => day.relative_nav), color: 'var(--accent-2)' }],
+    { x: navDates, ariaLabel: 'Staggered relative NAV', yFormat: value => num(value, 4), emptyMessage: '暂无相对净值序列' }
+  );
   staggeredResultEl.innerHTML = `
     <div class="panel report-section" id="report-staggered">
       <h3>首月逐日建仓稳健性回测</h3>
@@ -331,7 +396,8 @@ export function renderStaggered(payload) {
         <div class="tile">Terminal NAV<b>${num(terminal.net_nav, 4)}</b></div>
         <div class="tile">Inactive Cash<b>${pct(terminal.inactive_cash_weight)}</b></div>
       </div>
-      ${spark ? `<p class="sparkline-row">${spark}</p>` : ''}
+      <div class="qf-chart-row">${navChart}</div>
+      <div class="qf-chart-row">${relChart}</div>
       <p class="meta">${esc(payload.sample_role || 'staggered_entry_backtest')} · ${esc(payload.formation_window_mode || 'first_month')}</p>
       <p>${cohortRows || '<span class="pill">暂无 cohort 明细</span>'}</p>
       <p class="meta">${esc(payload.artifact_path || '')}</p>

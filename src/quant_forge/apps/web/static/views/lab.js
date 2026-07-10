@@ -1,15 +1,24 @@
-/* Lab workbench chrome (CP6-2, D8): surface-tab controller, research-flow
- * stepper state, hash routing, and per-tab status dots.
+/* Lab workbench chrome (CP6-2, D8; CP9-2 IA consolidation): surface-tab
+ * controller, workbench module nav, research-flow stepper state, hash
+ * routing, and per-tab status dots.
  *
  * Pure client-side state over the existing panels — no fetch calls, no new
  * endpoints. The tab panels only host per-view mounts (#result,
  * #staggered-result, #rd-result, #history-result, #bench-result,
- * #data-result, #registry-result, #docs-result, #extensions-result);
+ * #data-result, #registry-result, #docs-result, #extensions-result, plus
+ * the CP10-reserved #multi-result placeholder);
  * hidden panels use the `hidden` attribute
  * so the existing render functions keep writing into their mounts while a
  * panel is inactive. Tab activation only notifies the optional `onActivate`
  * callback wired by app.js — all panel data loading stays out of this
  * module.
+ *
+ * CP9-2: the workbench tab (kept id lab-tab-factor, relabelled
+ * 「LLM 因子工作台」) absorbs the former RD 循环 and Benchmark tabs as the
+ * #workbench-rd and #report-comparison sections of its 单因子研究 module;
+ * the 多因子策略回测 module is a reserved CP10 slot. Legacy #lab-tab-rd /
+ * #lab-tab-bench hashes migrate through LEGACY_HASH_ALIASES — no deep link
+ * dead-ends.
  *
  * Known flow-step gaps (documented, intentionally not wired to new
  * endpoints): there is no job re-attach after reload and no
@@ -19,9 +28,10 @@
  */
 
 const TAB_IDS = [
-  'lab-tab-factor', 'lab-tab-rd', 'lab-tab-history', 'lab-tab-bench',
-  'lab-tab-data', 'lab-tab-registry', 'lab-tab-docs', 'lab-tab-extensions'
+  'lab-tab-factor', 'lab-tab-history', 'lab-tab-data',
+  'lab-tab-registry', 'lab-tab-docs', 'lab-tab-extensions'
 ];
+const MODULE_IDS = ['lab-module-single', 'lab-module-multi'];
 const STEP_IDS = ['idea', 'parse', 'validate', 'report', 'rd'];
 const REPORT_SECTION_IDS = [
   'report-hero',
@@ -32,8 +42,16 @@ const REPORT_SECTION_IDS = [
   'report-diagnostics',
   'report-evidence',
   'report-artifacts',
-  'report-staggered'
+  'report-staggered',
+  'report-comparison'
 ];
+// Workbench anchors the hash router scrolls to inside the single-factor
+// module: every report section plus the absorbed RD stage.
+const WORKBENCH_ANCHOR_IDS = [...REPORT_SECTION_IDS, 'workbench-rd'];
+// CP9-2 IA consolidation: the removed RD 循环 / Benchmark top-level tabs
+// migrate to their workbench sections; applyHash normalizes the URL so
+// reload / copy-link carry the new canonical fragment.
+const LEGACY_HASH_ALIASES = { 'lab-tab-rd': 'workbench-rd', 'lab-tab-bench': 'report-comparison' };
 // FactorDefinition id charset (core/contracts.py) pinned client-side so a
 // #registry-factor-<id> anchor can activate the owning tab. Only the hash
 // prefix is known here; which factor the anchor selects is applied by the
@@ -65,6 +83,21 @@ function tabBaseLabel(tab) {
   return tab.dataset.baseLabel;
 }
 
+// The active workbench module decides the workbench tab's canonical hash:
+// the multi module keeps its own #lab-module-multi fragment (mirroring
+// activateModule's canonical mapping) so reload / copy-link return to it;
+// the single module (the default) maps back to the tab id.
+function activeModuleId() {
+  return MODULE_IDS.find(id => {
+    const moduleTab = document.getElementById(id);
+    return moduleTab && moduleTab.getAttribute('aria-selected') === 'true';
+  }) || 'lab-module-single';
+}
+
+function workbenchCanonicalHash() {
+  return activeModuleId() === 'lab-module-multi' ? '#lab-module-multi' : '#lab-tab-factor';
+}
+
 export function activateTab(tabId, options) {
   const target = tabElement(tabId);
   if (!target) return;
@@ -85,10 +118,39 @@ export function activateTab(tabId, options) {
   // that activates the factor tab but keeps its section anchor in the
   // URL for reload / back / copy-link.
   const updateHash = !(options && options.updateHash === false);
-  if (updateHash && window.location.hash !== `#${tabId}`) {
-    window.history.replaceState(null, '', `#${tabId}`);
+  if (updateHash) {
+    // The workbench tab's canonical fragment reflects the ACTIVE module
+    // (A-MINOR-3): module state persists across top-tab switches, so
+    // returning to the workbench while the multi module is showing must
+    // write #lab-module-multi — its canonical form — instead of always
+    // #lab-tab-factor, or reload / copy-link would land on the single
+    // module. Every other tab keeps its own id.
+    const canonical = tabId === 'lab-tab-factor' ? workbenchCanonicalHash() : `#${tabId}`;
+    if (window.location.hash !== canonical) {
+      window.history.replaceState(null, '', canonical);
+    }
   }
   if (onTabActivate) onTabActivate(tabId);
+}
+
+export function activateModule(moduleId, options) {
+  if (!MODULE_IDS.includes(moduleId)) return;
+  MODULE_IDS.forEach(id => {
+    const tab = document.getElementById(id);
+    const panel = document.getElementById(id.replace('lab-module-', 'lab-module-panel-'));
+    if (!tab || !panel) return;
+    const selected = id === moduleId;
+    tab.setAttribute('aria-selected', selected ? 'true' : 'false');
+    tab.tabIndex = selected ? 0 : -1;
+    panel.hidden = !selected;
+  });
+  // Canonical hash: the single module is the default, so it maps back to
+  // the workbench tab hash; only the reserved multi module gets its own.
+  const updateHash = !(options && options.updateHash === false);
+  const canonical = moduleId === 'lab-module-single' ? '#lab-tab-factor' : `#${moduleId}`;
+  if (updateHash && window.location.hash !== canonical) {
+    window.history.replaceState(null, '', canonical);
+  }
 }
 
 export function setTabDot(tabId, state) {
@@ -127,13 +189,26 @@ function scrollToReportSection(sectionId) {
 }
 
 function applyHash(hash) {
-  const target = (hash || '').replace(/^#/, '');
+  let target = (hash || '').replace(/^#/, '');
+  const alias = LEGACY_HASH_ALIASES[target];
+  if (alias) {
+    // Legacy tab hashes migrate to their workbench anchors; the URL is
+    // normalized so reload / copy-link carry the new canonical fragment.
+    window.history.replaceState(null, '', `#${alias}`);
+    target = alias;
+  }
   if (TAB_IDS.includes(target)) {
     activateTab(target);
     return;
   }
-  if (REPORT_SECTION_IDS.includes(target)) {
+  if (MODULE_IDS.includes(target)) {
     activateTab('lab-tab-factor', { updateHash: false });
+    activateModule(target, { updateHash: false });
+    return;
+  }
+  if (WORKBENCH_ANCHOR_IDS.includes(target)) {
+    activateTab('lab-tab-factor', { updateHash: false });
+    activateModule('lab-module-single', { updateHash: false });
     scrollToReportSection(target);
     return;
   }
@@ -183,6 +258,37 @@ function onTablistKeydown(event) {
   }
 }
 
+// Module-nav roving tabindex: mirrors onTablistKeydown over MODULE_IDS
+// (same Arrow / Home / End semantics, activateModule instead of
+// activateTab).
+function focusModuleByOffset(currentId, offset) {
+  const index = MODULE_IDS.indexOf(currentId);
+  if (index === -1) return;
+  const next = MODULE_IDS[(index + offset + MODULE_IDS.length) % MODULE_IDS.length];
+  const tab = document.getElementById(next);
+  if (!tab) return;
+  tab.focus();
+  activateModule(next);
+}
+
+function onModuleNavKeydown(event) {
+  const tab = event.target.closest('.lab-module-tab');
+  if (!tab) return;
+  if (event.key === 'ArrowRight') {
+    event.preventDefault();
+    focusModuleByOffset(tab.id, 1);
+  } else if (event.key === 'ArrowLeft') {
+    event.preventDefault();
+    focusModuleByOffset(tab.id, -1);
+  } else if (event.key === 'Home') {
+    event.preventDefault();
+    focusModuleByOffset(tab.id, -MODULE_IDS.indexOf(tab.id));
+  } else if (event.key === 'End') {
+    event.preventDefault();
+    focusModuleByOffset(tab.id, MODULE_IDS.length - 1 - MODULE_IDS.indexOf(tab.id));
+  }
+}
+
 function syncIdeaStep(ideaEl) {
   setStep('idea', ideaEl.value.trim() ? 'done' : 'active');
 }
@@ -196,6 +302,16 @@ export function initLabTabs(options) {
       if (tab) activateTab(tab.id);
     });
     tablist.addEventListener('keydown', onTablistKeydown);
+  }
+  // Workbench module nav (CP9-2): module state persists across top-tab
+  // switches — activateTab never resets it.
+  const moduleNav = document.querySelector('.lab-module-nav');
+  if (moduleNav) {
+    moduleNav.addEventListener('click', event => {
+      const tab = event.target.closest('.lab-module-tab');
+      if (tab) activateModule(tab.id);
+    });
+    moduleNav.addEventListener('keydown', onModuleNavKeydown);
   }
   window.addEventListener('hashchange', () => applyHash(window.location.hash));
   applyHash(window.location.hash);
@@ -212,9 +328,12 @@ export function initLabTabs(options) {
       const action = link.dataset.stepAction;
       if (action === 'report') {
         activateTab('lab-tab-factor');
+        activateModule('lab-module-single');
         scrollToReportSection('report-hero');
       } else if (action === 'rd') {
-        activateTab('lab-tab-rd');
+        activateTab('lab-tab-factor');
+        activateModule('lab-module-single');
+        scrollToReportSection('workbench-rd');
       }
     });
   }

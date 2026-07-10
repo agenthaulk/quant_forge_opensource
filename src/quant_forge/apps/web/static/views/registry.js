@@ -17,6 +17,7 @@
 
 import { esc, metricCellHtml, metricStatusSuffix, valueOr } from '../metric.js';
 import { fetchPanelJson } from '../api.js';
+import { formulaHtml } from './dsl.js';
 import { researchTagChipsHtml } from './tags.js';
 
 const registryResultEl = document.getElementById('registry-result');
@@ -87,9 +88,11 @@ function detailPlaceholderHtml() {
 function definitionCardHtml(factor) {
   const formula = factor.formula ? String(factor.formula) : '';
   const precomputed = formula.startsWith(PRECOMPUTED_PREFIX);
-  const formulaHtml = precomputed
+  // The precomputed branch keeps esc(key) behind the precomputed pill — a
+  // key is not an expression, so it is never syntax-highlighted (CP9-2).
+  const formulaBlock = precomputed
     ? `<div class="formula"><span class="pill">precomputed</span> ${esc(formula.slice(PRECOMPUTED_PREFIX.length))}</div>`
-    : `<div class="formula">${esc(formula)}</div>`;
+    : `<div class="formula">${formulaHtml(formula)}</div>`;
   const precomputedNote = precomputed
     ? '<p class="meta"><span class="pill">precomputed</span> 公式不在本仓库，输入字段不可观测。</p>'
     : '';
@@ -107,7 +110,7 @@ function definitionCardHtml(factor) {
         <div>
           <p class="eyebrow">Registry · Factor</p>
           <h3>${esc(factor.name || factor.factor_id || '')} ${factorStatusPillHtml(factor.status)}</h3>
-          ${formulaHtml}
+          ${formulaBlock}
           <p>${esc(factor.description || '')}</p>
           <p class="meta">持有 ${esc(valueOr(factor.horizon_days, 'n/a'))} 天 · source ${esc(factor.source || 'n/a')}</p>
           ${precomputedNote}

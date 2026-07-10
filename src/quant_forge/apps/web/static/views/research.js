@@ -4,6 +4,7 @@
  * (text label always present — color is never the sole signal). */
 
 import { esc, metricNum, num, pct, valueOr } from '../metric.js';
+import { barChart } from './charts.js';
 import { profilePeriodText } from './factor.js';
 
 const rdResultEl = document.getElementById('rd-result');
@@ -51,10 +52,20 @@ export function renderComparisonTable(payload) {
         <td>${gatePillHtml(gate)}<br><span class="meta">${esc((row.gate_reasons || []).join('; '))}</span></td>
       </tr>`;
   }).join('');
+  // C7: RD candidate selection score per comparison row (null score ⇒ n/a
+  // tick, never 0); 0-based. selection_score arrives as number|null from
+  // _json_safe, so barChart's finite check drives the n/a rendering.
+  const scoreChart = rows.length
+    ? `<div class="qf-chart-row">${barChart(
+        rows.map(row => ({ label: row.factor_id || '', value: row.selection_score })),
+        { ariaLabel: 'RD 候选选择分数', yFormat: value => num(value, 4), emptyMessage: '暂无候选分数' }
+      )}</div>`
+    : '';
   return `
     <div class="panel report-section" id="rd-comparison">
       <h3>RD 因子迭代对比</h3>
       <p class="meta">selection 样本用于 RD 排序和 gate；external OOS 只用于审计展示，不参与 winner 选择。</p>
+      ${scoreChart}
       <table class="comparison-table">
         <thead>
           <tr>

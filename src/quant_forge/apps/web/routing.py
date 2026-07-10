@@ -33,11 +33,14 @@ from quant_forge.apps.web.api import (
     _optional_int,
     _optional_parameters_payload,
     _optional_parser_payload,
+    _optional_standardization,
     _optional_str,
     _paths_payload,
     _query_parameter,
     _rd_status_payload,
     _registry_factor_id_from_path,
+    _synthesis_block,
+    _synthesis_factor_refs,
 )
 from quant_forge.apps.web.html import _index_html
 from quant_forge.apps.web.jobs import LOGGER, RequestBodyTooLarge, _WebJobManager, _client_error_message
@@ -175,6 +178,9 @@ def create_local_web_server(
                     # path detail, so they keep the generic mapping below.
                     self._require_control_token()
                     self._json(_server._data_status_payload(config))
+                elif path == "/api/synthesis/methods":
+                    self._require_control_token()
+                    self._json(_server._synthesis_methods_payload(config))
                 elif path == "/api/registry/factors":
                     self._require_control_token()
                     self._json(_server._registry_factors_payload(config))
@@ -389,6 +395,40 @@ def create_local_web_server(
                                 objective=str(payload.get("objective", research_config.objective)),
                                 max_candidates=_optional_int(payload.get("max_candidates"), "max_candidates"),
                                 iterations=_optional_int(payload.get("iterations"), "iterations"),
+                                rd_config=research_config,
+                                cancel_event=cancel_event,
+                            ),
+                        ),
+                        status=202,
+                    )
+                    return
+                if path == "/api/jobs/multi-factor-backtest":
+                    # Shape guards run eagerly (not inside the deferred job
+                    # lambda) and the preflight re-asserts every §13 request
+                    # rejection — including the data-dependent WINDOW_TOO_SHORT
+                    # and UNIVERSE_MISMATCH — synchronously, so a bad request
+                    # is a clean 400 here instead of a failed background job.
+                    factor_refs = _synthesis_factor_refs(payload.get("factor_refs"))
+                    synthesis = _synthesis_block(payload.get("synthesis"))
+                    standardization = _optional_standardization(payload.get("standardization"))
+                    run_parameters = _optional_parameters_payload(payload.get("parameters"))
+                    _server.preflight_multi_factor_backtest(
+                        config,
+                        factor_refs=factor_refs,
+                        synthesis=synthesis,
+                        standardization=standardization,
+                        parameters=run_parameters,
+                        rd_config=research_config,
+                    )
+                    self._json(
+                        job_manager.start(
+                            "multi_factor_backtest",
+                            lambda cancel_event: _server.run_multi_factor_backtest_workflow(
+                                config,
+                                factor_refs=factor_refs,
+                                synthesis=synthesis,
+                                standardization=standardization,
+                                parameters=run_parameters,
                                 rd_config=research_config,
                                 cancel_event=cancel_event,
                             ),
