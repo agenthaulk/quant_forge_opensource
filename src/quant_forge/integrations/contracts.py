@@ -45,6 +45,15 @@ MEMBER_FORMULA_DRIFT = "MEMBER_FORMULA_DRIFT"
 SUBMIT_NOT_CONFIRMED = "SUBMIT_NOT_CONFIRMED"
 PRESCREEN_LOCAL_PROXY_ONLY = "PRESCREEN_LOCAL_PROXY_ONLY"
 UNKNOWN_BACKEND = "UNKNOWN_BACKEND"
+# A requested target region the backend does not serve: prescreening for it
+# would be a claim about a market the gate spec does not describe, so the
+# flow refuses instead of guessing (FP-4 / FP-G).
+TARGET_REGION_UNSUPPORTED = "TARGET_REGION_UNSUPPORTED"
+# A platform-side failure surfaced by an adapter (client/API error, failed
+# simulation, or a platform response missing its object id). Carried on
+# typed results/receipts so live-path failures stay inside the contract
+# instead of escaping as raw exceptions mid-flow.
+BACKEND_ERROR = "BACKEND_ERROR"
 
 WARNING_CODES: frozenset[str] = frozenset(
     (
@@ -57,6 +66,8 @@ WARNING_CODES: frozenset[str] = frozenset(
         SUBMIT_NOT_CONFIRMED,
         PRESCREEN_LOCAL_PROXY_ONLY,
         UNKNOWN_BACKEND,
+        TARGET_REGION_UNSUPPORTED,
+        BACKEND_ERROR,
     )
 )
 

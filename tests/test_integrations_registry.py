@@ -70,6 +70,10 @@ from quant_forge.integrations.registry import (
 
 
 def test_warning_codes_closed_set_is_pinned() -> None:
+    # TARGET_REGION_UNSUPPORTED and BACKEND_ERROR joined the closed set in the
+    # post-review hardening pass: an unserved target region is refused up
+    # front instead of crossing the seam as a raw adapter error, and
+    # platform-side failures ride typed results instead of escaping mid-flow.
     assert WARNING_CODES == frozenset(
         (
             "BACKEND_NOT_INSTALLED",
@@ -81,6 +85,8 @@ def test_warning_codes_closed_set_is_pinned() -> None:
             "SUBMIT_NOT_CONFIRMED",
             "PRESCREEN_LOCAL_PROXY_ONLY",
             "UNKNOWN_BACKEND",
+            "TARGET_REGION_UNSUPPORTED",
+            "BACKEND_ERROR",
         )
     )
     # Constant values equal the constant names (decision-register spelling).
@@ -490,3 +496,71 @@ def test_package_reexports_the_public_seam() -> None:
     ):
         assert hasattr(integrations, name), name
         assert name in integrations.__all__, name
+
+
+# ---------------------------------------------------------------------------
+# Post-review hardening: gate-var uniqueness + per-row violation containment
+# ---------------------------------------------------------------------------
+
+
+def test_enable_env_vars_are_unique_across_the_table() -> None:
+    # Distinct ids like "a.b"/"a-b"/"a_b" all map onto QF_ENABLE_BACKEND_A_B;
+    # this pins the invariant that the reviewed table never ships two ids
+    # sharing one opt-in gate variable.
+    gates = [enable_env_var(backend_id) for backend_id in KNOWN_FACTOR_BACKENDS]
+    assert len(set(gates)) == len(gates)
+
+
+def test_list_backends_isolates_a_contract_violation_to_its_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One misdeclared adapter must not hide every other backend's row."""
+
+    healthy_module = types.ModuleType("qf_row_ok_mod")
+
+    class _HealthyPort(contracts.FactorBackendPort):
+        def describe(self) -> contracts.BackendDescriptor:
+            return contracts.BackendDescriptor(
+                backend_id="rowok",
+                label="Row OK",
+                regions=("REGION_A",),
+                capabilities=frozenset({"translate"}),
+            )
+
+    healthy_module.create_backend = _HealthyPort  # type: ignore[attr-defined]
+
+    misdeclared_module = types.ModuleType("qf_row_bad_mod")
+
+    class _MisdeclaredPort(contracts.FactorBackendPort):
+        def describe(self) -> contracts.BackendDescriptor:
+            return contracts.BackendDescriptor(
+                backend_id="someotherid",
+                label="Misdeclared",
+                regions=("REGION_A",),
+                capabilities=frozenset({"translate"}),
+            )
+
+    misdeclared_module.create_backend = _MisdeclaredPort  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "qf_row_ok_mod", healthy_module)
+    monkeypatch.setitem(sys.modules, "qf_row_bad_mod", misdeclared_module)
+    monkeypatch.setattr(
+        registry,
+        "KNOWN_FACTOR_BACKENDS",
+        {"rowok": "qf_row_ok_mod", "rowbad": "qf_row_bad_mod"},
+    )
+    monkeypatch.setenv("QF_ENABLE_BACKEND_ROWOK", "1")
+    monkeypatch.setenv("QF_ENABLE_BACKEND_ROWBAD", "1")
+
+    rows = {row["backend_id"]: row for row in list_backends()}
+
+    # The violation is loud in its own row...
+    assert rows["rowbad"]["status"] == "contract_violation"
+    assert "identity mismatch" in rows["rowbad"]["violation"]
+    assert rows["rowbad"]["warning_code"] is None
+    # ...while the healthy backend still reports normally.
+    assert rows["rowok"]["status"] == "available"
+    assert rows["rowok"]["label"] == "Row OK"
+    # Direct single-backend resolution keeps the loud raise.
+    with pytest.raises(contracts.BackendContractViolation):
+        resolve_backend("rowbad")

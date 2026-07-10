@@ -42,6 +42,7 @@ from quant_forge.integrations.contracts import (
     PRESCREEN_LOCAL_PROXY_ONLY,
     REGION_MISMATCH,
     SUBMIT_NOT_CONFIRMED,
+    TARGET_REGION_UNSUPPORTED,
     BackendDescriptor,
     CapabilityNotSupported,
     FactorBackendPort,
@@ -775,3 +776,63 @@ def test_agent_facade_reports_degradation_codes(
     assert payload["ok"] is False
     assert payload["resolution"]["warning_code"] == "BACKEND_NOT_ENABLED"
     assert FAKE_ENABLE_ENV in payload["resolution"]["hint"]
+
+
+# ---------------------------------------------------------------------------
+# Post-review hardening: unserved target region + degraded-simulation block
+# ---------------------------------------------------------------------------
+
+
+def test_submit_refuses_unsupported_target_region_before_prescreen(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--target-region outside descriptor.regions ends the flow honestly.
+
+    Previously the request crossed the seam and surfaced as an uncontained
+    adapter error; now the dry run refuses up front with the closed code and
+    the adapter's prescreen is never invoked.
+    """
+
+    calls = _install_fake_backend(monkeypatch)
+    factor_root, artifact_root = _make_workspace(tmp_path)
+
+    exit_code = cli_main.main(
+        _submit_argv(
+            "F_PLAIN", factor_root, artifact_root, "--target-region", "REGION_ELSEWHERE"
+        )
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 2
+    assert TARGET_REGION_UNSUPPORTED in out
+    # Translation may run (it is region-independent); prescreen must not.
+    assert "prescreen" not in [name for name, _ in calls]
+
+
+def test_confirm_submit_blocked_on_degraded_simulation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A degraded simulation (warnings / empty backend_ref) blocks submission.
+
+    Previously the confirmed flow chained into port.submit with an empty
+    platform object id; now it exits 2 without attempting the submission.
+    """
+
+    calls = _install_fake_backend(
+        monkeypatch,
+        capabilities=("translate", "prescreen", "simulate", "submit"),
+        simulate_result=SimulationResult(
+            backend_ref="", warnings=(BACKEND_NOT_CONFIGURED,)
+        ),
+    )
+    factor_root, artifact_root = _make_workspace(tmp_path)
+
+    exit_code = cli_main.main(
+        _submit_argv("F_PLAIN", factor_root, artifact_root, "--confirm-submit")
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 2
+    assert "submission not attempted" in out
+    assert "submit" not in [name for name, _ in calls]
+    assert "simulate" in [name for name, _ in calls]

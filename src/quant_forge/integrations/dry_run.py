@@ -46,6 +46,7 @@ from quant_forge.integrations.contracts import (
     PRESCREEN_LOCAL_PROXY_ONLY,
     REGION_MISMATCH,
     SUBMIT_NOT_CONFIRMED,
+    TARGET_REGION_UNSUPPORTED,
     UNKNOWN_BACKEND,
     CapabilityNotSupported,
     PrescreenReport,
@@ -490,6 +491,28 @@ def run_translate_prescreen(
     resolved_target_region = target_region or (
         descriptor.regions[0] if descriptor.regions else "unknown"
     )
+    if (
+        target_region is not None
+        and descriptor.regions
+        and resolved_target_region not in descriptor.regions
+    ):
+        # A region the backend does not serve is refused up front (FP-4/FP-G):
+        # forwarding it would force the adapter to either fabricate a report
+        # or escape the contract with a raw error.
+        payload["prescreen"] = {
+            "data_region": resolved_data_region,
+            "target_region": resolved_target_region,
+            "region_alignment": "unknown",
+            "warning_codes": [TARGET_REGION_UNSUPPORTED],
+            "checks": [],
+        }
+        payload["notes"].append(
+            f"backend '{descriptor.backend_id}' serves region(s) "
+            f"{', '.join(descriptor.regions)}; it cannot honestly prescreen for "
+            f"'{resolved_target_region}'"
+        )
+        payload["terminal_warning_codes"] = [TARGET_REGION_UNSUPPORTED]
+        return DryRunOutcome(payload, False, resolution, factor, translation, None)
     prescreen_request = PrescreenRequest(
         factor_id=factor.factor_id,
         data_region=resolved_data_region,

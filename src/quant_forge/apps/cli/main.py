@@ -883,6 +883,22 @@ def _perform_backend_submission(outcome: DryRunOutcome) -> tuple[dict[str, Any],
             "notes": list(simulation.notes),
         }
         backend_ref = simulation.backend_ref
+        if simulation.warnings or not backend_ref:
+            # A degraded simulation (warning codes, or no platform object id)
+            # cannot honestly feed a submission: chaining ahead would hand
+            # submit an empty/unvetted backend_ref. Blocked, not attempted.
+            return (
+                {
+                    "status": "blocked",
+                    "error": (
+                        "simulation degraded — submission not attempted "
+                        f"(warnings: {', '.join(simulation.warnings) or 'none'}; "
+                        f"backend_ref: {simulation.backend_ref!r})"
+                    ),
+                    "simulation": simulation_payload,
+                },
+                2,
+            )
     receipt = port.submit(
         SubmitRequest(
             factor_id=factor.factor_id,

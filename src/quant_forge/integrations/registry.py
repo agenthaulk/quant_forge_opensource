@@ -159,7 +159,23 @@ def list_backends() -> list[dict[str, Any]]:
 
     rows: list[dict[str, Any]] = []
     for backend_id in sorted(KNOWN_FACTOR_BACKENDS):
-        resolution = resolve_backend(backend_id)
+        try:
+            resolution = resolve_backend(backend_id)
+        except BackendContractViolation as violation:
+            # One misdeclared adapter must not hide every other backend's
+            # status row. The violation stays loud — in its own row — while
+            # direct resolve_backend() callers still get the raise.
+            rows.append(
+                {
+                    "backend_id": backend_id,
+                    "module": KNOWN_FACTOR_BACKENDS[backend_id],
+                    "status": "contract_violation",
+                    "warning_code": None,
+                    "enable_env_var": enable_env_var(backend_id),
+                    "violation": str(violation),
+                }
+            )
+            continue
         row: dict[str, Any] = {
             "backend_id": backend_id,
             "module": resolution.module,
