@@ -207,24 +207,54 @@ def _load_registry_factor(
     except ValueError as exc:
         raise FactorLoadError(f"invalid factor id {factor_id!r}: {exc}") from exc
     report: Mapping[str, Any] = {}
+    parameters: dict[str, Any] = {}
     report_rel: str | None = None
     notes: tuple[str, ...] = ()
+    fallback: tuple[str, Mapping[str, Any]] | None = None
     for rel, payload in _run_artifact_payloads(artifact_root, factor_id):
-        if isinstance(payload.get("metrics"), Mapping):
-            report = payload
+        # Codex B-3: prefer a backtest-shaped artifact — its 'backtest' block
+        # (whose 'metrics' the gate reads) plus the run's pinned 'parameters'
+        # are exactly what prescreen and translation need. An evaluation
+        # artifact that merely carries a top-level metrics map must not
+        # eclipse it; it stays a last-resort fallback whose foreign metric
+        # keys degrade honestly to not_evaluable.
+        backtest_block = payload.get("backtest")
+        if isinstance(backtest_block, Mapping) and isinstance(
+            backtest_block.get("metrics"), Mapping
+        ):
+            report = backtest_block
             report_rel = rel
+            # Codex B-2: pinned run-time parameters travel with the artifact
+            # so the translator sees the transform settings the factor was
+            # actually backtested with (a decay_days>1 run must hit the
+            # adapter's decay refusal, never bypass it via an empty map).
+            raw_parameters = payload.get("parameters")
+            if isinstance(raw_parameters, Mapping):
+                parameters = dict(raw_parameters)
             break
+        if fallback is None and isinstance(payload.get("metrics"), Mapping):
+            fallback = (rel, payload)
+    if report_rel is None and fallback is not None:
+        report_rel, report = fallback
+        raw_parameters = report.get("parameters")
+        if isinstance(raw_parameters, Mapping):
+            parameters = dict(raw_parameters)
     if report_rel is None:
         notes = (
             "no local backtest report artifact found for this factor; "
             "prescreen checks will be not_evaluable",
+        )
+    elif not parameters:
+        notes = notes + (
+            "selected artifact carries no pinned run parameters; translation "
+            "cannot verify transform settings (e.g. decay)",
         )
     return TargetFactor(
         factor_id=factor_id,
         kind="registry",
         formula=definition.formula,
         horizon_days=definition.horizon_days,
-        parameters={},
+        parameters=parameters,
         provenance=None,
         prescreen_report=report,
         report_artifact_rel=report_rel,

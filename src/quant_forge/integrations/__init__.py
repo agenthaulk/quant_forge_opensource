@@ -11,6 +11,7 @@ concrete backend at module load.
 """
 
 from quant_forge.integrations.contracts import (
+    BACKEND_ERROR,
     BACKEND_NOT_CONFIGURED,
     BACKEND_NOT_ENABLED,
     BACKEND_NOT_INSTALLED,
@@ -22,6 +23,7 @@ from quant_forge.integrations.contracts import (
     REGION_ALIGNMENTS,
     REGION_MISMATCH,
     SUBMIT_NOT_CONFIRMED,
+    TARGET_REGION_UNSUPPORTED,
     UNKNOWN_BACKEND,
     WARNING_CODES,
     BackendContractViolation,
@@ -55,6 +57,7 @@ from quant_forge.integrations.registry import (
 )
 
 __all__ = [
+    "BACKEND_ERROR",
     "BACKEND_NOT_CONFIGURED",
     "BACKEND_NOT_ENABLED",
     "BACKEND_NOT_INSTALLED",
@@ -69,6 +72,7 @@ __all__ = [
     "REGION_ALIGNMENTS",
     "REGION_MISMATCH",
     "SUBMIT_NOT_CONFIRMED",
+    "TARGET_REGION_UNSUPPORTED",
     "UNKNOWN_BACKEND",
     "WARNING_CODES",
     "BackendContractViolation",

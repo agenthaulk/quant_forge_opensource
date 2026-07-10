@@ -37,6 +37,7 @@ from quant_forge.core.contracts import FactorDefinition
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.integrations import registry
 from quant_forge.integrations.contracts import (
+    BACKEND_ERROR,
     BACKEND_NOT_CONFIGURED,
     NOT_TRANSLATABLE,
     PRESCREEN_LOCAL_PROXY_ONLY,
@@ -836,3 +837,124 @@ def test_confirm_submit_blocked_on_degraded_simulation(
     assert "submission not attempted" in out
     assert "submit" not in [name for name, _ in calls]
     assert "simulate" in [name for name, _ in calls]
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        SubmitReceipt(submission_ref="", status="rejected"),
+        SubmitReceipt(
+            submission_ref="", status="not_submitted", warnings=(BACKEND_ERROR,)
+        ),
+        SubmitReceipt(
+            submission_ref="wq-123", status="submitted", warnings=(BACKEND_ERROR,)
+        ),
+    ],
+    ids=["rejected", "not_submitted_backend_error", "submitted_with_warning"],
+)
+def test_confirm_submit_exits_2_on_unsuccessful_receipts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    receipt: SubmitReceipt,
+) -> None:
+    # Codex B-1: a rejected / errored / ref-less receipt must never exit 0 —
+    # shell automation treats 0 as "the alpha was submitted".
+    _install_fake_backend(monkeypatch, submit_result=receipt)
+    factor_root, artifact_root = _make_workspace(tmp_path)
+
+    exit_code = cli_main.main(
+        _submit_argv("F_PLAIN", factor_root, artifact_root, "--confirm-submit")
+    )
+
+    assert exit_code == 2
+
+
+def _write_plain_backtest_artifact(
+    artifact_root: Path,
+    *,
+    rel: str = "backtests/F_PLAIN_report.json",
+    run_id: str = "backtest-20260709T010000000000Z-cdcdcdcd",
+    decay_days: int = 10,
+) -> None:
+    payload = {
+        "factor": {"factor_id": "F_PLAIN", "formula": "rank(close)", "horizon_days": 5},
+        "parameters": {"holding_days": 5, "decay_days": decay_days, "top_quantile": 0.3},
+        "backtest": {
+            "holding_days": 5,
+            "metrics": {
+                "net_long_short_sharpe": {"value": 1.1, "status": "available"},
+            },
+            "period_returns": [],
+        },
+    }
+    path = artifact_root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    RunIndex(artifact_root).append_run(
+        run_id=run_id,
+        kind="backtest",
+        factor_ids=["F_PLAIN"],
+        created_at="2026-07-09T01:00:00+00:00",
+        data_window={"start_date": None, "end_date": None, "status": "unavailable"},
+        config_fingerprint="cd" * 32,
+        metric_highlights={},
+        artifact_paths_rel=(rel,),
+        warnings_count=0,
+    )
+
+
+def test_plain_factor_translation_carries_pinned_artifact_parameters(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Codex B-2: the transform settings the factor was actually backtested
+    # with (decay_days etc.) must reach the translator; an empty parameters
+    # map let decay>1 runs bypass the adapter's decay refusal.
+    calls = _install_fake_backend(monkeypatch)
+    factor_root, artifact_root = _make_workspace(tmp_path)
+    _write_plain_backtest_artifact(artifact_root, decay_days=10)
+
+    exit_code = cli_main.main(_submit_argv("F_PLAIN", factor_root, artifact_root))
+
+    assert exit_code == 0
+    translate_request = [req for name, req in calls if name == "translate"][0]
+    assert dict(translate_request.parameters).get("decay_days") == 10
+
+
+def test_backtest_artifact_preferred_over_newer_evaluation_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Codex B-3: an evaluation artifact (top-level metrics map, no backtest
+    # block) written AFTER the backtest run must not eclipse the backtest
+    # artifact as the prescreen/translation input.
+    calls = _install_fake_backend(monkeypatch)
+    factor_root, artifact_root = _make_workspace(tmp_path)
+    _write_plain_backtest_artifact(artifact_root, decay_days=7)
+    eval_rel = "evaluations/F_PLAIN_eval.json"
+    eval_path = artifact_root / eval_rel
+    eval_path.parent.mkdir(parents=True, exist_ok=True)
+    eval_path.write_text(
+        json.dumps({"metrics": {"ic_mean": {"value": 0.03, "status": "available"}}}),
+        encoding="utf-8",
+    )
+    RunIndex(artifact_root).append_run(
+        run_id="evaluate-20260709T020000000000Z-efefefef",
+        kind="evaluate",
+        factor_ids=["F_PLAIN"],
+        created_at="2026-07-09T02:00:00+00:00",
+        data_window={"start_date": None, "end_date": None, "status": "unavailable"},
+        config_fingerprint="ef" * 32,
+        metric_highlights={},
+        artifact_paths_rel=(eval_rel,),
+        warnings_count=0,
+    )
+
+    exit_code = cli_main.main(
+        _submit_argv("F_PLAIN", factor_root, artifact_root, "--json")
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["factor"]["report_artifact_rel"] == "backtests/F_PLAIN_report.json"
+    translate_request = [req for name, req in calls if name == "translate"][0]
+    assert dict(translate_request.parameters).get("decay_days") == 7

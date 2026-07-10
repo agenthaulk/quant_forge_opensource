@@ -125,18 +125,30 @@ def resolve_backend(backend_id: str) -> BackendResolution:
         )
     try:
         # The argument is always the fixed reviewed constant above, never
-        # caller input; only ImportError means absence — any other failure
-        # inside an opted-in adapter propagates loudly.
+        # caller input. Codex B-5: only the TOP-LEVEL module being absent
+        # means "not installed" — a nested import failure inside an installed
+        # adapter is a real defect and must not masquerade as absence (the
+        # user would be told to install something that is already installed).
         module = importlib.import_module(module_name)
-    except ImportError:
-        return BackendResolution(
-            backend_id=backend_id,
-            status="not_installed",
-            warning_code=BACKEND_NOT_INSTALLED,
-            port=None,
-            module=module_name,
-            enable_env_var=gate,
-        )
+    except ModuleNotFoundError as exc:
+        missing = exc.name or ""
+        if missing == module_name or module_name.startswith(missing + "."):
+            return BackendResolution(
+                backend_id=backend_id,
+                status="not_installed",
+                warning_code=BACKEND_NOT_INSTALLED,
+                port=None,
+                module=module_name,
+                enable_env_var=gate,
+            )
+        raise BackendContractViolation(
+            f"adapter '{module_name}' is installed but failed to import a "
+            f"dependency: {exc}"
+        ) from exc
+    except ImportError as exc:
+        raise BackendContractViolation(
+            f"adapter '{module_name}' import failed: {exc}"
+        ) from exc
     port = _create_port(backend_id, module_name, module)
     return BackendResolution(
         backend_id=backend_id,

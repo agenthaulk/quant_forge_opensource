@@ -493,6 +493,11 @@ def test_package_reexports_the_public_seam() -> None:
         "list_backends",
         "enable_env_var",
         "is_known_backend",
+        # Post-review closed-code additions ride the same seam re-export
+        # (Codex B-4): a code in WARNING_CODES that the package does not
+        # re-export is an inconsistent public API.
+        "TARGET_REGION_UNSUPPORTED",
+        "BACKEND_ERROR",
     ):
         assert hasattr(integrations, name), name
         assert name in integrations.__all__, name
@@ -564,3 +569,32 @@ def test_list_backends_isolates_a_contract_violation_to_its_row(
     # Direct single-backend resolution keeps the loud raise.
     with pytest.raises(contracts.BackendContractViolation):
         resolve_backend("rowbad")
+
+
+def test_nested_import_failure_is_a_contract_violation_not_absence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    # Codex B-5: an INSTALLED adapter whose import dies on a missing
+    # dependency must not masquerade as "not installed" — the user would be
+    # told to install a package that is already present.
+    pkg = tmp_path / "qf_nested_fail_mod.py"
+    pkg.write_text("import qf_dep_that_does_not_exist_zz\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(
+        registry, "KNOWN_FACTOR_BACKENDS", {"nestedfail": "qf_nested_fail_mod"}
+    )
+    monkeypatch.setenv("QF_ENABLE_BACKEND_NESTEDFAIL", "1")
+    sys.modules.pop("qf_nested_fail_mod", None)
+
+    with pytest.raises(contracts.BackendContractViolation, match="dependency"):
+        resolve_backend("nestedfail")
+    # The listing contains it loudly per-row instead of hiding other rows.
+    rows = {row["backend_id"]: row for row in list_backends()}
+    assert rows["nestedfail"]["status"] == "contract_violation"
+    assert "dependency" in rows["nestedfail"]["violation"]
+    # A genuinely absent top-level module still reads as not_installed.
+    monkeypatch.setattr(
+        registry, "KNOWN_FACTOR_BACKENDS", {"absent": "qf_truly_absent_mod_zz"}
+    )
+    monkeypatch.setenv("QF_ENABLE_BACKEND_ABSENT", "1")
+    assert resolve_backend("absent").status == "not_installed"

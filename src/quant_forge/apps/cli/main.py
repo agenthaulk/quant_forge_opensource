@@ -914,8 +914,14 @@ def _perform_backend_submission(outcome: DryRunOutcome) -> tuple[dict[str, Any],
         "notes": list(receipt.notes),
         "provenance_carried": receipt.provenance is not None,
     }
-    blocked = receipt.status == "refused" or any(
-        code in receipt.warnings for code in (SUBMIT_NOT_CONFIRMED, BACKEND_NOT_CONFIGURED)
+    # Codex B-1: success is the narrow case, not the default. ANY warning code
+    # (SUBMIT_NOT_CONFIRMED / BACKEND_NOT_CONFIGURED / BACKEND_ERROR / ...), an
+    # empty platform object id, or a non-submitted status must exit 2 — a
+    # rejected receipt looking successful to shell automation is the hazard.
+    blocked = (
+        bool(receipt.warnings)
+        or not str(receipt.submission_ref or "").strip()
+        or receipt.status in ("refused", "rejected", "not_submitted", "error")
     )
     return ({"simulation": simulation_payload, "receipt": receipt_payload}, 2 if blocked else 0)
 
