@@ -7,6 +7,7 @@ from pathlib import Path
 
 from quant_forge.core.contracts import SampleSplitSpec, SimulationProfile, TransactionCostModel
 from quant_forge.factor_library.repository import parse_idea_to_definition
+from quant_forge.integrations.dry_run import run_translate_prescreen
 from quant_forge.mcp import read_models
 from quant_forge.workbench.service import WorkbenchService
 
@@ -76,3 +77,29 @@ class AgentWorkspaceTools:
             "status": "requires_user_decision",
             "reason": "Agents cannot directly promote factors in the public workbench.",
         }
+
+    def backend_translate_prescreen(
+        self,
+        backend_id: str,
+        factor_id: str,
+        *,
+        data_region: str | None = None,
+        target_region: str | None = None,
+    ) -> dict[str, object]:
+        """Read-only external-backend dry run: resolve, translate, prescreen.
+
+        FP-D boundary: outward submission is irreversible and stays gated
+        behind the human CLI (`qf factor submit --confirm-submit`). This
+        method routes through the deliberately submission-free dry-run flow
+        in :mod:`quant_forge.integrations.dry_run`, so the agent-facing
+        surface has no path to a backend submit call at all.
+        """
+
+        return run_translate_prescreen(
+            backend_id,
+            factor_id,
+            factor_root=self.factor_root,
+            artifact_root=self.artifact_root,
+            data_region=data_region,
+            target_region=target_region,
+        ).payload

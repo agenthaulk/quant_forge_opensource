@@ -412,6 +412,7 @@ def test_extensions_points_catalog_is_static_and_pinned(extensions_root, web_app
         ("data.quality_rule", "supported"),
         ("agent.context_pack", "supported"),
         ("docs.pack", "supported"),
+        ("integration.factor_backend", "supported"),
         ("data.provider_adapter", "reserved"),
         ("data.pit_resolver", "reserved"),
         ("report.renderer", "reserved"),
@@ -584,7 +585,7 @@ def test_extensions_missing_root_degrades_to_unavailable(monkeypatch, web_app, t
     assert payload["extensions"] == []
     assert payload["count"] == payload["valid_count"] == payload["rejected_count"] == 0
     # The static point catalog is always present.
-    assert len(payload["points"]) == 10
+    assert len(payload["points"]) == 11
 
 
 # ---------------------------------------------------------------------------

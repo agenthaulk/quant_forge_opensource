@@ -25,6 +25,7 @@ from pathlib import Path
 from quant_forge.extensions.manifest import (
     ALL_CONTRIBUTION_POINTS,
     EXTENSION_KINDS,
+    INTEGRATION_CONTRIBUTION_POINTS,
     ManifestIssue,
     MVP_CONTRIBUTION_POINTS,
     RESERVED_CONTRIBUTION_POINTS,
@@ -66,6 +67,7 @@ def test_contribution_point_and_kind_catalogs_are_pinned() -> None:
         "agent.context_pack",
         "docs.pack",
     )
+    assert INTEGRATION_CONTRIBUTION_POINTS == ("integration.factor_backend",)
     assert RESERVED_CONTRIBUTION_POINTS == (
         "data.provider_adapter",
         "data.pit_resolver",
@@ -73,8 +75,16 @@ def test_contribution_point_and_kind_catalogs_are_pinned() -> None:
         "agent.workflow",
         "lab.view",
     )
-    assert ALL_CONTRIBUTION_POINTS == MVP_CONTRIBUTION_POINTS + RESERVED_CONTRIBUTION_POINTS
-    assert EXTENSION_KINDS == ("data-extension", "docs-extension", "agent-extension", "mixed")
+    assert ALL_CONTRIBUTION_POINTS == (
+        MVP_CONTRIBUTION_POINTS + INTEGRATION_CONTRIBUTION_POINTS + RESERVED_CONTRIBUTION_POINTS
+    )
+    assert EXTENSION_KINDS == (
+        "data-extension",
+        "docs-extension",
+        "agent-extension",
+        "integration-extension",
+        "mixed",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +216,72 @@ def test_executable_contribution_rejected_unconditionally() -> None:
     assert _codes(
         _manifest(contributes=[{"id": "c_one", "point": "docs.pack", "executable": False}])
     ) == []
+
+
+def test_integration_extension_kind_and_point_are_declarative_metadata() -> None:
+    # D-iv/CP0: integration.factor_backend is a supported declarative point.
+    # Manifest validity never consults the import table, so a declared
+    # backend id absent from the reviewed table is valid metadata
+    # (declared-but-unbound); binding authority stays with the table alone.
+    payload = _manifest(
+        kind="integration-extension",
+        contributes=[
+            {
+                "id": "c_backend",
+                "point": "integration.factor_backend",
+                "config": {"backend_id": "marker.unbound.backend"},
+            }
+        ],
+    )
+    assert validate_extension_manifest(payload) == []
+    view = public_extension_view(payload)
+    assert view["kind"] == "integration-extension"
+    assert view["contributions"] == [
+        {
+            "id": "c_backend",
+            "point": "integration.factor_backend",
+            "reserved": False,
+            "config": {"backend_id": "marker.unbound.backend"},
+        }
+    ]
+
+    from quant_forge.integrations.registry import is_known_backend
+
+    assert not is_known_backend("marker.unbound.backend")
+
+
+def test_executable_integration_contribution_rejected_unconditionally() -> None:
+    # The D7 no-exec rule is unchanged by the integration vocabulary: an
+    # executable contribution on the new kind/point rejects the manifest, and
+    # builtin grants no exemption of any kind.
+    issues = validate_extension_manifest(
+        _manifest(
+            kind="integration-extension",
+            contributes=[
+                {"id": "c_backend", "point": "integration.factor_backend", "executable": True}
+            ],
+        )
+    )
+    assert issues == [
+        ManifestIssue("executable_contribution_rejected", "contributes[0].executable")
+    ]
+    issues = validate_extension_manifest(
+        _manifest(
+            kind="integration-extension",
+            builtin=True,
+            contributes=[
+                {
+                    "id": "c_backend",
+                    "point": "integration.factor_backend",
+                    "executable": True,
+                    "builtin": True,
+                }
+            ],
+        )
+    )
+    assert issues == [
+        ManifestIssue("executable_contribution_rejected", "contributes[0].executable")
+    ]
 
 
 def test_permissions_missing() -> None:
@@ -449,13 +525,20 @@ def test_scan_missing_root_returns_empty_list(tmp_path) -> None:
 def test_contribution_points_payload_is_the_pinned_catalog() -> None:
     payload = contribution_points_payload()
     assert [row["point"] for row in payload] == list(ALL_CONTRIBUTION_POINTS)
-    assert len(payload) == 10
+    assert len(payload) == 11
     by_point = {row["point"]: row for row in payload}
     for point in MVP_CONTRIBUTION_POINTS:
+        assert by_point[point]["status"] == "supported"
+    for point in INTEGRATION_CONTRIBUTION_POINTS:
         assert by_point[point]["status"] == "supported"
     for point in RESERVED_CONTRIBUTION_POINTS:
         assert by_point[point]["status"] == "reserved"
     assert by_point["docs.pack"]["note"] == "declarative documentation set"
+    assert by_point["integration.factor_backend"]["note"] == (
+        "declarative factor-backend metadata only; executable binding happens "
+        "exclusively via the reviewed static import table (D-iv/CP0), so a "
+        "declared id absent from that table stays declared-but-unbound"
+    )
     assert by_point["agent.workflow"]["note"] == "reserved stub; commercial boundary per D6/D7a"
     assert by_point["data.provider_adapter"]["note"] == (
         "reserved; in-repo adapter implementation permitted per D7a, no dynamic loading"

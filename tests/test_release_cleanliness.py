@@ -112,11 +112,17 @@ def test_public_source_has_no_internal_platform_imports() -> None:
         "quant_forge" + "_data_platform",
         "integrations" + ".",
     ]
+    # The provider-neutral seam quant_forge.integrations is a sanctioned
+    # PUBLIC package (decision register D-i/CP1): only that exact namespace
+    # is scrubbed before the marker check, so any other integrations.*
+    # reference (an internal platform namespace) still fails this gate.
+    sanctioned_public_namespace = "quant_forge" + ".integrations"
     offenders: list[str] = []
     for path in Path("src/quant_forge").rglob("*.py"):
         text = path.read_text(encoding="utf-8")
+        scrubbed = text.replace(sanctioned_public_namespace, "")
         for marker in forbidden:
-            if marker in text:
+            if marker in scrubbed:
                 offenders.append(f"{path}:{marker}")
     assert offenders == []
 
