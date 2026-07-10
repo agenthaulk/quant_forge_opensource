@@ -8,8 +8,9 @@ the server module namespace keep taking effect.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import date, datetime
+import gc
 import json
 import math
 import os
@@ -42,7 +43,8 @@ from quant_forge.factor_engine.signal_processing import (
     apply_test_period,
     prepare_factor_scores_result,
 )
-from quant_forge.factor_library.catalog import FactorCatalog
+from quant_forge.factor_engine.value_store import FactorValueStore
+from quant_forge.factor_library.catalog import FactorCatalog, is_precomputed_formula
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.lineage.store import RUN_KINDS, RunIndex, redact_free_text
 from quant_forge.mcp.read_models import list_factor_research_tags
@@ -81,16 +83,22 @@ from quant_forge.synthesis.service import (
     FittedCompositeResult,
     MemberFetchSpec,
     RebalancePrescan,
-    build_apriori_composite,
-    build_fitted_composite,
+    build_directed_matrix,
     build_member_fetch_plan,
     cleanup_composite_artifacts,
+    combine_apriori,
+    combine_fitted,
     derive_composite_id,
-    member_rank_ic_redundancy,
+    period_rank_ic_by_signal_index,
     prescan_rebalance_coverage,
+    rebalance_indices,
+    redundancy_from_period_ics,
     require_backtest_window,
+    require_matrix_dates_on_calendar,
     resolve_pinned_universe,
     run_composite_backtest,
+    validated_calendar,
+    validated_close_frame,
 )
 
 
@@ -636,6 +644,38 @@ def _multi_factor_backtest_settings(
     )
 
 
+def _precomputed_values_present(config: QuantForgeConfig, factor: FactorDefinition) -> bool | None:
+    """Probe whether a precomputed factor's VALUES exist under configured roots.
+
+    ``None`` for a non-precomputed formula: scores are computed from the
+    formula on demand, so "are values present" is not a meaningful question.
+    ``None`` also on any probe failure, including no ``factor_values_root``
+    or ``factor_values_overlay_root`` configured at all (FP-4: unobservable
+    is null, never guessed as True/False).
+
+    Otherwise mirrors EXACTLY how ``prepare_factor_scores_result`` builds its
+    ``FactorValueStore`` (read root = ``factor_values_root or
+    factor_values_overlay_root``, write root = ``factor_values_overlay_root``)
+    so the probe answers with the SAME roots the scoring path would actually
+    read from — a False here means selecting this factor as a synthesis
+    member would find no stored rows, not that the registry merely does not
+    know.
+    """
+
+    if not is_precomputed_formula(factor.formula):
+        return None
+    try:
+        read_root = config.paths.factor_values_root or config.paths.factor_values_overlay_root
+        store = FactorValueStore(read_root, write_root=config.paths.factor_values_overlay_root)
+        return store.has_stored_values(
+            factor_id=factor.factor_id,
+            factor_name=factor.name,
+            formula=factor.formula,
+        )
+    except Exception:
+        return None
+
+
 def _prepare_multi_factor_backtest(
     config: QuantForgeConfig,
     *,
@@ -682,6 +722,19 @@ def _prepare_multi_factor_backtest(
             members.append(repository.get(factor_id))
         except FileNotFoundError:
             raise ValueError(f"unknown factor: {factor_id}") from None
+    # A precomputed member's DEFINITION can persist in factor_root while its
+    # VALUES were only ever written to a past run's overlay directory that
+    # this run does not read. Refuse here — before any panel load or engine
+    # work — instead of letting the composite drive fail deep inside
+    # materialization with an opaque "no rows" error. Only a CONFIRMED
+    # absence (False) refuses; an unobservable probe (None) never guesses.
+    for member in members:
+        if is_precomputed_formula(member.formula) and _precomputed_values_present(config, member) is False:
+            raise ValueError(
+                f"factor {member.factor_id} is precomputed but has no stored values under "
+                "the configured factor_values_root/factor_values_overlay_root: its values "
+                "were materialized for a past run only and are not present for this run"
+            )
     # RB-6 + Codex A-1: when no member declares a universe, the pin falls back
     # to the cn_a formation default instead of an empty (unfiltered) set — an
     # empty pin would let ST names scored by every member enter the book.
@@ -805,7 +858,7 @@ def run_multi_factor_backtest_workflow(
     _raise_if_cancelled(cancel_event)
     member_scores: dict[str, Any] = {}
     for spec in plan.member_plan:
-        member_scores[spec.factor_id] = prepare_factor_scores_result(
+        member_result_scores = prepare_factor_scores_result(
             plan.panel,
             spec.formula,
             spec.universe_filters,
@@ -815,6 +868,19 @@ def run_multi_factor_backtest_workflow(
             factor_values_root=config.paths.factor_values_root,
             factor_values_overlay_root=config.paths.factor_values_overlay_root,
         ).scores
+        # Backstop distinct from the earlier presence refusal (which already
+        # confirmed a stored value file exists somewhere for this factor):
+        # zero rows survived the formula-signature + panel-key read filter,
+        # so the stored values do not cover THIS request's universe/dates —
+        # a different failure than "no file at all", named as such instead of
+        # surfacing as an opaque empty composite deep inside materialization.
+        if is_precomputed_formula(spec.formula) and member_result_scores.empty:
+            raise ValueError(
+                f"factor {spec.factor_id} has stored precomputed values, but none are "
+                "readable for this request's universe/date signature; rerun the synthesis "
+                "that produced it, or check factor_values_root/factor_values_overlay_root"
+            )
+        member_scores[spec.factor_id] = member_result_scores
         _raise_if_cancelled(cancel_event)
     # The working-panel close frame over the SAME in-window dates the engine
     # trades: the RB-5 forward-return source for the fitted IC estimate and
@@ -823,12 +889,43 @@ def run_multi_factor_backtest_workflow(
         ["trade_date", "instrument", "close"]
     ].copy()
     delay = plan.settings.profile.execution_delay_days
+    # Standardize + direction the full member panel ONCE, then release the
+    # per-member tidy frames right away: they are the largest live objects here
+    # and nothing downstream needs them once the wide matrix exists. Jobs run
+    # with gc disabled (jobs.py), so freeing is refcount-driven — clearing the
+    # mapping drops the last references and the explicit collect reclaims them.
+    directed, standardization_outcome = build_directed_matrix(
+        member_scores,
+        directions=plan.directions,
+        standardization=plan.standardization,
+    )
+    member_scores.clear()
+    gc.collect()
+
+    # Compute the per-period rank IC sweep ONCE over the sorted directed matrix
+    # and share it between the fitted weights and the advisory redundancy matrix.
+    # Both service functions would otherwise rebuild this identical sweep from
+    # the same inputs — a second full-panel forward-return pass — so threading it
+    # through is a structural single-sweep, numerics unchanged.
+    working = directed.sort_index()
+    calendar = validated_calendar(plan.dates)
+    require_matrix_dates_on_calendar(working, calendar)
+    grid = rebalance_indices(
+        calendar, delay=delay, holding=plan.settings.holding_days, start_signal_index=0
+    )
+    ic_by_period = period_rank_ic_by_signal_index(
+        working,
+        close=validated_close_frame(working_close),
+        calendar=calendar,
+        grid=grid,
+        delay=delay,
+        holding=plan.settings.holding_days,
+    )
+
     composite: CompositeResult | FittedCompositeResult
     if plan.method.is_fitted:
-        composite = build_fitted_composite(
-            member_scores,
-            directions=plan.directions,
-            standardization=plan.standardization,
+        composite = combine_fitted(
+            working,
             method=plan.method.name,
             close=working_close,
             dates=plan.dates,
@@ -838,24 +935,24 @@ def run_multi_factor_backtest_workflow(
             # the single source of truth (a service-side fallback here would
             # read as if a second constant could govern).
             ic_min_periods=int(plan.method_params["ic_min_periods"]),
+            period_ics=ic_by_period,
         )
     else:
-        composite = build_apriori_composite(
-            member_scores,
-            directions=plan.directions,
-            standardization=plan.standardization,
+        composite = combine_apriori(
+            working,
             method=plan.method.name,
             weights=plan.weights,
         )
-    _raise_if_cancelled(cancel_event)
-    redundancy = member_rank_ic_redundancy(
-        member_scores,
-        directions=plan.directions,
+    # Enrich with the §4.2 standardization provenance exactly as the pure
+    # build_*_composite entry points do, so every payload field is byte-identical.
+    composite = replace(
+        composite,
         standardization=plan.standardization,
-        close=working_close,
-        dates=plan.dates,
-        delay=delay,
-        holding=plan.settings.holding_days,
+        degenerate_dates_by_factor=standardization_outcome.degenerate_dates_by_factor,
+    )
+    _raise_if_cancelled(cancel_event)
+    redundancy = redundancy_from_period_ics(
+        ic_by_period, [str(column) for column in working.columns]
     )
     prescan = prescan_rebalance_coverage(
         composite.composite,
@@ -865,6 +962,12 @@ def run_multi_factor_backtest_workflow(
         include_partial_final_period=plan.settings.include_partial_final_period,
     )
     _raise_if_cancelled(cancel_event)
+    # Release the wide-matrix working set before the engine drive — the largest
+    # allocator ahead. ``composite`` already holds the degenerate-date mapping it
+    # needs, so dropping ``standardization_outcome`` frees its standardized matrix
+    # without losing provenance; ``plan.panel`` is kept for the engine.
+    del working_close, directed, working, ic_by_period, standardization_outcome
+    gc.collect()
     run = run_composite_backtest(
         composite.composite,
         composite_id=plan.composite_id,
@@ -2707,13 +2810,25 @@ def _factor_research_tags_by_id(config: QuantForgeConfig) -> dict[str, dict[str,
     return {str(tag.get("subject_id")): tag for tag in tags}
 
 
-def _registry_factor_row(factor: FactorDefinition, tags: dict[str, Any] | None) -> dict[str, Any]:
+def _registry_factor_row(
+    config: QuantForgeConfig, factor: FactorDefinition, tags: dict[str, Any] | None
+) -> dict[str, Any]:
     """Project one FactorDefinition into the Registry list/detail row shape.
 
     Extends the pinned ``read_models.list_factors`` projection (which stays
-    unchanged for LLM/CLI surfaces) with ``description``, ``source``, and the
-    joined research tags. ``tags`` is ``None`` when unobservable (FP-4);
-    precomputed formulas already render as ``precomputed:<key>`` — no paths.
+    unchanged for LLM/CLI surfaces) with ``description``, ``source``, the
+    joined research tags, and ``precomputed_values_present``. ``tags`` is
+    ``None`` when unobservable (FP-4); precomputed formulas already render
+    as ``precomputed:<key>`` — no paths.
+
+    ``precomputed_values_present`` is ``null`` for a non-precomputed formula
+    (values are computed from the formula on demand — presence is not a
+    meaningful question) and ``null`` on any probe failure (FP-4: unobservable
+    is null, never a guess). Otherwise it reports whether the value store —
+    probed with the SAME roots the scoring path uses — holds at least one
+    stored value file for this factor, so a dangling composite (definition
+    saved, values only ever written to a past run's overlay) is marked
+    ``false`` here instead of failing deep inside a synthesis run.
     """
 
     return {
@@ -2726,6 +2841,7 @@ def _registry_factor_row(factor: FactorDefinition, tags: dict[str, Any] | None) 
         "description": factor.description,
         "source": factor.source,
         "tags": tags,
+        "precomputed_values_present": _precomputed_values_present(config, factor),
     }
 
 
@@ -2748,7 +2864,7 @@ def _registry_factors_payload(config: QuantForgeConfig) -> dict[str, Any]:
     except Exception:
         factors = []
     tags_by_id = _factor_research_tags_by_id(config) if factors else {}
-    rows = [_registry_factor_row(factor, tags_by_id.get(factor.factor_id)) for factor in factors]
+    rows = [_registry_factor_row(config, factor, tags_by_id.get(factor.factor_id)) for factor in factors]
     payload = {"factors": rows, "count": len(rows)}
     return _server._web_public_json(_redact_web_text(payload))
 
@@ -2789,7 +2905,7 @@ def _registry_factor_detail_payload(
     rows = RunIndex(config.paths.artifact_root).search(factor_id=factor.factor_id, kind=parsed_kind)
     ordered = list(reversed(rows))[:parsed_limit]
     payload = {
-        "factor": _registry_factor_row(factor, tags_by_id.get(factor.factor_id)),
+        "factor": _registry_factor_row(config, factor, tags_by_id.get(factor.factor_id)),
         "runs": [_run_record_payload(row) for row in ordered],
         "count": len(ordered),
         "limit": parsed_limit,

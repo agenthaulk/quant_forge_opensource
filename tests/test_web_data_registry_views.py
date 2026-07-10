@@ -291,6 +291,27 @@ def test_registry_metric_cells_render_only_via_metric_helpers() -> None:
     assert "公式不在本仓库，输入字段不可观测。" in registry_js
 
 
+def test_registry_row_and_detail_flag_unavailable_precomputed_values() -> None:
+    """A dangling composite's row + detail header render a 值不可用 pill.
+
+    Additive honesty pill (FP-4): a precomputed factor's DEFINITION can
+    persist while its VALUES were only ever written to a past run's overlay.
+    Strictly ``=== false`` renders the pill — ``null`` (not precomputed, or
+    the presence probe itself failed) and ``true`` render unchanged, and both
+    the list row and the detail header share ONE helper.
+    """
+
+    registry_js = _static_module_text("views/registry.js")
+    assert "factor.precomputed_values_present === false" in registry_js
+    assert "值不可用" in registry_js
+    # One helper definition + exactly two call sites (list row, detail card);
+    # additive next to the existing lifecycle pill, never replacing it.
+    assert registry_js.count("valuesUnavailablePillHtml(factor)") == 3
+    assert registry_js.count(
+        "${factorStatusPillHtml(factor.status)}${valuesUnavailablePillHtml(factor)}"
+    ) == 2
+
+
 # ---------------------------------------------------------------------------
 # Escaping and FP-4 sweeps across the new modules
 # ---------------------------------------------------------------------------

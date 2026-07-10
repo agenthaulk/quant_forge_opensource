@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import warnings
 
 import pandas as pd
 import pytest
@@ -1266,6 +1267,55 @@ def test_prepare_factor_scores_ignores_legacy_incremental_cache_without_signatur
     assert set(legacy_incremental["factor_value"]) == {9.0}
     assert set(incremental["factor_value"]) == {0.5, 1.0}
     assert incremental["formula_signature"].nunique() == 1
+
+
+def test_prepare_factor_scores_computes_from_empty_cache_without_concat_futurewarning(tmp_path) -> None:
+    panel = _two_day_panel()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        result = prepare_factor_scores_result(
+            panel,
+            "rank(market_cap)",
+            factor_id="FTR_CONCAT_WARNING_EMPTY_CACHE",
+            factor_name="FTR_CONCAT_WARNING_EMPTY_CACHE",
+            factor_values_root=tmp_path,
+        )
+
+    assert result.source == "factor_values_incremental"
+    assert result.cached_rows == 0
+    assert result.computed_rows == 4
+    assert list(result.scores["score"]) == [0.5, 1.0, 0.5, 1.0]
+
+
+def test_prepare_factor_scores_reads_full_cache_without_concat_futurewarning(tmp_path) -> None:
+    panel = _two_day_panel()
+    factor_dir = tmp_path / "factor_id=FTR_CONCAT_WARNING_FULL_CACHE"
+    factor_dir.mkdir(parents=True)
+    signature = _formula_signature("FTR_CONCAT_WARNING_FULL_CACHE", "rank(market_cap)", ())
+    pd.DataFrame(
+        {
+            "trade_date": ["2025-01-02", "2025-01-02", "2025-01-03", "2025-01-03"],
+            "instrument": ["AAA", "BBB", "AAA", "BBB"],
+            "formula_signature": [signature] * 4,
+            "factor_value": [0.5, 1.0, 0.5, 1.0],
+        }
+    ).to_parquet(factor_dir / "2025.parquet", index=False)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        result = prepare_factor_scores_result(
+            panel,
+            "rank(market_cap)",
+            factor_id="FTR_CONCAT_WARNING_FULL_CACHE",
+            factor_name="FTR_CONCAT_WARNING_FULL_CACHE",
+            factor_values_root=tmp_path,
+        )
+
+    assert result.source == "factor_values_cached"
+    assert result.cached_rows == 4
+    assert result.computed_rows == 0
+    assert list(result.scores["score"]) == [0.5, 1.0, 0.5, 1.0]
 
 
 def _two_day_panel() -> pd.DataFrame:

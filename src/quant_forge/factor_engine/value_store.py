@@ -87,15 +87,7 @@ class FactorValueStore:
                 formula_signature=legacy_formula_signature,
                 allow_unsigned_root_values=cache_only,
             )
-            cached = _dedupe_scores(
-                pd.concat(
-                    [
-                        legacy_cached,
-                        cached,
-                    ],
-                    ignore_index=True,
-                )
-            )
+            cached = _dedupe_scores(_concat_score_frames([legacy_cached, cached]))
         result_panel = target_panel if target_panel is not None else panel
         panel_keys = _score_keys(result_panel)
         context_keys = _score_keys(panel)
@@ -143,7 +135,7 @@ class FactorValueStore:
                 scores=computed,
             )
 
-        combined = pd.concat([cached_complete, computed_for_result], ignore_index=True)
+        combined = _concat_score_frames([cached_complete, computed_for_result])
         if combined.empty:
             combined = _empty_scores()
         else:
@@ -195,6 +187,22 @@ class FactorValueStore:
             else (existing_read_dirs[-1] if existing_read_dirs else (write_dir or self.root))
         )
         return _ResolvedFactorValuePaths(read_dirs=read_dirs, write_dir=write_dir, primary_dir=primary_dir)
+
+    def has_stored_values(self, *, factor_id: str, factor_name: str, formula: str) -> bool:
+        """Report whether ANY stored value file exists for this factor.
+
+        This is a PRESENCE probe, not a readability guarantee: it resolves
+        the factor's directories through the store's own
+        ``_resolve_factor_paths`` (never a hand-built path) and returns True
+        iff at least one ``*.parquet`` exists under any read dir. The read
+        path (``prepare_scores`` / ``read_factor_values``) still enforces the
+        formula signature row by row, so a True result here does not promise
+        that any rows will actually satisfy a given request — only that some
+        value file exists on disk for this factor.
+        """
+
+        factor_paths = self._resolve_factor_paths(factor_id=factor_id, factor_name=factor_name, formula=formula)
+        return any(_factor_value_files(read_dir) for read_dir in factor_paths.read_dirs)
 
     def read_factor_values(
         self,
@@ -478,6 +486,19 @@ def _empty_scores() -> pd.DataFrame:
             "score": pd.Series(dtype="float64"),
         }
     )
+
+
+def _concat_score_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    # pandas warns when a concat operand is empty or all-NA because a future
+    # release will stop excluding it from result-dtype inference; drop empty
+    # frames before concatenating so the score-combining call sites never
+    # depend on that inference and never trip the warning.
+    non_empty = [frame for frame in frames if not frame.empty]
+    if not non_empty:
+        return _empty_scores()
+    if len(non_empty) == 1:
+        return non_empty[0]
+    return pd.concat(non_empty, ignore_index=True)
 
 
 def _factor_value_files(factor_dir: Path) -> list[Path]:

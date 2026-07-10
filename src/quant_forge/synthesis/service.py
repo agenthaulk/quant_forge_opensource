@@ -554,6 +554,32 @@ def apply_directions(matrix: pd.DataFrame, directions: Mapping[str, int]) -> pd.
     return matrix.mul(multiplier, axis=1)
 
 
+def build_directed_matrix(
+    member_scores: Mapping[str, pd.DataFrame],
+    *,
+    directions: Mapping[str, int],
+    standardization: str,
+) -> tuple[pd.DataFrame, StandardizationOutcome]:
+    """Shared prefix of every combiner: matrix -> standardize -> direction.
+
+    Runs :func:`build_score_matrix`, :func:`standardize_matrix`, and
+    :func:`apply_directions` in that exact order and returns the standardized,
+    direction-applied matrix together with the :class:`StandardizationOutcome`
+    so callers keep the §4.2 per-factor degenerate marks without recomputing
+    them. This is the identical sequence :func:`build_apriori_composite`,
+    :func:`build_fitted_composite`, and :func:`member_rank_ic_redundancy` each
+    run before they diverge, factored out so ONE build can feed all of them —
+    the web workflow standardizes the full member panel a single time and
+    releases the per-member tidy frames before combining, rather than rebuilding
+    the wide-matrix pipeline once per consumer.
+    """
+
+    matrix = build_score_matrix(member_scores)
+    standardized = standardize_matrix(matrix, standardization=standardization)
+    directed = apply_directions(standardized.matrix, directions)
+    return directed, standardized
+
+
 def _resolve_apriori_weights(
     columns: Sequence[str],
     *,
@@ -762,9 +788,9 @@ def build_apriori_composite(
     level RB-9 dates so provenance can report both.
     """
 
-    matrix = build_score_matrix(member_scores)
-    standardized = standardize_matrix(matrix, standardization=standardization)
-    directed = apply_directions(standardized.matrix, directions)
+    directed, standardized = build_directed_matrix(
+        member_scores, directions=directions, standardization=standardization
+    )
     result = combine_apriori(
         directed,
         method=method,
@@ -976,6 +1002,60 @@ def _period_rank_ic_by_signal_index(
     return by_period
 
 
+# ---------------------------------------------------------------------------
+# Public reuse seams (single-build orchestration)
+#
+# The fitted combiner and the redundancy diagnostic each rebuild the same
+# per-period rank IC sweep from the same inputs. These thin wrappers expose the
+# exact internal helpers so an orchestrator (the web workflow) can run the sort,
+# calendar/close validation, grid, and IC sweep ONCE and thread the result into
+# both consumers instead of paying for the wide-matrix pipeline twice. The IC
+# wrapper delegates to the module-level ``_period_rank_ic_by_signal_index`` by
+# name so a test double patched onto that name is honored through this seam too.
+# ---------------------------------------------------------------------------
+
+
+def period_rank_ic_by_signal_index(
+    directed_matrix: pd.DataFrame,
+    *,
+    close: pd.DataFrame,
+    calendar: Sequence[pd.Timestamp],
+    grid: Sequence[int],
+    delay: int,
+    holding: int,
+) -> dict[int, dict[str, float]]:
+    """Public seam over the per-member per-period rank IC sweep (RB-5)."""
+
+    return _period_rank_ic_by_signal_index(
+        directed_matrix,
+        close=close,
+        calendar=calendar,
+        grid=grid,
+        delay=delay,
+        holding=holding,
+    )
+
+
+def validated_calendar(dates: Sequence[object]) -> list[pd.Timestamp]:
+    """Public seam over the strictly-increasing trade-date calendar check."""
+
+    return _validated_calendar(dates)
+
+
+def validated_close_frame(close: pd.DataFrame) -> pd.DataFrame:
+    """Public seam over the close-frame column/dtype normalization."""
+
+    return _validated_close_frame(close)
+
+
+def require_matrix_dates_on_calendar(
+    matrix: pd.DataFrame, calendar: Sequence[pd.Timestamp]
+) -> None:
+    """Public seam over the matrix-dates-on-calendar precondition."""
+
+    _require_matrix_dates_on_calendar(matrix, calendar)
+
+
 def _normalize_ic_weights(
     raw: Mapping[str, float], factors: Sequence[str]
 ) -> tuple[dict[str, float], str | None]:
@@ -1004,6 +1084,40 @@ def _normalize_ic_weights(
     return {factor: value / total for factor, value in clipped.items()}, None
 
 
+def _validate_period_ics(
+    period_ics: Mapping[int, Mapping[str, float]],
+    *,
+    grid: Sequence[int],
+    factors: Sequence[str],
+) -> None:
+    """Guard the ``period_ics`` reuse seam against a foreign IC set.
+
+    The seam exists only so a caller that already computed the per-period rank
+    IC over the SAME sorted directed matrix / calendar / grid / delay / holding
+    can hand it back and skip a second sweep. Feeding ICs from any OTHER
+    estimate would silently break the §4.4 point-in-time honesty — the weights
+    would be fit off numbers that do not match the returns the engine realizes.
+    So the handed set is validated hard: every signal index MUST be on the grid
+    computed here, and every per-period factor key set MUST equal the matrix
+    columns. A violation is a caller programming error, raised as ``ValueError``.
+    """
+
+    grid_set = set(grid)
+    factor_set = {str(factor) for factor in factors}
+    for signal_index, ics in period_ics.items():
+        if signal_index not in grid_set:
+            raise ValueError(
+                f"period_ics carries signal index {signal_index!r} that is not on the "
+                "rebalance grid; period ICs must come from the same "
+                "_period_rank_ic_by_signal_index sweep over this directed matrix"
+            )
+        if {str(key) for key in ics} != factor_set:
+            raise ValueError(
+                "period_ics factor keys must equal the matrix columns "
+                f"{sorted(factor_set)}; signal index {signal_index} carries {sorted(ics)}"
+            )
+
+
 def fitted_weights_by_rebalance(
     directed_matrix: pd.DataFrame,
     *,
@@ -1014,6 +1128,7 @@ def fitted_weights_by_rebalance(
     method: str,
     ic_min_periods: int = DEFAULT_IC_MIN_PERIODS,
     start_signal_index: int = 0,
+    period_ics: Mapping[int, Mapping[str, float]] | None = None,
 ) -> tuple[FittedWeightEntry, ...]:
     """§4.4 point-in-time weight vectors for EVERY shared-grid rebalance.
 
@@ -1028,6 +1143,13 @@ def fitted_weights_by_rebalance(
     weight rule; the finite-check clip, the ICIR ``std == 0`` guard
     (population std, matching the pseudocode's ``np.std``), the all-zero
     equal-weight fallback and the warm-up fallback are implemented verbatim.
+
+    ``period_ics`` is an advanced reuse seam: when supplied it REPLACES the
+    internal sweep with the caller's precomputed per-period ICs, which MUST come
+    from :func:`_period_rank_ic_by_signal_index` over the SAME sorted directed
+    matrix, calendar, grid, delay, and holding — validated hard by
+    :func:`_validate_period_ics` because a foreign set would silently break the
+    point-in-time fit.
     """
 
     _require_score_matrix(directed_matrix)
@@ -1042,14 +1164,26 @@ def fitted_weights_by_rebalance(
     calendar = _validated_calendar(dates)
     working = directed_matrix.sort_index()
     _require_matrix_dates_on_calendar(working, calendar)
-    close_frame = _validated_close_frame(close)
 
     grid = rebalance_indices(
         calendar, delay=delay, holding=holding, start_signal_index=start_signal_index
     )
-    ic_by_period = _period_rank_ic_by_signal_index(
-        working, close=close_frame, calendar=calendar, grid=grid, delay=delay, holding=holding
-    )
+    if period_ics is None:
+        ic_by_period = _period_rank_ic_by_signal_index(
+            working,
+            close=_validated_close_frame(close),
+            calendar=calendar,
+            grid=grid,
+            delay=delay,
+            holding=holding,
+        )
+    else:
+        # Reuse seam (see _validate_period_ics): the caller already ran this
+        # exact sweep and hands it back so the full-panel forward-return pass
+        # runs once, not once per consumer. ``close`` is intentionally left
+        # unread here — the ICs already encode it — which is the peak-memory win.
+        _validate_period_ics(period_ics, grid=grid, factors=factors)
+        ic_by_period = period_ics
     equal = {factor: 1.0 / len(factors) for factor in factors}
 
     entries: list[FittedWeightEntry] = []
@@ -1127,6 +1261,7 @@ def combine_fitted(
     ic_min_periods: int = DEFAULT_IC_MIN_PERIODS,
     min_factor_coverage: int | None = None,
     start_signal_index: int = 0,
+    period_ics: Mapping[int, Mapping[str, float]] | None = None,
 ) -> FittedCompositeResult:
     """Combine with §4.4 point-in-time fitted weights, folded in pre-materialization.
 
@@ -1148,6 +1283,15 @@ def combine_fitted(
     fitted vector the run traded per-date equal weight throughout —
     ``is_fitted`` is ``False`` and ``NO_FITTED_PERIODS`` is flagged; the
     result never advertises fitting on an all-fallback run.
+
+    ``period_ics`` is the advanced reuse seam threaded to
+    :func:`fitted_weights_by_rebalance`: when supplied the per-period rank IC
+    sweep is not recomputed. The values MUST come from
+    :func:`_period_rank_ic_by_signal_index` over the SAME sorted directed matrix,
+    calendar, grid, delay, and holding this call would have built internally
+    (``combine_fitted`` sorts with ``directed_matrix.sort_index()``, so the ICs
+    must be computed from that same sorted frame); it is validated hard so the
+    seam cannot silently corrupt the point-in-time weights.
     """
 
     entries = fitted_weights_by_rebalance(
@@ -1159,6 +1303,7 @@ def combine_fitted(
         method=method,
         ic_min_periods=ic_min_periods,
         start_signal_index=start_signal_index,
+        period_ics=period_ics,
     )
     calendar = _validated_calendar(dates)
     working = directed_matrix.sort_index()
@@ -1259,9 +1404,9 @@ def build_fitted_composite(
     realizes (RB-5).
     """
 
-    matrix = build_score_matrix(member_scores)
-    standardized = standardize_matrix(matrix, standardization=standardization)
-    directed = apply_directions(standardized.matrix, directions)
+    directed, standardized = build_directed_matrix(
+        member_scores, directions=directions, standardization=standardization
+    )
     result = combine_fitted(
         directed,
         method=method,
@@ -1278,6 +1423,49 @@ def build_fitted_composite(
         standardization=standardization,
         degenerate_dates_by_factor=standardized.degenerate_dates_by_factor,
     )
+
+
+def redundancy_from_period_ics(
+    ic_by_period: Mapping[int, Mapping[str, float]],
+    factors: Sequence[str],
+) -> dict[str, object]:
+    """Advisory §4.5 crowding matrix from a precomputed per-period IC sweep.
+
+    The tail of :func:`member_rank_ic_redundancy`, split out so a caller that
+    already computed ``ic_by_period`` once (over the SAME sorted directed matrix,
+    calendar, grid, delay, and holding) can build the redundancy matrix from it
+    directly — identical numbers and identical key order — instead of paying for
+    a second sweep. ``factors`` fixes the row/column order (the directed matrix
+    columns). Unobservable cells — fewer than 2 common finite periods, or a
+    zero-variance series — stay a real ``None`` (FP-4), never a fabricated number.
+    """
+
+    factors = [str(factor) for factor in factors]
+    closed_periods = sorted(ic_by_period)
+    series = {
+        factor: np.asarray([ic_by_period[s][factor] for s in closed_periods], dtype=float)
+        for factor in factors
+    }
+    matrix_rows: list[list[float | None]] = []
+    for row_factor in factors:
+        row: list[float | None] = []
+        for column_factor in factors:
+            both_finite = np.isfinite(series[row_factor]) & np.isfinite(series[column_factor])
+            if int(both_finite.sum()) < 2:
+                row.append(None)
+                continue
+            pair = np.corrcoef(
+                series[row_factor][both_finite], series[column_factor][both_finite]
+            )[0, 1]
+            row.append(float(pair) if np.isfinite(pair) else None)
+        matrix_rows.append(row)
+    return {
+        "advisory": True,
+        "basis": "pearson_correlation_of_realized_period_rank_ic_series",
+        "period_count": len(closed_periods),
+        "factors": factors,
+        "matrix": matrix_rows,
+    }
 
 
 def member_rank_ic_redundancy(
@@ -1306,9 +1494,10 @@ def member_rank_ic_redundancy(
     """
 
     _validate_grid_params(delay, holding, start_signal_index)
-    matrix = build_score_matrix(member_scores)
-    standardized = standardize_matrix(matrix, standardization=standardization)
-    directed = apply_directions(standardized.matrix, directions).sort_index()
+    directed, _standardized = build_directed_matrix(
+        member_scores, directions=directions, standardization=standardization
+    )
+    directed = directed.sort_index()
     calendar = _validated_calendar(dates)
     _require_matrix_dates_on_calendar(directed, calendar)
     grid = rebalance_indices(
@@ -1323,31 +1512,7 @@ def member_rank_ic_redundancy(
         holding=holding,
     )
     factors = [str(column) for column in directed.columns]
-    closed_periods = sorted(ic_by_period)
-    series = {
-        factor: np.asarray([ic_by_period[s][factor] for s in closed_periods], dtype=float)
-        for factor in factors
-    }
-    matrix_rows: list[list[float | None]] = []
-    for row_factor in factors:
-        row: list[float | None] = []
-        for column_factor in factors:
-            both_finite = np.isfinite(series[row_factor]) & np.isfinite(series[column_factor])
-            if int(both_finite.sum()) < 2:
-                row.append(None)
-                continue
-            pair = np.corrcoef(
-                series[row_factor][both_finite], series[column_factor][both_finite]
-            )[0, 1]
-            row.append(float(pair) if np.isfinite(pair) else None)
-        matrix_rows.append(row)
-    return {
-        "advisory": True,
-        "basis": "pearson_correlation_of_realized_period_rank_ic_series",
-        "period_count": len(closed_periods),
-        "factors": factors,
-        "matrix": matrix_rows,
-    }
+    return redundancy_from_period_ics(ic_by_period, factors)
 
 
 def prescan_rebalance_coverage(
