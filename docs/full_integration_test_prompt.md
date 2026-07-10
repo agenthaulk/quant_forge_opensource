@@ -240,32 +240,36 @@ seed）、`last_accepted_factor_id`、`last_explored_factor_id`、
 
 - **因子选择（`#synth-factors`）：** 勾选 ≥ 2 个因子；每个因子显式设定方向
   （`.synth-direction`，`+1 按定义使用` / `-1 反向使用`），无静默符号翻转。
-- **合成方法（`#synth-method`）：** 从方法目录选择——`equal_weight` / `custom_weight` /
-  `rank_average` 三个可用；`ic_weighted` 预留、disabled（`available=false`，选项后缀
-  “（预留）”）。
+- **合成方法（`#synth-method`）：** 从方法目录选择——`equal_weight` / `weighted`（先验，
+  `is_fitted:false`）与 `ic_weighted` / `icir_weighted`（拟合，`is_fitted:true`，PIT
+  embargo）四个可用（P6 后的 §9 终态；P6 前拟合两项渲染为 disabled 预留）。
 - **动态、schema 驱动的参数表单（`#synth-params`）：** 表单纯由所选方法的 `params[]`
   ParamSpec 渲染，无任何按方法硬编码：
-  - `custom_weight` → 为**每个已勾选因子**生成一个权重输入框；勾选集合变化时表单随之更新。
-  - `rank_average` → 标准化被钉住并置灰（`#synth-standardization` disabled，pinned
-    `cross_sectional_rank`），带说明；请求里省略 standardization 字段（由后端按方法钉住）。
+  - `weighted` → 为**每个已勾选因子**生成一个权重输入框；勾选集合变化时表单随之更新。
+  - `ic_weighted` / `icir_weighted` → `ic_min_periods` 整数参数（默认 6，范围 3–60）。
 - **必填 holding_days 守卫：** `#synth-param-holding-days` 为必填（预填 5 仅为建议值）。
   未满足运行前置条件时「合成并回测」按钮（`#synth-run`）disabled，且 `#synth-run-hint`
   实时说明原因（已选因子数不足 2 / 方法目录不可用 / 无可用方法 / job 运行中）——按钮
   从不无理由置灰。
 - 点「合成并回测」（`#synth-run`）→ 组合报告（`#synth-report`）应包含：
-  - evaluation + IS（`#synth-insample`）+ OOS（`#synth-oos`）。
-  - **合成 provenance 卡（`#synth-provenance`）：** RAW 声明权重，**不做归一化展示**
-    （`weights_effective` 原样回显）。
-  - **先验 validity 横幅（`#synth-validity`）：** `is_fitted=false`，basis =
-    `a_priori_declared_weights`，措辞“权重与方法为先验选择，非拟合（chosen-not-fitted）”。
-  - **按角色覆盖表（per-role coverage，`coverage_by_role`）：** research_evaluation /
-    external_oos_backtest 两个角色各一张表；`coverage_ratio` 为 null → `n/a`；complete-case
-    剔除以 caveat 呈现（“missing values are never imputed / 缺失从不填补”）。
+  - evaluation（**同窗诊断**，`meta.basis = same_window_diagnostics`——本模块 backtest-only，
+    无独立评价区间）+ 外部样本外回测段；`in_sample_backtest` 为 null 且渲染安全。
+  - **合成 provenance 卡（`#synth-provenance`）：** 先验方法 RAW 声明权重**不做归一化展示**
+    （`weights_effective` 原样回显）；拟合方法**没有** `weights_effective`，改为
+    `fitted_weights_latest` / `fitted_weights_path` / `fitted_period_fraction` /
+    `warmup_period_count`；成员条目携带**钉定公式**（`factors[].formula`）。
+  - **validity 横幅（`#synth-validity`）：** 徽标按权重制度如实分支——先验 =「先验声明」、
+    拟合 =「拟合权重（时变）」；caveats 含 RB-1 非重叠/相位敏感警示与同窗诊断说明。
+  - **覆盖表（`coverage_by_role`）：** 单一 `external_oos_backtest` 角色一张表；
+    `coverage_ratio` 为 null → `n/a`；complete-case 剔除以 caveat 呈现
+    （“missing values are never imputed / 缺失从不填补”）。
   - **诚实性检查（HONESTY）：** 全程**不出现任何 optimizer 措辞**（no optimizer /
-    covariance / risk model language anywhere）。
-- **记录：** 参与因子 + 方向；方法 + 参数；composite `MFC_` id（`composite_id`）；每角色
-  coverage；validity（`is_fitted`、basis、caveats）；**动态表单是否与所选方法的 schema
-  匹配**（例如 custom_weight 是否恰好每因子一个权重框、rank_average 是否钉住标准化）。
+    covariance / risk model language anywhere）；短窗拟合应诚实降级
+    （`WARM_UP_IC_UNFITTED` / `NO_FITTED_PERIODS`，`is_fitted` 如实回落 false）。
+- **记录：** 参与因子 + 方向；方法 + 参数；composite `COMPOSITE_` id（`composite_id`，
+  全输入哈希含 `holding_days`）；覆盖；validity（`is_fitted`、basis、caveats）；**动态
+  表单是否与所选方法的 schema 匹配**（例如 weighted 是否恰好每因子一个权重框、拟合方法
+  是否出现 `ic_min_periods`）。
 
 ### 4.4 只读面 / read-only surfaces
 
@@ -298,13 +302,15 @@ seed）、`last_accepted_factor_id`、`last_explored_factor_id`、
 - **payload 卫生（hygiene）：** 任何 payload 都**不得含绝对路径**；尤其
   `GET /api/data/status` 不得泄漏 `data_root` / `panel_path`（artifact 字段应为 basename）。
 - **合成端点形状：**
-  - `GET /api/synthesis/methods` 返回 `{methods, standardizations, coverage}`：3 个可运行
-    方法（`equal_weight` / `custom_weight` / `rank_average`，`available:true`）+ 1 个预留
-    （`ic_weighted`，`available:false`）+ 2 个标准化器（`zscore` /
-    `cross_sectional_rank`）。
+  - `GET /api/synthesis/methods` 返回 `{methods, standardizations}`：4 个方法
+    （`equal_weight` / `weighted` 先验 + `ic_weighted` / `icir_weighted` 拟合，P6 终态全部
+    `available:true`；拟合两项 `is_fitted:true` 且带 `ic_min_periods` ParamSpec）+ 2 个
+    标准化器（`zscore` / `rank`）。请求体的标准化字段是 `standardization.method`。
   - `POST /api/jobs/multi-factor-backtest` 能完成（compute-heavy，耐心轮询；**终态
     status 是 `completed`**，另有 `failed` / `cancelled`）；结果 payload 携带
-    `synthesis_provenance{coverage_by_role}` 与 `validity`。
+    `synthesis_provenance{coverage_by_role, factors[].formula 钉定公式}` 与 `validity`；
+    契约违约（<2 因子 / 缺 holding_days / 未知方法 / 窗口过短 / 宇宙冲突）应是**同步的
+    干净 4xx JSON**，不是失败的后台 job。
 - **禁止用 API 替代点击：** 不得用 `/api/jobs/parse-idea` 替代「解析因子」、
   `/api/jobs/validate-idea` 替代「验证并评测」、`/api/jobs/research-run-once` 替代 RD
   「运行一次」、`/api/jobs/multi-factor-backtest` 替代「合成并回测」。
@@ -487,14 +493,16 @@ L3 API 仅补充非验收）：走 4.0–4.5——6-tab + 两模块 IA；provide
 **一个多因子合成配方 / a multi-factor recipe（用于 4.3）：**
 
 - 从注册表/已产出的因子里挑 2–3 个（例如上面三个 seed 验证后注册的因子）。
-- 方法选 `custom_weight`，为每个因子填一个权重，例如 `0.5 / 0.3 / 0.2`（方向按定义 `+1`，
+- 方法选 `weighted`，为每个因子填一个权重，例如 `0.5 / 0.3 / 0.2`（方向按定义 `+1`，
   除非要显式反向 `-1`）；标准化选 `zscore`。
 - `holding_days = 5`（必填）；其余留空由后端 profile 默认值决定。
-- 点「合成并回测」运行。**验证：** provenance 卡里权重原样回显（RAW，未归一化）；两张
-  per-role coverage 表（research_evaluation / external_oos_backtest）；先验 validity 横幅
-  `is_fitted=false`、basis = `a_priori_declared_weights`；全程无 optimizer 措辞。
-- 可再切 `rank_average` 跑一次，确认标准化被钉住并置灰（`cross_sectional_rank`）、请求里
-  省略 standardization 字段、动态表单随方法 schema 变化。
+- 点「合成并回测」运行。**验证：** provenance 卡里权重原样回显（RAW，未归一化）；单一
+  `external_oos_backtest` 覆盖表；先验 validity 徽标「先验声明」、`is_fitted=false`；
+  evaluation 段为同窗诊断（`same_window_diagnostics`）；全程无 optimizer 措辞。
+- 再切 `ic_weighted` 跑一次（`ic_min_periods` 默认 6，可降到 3 适配短窗）：确认
+  `weights_effective` **消失**、出现 `fitted_weights_latest/_path` 与
+  `fitted_period_fraction`、validity 徽标变为「拟合权重（时变）」；短窗诚实降级
+  （`NO_FITTED_PERIODS` → `is_fitted=false`）也算通过——**如实**是验收标准，不是拟合成功。
 
 ---
 

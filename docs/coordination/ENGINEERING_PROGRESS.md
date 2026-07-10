@@ -335,3 +335,92 @@ pytest -q` + `python3 scripts/release_safety_scan.py` + CLI `--help` +
   (`qf backends list`, `qf factor submit --target`) → CP4 adversarial reviews.
   Then CP-INT per `docs/full_integration_test_prompt.md` over a local merge of
   both branches.
+
+### Implementation wave landed (2026-07-09, same day)
+
+- **Workflow A (`fable/phase-d-synthesis-backend`):** P1 `485e988` catalog
+  endpoint (fitted reserved) → P2 `2261850` additive engine fixes
+  (RB-3 stable mergesort tie-break, RB-7 skip-ledger stubs excluded from
+  metric series, RB-5 `rebalance_indices`; zero existing assertions
+  re-baselined, BASE artifacts byte-identical on no-tie runs) → P3 `02c2d6a`
+  a-priori core → P4 `533d462` materialization + engine drive (RF-1/2/3,
+  LA-1, RB-10 all-input hash, failure cleanup) → P5 `cd48bcf` job endpoint +
+  §8 payload (eager preflight = clean 4xx, degraded evaluation slot instead
+  of a literal-"undefined" tile, orchestrator placed in `apps/web/api.py`
+  to avoid a core→web import inversion, `architecture.md` updated, Node
+  renderer drive over a real wire payload) → P6 `aa13ccd` fitted PIT IC/ICIR
+  (shared-grid embargo, engine forward returns, noise-floored ICIR guard,
+  honest downgrades, FP-1 fitted-field split) → `4119237` verify-pass nit
+  cleanup. **Gate: 1108 passed, scan 226 files, CLI OK, diff clean.**
+- **Workflow A verification:** P4 targeted adversarial verify PASS (5 minors
+  carried to final review); P6 anti-peek verify PASS — independent reference
+  implementation matched to 1e-12 across 6 geometries, embargo boundary
+  teeth-proofs (strict-< and ≤d+1 both distinguishable and absent),
+  survivorship-fill inheritance proven, downgrade honesty probed, ICIR
+  noise-floor misclassification unreachable below n≈18k names/cross-section.
+- **Workflow B (`fable/phase-e-external-backends`):** CP1 `aeb368c` port/
+  contracts/static registry + extensions vocabulary → CP2 `84205f4`
+  provider-neutral gate evaluator (public) + local-only WorldQuant adapter
+  under gitignored `worldquant/adapter/` (87 offline tests; D-i) → CP3
+  `97225e1` `qf backends list` + gated `qf factor submit --target` + agent
+  facade without submit (FP-D) → `aebca45` review-fix batch
+  (TARGET_REGION_UNSUPPORTED + BACKEND_ERROR closed codes, degraded-
+  simulation block, per-row violation containment, gate-var uniqueness).
+  **Gate: 991 passed, scan 203 files.** Opus adversarial review: PASS,
+  0 blocking/major; all 4 public minors/nits fixed in `aebca45`; adapter
+  advisories fixed in the local package (honest region-refusal report,
+  BACKEND_ERROR receipts, refuse-first on truncated provenance, absolute-URL
+  rejection for cookie scoping).
+- **CP-INT integration line:** local-only `fable/phase-de-integration`
+  (`232fdd1` = merge of both tips; NOT a PR branch). Combined gate:
+  **1195 passed, scan 234 files, CLI OK, diff clean**; merge had zero
+  conflicts (file scopes disjoint by construction).
+- **Model-routing incident (recorded honestly):** every implementation lane
+  this day ran on the session model despite explicit per-lane model opts — a
+  host-config issue (subagent model env override + gateway alias remaps),
+  fixed owner-approved in host settings afterwards. Verification quality was
+  unaffected (all lanes ≥ session-model tier); Codex xhigh cross-reviews of
+  both branches were dispatched once the Codex CLI was repaired (broken
+  platform binary reinstalled).
+
+### Codex xhigh cross-reviews + fix closure (2026-07-09, post-embargo)
+
+- **Branch A review** (fingerprint `WFA-P1P6-4119237`): FIX_FIRST — 1 blocking
+  (empty-universe pin let ST names into the book), 2 major (all-tied rank
+  ladder unflagged; `composite_id` digest missing `holding_days`), 1 minor
+  (fitted runs wore the hard-coded a-priori banner). All closed at `9d932bd`
+  with regressions + a one-time golden-id re-pin (digest input list changed
+  by design); the caller-supplied-overlay reuse loophole from the earlier
+  targeted verify was hardened in the same commit (fresh-directory refusal).
+  Engine additive-only proof, FE payload closure, and release safety were
+  confirmed clean by the same review. **Post-fix gate: 1110 passed, scan 226.**
+- **Branch B review** (fingerprint `WFB-CP1FIX-aebca45`): FIX_FIRST — 2
+  blocking (rejected/errored receipts exited 0; plain-factor dry runs lost
+  pinned parameters so decay>1 bypassed the adapter refusal), 3 major
+  (evaluation artifacts eclipsed backtest artifacts; new closed codes not
+  re-exported; nested adapter ImportError masqueraded as not-installed).
+  All closed at `fd677f6` with regressions; adapter advisories (platform-
+  error containment tests, truncated-provenance refusal tests) landed in the
+  local package (**92 offline tests**). **Post-fix gate: 997 passed, scan 203.**
+- **CP-INT (Fable-driven, per docs/full_integration_test_prompt.md):** fresh
+  `python:3.12-slim` container from the local integration merge, real Chrome
+  via the spec's L2 ladder (Playwright `channel:"chrome"`; L1 Computer-Use
+  path was blocked by a host-side classifier outage), real DeepSeek key via
+  `--env-file` reference only. Verified live: token gate via the native
+  prompt dialog; all 6 IA tabs; two Appendix-C seeds parsed by the real LLM
+  into sensible DSL and validated into the registry; multi-factor module
+  end-to-end for `equal_weight`, `weighted` (raw 0.6/0.4 echoed), and
+  `ic_weighted` — resolving the workorder's founding defect (合成并回测 dead
+  button); §8 payload field-audit over the job API (fitted run: genuine fit
+  with `fitted_period_fraction=0.875`, `weights_effective` absent, pinned
+  member formulas present, single `external_oos_backtest` role, six warning
+  codes surfaced, `same_window_diagnostics` evaluation); deep-link reload,
+  dark scheme, true-375px zero-overflow; zero console errors across the
+  synthesis stages. Post-fix re-verify on the rebuilt image confirmed the
+  fitted banner branch (拟合权重（时变）) live. CLI degradation ladder
+  verified in-container (`not_enabled` → `not_installed`, dry-run default)
+  and the full-capability adapter path verified host-side (install + enable
+  gate + translate boundary + cn_a REGION_MISMATCH prescreen; no live
+  platform call anywhere).
+- **Integration line:** `fable/phase-de-integration` (local-only) carries
+  both fix batches; combined image `qf-de:r2`.
