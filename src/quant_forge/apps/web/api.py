@@ -82,23 +82,20 @@ from quant_forge.synthesis.service import (
     CoverageAccounting,
     FittedCompositeResult,
     MemberFetchSpec,
+    PeriodICSweep,
     RebalancePrescan,
     build_directed_matrix,
     build_member_fetch_plan,
     cleanup_composite_artifacts,
     combine_apriori,
     combine_fitted,
+    compute_period_ic_sweep,
     derive_composite_id,
-    period_rank_ic_by_signal_index,
     prescan_rebalance_coverage,
-    rebalance_indices,
     redundancy_from_period_ics,
     require_backtest_window,
-    require_matrix_dates_on_calendar,
     resolve_pinned_universe,
     run_composite_backtest,
-    validated_calendar,
-    validated_close_frame,
 )
 
 
@@ -882,6 +879,11 @@ def run_multi_factor_backtest_workflow(
             )
         member_scores[spec.factor_id] = member_result_scores
         _raise_if_cancelled(cancel_event)
+    # The loop local still names the LAST member's full tidy frame after the
+    # loop exits; release it here so it does not outlive `member_scores.clear()`
+    # below and survive through the IC sweep and engine drive (members are
+    # validated >= 2, so the name is always bound at this point).
+    del member_result_scores
     # The working-panel close frame over the SAME in-window dates the engine
     # trades: the RB-5 forward-return source for the fitted IC estimate and
     # the advisory redundancy diagnostic.
@@ -906,18 +908,19 @@ def run_multi_factor_backtest_workflow(
     # and share it between the fitted weights and the advisory redundancy matrix.
     # Both service functions would otherwise rebuild this identical sweep from
     # the same inputs — a second full-panel forward-return pass — so threading it
-    # through is a structural single-sweep, numerics unchanged.
+    # through is a structural single-sweep, numerics unchanged; the returned
+    # sweep also binds the ICs to a recorded fingerprint of this matrix/close/
+    # grid so combine_fitted/redundancy_from_period_ics can verify provenance
+    # instead of trusting a bare mapping (see PeriodICSweep).
     working = directed.sort_index()
-    calendar = validated_calendar(plan.dates)
-    require_matrix_dates_on_calendar(working, calendar)
-    grid = rebalance_indices(
-        calendar, delay=delay, holding=plan.settings.holding_days, start_signal_index=0
-    )
-    ic_by_period = period_rank_ic_by_signal_index(
-        working,
-        close=validated_close_frame(working_close),
-        calendar=calendar,
-        grid=grid,
+    # Restore the pre-expensive-pass checkpoint: both method families (a-priori
+    # and fitted) pass through here BEFORE the full-panel forward-return sweep,
+    # matching where this check sat prior to the shared-sweep refactor.
+    _raise_if_cancelled(cancel_event)
+    sweep: PeriodICSweep = compute_period_ic_sweep(
+        directed,
+        close=working_close,
+        dates=plan.dates,
         delay=delay,
         holding=plan.settings.holding_days,
     )
@@ -935,7 +938,7 @@ def run_multi_factor_backtest_workflow(
             # the single source of truth (a service-side fallback here would
             # read as if a second constant could govern).
             ic_min_periods=int(plan.method_params["ic_min_periods"]),
-            period_ics=ic_by_period,
+            period_ics=sweep,
         )
     else:
         composite = combine_apriori(
@@ -951,9 +954,7 @@ def run_multi_factor_backtest_workflow(
         degenerate_dates_by_factor=standardization_outcome.degenerate_dates_by_factor,
     )
     _raise_if_cancelled(cancel_event)
-    redundancy = redundancy_from_period_ics(
-        ic_by_period, [str(column) for column in working.columns]
-    )
+    redundancy = redundancy_from_period_ics(sweep)
     prescan = prescan_rebalance_coverage(
         composite.composite,
         plan.dates,
@@ -965,8 +966,10 @@ def run_multi_factor_backtest_workflow(
     # Release the wide-matrix working set before the engine drive — the largest
     # allocator ahead. ``composite`` already holds the degenerate-date mapping it
     # needs, so dropping ``standardization_outcome`` frees its standardized matrix
-    # without losing provenance; ``plan.panel`` is kept for the engine.
-    del working_close, directed, working, ic_by_period, standardization_outcome
+    # without losing provenance; ``plan.panel`` is kept for the engine. ``sweep``
+    # replaces the old ``ic_by_period`` local here; its ``ics`` mapping is small,
+    # but it is released in the same batch anyway for a single clean cut.
+    del working_close, directed, working, sweep, standardization_outcome
     gc.collect()
     run = run_composite_backtest(
         composite.composite,

@@ -7,16 +7,21 @@ redundancy matrix — instead of ``build_fitted_composite`` /
 the identical wide-matrix pipeline and forward-return sweep from the same
 inputs. This file pins that the seams are a pure structural refactor:
 
-- ``build_directed_matrix`` + ``combine_fitted(..., period_ics=...)`` /
-  ``combine_apriori`` + ``redundancy_from_period_ics`` reproduce the pure
-  builders byte-for-byte (composite frame, weights path, coverage, warning
-  codes, degenerate metadata, redundancy dict) across ``zscore``/``rank`` and
-  every runnable method;
-- the ``period_ics`` seam validates its input hard — a foreign signal index or
-  a wrong factor set is a ``ValueError``, never a silent point-in-time leak;
+- ``build_directed_matrix`` + ``combine_fitted(..., period_ics=sweep)`` /
+  ``combine_apriori`` + ``redundancy_from_period_ics(sweep)`` reproduce the
+  pure builders byte-for-byte (composite frame, weights path, coverage,
+  warning codes, degenerate metadata, redundancy dict) across ``zscore``/
+  ``rank`` and every runnable method, where ``sweep`` is a
+  :class:`~quant_forge.synthesis.service.PeriodICSweep` built by
+  :func:`~quant_forge.synthesis.service.compute_period_ic_sweep`;
+- the ``period_ics`` seam accepts ONLY a ``PeriodICSweep`` and validates its
+  provenance hard — a raw mapping is a ``TypeError`` naming
+  ``compute_period_ic_sweep``, and a tampered sweep field (grid, dates,
+  columns, matrix row count, ...) is a ``ValueError`` naming that field,
+  never a silent point-in-time leak;
 - the web workflow runs the ``_period_rank_ic_by_signal_index`` sweep exactly
   ONCE per fitted run and ONCE per a-priori run (it used to run it twice on the
-  fitted branch).
+  fitted branch), via exactly one ``compute_period_ic_sweep`` call.
 
 The fixture builds an exact close chain (each instrument's close steps only at
 each closed grid period's exit bar), so the forward returns the engine
@@ -35,22 +40,19 @@ import pytest
 
 import quant_forge.apps.web.server as web_server
 import quant_forge.synthesis.service as synthesis_service
-from quant_forge.backtesting.service import rebalance_indices
 from quant_forge.config import QuantForgeConfig
 from quant_forge.data.local import create_demo_workspace
 from quant_forge.research_loop.config import load_research_loop_config
 from quant_forge.synthesis.service import (
+    PeriodICSweep,
     build_apriori_composite,
     build_directed_matrix,
     build_fitted_composite,
     combine_apriori,
     combine_fitted,
+    compute_period_ic_sweep,
     member_rank_ic_redundancy,
-    period_rank_ic_by_signal_index,
     redundancy_from_period_ics,
-    require_matrix_dates_on_calendar,
-    validated_calendar,
-    validated_close_frame,
 )
 
 INSTRUMENTS = [f"STK{index:03d}" for index in range(6)]
@@ -109,7 +111,7 @@ def _build_fixture() -> tuple[list[pd.Timestamp], pd.DataFrame, dict[str, pd.Dat
     return dates, pd.DataFrame(close_rows), members
 
 
-def _seam_ic_by_period(
+def _seam_sweep(
     members: dict[str, pd.DataFrame],
     dates: list[pd.Timestamp],
     close: pd.DataFrame,
@@ -121,18 +123,15 @@ def _seam_ic_by_period(
         members, directions=DIRECTIONS, standardization=standardization
     )
     working = directed.sort_index()
-    calendar = validated_calendar(dates)
-    require_matrix_dates_on_calendar(working, calendar)
-    grid = rebalance_indices(calendar, delay=DELAY, holding=HOLDING, start_signal_index=0)
-    ic_by_period = period_rank_ic_by_signal_index(
-        working,
-        close=validated_close_frame(close),
-        calendar=calendar,
-        grid=grid,
+    sweep = compute_period_ic_sweep(
+        directed,
+        close=close,
+        dates=dates,
         delay=DELAY,
         holding=HOLDING,
     )
-    return outcome, working, ic_by_period
+    assert isinstance(sweep, PeriodICSweep)
+    return outcome, working, sweep
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +154,7 @@ def test_fitted_seam_matches_build_fitted_composite(standardization: str, method
         holding=HOLDING,
         ic_min_periods=IC_MIN_PERIODS,
     )
-    outcome, working, ic_by_period = _seam_ic_by_period(members, dates, close, standardization)
+    outcome, working, sweep = _seam_sweep(members, dates, close, standardization)
     seam = replace(
         combine_fitted(
             working,
@@ -165,7 +164,7 @@ def test_fitted_seam_matches_build_fitted_composite(standardization: str, method
             delay=DELAY,
             holding=HOLDING,
             ic_min_periods=IC_MIN_PERIODS,
-            period_ics=ic_by_period,
+            period_ics=sweep,
         ),
         standardization=standardization,
         degenerate_dates_by_factor=outcome.degenerate_dates_by_factor,
@@ -203,9 +202,7 @@ def test_fitted_seam_matches_build_fitted_composite(standardization: str, method
         delay=DELAY,
         holding=HOLDING,
     )
-    seam_redundancy = redundancy_from_period_ics(
-        ic_by_period, [str(column) for column in working.columns]
-    )
+    seam_redundancy = redundancy_from_period_ics(sweep)
     assert seam_redundancy == pure_redundancy
 
 
@@ -228,7 +225,7 @@ def test_apriori_seam_matches_build_apriori_composite(
         method=method,
         weights=weights,
     )
-    outcome, working, ic_by_period = _seam_ic_by_period(members, dates, close, standardization)
+    outcome, working, sweep = _seam_sweep(members, dates, close, standardization)
     seam = replace(
         combine_apriori(working, method=method, weights=weights),
         standardization=standardization,
@@ -255,24 +252,22 @@ def test_apriori_seam_matches_build_apriori_composite(
         delay=DELAY,
         holding=HOLDING,
     )
-    seam_redundancy = redundancy_from_period_ics(
-        ic_by_period, [str(column) for column in working.columns]
-    )
+    seam_redundancy = redundancy_from_period_ics(sweep)
     assert seam_redundancy == pure_redundancy
 
 
 # ---------------------------------------------------------------------------
-# The period_ics seam is validated hard against a foreign IC set
+# The period_ics seam accepts ONLY a genuine PeriodICSweep and validates its
+# provenance hard against this call's own computed values.
 # ---------------------------------------------------------------------------
 
 
-def test_period_ics_foreign_signal_index_raises() -> None:
+def test_period_ics_raw_mapping_raises_type_error() -> None:
+    """A bare dict is a caller programming error, not a foreign-data case."""
+
     dates, close, members = _build_fixture()
-    _outcome, working, ic_by_period = _seam_ic_by_period(members, dates, close, "zscore")
-    corrupted = dict(ic_by_period)
-    template = dict(next(iter(ic_by_period.values())))
-    corrupted[max(ic_by_period) + 500] = template  # a signal index off the grid
-    with pytest.raises(ValueError, match="not on the rebalance grid"):
+    _outcome, working, sweep = _seam_sweep(members, dates, close, "zscore")
+    with pytest.raises(TypeError, match="compute_period_ic_sweep"):
         combine_fitted(
             working,
             method="ic_weighted",
@@ -281,17 +276,31 @@ def test_period_ics_foreign_signal_index_raises() -> None:
             delay=DELAY,
             holding=HOLDING,
             ic_min_periods=IC_MIN_PERIODS,
-            period_ics=corrupted,
+            period_ics=dict(sweep.ics),
         )
 
 
-def test_period_ics_wrong_factor_set_raises() -> None:
+@pytest.mark.parametrize(
+    ("field", "tampered_value", "match"),
+    [
+        ("grid", (0, 999), "grid"),
+        ("dates", (pd.Timestamp("2020-01-01"),), "dates"),
+        ("columns", ("F_ALPHA", "F_BRAVO"), "columns"),
+        ("matrix_row_count", 1, "matrix_row_count"),
+    ],
+)
+def test_period_ics_tampered_sweep_field_raises_value_error(
+    field: str, tampered_value: object, match: str
+) -> None:
+    """A ``PeriodICSweep`` whose recorded provenance disagrees with this call
+    is rejected naming the mismatched field — proven via ``dataclasses.replace``
+    on a GENUINE sweep (never a hand-built one), so only ``field`` differs from
+    a sweep that would otherwise validate cleanly."""
+
     dates, close, members = _build_fixture()
-    _outcome, working, ic_by_period = _seam_ic_by_period(members, dates, close, "zscore")
-    corrupted = {index: dict(ics) for index, ics in ic_by_period.items()}
-    victim = next(iter(corrupted))
-    corrupted[victim].pop(next(iter(corrupted[victim])))  # drop one factor key
-    with pytest.raises(ValueError, match="factor keys must equal"):
+    _outcome, working, sweep = _seam_sweep(members, dates, close, "zscore")
+    tampered = replace(sweep, **{field: tampered_value})
+    with pytest.raises(ValueError, match=match):
         combine_fitted(
             working,
             method="ic_weighted",
@@ -300,7 +309,7 @@ def test_period_ics_wrong_factor_set_raises() -> None:
             delay=DELAY,
             holding=HOLDING,
             ic_min_periods=IC_MIN_PERIODS,
-            period_ics=corrupted,
+            period_ics=tampered,
         )
 
 

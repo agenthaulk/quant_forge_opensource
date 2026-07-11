@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import stat
 
 import pandas as pd
 
@@ -191,18 +192,41 @@ class FactorValueStore:
     def has_stored_values(self, *, factor_id: str, factor_name: str, formula: str) -> bool:
         """Report whether ANY stored value file exists for this factor.
 
-        This is a PRESENCE probe, not a readability guarantee: it resolves
-        the factor's directories through the store's own
-        ``_resolve_factor_paths`` (never a hand-built path) and returns True
-        iff at least one ``*.parquet`` exists under any read dir. The read
-        path (``prepare_scores`` / ``read_factor_values``) still enforces the
-        formula signature row by row, so a True result here does not promise
-        that any rows will actually satisfy a given request — only that some
-        value file exists on disk for this factor.
+        This is a PRESENCE probe, not a readability guarantee: it matches
+        candidate directories with the SAME two-strategy rules
+        ``_resolve_factor_paths`` -> ``_find_existing_factor_dirs`` uses
+        (direct category-dir candidates + a case-insensitive listing match;
+        never a hand-built path — see ``_stored_value_dirs``) and returns
+        True iff at least one ``*.parquet`` is found under any of them. The
+        read path (``prepare_scores`` / ``read_factor_values``) still enforces
+        the formula signature row by row, so a True result here does not
+        promise that any rows will actually satisfy a given request — only
+        that some value file exists on disk for this factor.
+
+        Contract: this probe RAISES when presence is unobservable and
+        returns ``False`` ONLY on a readable, confirmed absence. Unlike the
+        read/write path's directory resolution (``_resolve_factor_paths`` ->
+        ``_find_existing_factor_dirs``, which tolerates an inaccessible
+        candidate by treating it as absent so an ordinary score computation
+        can still fall back to computing from the formula), every
+        filesystem call this probe makes is deliberately non-swallowing: a
+        directory that structurally does not exist resolves to absence, but
+        any OTHER ``OSError`` (permission denied, a stale/broken mount, a
+        hardware read failure, ...) PROPAGATES instead of being silently
+        read as confirmed absence — a caller mapping that to a hard refusal
+        would otherwise be acting on a guess. Callers that need FP-4
+        null-on-unobservable semantics (e.g. the registry probe) must catch
+        around this call themselves; see ``_precomputed_values_present`` in
+        ``apps/web/api.py``, which already maps any raised exception to
+        ``None``.
         """
 
-        factor_paths = self._resolve_factor_paths(factor_id=factor_id, factor_name=factor_name, formula=formula)
-        return any(_factor_value_files(read_dir) for read_dir in factor_paths.read_dirs)
+        candidates = _factor_dir_candidates(factor_id=factor_id, factor_name=factor_name, formula=formula)
+        roots = (self.root, *((self.write_root,) if self.write_root else ()))
+        read_dirs = _unique_existing_dirs(
+            tuple(directory for root in roots for directory in _stored_value_dirs(root, candidates))
+        )
+        return any(_listed_parquet_files(read_dir) for read_dir in read_dirs)
 
     def read_factor_values(
         self,
@@ -675,6 +699,124 @@ def _safe_is_dir(path: Path) -> bool:
 
 def _is_ignored_mount_entry(path: Path) -> bool:
     return path.name.startswith("._") or path.name in {".DS_Store", ".Spotlight-V100", ".Trashes", ".fseventsd"}
+
+
+# ---------------------------------------------------------------------------
+# Strict (non-swallowing) directory resolution — ``has_stored_values`` only.
+#
+# Everything above this line (``_find_existing_factor_dirs``,
+# ``_factor_value_search_roots``, ``_safe_child_dirs``, ``_safe_is_dir``) is
+# deliberately TOLERANT: the read/write path treats an inaccessible
+# candidate directory as absent so an ordinary score computation can still
+# fall back to computing from the formula instead of hard-failing on a
+# filesystem hiccup. The presence probe (``has_stored_values``) needs the
+# opposite contract — an unobservable directory must never be reported as
+# confirmed absence (a downstream hard refusal would then be acting on a
+# guess, not an observation) — so it uses this separate, strict set of
+# helpers instead of the tolerant ones above. ``Path.is_dir()`` cannot be
+# used for the strict form: on this stdlib (see ``genericpath.isdir``) it
+# swallows EVERY ``OSError`` — including permission failures, not just a
+# missing path — into ``False``, exactly the swallow this probe must not
+# have. ``Path.stat()``/``Path.iterdir()`` are plain passthroughs to
+# ``os.stat``/``os.scandir`` with no such swallow, so the strict helpers are
+# built on those instead, narrowly treating only ``FileNotFoundError`` /
+# ``NotADirectoryError`` (a path that structurally is not there — a normal,
+# observable absence) as a negative result and letting every other
+# ``OSError`` propagate.
+# ---------------------------------------------------------------------------
+
+
+def _is_dir_strict(path: Path) -> bool:
+    """True if ``path`` is a directory; False ONLY on confirmed absence.
+
+    ``FileNotFoundError``/``NotADirectoryError`` from ``Path.stat()`` mean
+    the path structurally is not there; any OTHER ``OSError`` (permission
+    denied, a stale/broken mount, a hardware read failure, ...) propagates.
+    """
+
+    if _is_ignored_mount_entry(path):
+        return False
+    try:
+        info = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return stat.S_ISDIR(info.st_mode)
+
+
+def _listed_dir_entries(path: Path) -> list[Path]:
+    """Plain (non-swallowing) directory listing for the presence probe.
+
+    ``FileNotFoundError``/``NotADirectoryError`` mean ``path`` simply is not
+    there — a normal, confirmed absence — so they resolve to an empty list.
+    Any OTHER ``OSError`` propagates: the listing genuinely failed and
+    presence is UNOBSERVABLE, never silently "no entries".
+    """
+
+    try:
+        return sorted(path.iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+
+
+def _stored_value_dirs(root: Path, candidates: list[str]) -> tuple[Path, ...]:
+    """Presence-probe directory candidates for ``root`` (strict I/O).
+
+    Mirrors ``_find_existing_factor_dirs``'s two matching strategies — direct
+    candidate paths under each category directory, plus a case-insensitive
+    child-name match against a listing of ``root`` and its category
+    subdirectories — using ``_is_dir_strict``/``_listed_dir_entries`` in
+    place of ``_safe_is_dir``/``_safe_child_dirs`` so an inaccessible
+    directory raises instead of silently matching nothing.
+    """
+
+    if not _is_dir_strict(root):
+        return ()
+    matches: list[Path] = []
+    for candidate in reversed(candidates):
+        if not _is_child_name(candidate):
+            continue
+        for category_dir in FACTOR_CATEGORY_DIRS.values():
+            direct = root / category_dir / candidate
+            if _is_dir_strict(direct):
+                matches.append(direct)
+        direct = root / candidate
+        if _is_dir_strict(direct):
+            matches.append(direct)
+    search_roots = [root]
+    for category_dir in FACTOR_CATEGORY_DIRS.values():
+        category_root = root / category_dir
+        if _is_dir_strict(category_root):
+            search_roots.append(category_root)
+    children: dict[str, Path] = {}
+    for search_root in search_roots:
+        for child in _listed_dir_entries(search_root):
+            if _is_dir_strict(child):
+                children[child.name.lower()] = child
+    for candidate in reversed(candidates):
+        match = children.get(candidate.lower())
+        if match is not None:
+            matches.append(match)
+    return _unique_existing_dirs(tuple(matches))
+
+
+def _listed_parquet_files(factor_dir: Path) -> list[Path]:
+    """``*.parquet`` value files under ``factor_dir`` (+ ``incremental/``).
+
+    A non-swallowing replacement for the read path's ``Path.glob`` use
+    (``_factor_value_files``): pathlib's ``glob`` documents that it silently
+    skips directories it cannot read, including on ``PermissionError`` —
+    exactly the swallow this probe must not have. Every entry is listed via
+    ``_listed_dir_entries`` and matched by the same yearly-file name pattern
+    ``_factor_value_files`` uses (``_is_yearly_factor_value_file``).
+    """
+
+    files = [entry for entry in _listed_dir_entries(factor_dir) if _is_yearly_factor_value_file(entry)]
+    files.extend(
+        entry
+        for entry in _listed_dir_entries(factor_dir / "incremental")
+        if _is_yearly_factor_value_file(entry)
+    )
+    return files
 
 
 def _unique_existing_dirs(paths: tuple[Path, ...]) -> tuple[Path, ...]:

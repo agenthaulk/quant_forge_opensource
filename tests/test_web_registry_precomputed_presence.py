@@ -294,12 +294,78 @@ def test_multi_factor_backtest_route_rejects_dangling_precomputed_member(web_con
 
 
 def test_registry_row_precomputed_values_present_null_on_probe_error(monkeypatch, web_config, web_app) -> None:
+    """Coarse-grained contract: ANY exception from ``has_stored_values`` maps
+    to ``None`` at the API layer, regardless of what raised it."""
+
     _save_precomputed_factor(web_config, "COMPOSITE_BROKEN")
 
     def _raise(self, *, factor_id, factor_name, formula):
         raise RuntimeError("probe boom")
 
     monkeypatch.setattr(FactorValueStore, "has_stored_values", _raise)
+
+    status, _, body = _get(f"{web_app}/api/registry/factors")
+    by_id = {row["factor_id"]: row for row in json.loads(body.decode("utf-8"))["factors"]}
+
+    assert by_id["COMPOSITE_BROKEN"]["precomputed_values_present"] is None
+
+
+# ---------------------------------------------------------------------------
+# (e2) the probe itself: a filesystem error PROPAGATES, never reads as absence
+# ---------------------------------------------------------------------------
+
+
+def test_has_stored_values_raises_when_listing_fails(tmp_path, monkeypatch) -> None:
+    """Unit contract: ``has_stored_values`` raises when it cannot observe
+    presence — it must never fold an unreadable root into a confirmed-absent
+    ``False`` (the bug this closes: an I/O failure used to be swallowed by
+    ``_safe_is_dir``/``_safe_child_dirs`` and reported as "no values")."""
+
+    root = tmp_path / "factor_values"
+    root.mkdir()
+    store = FactorValueStore(root, write_root=root)
+
+    def _raising_iterdir(self):
+        raise PermissionError("simulated unreadable directory")
+
+    monkeypatch.setattr(Path, "iterdir", _raising_iterdir)
+
+    with pytest.raises(PermissionError, match="simulated unreadable directory"):
+        store.has_stored_values(
+            factor_id="COMPOSITE_X", factor_name="composite_x", formula="precomputed:factor_id=COMPOSITE_X"
+        )
+
+
+def test_registry_row_precomputed_values_present_null_on_real_probe_io_error(
+    monkeypatch, web_config, web_app
+) -> None:
+    """The REAL (non-monkeypatched-method) propagation path also lands ``None``.
+
+    Unlike ``test_registry_row_precomputed_values_present_null_on_probe_error``
+    (which replaces the whole ``has_stored_values`` method with a raising
+    stub), this drives ``has_stored_values``'s OWN new non-swallowing code:
+    the configured values root is created on disk (so it is observably a
+    directory) but its listing is forced to fail, exactly the "unreadable
+    values root" scenario the fix targets. The patch is scoped to that one
+    resolved root so unrelated listings (factor definitions under
+    ``factor_root``, a different directory) are unaffected.
+    """
+
+    _save_precomputed_factor(web_config, "COMPOSITE_BROKEN")
+    probe_root = FactorValueStore(
+        web_config.paths.factor_values_root or web_config.paths.factor_values_overlay_root,
+        write_root=web_config.paths.factor_values_overlay_root,
+    ).root
+    probe_root.mkdir(parents=True, exist_ok=True)
+
+    real_iterdir = Path.iterdir
+
+    def _raising_iterdir(self):
+        if self == probe_root:
+            raise PermissionError("simulated unreadable values root")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", _raising_iterdir)
 
     status, _, body = _get(f"{web_app}/api/registry/factors")
     by_id = {row["factor_id"]: row for row in json.loads(body.decode("utf-8"))["factors"]}
