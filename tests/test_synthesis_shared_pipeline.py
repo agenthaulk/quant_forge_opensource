@@ -401,6 +401,51 @@ def test_period_ics_rejects_revised_matrix_interior_value() -> None:
         )
 
 
+def test_period_ics_payload_is_proxy_frozen() -> None:
+    """The ``ics`` payload rejects in-place mutation at BOTH nesting levels:
+    a frozen dataclass alone only freezes attribute rebinding, so the
+    constructor wraps fresh copies in read-only proxies."""
+
+    dates, close, members = _build_fixture()
+    _outcome, _working, sweep = _seam_sweep(members, dates, close, "zscore")
+    signal_index = next(iter(sweep.ics))
+    factor = next(iter(sweep.ics[signal_index]))
+    with pytest.raises(TypeError):
+        sweep.ics[signal_index] = {}  # type: ignore[index]
+    with pytest.raises(TypeError):
+        sweep.ics[signal_index][factor] = 0.5  # type: ignore[index]
+
+
+def test_period_ics_rejects_swapped_payload_values() -> None:
+    """The poisoning scenario, payload side: an otherwise-honest sweep whose
+    nested IC dict carries ONE changed value (swapped in via
+    ``dataclasses.replace``, the route left open once the proxies block
+    in-place writes) passes every INPUT fingerprint — same matrix, same
+    close, same grid — and must be refused by the payload self-hash."""
+
+    dates, close, members = _build_fixture()
+    _outcome, working, sweep = _seam_sweep(members, dates, close, "zscore")
+    doctored = {
+        signal_index: dict(row) for signal_index, row in sweep.ics.items()
+    }
+    signal_index = sorted(doctored)[len(doctored) // 2]
+    factor = sorted(doctored[signal_index])[0]
+    original = doctored[signal_index][factor]
+    doctored[signal_index][factor] = (0.0 if original != original else original) + 0.25
+    tampered = replace(sweep, ics=doctored)
+    with pytest.raises(ValueError, match="ics_content_hash"):
+        combine_fitted(
+            working,
+            method="ic_weighted",
+            close=close,
+            dates=dates,
+            delay=DELAY,
+            holding=HOLDING,
+            ic_min_periods=IC_MIN_PERIODS,
+            period_ics=tampered,
+        )
+
+
 # ---------------------------------------------------------------------------
 # The web workflow runs the forward-return IC sweep exactly once per run
 # ---------------------------------------------------------------------------

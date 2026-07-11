@@ -149,6 +149,7 @@ from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 import hashlib
+from types import MappingProxyType
 import json
 from pathlib import Path
 import re
@@ -1096,6 +1097,18 @@ class PeriodICSweep:
     seam's whole lifetime — a sweep is produced and consumed inside one run,
     never persisted or shared across a version boundary; ``index=True`` so
     index identity is part of the content, not just the column values.
+
+    The ``ics`` PAYLOAD is guarded too, not just the inputs it came from: a
+    frozen dataclass only freezes attribute REBINDING, so without more, an
+    honest sweep's nested IC dict could be mutated in place after
+    construction and every input fingerprint would still pass. Two layers
+    close that: the constructor deep-wraps ``ics`` in ``MappingProxyType``
+    over fresh copies (in-place assignment raises ``TypeError``), and
+    ``ics_content_hash`` records a canonical hash of the payload at
+    construction which the consumer recomputes from the ``ics`` it actually
+    received (see ``_ics_payload_hash``) — so even a payload swapped in via
+    ``dataclasses.replace`` or reached through some aliasing hole is
+    rejected naming ``ics_content_hash``.
     """
 
     ics: Mapping[int, Mapping[str, float]]
@@ -1113,6 +1126,32 @@ class PeriodICSweep:
     close_first: tuple
     close_last: tuple
     close_content_hash: int
+    ics_content_hash: int
+
+
+def _ics_payload_hash(ics: Mapping[int, Mapping[str, float]]) -> int:
+    """Canonical content hash of a per-period IC payload.
+
+    Signal indices sorted numerically, factor keys sorted lexically, every
+    value rendered through ``float.hex()`` (with NaN normalized to the
+    literal ``"nan"`` — ``float("nan").hex()`` is platform-stable but the
+    explicit branch keeps the canonical form self-evident) so the digest is
+    deterministic for exactly the payload content: any added/removed period
+    or factor key and any changed value — including sign-of-zero and inf —
+    changes the digest. SHA-256 truncated to 64 bits, matching the int width
+    of the frame content hashes.
+    """
+
+    parts: list[str] = []
+    for signal_index in sorted(int(key) for key in ics):
+        parts.append(str(signal_index))
+        row = ics[signal_index]
+        for factor in sorted(str(key) for key in row):
+            value = float(row[factor])
+            parts.append(factor)
+            parts.append("nan" if value != value else value.hex())
+    digest = hashlib.sha256("|".join(parts).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big")
 
 
 def compute_period_ic_sweep(
@@ -1174,8 +1213,16 @@ def compute_period_ic_sweep(
         close_first = ()
         close_last = ()
     close_content_hash = int(pd.util.hash_pandas_object(validated_close, index=True).sum())
+    # Deep-freeze the payload: fresh inner copies (no caller-visible alias to
+    # the mutable originals) wrapped in read-only proxies, so an in-place
+    # mutation attempt raises instead of silently rewriting fitted inputs;
+    # the recorded payload hash is what catches anything that gets around
+    # the proxies (see PeriodICSweep's docstring).
+    frozen_ics: Mapping[int, Mapping[str, float]] = MappingProxyType(
+        {int(signal_index): MappingProxyType(dict(row)) for signal_index, row in ics.items()}
+    )
     return PeriodICSweep(
-        ics=ics,
+        ics=frozen_ics,
         dates=tuple(calendar),
         grid=tuple(grid),
         delay=delay,
@@ -1190,6 +1237,7 @@ def compute_period_ic_sweep(
         close_first=close_first,
         close_last=close_last,
         close_content_hash=close_content_hash,
+        ics_content_hash=_ics_payload_hash(frozen_ics),
     )
 
 
@@ -1262,8 +1310,13 @@ def _validate_period_ic_sweep(
     forward-return pass the seam exists to avoid paying twice — and its row
     count, first/last row fingerprints, and content hash are compared
     against ``close_row_count`` / ``close_first`` / ``close_last`` /
-    ``close_content_hash``. Every mismatch, matrix or close, raises
-    ``ValueError`` naming that specific field.
+    ``close_content_hash``. And the sweep's OWN payload is re-hashed from
+    the ``ics`` actually received and compared against the construction-time
+    ``ics_content_hash``, so a nested IC value mutated or swapped after
+    construction cannot ride an otherwise-honest sweep (the payload is also
+    proxy-frozen at construction; the hash is the backstop for anything that
+    gets around the proxies). Every mismatch — matrix, close, or payload —
+    raises ``ValueError`` naming that specific field.
     """
 
     if not isinstance(period_ics, PeriodICSweep):
@@ -1307,6 +1360,13 @@ def _validate_period_ic_sweep(
         "close_first": close_first,
         "close_last": close_last,
         "close_content_hash": close_content_hash,
+        # Payload self-integrity: unlike the input fingerprints above (sweep-
+        # recorded vs THIS call's own computation), this one recomputes the
+        # canonical hash from the ``ics`` payload as RECEIVED and compares it
+        # to the hash recorded at construction — a payload mutated in place
+        # (past the read-only proxies) or swapped via dataclasses.replace no
+        # longer matches what compute_period_ic_sweep actually measured.
+        "ics_content_hash": _ics_payload_hash(period_ics.ics),
     }
     for name, value in expected.items():
         actual = getattr(period_ics, name)
