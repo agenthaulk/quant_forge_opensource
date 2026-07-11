@@ -1150,7 +1150,11 @@ def _ics_payload_hash(ics: Mapping[int, Mapping[str, float]]) -> int:
             value = float(row[factor])
             parts.append(factor)
             parts.append("nan" if value != value else value.hex())
-    digest = hashlib.sha256("|".join(parts).encode("utf-8")).digest()
+    # Length-prefixed encoding: a plain delimiter join is not injective when a
+    # factor key may itself contain the delimiter, so every part carries its
+    # own length and no crafted key can straddle a boundary.
+    encoded = "".join(f"{len(part)}:{part}" for part in parts)
+    digest = hashlib.sha256(encoded.encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "big")
 
 
@@ -1279,8 +1283,16 @@ def _validate_period_ic_sweep(
     start_signal_index: int,
     matrix: pd.DataFrame,
     close: pd.DataFrame,
-) -> None:
+) -> dict[int, dict[str, float]]:
     """Guard the ``period_ics`` reuse seam against a foreign sweep (provenance check).
+
+    Returns the validated payload as a fresh private SNAPSHOT, and the caller
+    must fit from that snapshot, never from ``period_ics.ics`` — validating
+    an aliased mutable mapping and then reading it again is a check-then-use
+    hole: a payload swapped in via ``dataclasses.replace`` can hash-match at
+    validation time and still be mutated through the alias afterwards (web
+    jobs run threads). The hash below is computed OVER THE SNAPSHOT, so the
+    bytes verified are exactly the bytes consumed.
 
     The seam exists only so a caller that already ran
     :func:`compute_period_ic_sweep` over the SAME sorted directed matrix /
@@ -1324,6 +1336,10 @@ def _validate_period_ic_sweep(
             "period_ics must be a PeriodICSweep built by compute_period_ic_sweep, "
             f"not {type(period_ics).__name__}"
         )
+    ics_snapshot: dict[int, dict[str, float]] = {
+        int(signal_index): {str(factor): float(value) for factor, value in row.items()}
+        for signal_index, row in period_ics.ics.items()
+    }
     columns = tuple(str(column) for column in matrix.columns)
     if len(matrix):
         matrix_first_key = tuple(matrix.index[0])
@@ -1362,11 +1378,13 @@ def _validate_period_ic_sweep(
         "close_content_hash": close_content_hash,
         # Payload self-integrity: unlike the input fingerprints above (sweep-
         # recorded vs THIS call's own computation), this one recomputes the
-        # canonical hash from the ``ics`` payload as RECEIVED and compares it
-        # to the hash recorded at construction — a payload mutated in place
-        # (past the read-only proxies) or swapped via dataclasses.replace no
-        # longer matches what compute_period_ic_sweep actually measured.
-        "ics_content_hash": _ics_payload_hash(period_ics.ics),
+        # canonical hash from the private SNAPSHOT of the payload as RECEIVED
+        # and compares it to the hash recorded at construction — a payload
+        # mutated in place (past the read-only proxies) or swapped via
+        # dataclasses.replace no longer matches what compute_period_ic_sweep
+        # actually measured, and hashing the snapshot (not the caller-visible
+        # mapping) closes the check-then-use window.
+        "ics_content_hash": _ics_payload_hash(ics_snapshot),
     }
     for name, value in expected.items():
         actual = getattr(period_ics, name)
@@ -1377,6 +1395,7 @@ def _validate_period_ic_sweep(
                 "compute_period_ic_sweep over this SAME directed matrix, close frame, "
                 "dates, delay, holding, and start_signal_index"
             )
+    return ics_snapshot
 
 
 def fitted_weights_by_rebalance(
@@ -1458,7 +1477,11 @@ def fitted_weights_by_rebalance(
         # REVISED close series with matching shape and edge keys cannot pass
         # as this run's provenance — integrity beats trusting the sweep's
         # saved copy.
-        _validate_period_ic_sweep(
+        # The fit consumes the validator's returned snapshot, never the
+        # sweep's own mapping: the snapshot is what the payload hash was
+        # computed over, so no alias can change the ICs between the check
+        # and their use.
+        ic_by_period = _validate_period_ic_sweep(
             period_ics,
             calendar=calendar,
             grid=grid,
@@ -1468,7 +1491,6 @@ def fitted_weights_by_rebalance(
             matrix=working,
             close=close,
         )
-        ic_by_period = period_ics.ics
     equal = {factor: 1.0 / len(factors) for factor in factors}
 
     entries: list[FittedWeightEntry] = []
@@ -1728,10 +1750,29 @@ def redundancy_from_period_ics(sweep: PeriodICSweep) -> dict[str, object]:
     row/column order (the directed matrix columns). Unobservable cells —
     fewer than 2 common finite periods, or a zero-variance series — stay a
     real ``None`` (FP-4), never a fabricated number.
+
+    The advisory surface verifies the payload's SELF-integrity before
+    rendering from it: the crowding matrix is user-facing diagnostics, so a
+    payload mutated or swapped after construction must refuse here exactly
+    as it does on the weight-driving seam — this function has no matrix or
+    close frame to re-derive input provenance from (that binding lives in
+    ``_validate_period_ic_sweep``), but the construction-time
+    ``ics_content_hash`` needs nothing beyond the sweep itself.
     """
 
+    ic_by_period: dict[int, dict[str, float]] = {
+        int(signal_index): {str(factor): float(value) for factor, value in row.items()}
+        for signal_index, row in sweep.ics.items()
+    }
+    # Hash the snapshot, then render only from the snapshot — same
+    # check-then-use discipline as the weight-driving seam.
+    if _ics_payload_hash(ic_by_period) != sweep.ics_content_hash:
+        raise ValueError(
+            "period_ics sweep field 'ics_content_hash' does not match the payload: "
+            "the ics mapping was mutated or replaced after compute_period_ic_sweep "
+            "recorded it; rebuild the sweep instead of editing it"
+        )
     factors = list(sweep.columns)
-    ic_by_period = sweep.ics
     closed_periods = sorted(ic_by_period)
     series = {
         factor: np.asarray([ic_by_period[s][factor] for s in closed_periods], dtype=float)

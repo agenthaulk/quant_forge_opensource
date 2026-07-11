@@ -444,6 +444,47 @@ def test_period_ics_rejects_swapped_payload_values() -> None:
             ic_min_periods=IC_MIN_PERIODS,
             period_ics=tampered,
         )
+    # The advisory surface refuses the same swapped payload: the crowding
+    # matrix renders to users, so it must not be built from ICs the sweep
+    # never measured.
+    with pytest.raises(ValueError, match="ics_content_hash"):
+        redundancy_from_period_ics(tampered)
+
+
+def test_period_ics_consumers_fit_from_a_private_snapshot() -> None:
+    """Check-then-use discipline: validation hashes a private snapshot and
+    consumers read ONLY that snapshot, so an alias to a replace()-swapped
+    mutable payload cannot change the ICs after the hash check. Pinned at
+    the contract level: with an honest-content plain-dict payload (hash
+    matches), the fitted result equals the genuine-sweep result, and
+    mutating the aliased dict AFTER the run changes nothing retroactively
+    while a SUBSEQUENT run refuses on the now-stale hash."""
+
+    dates, close, members = _build_fixture()
+    _outcome, working, sweep = _seam_sweep(members, dates, close, "zscore")
+    aliased = {
+        signal_index: dict(row) for signal_index, row in sweep.ics.items()
+    }
+    honest_swap = replace(sweep, ics=aliased)
+    kwargs = dict(
+        method="ic_weighted",
+        close=close,
+        dates=dates,
+        delay=DELAY,
+        holding=HOLDING,
+        ic_min_periods=IC_MIN_PERIODS,
+    )
+    baseline = combine_fitted(working, **kwargs, period_ics=sweep)
+    swapped = combine_fitted(working, **kwargs, period_ics=honest_swap)
+    assert swapped.composite.equals(baseline.composite)
+    assert swapped.weights_path == baseline.weights_path
+    signal_index = sorted(aliased)[0]
+    factor = sorted(aliased[signal_index])[0]
+    aliased[signal_index][factor] = 99.0
+    with pytest.raises(ValueError, match="ics_content_hash"):
+        combine_fitted(working, **kwargs, period_ics=honest_swap)
+    with pytest.raises(ValueError, match="ics_content_hash"):
+        redundancy_from_period_ics(honest_swap)
 
 
 # ---------------------------------------------------------------------------
