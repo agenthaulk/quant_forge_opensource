@@ -1079,12 +1079,23 @@ class PeriodICSweep:
     panel's numbers into the §4.4 point-in-time fit. ``dates``/``grid`` are
     the validated calendar and the ``rebalance_indices`` grid the sweep was
     walked over; ``columns``/``matrix_row_count``/``matrix_first_key``/
-    ``matrix_last_key`` fingerprint the SORTED directed matrix the sweep
-    read (first/last ``(trade_date, instrument)`` index tuples);
-    ``close_row_count``/``close_first``/``close_last`` fingerprint the
-    validated close frame (first/last ``(trade_date, instrument, close)``
-    rows) — recorded for audit even though a consumer never re-reads
-    ``close`` to confirm it (see :func:`compute_period_ic_sweep`).
+    ``matrix_last_key``/``matrix_content_hash`` fingerprint the SORTED
+    directed matrix the sweep read (first/last ``(trade_date, instrument)``
+    index tuples, plus a whole-frame content hash so a foreign matrix with
+    matching shape and edge keys but REVISED interior scores is caught, not
+    just a resized or reordered one); ``close_row_count``/``close_first``/
+    ``close_last``/``close_content_hash`` fingerprint the validated close
+    frame the sweep actually swept (first/last ``(trade_date, instrument,
+    close)`` rows, plus the same kind of whole-frame content hash) —
+    recorded for audit and, on the ``period_ics`` reuse path, re-checked
+    hard against an independently re-validated close frame rather than
+    trusted on the sweep's say-so (see :func:`_validate_period_ic_sweep`).
+    Both content hashes are
+    ``int(pandas.util.hash_pandas_object(frame, index=True).sum())``:
+    deterministic within a single process/pandas version, which is the
+    seam's whole lifetime — a sweep is produced and consumed inside one run,
+    never persisted or shared across a version boundary; ``index=True`` so
+    index identity is part of the content, not just the column values.
     """
 
     ics: Mapping[int, Mapping[str, float]]
@@ -1097,9 +1108,11 @@ class PeriodICSweep:
     matrix_row_count: int
     matrix_first_key: tuple
     matrix_last_key: tuple
+    matrix_content_hash: int
     close_row_count: int
     close_first: tuple
     close_last: tuple
+    close_content_hash: int
 
 
 def compute_period_ic_sweep(
@@ -1117,7 +1130,11 @@ def compute_period_ic_sweep(
     matrix (``sort_index()``), validate the calendar and the close frame,
     derive the shared ``rebalance_indices`` grid, and run the per-period rank
     IC sweep — then returns a :class:`PeriodICSweep` fingerprinting every
-    input the sweep depended on. This is the ONLY supported way to build a
+    input the sweep depended on, INCLUDING a whole-frame content hash of the
+    sorted matrix and of the validated close frame (not just their shape and
+    edge rows), so a foreign sweep built from a REVISED close series or
+    REVISED scores with an otherwise matching shape cannot pass downstream
+    provenance checks. This is the ONLY supported way to build a
     ``PeriodICSweep``: :func:`combine_fitted` / :func:`fitted_weights_by_rebalance`
     and :func:`redundancy_from_period_ics` accept nothing else for their
     sweep argument, so a caller cannot hand in a hand-rolled or foreign
@@ -1148,6 +1165,7 @@ def compute_period_ic_sweep(
     else:
         matrix_first_key = ()
         matrix_last_key = ()
+    matrix_content_hash = int(pd.util.hash_pandas_object(working, index=True).sum())
     close_columns = list(_CLOSE_COLUMNS)
     if len(validated_close):
         close_first = tuple(validated_close[close_columns].iloc[0])
@@ -1155,6 +1173,7 @@ def compute_period_ic_sweep(
     else:
         close_first = ()
         close_last = ()
+    close_content_hash = int(pd.util.hash_pandas_object(validated_close, index=True).sum())
     return PeriodICSweep(
         ics=ics,
         dates=tuple(calendar),
@@ -1166,9 +1185,11 @@ def compute_period_ic_sweep(
         matrix_row_count=len(working),
         matrix_first_key=matrix_first_key,
         matrix_last_key=matrix_last_key,
+        matrix_content_hash=matrix_content_hash,
         close_row_count=len(validated_close),
         close_first=close_first,
         close_last=close_last,
+        close_content_hash=close_content_hash,
     )
 
 
@@ -1209,6 +1230,7 @@ def _validate_period_ic_sweep(
     holding: int,
     start_signal_index: int,
     matrix: pd.DataFrame,
+    close: pd.DataFrame,
 ) -> None:
     """Guard the ``period_ics`` reuse seam against a foreign sweep (provenance check).
 
@@ -1225,12 +1247,23 @@ def _validate_period_ic_sweep(
     against the value THIS call computed independently (dates, grid, delay,
     holding, start_signal_index, matrix columns, matrix row count, first/last
     matrix index key); a single mismatch raises ``ValueError`` naming the
-    field. The close-frame provenance is bound by construction: the only way
-    to build a ``PeriodICSweep`` is through ``compute_period_ic_sweep``, which
-    reads and fingerprints the close frame itself (``close_row_count`` /
-    ``close_first`` / ``close_last``) — this call never re-reads ``close`` to
-    confirm it (that full-panel read is exactly the cost the seam exists to
-    avoid paying twice).
+    field.
+
+    Shape and edge-key equality alone are not enough: a foreign sweep built
+    from a REVISED close series or REVISED score values, but with matching
+    dates/grid/params/columns/row-count/edge keys, would otherwise pass and
+    silently supply foreign IC weights to the §4.4 fit. Two content hashes
+    close that gap. ``matrix_content_hash`` is recomputed over THIS call's
+    own sorted ``matrix`` and compared against the sweep's recorded value.
+    The close frame is independently re-validated here via
+    ``_validated_close_frame`` — yes, this reinstates that validation/copy on
+    the reuse-seam path; integrity beats trusting the sweep's saved copy,
+    and the cost is a cheap column-select/copy, not the expensive full-panel
+    forward-return pass the seam exists to avoid paying twice — and its row
+    count, first/last row fingerprints, and content hash are compared
+    against ``close_row_count`` / ``close_first`` / ``close_last`` /
+    ``close_content_hash``. Every mismatch, matrix or close, raises
+    ``ValueError`` naming that specific field.
     """
 
     if not isinstance(period_ics, PeriodICSweep):
@@ -1245,6 +1278,20 @@ def _validate_period_ic_sweep(
     else:
         matrix_first_key = ()
         matrix_last_key = ()
+    matrix_content_hash = int(pd.util.hash_pandas_object(matrix, index=True).sum())
+    # Re-derive the close fingerprints from the ACTUAL close frame this call
+    # was handed, rather than trusting the sweep's recorded copy: the frame
+    # returned here is function-local and dropped when this call returns
+    # (never retained past the existing release points in the caller).
+    validated_close = _validated_close_frame(close)
+    close_columns = list(_CLOSE_COLUMNS)
+    if len(validated_close):
+        close_first = tuple(validated_close[close_columns].iloc[0])
+        close_last = tuple(validated_close[close_columns].iloc[-1])
+    else:
+        close_first = ()
+        close_last = ()
+    close_content_hash = int(pd.util.hash_pandas_object(validated_close, index=True).sum())
     expected: dict[str, object] = {
         "dates": tuple(calendar),
         "grid": tuple(grid),
@@ -1255,6 +1302,11 @@ def _validate_period_ic_sweep(
         "matrix_row_count": len(matrix),
         "matrix_first_key": matrix_first_key,
         "matrix_last_key": matrix_last_key,
+        "matrix_content_hash": matrix_content_hash,
+        "close_row_count": len(validated_close),
+        "close_first": close_first,
+        "close_last": close_last,
+        "close_content_hash": close_content_hash,
     }
     for name, value in expected.items():
         actual = getattr(period_ics, name)
@@ -1300,10 +1352,15 @@ def fitted_weights_by_rebalance(
     ``start_signal_index`` — a bare mapping is rejected with ``TypeError``
     (foreign or hand-rolled ICs would silently break the point-in-time fit),
     and every provenance field the sweep recorded is checked hard against the
-    values THIS call computes, by :func:`_validate_period_ic_sweep`. The
-    close-frame provenance is bound by construction: the sweep can only exist
-    if ``compute_period_ic_sweep`` already read and fingerprinted the close
-    frame, which is why ``close`` is never re-read on this path.
+    values THIS call computes, by :func:`_validate_period_ic_sweep`,
+    INCLUDING a whole-frame content hash of the sorted matrix and of the
+    close frame — not just their shape and edge rows — so a foreign sweep
+    built from a REVISED close series or REVISED scores with a matching
+    shape cannot pass as this run's provenance. ``close`` IS re-read on this
+    path (re-run through :func:`_validated_close_frame`, a cheap
+    column-select/copy) specifically to make that content check possible;
+    the sweep's saved close fingerprints are audit metadata, never trusted
+    on their own.
     """
 
     _require_score_matrix(directed_matrix)
@@ -1334,11 +1391,13 @@ def fitted_weights_by_rebalance(
     else:
         # Reuse seam (see _validate_period_ic_sweep): the caller already ran
         # this exact sweep via compute_period_ic_sweep and hands it back so
-        # the full-panel forward-return pass runs once, not once per
-        # consumer. ``close`` is intentionally left unread here — the ICs
-        # already encode it, and the close-frame provenance is bound by
-        # construction through compute_period_ic_sweep plus its recorded
-        # close fingerprints — which is the peak-memory win.
+        # the expensive full-panel forward-return pass runs once, not once
+        # per consumer. ``close`` IS re-read here (a cheap column-select/
+        # copy through _validated_close_frame, not the expensive pass the
+        # seam exists to avoid paying twice) so a foreign sweep built from a
+        # REVISED close series with matching shape and edge keys cannot pass
+        # as this run's provenance — integrity beats trusting the sweep's
+        # saved copy.
         _validate_period_ic_sweep(
             period_ics,
             calendar=calendar,
@@ -1347,6 +1406,7 @@ def fitted_weights_by_rebalance(
             holding=holding,
             start_signal_index=start_signal_index,
             matrix=working,
+            close=close,
         )
         ic_by_period = period_ics.ics
     equal = {factor: 1.0 / len(factors) for factor in factors}
@@ -1457,11 +1517,12 @@ def combine_fitted(
     (``combine_fitted`` sorts with ``directed_matrix.sort_index()``, so the
     sweep must be computed from that same sorted frame). A bare mapping is
     rejected with ``TypeError``, and every provenance field the sweep
-    recorded is validated hard against this call's own computed values, so
-    the seam cannot silently corrupt the point-in-time weights. The
-    close-frame provenance is bound by construction through
-    ``compute_period_ic_sweep`` plus its recorded close fingerprints — this
-    call never re-reads ``close`` to confirm it.
+    recorded — INCLUDING a content hash of the matrix and of the close frame,
+    not just their shape and edge rows — is validated hard against this
+    call's own freshly computed values, so the seam cannot silently corrupt
+    the point-in-time weights with a foreign sweep built from a REVISED
+    close series or REVISED scores. ``close`` IS re-read on this path (see
+    :func:`_validate_period_ic_sweep`) to make that content check possible.
     """
 
     entries = fitted_weights_by_rebalance(

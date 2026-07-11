@@ -17,8 +17,11 @@ inputs. This file pins that the seams are a pure structural refactor:
 - the ``period_ics`` seam accepts ONLY a ``PeriodICSweep`` and validates its
   provenance hard — a raw mapping is a ``TypeError`` naming
   ``compute_period_ic_sweep``, and a tampered sweep field (grid, dates,
-  columns, matrix row count, ...) is a ``ValueError`` naming that field,
-  never a silent point-in-time leak;
+  columns, matrix row count, matrix/close content hash, ...) is a
+  ``ValueError`` naming that field, never a silent point-in-time leak. The
+  content hashes specifically close the gap structural checks alone leave
+  open: a foreign matrix or close frame with the SAME shape and edge keys
+  but REVISED interior values is caught too, not just a resized one;
 - the web workflow runs the ``_period_rank_ic_by_signal_index`` sweep exactly
   ONCE per fitted run and ONCE per a-priori run (it used to run it twice on the
   fitted branch), via exactly one ``compute_period_ic_sweep`` call.
@@ -310,6 +313,91 @@ def test_period_ics_tampered_sweep_field_raises_value_error(
             holding=HOLDING,
             ic_min_periods=IC_MIN_PERIODS,
             period_ics=tampered,
+        )
+
+
+@pytest.mark.parametrize("field", ["matrix_content_hash", "close_content_hash"])
+def test_period_ics_tampered_content_hash_raises_value_error(field: str) -> None:
+    """The content-hash fields participate in the same field-named rejection
+    as the structural fields. Tampering is ``genuine + 1`` (never a fixed
+    constant), so the tampered value is guaranteed to differ from the value
+    this call recomputes."""
+
+    dates, close, members = _build_fixture()
+    _outcome, working, sweep = _seam_sweep(members, dates, close, "zscore")
+    tampered = replace(sweep, **{field: getattr(sweep, field) + 1})
+    with pytest.raises(ValueError, match=field):
+        combine_fitted(
+            working,
+            method="ic_weighted",
+            close=close,
+            dates=dates,
+            delay=DELAY,
+            holding=HOLDING,
+            ic_min_periods=IC_MIN_PERIODS,
+            period_ics=tampered,
+        )
+
+
+def _interior_close_row(close: pd.DataFrame, dates: list[pd.Timestamp]) -> pd.Index:
+    """One close row that is interior under any stable ordering: a middle
+    instrument on a middle date, so the first/last edge fingerprints the
+    validator also checks stay untouched and only the CONTENT hash can catch
+    the revision."""
+
+    mask = (close["instrument"] == INSTRUMENTS[2]) & (close["trade_date"] == dates[15])
+    index = close.index[mask]
+    assert len(index) == 1
+    return index
+
+
+def test_period_ics_rejects_revised_close_interior_value() -> None:
+    """The poisoning scenario, close side: a close series with the SAME shape
+    and SAME first/last rows but ONE revised interior value must not drive
+    weights fitted from the original series — every structural field still
+    matches, and ``close_content_hash`` is what refuses."""
+
+    dates, close, members = _build_fixture()
+    _outcome, working, sweep = _seam_sweep(members, dates, close, "zscore")
+    revised_close = close.copy()
+    row = _interior_close_row(revised_close, dates)
+    revised_close.loc[row, "close"] = float(revised_close.loc[row, "close"].iloc[0]) + 1.0
+    with pytest.raises(ValueError, match="close_content_hash"):
+        combine_fitted(
+            working,
+            method="ic_weighted",
+            close=revised_close,
+            dates=dates,
+            delay=DELAY,
+            holding=HOLDING,
+            ic_min_periods=IC_MIN_PERIODS,
+            period_ics=sweep,
+        )
+
+
+def test_period_ics_rejects_revised_matrix_interior_value() -> None:
+    """The poisoning scenario, matrix side: a directed matrix with the SAME
+    index (row count and edge keys unchanged) but ONE revised interior score
+    must not consume a sweep computed from the original values —
+    ``matrix_content_hash`` is what refuses."""
+
+    dates, close, members = _build_fixture()
+    _outcome, working, sweep = _seam_sweep(members, dates, close, "zscore")
+    revised = working.copy()
+    key = (dates[15], INSTRUMENTS[2])
+    revised.loc[key, "F_ALPHA"] = float(revised.loc[key, "F_ALPHA"]) + 1.0
+    assert tuple(revised.index[0]) == tuple(working.index[0])
+    assert tuple(revised.index[-1]) == tuple(working.index[-1])
+    with pytest.raises(ValueError, match="matrix_content_hash"):
+        combine_fitted(
+            revised,
+            method="ic_weighted",
+            close=close,
+            dates=dates,
+            delay=DELAY,
+            holding=HOLDING,
+            ic_min_periods=IC_MIN_PERIODS,
+            period_ics=sweep,
         )
 
 
