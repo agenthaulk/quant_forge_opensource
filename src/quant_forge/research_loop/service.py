@@ -686,13 +686,37 @@ class ResearchLoopService:
             "research_memory_enabled": self.research_memory_enabled,
         }
         self.trace_store.write_config_snapshot(run_id, config_snapshot)
-        seed_assessment = self._assess_factor(
-            seed,
-            role="seed",
-            parent_seed_factor_id=seed.factor_id,
-            objective_weights=objective_weights,
-            gate=candidate_gate,
-        )
+        # BUG #006: the seed's own score can be unscorable (a nonzero-weight
+        # component's required metric is unavailable, e.g. net_annualized_return
+        # under INSUFFICIENT_ANNUALIZATION_HISTORY on a short RD window). That
+        # must never abort the whole run — it mirrors the existing per-trial
+        # exception handling below (final_trials loop), just for the one
+        # assessment that happens before any candidate exists. A caught failure
+        # here degrades to seed_assessment=None (never a fabricated score) and
+        # is recorded on the trace for observability.
+        seed_assessment: FactorAssessmentBundle | None
+        try:
+            seed_assessment = self._assess_factor(
+                seed,
+                role="seed",
+                parent_seed_factor_id=seed.factor_id,
+                objective_weights=objective_weights,
+                gate=candidate_gate,
+            )
+        except _ResearchRunCancelled:
+            raise
+        except Exception as exc:
+            seed_assessment = None
+            self.trace_store.append_trace(
+                {
+                    "run_id": run_id,
+                    "lane_id": "seed",
+                    "phase": "seed_unscorable",
+                    "timestamp": utc_timestamp(),
+                    "schema_version": "qf.research_loop.trace.v1",
+                    "error": str(exc),
+                }
+            )
 
         trials: list[_ResearchTrial] = []
         blocked_plans: list[StructuredFactorExperimentResult] = []
@@ -933,7 +957,10 @@ class ResearchLoopService:
                     round_index=strategy_round_index,
                     planned_count=len(planned[:max_candidates]),
                     results=results,
-                    seed_score=seed_assessment.selection_score,
+                    # FP-4: no fabricated score when the seed itself could not
+                    # be scored (_round_summary_payload's _finite_float_or_none
+                    # already turns None into an honest missing seed_score).
+                    seed_score=(seed_assessment.selection_score if seed_assessment is not None else None),
                     dedup_summary=dedup_summary,
                     accepted_candidate_ids=accepted,
                     winner_candidate_ref=winner.factor.factor_id if winner is not None else None,
@@ -954,7 +981,10 @@ class ResearchLoopService:
             accepted_candidate_ids=accepted,
             seed_assessment=seed_assessment,
             comparison_rows=(
-                _assessment_comparison_row(seed_assessment, seed),
+                # FP-4: an unscorable seed contributes no row rather than one
+                # built from a fabricated/missing score (mirrors the candidate
+                # side, which already only emits rows for a real assessment).
+                *((_assessment_comparison_row(seed_assessment, seed),) if seed_assessment is not None else ()),
                 *tuple(
                     _assessment_comparison_row(candidate.assessment, candidate.factor, candidate.hypothesis.text)
                     for candidate in results
@@ -1693,7 +1723,7 @@ class ResearchLoopService:
         run_id: str,
         seed_factor_id: str,
         result: ResearchLoopResult,
-        seed_assessment: FactorAssessmentBundle,
+        seed_assessment: FactorAssessmentBundle | None,
         config_snapshot: dict[str, Any],
     ) -> None:
         """Append one honest run-history row (kind "rd") at run completion.
@@ -1701,15 +1731,25 @@ class ResearchLoopService:
         Artifact paths are stored relative to ``artifact_root`` (or dropped
         when outside it); metric highlights keep their MetricValue statuses so
         an unavailable metric is never rendered as a number (FP-2/FP-4).
+        ``seed_assessment`` is None when the seed itself could not be scored
+        (BUG #006); the run is still recorded, honestly, with empty highlights
+        and an unavailable data_window rather than being skipped or crashing
+        on a missing evaluation.
         """
         created_at = datetime.now(UTC)
         best = result.candidates[0] if result.candidates else None
-        highlight_source = (best.evaluation if best is not None else seed_assessment.evaluation).metrics
-        highlights = {
-            name: metric_highlight(highlight_source[name])
-            for name in RD_RUN_HIGHLIGHT_METRICS
-            if name in highlight_source
-        }
+        highlight_evaluation = (
+            best.evaluation if best is not None else (seed_assessment.evaluation if seed_assessment is not None else None)
+        )
+        highlights = (
+            {
+                name: metric_highlight(highlight_evaluation.metrics[name])
+                for name in RD_RUN_HIGHLIGHT_METRICS
+                if name in highlight_evaluation.metrics
+            }
+            if highlight_evaluation is not None
+            else {}
+        )
         artifact_paths_rel = [
             path_rel
             for path_rel in (
@@ -1723,7 +1763,11 @@ class ResearchLoopService:
             kind=RD_RUN_INDEX_KIND,
             factor_ids=tuple(dict.fromkeys((seed_factor_id, *result.accepted_candidate_ids))),
             created_at=created_at.isoformat(),
-            data_window=evaluation_data_window(seed_assessment.evaluation),
+            data_window=(
+                evaluation_data_window(highlight_evaluation)
+                if highlight_evaluation is not None
+                else {"start_date": None, "end_date": None, "status": "unavailable"}
+            ),
             config_fingerprint=canonical_fingerprint(
                 {"kind": RD_RUN_INDEX_KIND, "seed_factor_id": seed_factor_id, "config": config_snapshot}
             ),
@@ -1752,12 +1796,41 @@ def objective_weights_for(objective: str) -> ResearchObjectiveWeights:
     raise ValueError("objective must be one of: rank_ic, rank_icir, annualized_return, balanced")
 
 
+class _RequiredMetricUnavailable(ValueError):
+    """A nonzero-weight scoring component has no available metric value.
+
+    BUG #006: this is a ``ValueError`` subclass (not a new exception family)
+    so every existing ``except ValueError`` / ``except Exception`` catch —
+    including the pre-existing per-trial rejection handling in ``run_once``'s
+    final-trial loop and (now) the seed-assessment handling right above it —
+    keeps catching it unchanged. The message is a typed, parseable reason
+    (``metric_unavailable:<name> (<status>[: <warning codes>])``) so a
+    rejected candidate/seed carries WHY it was skipped instead of an opaque
+    trace, matching the ``INSUFFICIENT_*``-style typed reasons already used by
+    ``candidate_gate``.
+    """
+
+
 def score_candidate(
     evaluation: EvaluationResult,
     backtest: BacktestResult,
     weights: ResearchObjectiveWeights,
     split_weighted_icir: float | None = None,
 ) -> float:
+    """Weighted objective score.
+
+    Weight-gated laziness (BUG #006, F-1/FP-2 style honesty): a component
+    whose weight is 0 is never fetched, so a metric that is genuinely
+    unavailable (e.g. ``net_annualized_return`` under
+    ``INSUFFICIENT_ANNUALIZATION_HISTORY`` on a short RD window) cannot raise
+    when the objective does not even use it. A component with a NONZERO
+    weight whose required metric is unavailable still raises
+    ``_RequiredMetricUnavailable`` — the caller (a candidate's final-trial
+    evaluation, or the seed's own assessment) is responsible for treating
+    that as "this factor cannot be scored" rather than letting it propagate
+    and abort the whole run.
+    """
+
     split_component = 0.0
     if weights.weighted_split_icir > 0:
         split_component = (
@@ -1783,11 +1856,11 @@ def _required_backtest_metric(backtest: BacktestResult, name: str) -> float:
             detail = metric.status
             if metric.warning_codes:
                 detail = f"{detail}: {', '.join(metric.warning_codes)}"
-            raise ValueError(f"{name} is unavailable ({detail})")
+            raise _RequiredMetricUnavailable(f"metric_unavailable:{name} ({detail})")
         return float(metric.value)
     value = getattr(backtest, name)
     if value is None:
-        raise ValueError(f"{name} is unavailable")
+        raise _RequiredMetricUnavailable(f"metric_unavailable:{name} (missing)")
     return float(value)
 
 
@@ -2997,7 +3070,7 @@ def _round_summary_payload(
     round_index: int | None,
     planned_count: int,
     results: list[ResearchCandidateResult],
-    seed_score: float,
+    seed_score: float | None,
     dedup_summary: dict[str, object],
     accepted_candidate_ids: tuple[str, ...],
     winner_candidate_ref: str | None = None,
@@ -3040,16 +3113,20 @@ def _round_summary_payload(
 
 
 def _rd_warnings_count(
-    seed_assessment: FactorAssessmentBundle,
+    seed_assessment: FactorAssessmentBundle | None,
     candidates: tuple[ResearchCandidateResult, ...],
 ) -> int:
     """Distinct warning messages plus distinct warning codes across the run."""
 
-    sources: list[Any] = [
-        seed_assessment.evaluation,
-        seed_assessment.selection_backtest,
-        seed_assessment.external_oos_backtest,
-    ]
+    sources: list[Any] = (
+        [
+            seed_assessment.evaluation,
+            seed_assessment.selection_backtest,
+            seed_assessment.external_oos_backtest,
+        ]
+        if seed_assessment is not None
+        else []
+    )
     for candidate in candidates:
         sources.extend((candidate.evaluation, candidate.backtest))
         if candidate.selection_backtest is not None:
