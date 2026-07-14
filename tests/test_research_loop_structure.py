@@ -2317,6 +2317,31 @@ def test_research_loop_completes_honestly_when_seed_and_all_candidates_unscorabl
     assert rows[-1]["data_window"]["status"] == "unavailable"
 
 
+def test_research_loop_seed_assessment_non_metric_exception_fails_loudly(monkeypatch, tmp_path: Path) -> None:
+    # PF-F1: the seed-assessment except clause (BUG #006) must catch ONLY
+    # _RequiredMetricUnavailable. Any other exception - a programming error,
+    # I/O failure, or artifact corruption - is a real failure and must
+    # propagate exactly as it did before fe23744 (loud failure), never
+    # relabeled seed_unscorable. Contrast with
+    # test_research_loop_completes_honestly_when_seed_and_all_candidates_unscorable
+    # above, where the metric-unavailable path still degrades gracefully.
+    paths = create_demo_workspace(tmp_path / "demo")
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        deduplication=ResearchDeduplicationConfig(enabled=False),
+    )
+
+    def _boom(self, factor, **kwargs):
+        raise RuntimeError("seed evaluation blew up")
+
+    monkeypatch.setattr(ResearchLoopService, "_assess_factor", _boom)
+
+    with pytest.raises(RuntimeError, match="seed evaluation blew up"):
+        service.run_once("FTR_DEMO_SMALL_CAP", objective="balanced", max_candidates=3)
+
+
 def test_hypotheses_from_payload_warns_on_schema_or_task_mismatch() -> None:
     # COR-10 regression: schema/task drift is recorded (warned), not silently
     # accepted, but parsing still succeeds.

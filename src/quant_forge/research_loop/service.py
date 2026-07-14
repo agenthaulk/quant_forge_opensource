@@ -686,14 +686,17 @@ class ResearchLoopService:
             "research_memory_enabled": self.research_memory_enabled,
         }
         self.trace_store.write_config_snapshot(run_id, config_snapshot)
-        # BUG #006: the seed's own score can be unscorable (a nonzero-weight
-        # component's required metric is unavailable, e.g. net_annualized_return
-        # under INSUFFICIENT_ANNUALIZATION_HISTORY on a short RD window). That
-        # must never abort the whole run — it mirrors the existing per-trial
-        # exception handling below (final_trials loop), just for the one
-        # assessment that happens before any candidate exists. A caught failure
-        # here degrades to seed_assessment=None (never a fabricated score) and
-        # is recorded on the trace for observability.
+        # BUG #006 / PF-F1: the seed's own score can be unscorable (a
+        # nonzero-weight component's required metric is unavailable, e.g.
+        # net_annualized_return under INSUFFICIENT_ANNUALIZATION_HISTORY on a
+        # short RD window). That must never abort the whole run — it mirrors
+        # the existing per-trial exception handling below (final_trials
+        # loop), just for the one assessment that happens before any
+        # candidate exists. Only _RequiredMetricUnavailable degrades to
+        # seed_assessment=None (never a fabricated score) with a trace entry
+        # for observability; any other exception (a programming error, I/O
+        # failure, or artifact corruption) is a real failure and propagates
+        # exactly as it did before this handling existed.
         seed_assessment: FactorAssessmentBundle | None
         try:
             seed_assessment = self._assess_factor(
@@ -705,7 +708,7 @@ class ResearchLoopService:
             )
         except _ResearchRunCancelled:
             raise
-        except Exception as exc:
+        except _RequiredMetricUnavailable as exc:
             seed_assessment = None
             self.trace_store.append_trace(
                 {

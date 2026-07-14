@@ -20,6 +20,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+import quant_forge.apps.web.api as web_api
 import quant_forge.apps.web.server as web_server
 from quant_forge.apps.web.server import (
     _registry_factor_detail_payload,
@@ -125,3 +128,41 @@ def test_multi_factor_backtest_workflow_records_run_under_composite_id(tmp_path:
 
     by_composite = RunIndex(config.paths.artifact_root).search(factor_id=composite_id, kind="backtest")
     assert len(by_composite) == 1
+
+
+def test_multi_factor_backtest_workflow_payload_failure_leaves_no_dangling_run_row(
+    monkeypatch, tmp_path: Path
+) -> None:
+    # PF-F3: before this fix, the COMPOSITE_ RunIndex row was appended BEFORE
+    # _multi_factor_backtest_payload() was built; a payload-construction
+    # failure still triggered cleanup of the synthesized factor definition
+    # and overlay, but left the just-recorded RunIndex row dangling (a
+    # success-shaped row for a run that actually failed). Recording now sits
+    # LAST, immediately before return, so a payload failure records nothing.
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+    assert RunIndex(config.paths.artifact_root).read_rows() == []
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("payload assembly blew up")
+
+    monkeypatch.setattr(web_api, "_multi_factor_backtest_payload", _boom)
+
+    with pytest.raises(RuntimeError, match="payload assembly blew up"):
+        run_multi_factor_backtest_workflow(
+            config,
+            factor_refs=[
+                {"factor_id": "FTR_DEMO_SMALL_CAP", "direction": 1},
+                {"factor_id": "FTR_DEMO_MOMENTUM", "direction": -1},
+            ],
+            synthesis={"method": "equal_weight", "params": {}},
+            standardization={"method": "zscore", "params": {}},
+            parameters={"holding_days": 5},
+            rd_config=_rd_config(config),
+        )
+
+    # Cleanup ran (the synthesized COMPOSITE_ definition does not survive)
+    # AND the run index gained zero new rows.
+    remaining_ids = {factor.factor_id for factor in FactorRepository(config.paths.factor_root).list()}
+    assert not any(factor_id.startswith("COMPOSITE_") for factor_id in remaining_ids)
+    assert RunIndex(config.paths.artifact_root).read_rows() == []

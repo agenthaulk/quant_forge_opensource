@@ -1571,6 +1571,77 @@ def test_web_job_manager_fails_terminal_when_result_publication_fails(monkeypatc
     assert failed["slow"] is False
 
 
+def test_web_job_manager_cancel_before_recording_records_nothing_and_cancels() -> None:
+    # PF-F4 (completion-wins, rule a): a cancel observed BEFORE any recording
+    # call (the runner's cooperative _raise_if_cancelled checkpoint, mirrored
+    # here) finishes cancelled and records nothing.
+    manager = web_server._WebJobManager(slow_after_seconds=0.01)
+    rows: list[str] = []
+
+    def runner(cancel_event):
+        while not cancel_event.is_set():
+            time.sleep(0.005)
+        if cancel_event.is_set():
+            raise web_server._WebJobCancelled("cancelled for test")
+        rows.append("recorded")
+
+    started = manager.start("test", runner)
+    manager.cancel(started["job_id"])
+    final = _wait_for_manager_job(manager, started["job_id"])
+
+    assert final["status"] == "cancelled"
+    assert rows == []
+
+
+def test_web_job_manager_late_cancel_after_recording_keeps_completed_result() -> None:
+    # PF-F4 (completion-wins, rule b): the runner already returned here, so
+    # any recording it performed has already committed. A cancel_event that
+    # only flips true in the window between that return and terminal-state
+    # publication must not relabel the completed workflow as cancelled - the
+    # recorded row(s) would otherwise dangle under a "cancelled" job.
+    manager = web_server._WebJobManager(slow_after_seconds=0.01)
+    rows: list[str] = []
+
+    def runner(cancel_event):
+        rows.append("recorded")
+        cancel_event.set()
+        return {"ok": True}
+
+    started = manager.start("test", runner)
+    final = _wait_for_manager_job(manager, started["job_id"])
+
+    assert final["status"] == "completed"
+    assert rows == ["recorded"]
+
+
+def test_web_job_manager_publication_failure_after_recording_surfaces_failed_with_rows_standing(
+    monkeypatch,
+) -> None:
+    # PF-F4 (completion-wins, rule c): if terminal-state publication itself
+    # fails after recording already committed, the job surfaces "failed"
+    # with that error while the recorded rows stand untouched - RunIndex
+    # reflects computed truth, job state reflects delivery, and the two may
+    # honestly diverge in exactly this case.
+    manager = web_server._WebJobManager(slow_after_seconds=0.0)
+    rows: list[str] = []
+
+    def fail_public_json(value):
+        raise TypeError("bad result payload")
+
+    monkeypatch.setattr(web_server, "_web_public_json", fail_public_json)
+
+    def runner(cancel_event):
+        rows.append("recorded")
+        return {"ok": True}
+
+    started = manager.start("test", runner)
+    failed = _wait_for_manager_job(manager, started["job_id"])
+
+    assert failed["status"] == "failed"
+    assert failed["error"] == "job result serialization failed"
+    assert rows == ["recorded"]
+
+
 def test_web_public_json_normalizes_nonstandard_values(tmp_path) -> None:
     payload = web_server._web_public_json(
         {

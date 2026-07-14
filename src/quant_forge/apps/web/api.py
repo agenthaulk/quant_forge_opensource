@@ -1141,15 +1141,15 @@ def run_multi_factor_backtest_workflow(
         # BUG #007: record the composite backtest run under the COMPOSITE_
         # factor id so it reaches the registry evidence chain the same way a
         # CLI/workbench backtest does (mirrors WorkbenchService.run_backtest's
-        # kind/highlight semantics for a BacktestResult). This sits INSIDE the
-        # try so a recording failure is treated exactly like any other
-        # failure at this stage: the just-materialized composite definition
-        # and overlay are cleaned up by the except-clause below rather than
-        # leaving an inconsistent "recorded but then discarded" run behind.
-        _record_multi_factor_backtest_run(config, plan, run)
-        return _multi_factor_backtest_payload(
+        # kind/highlight semantics for a BacktestResult). PF-F3: recording sits
+        # LAST, after payload construction succeeds, so a payload-build failure
+        # never leaves a success-shaped run row behind; the except-clause below
+        # still cleans up the composite definition and overlay either way.
+        payload = _multi_factor_backtest_payload(
             plan, composite, prescan, run, evaluation_payload, redundancy
         )
+        _record_multi_factor_backtest_run(config, plan, run)
+        return payload
     except Exception:
         cleanup_composite_artifacts(
             config.paths.factor_root,
