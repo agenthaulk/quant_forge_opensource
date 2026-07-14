@@ -305,6 +305,9 @@ def _validate_factor_workflow(
     # which never wraps _record_run in a try/except either), and this sits
     # OUTSIDE the try/except above so a recording failure propagates as its
     # own error instead of triggering the compute-failure factor-restore path.
+    # PF-F4 residual: uniform last-look invariant — cancellation is observed
+    # immediately before the first record of every workflow.
+    _raise_if_cancelled(cancel_event)
     _record_validate_factor_runs(
         config,
         factor,
@@ -1148,6 +1151,11 @@ def run_multi_factor_backtest_workflow(
         payload = _multi_factor_backtest_payload(
             plan, composite, prescan, run, evaluation_payload, redundancy
         )
+        # PF-F4 residual: last look BEFORE recording begins — a cancel that
+        # arrives during payload assembly is still pre-recording, so it ends
+        # as a cooperative cancel (cleanup below, zero run rows), never a
+        # recorded-and-completed run.
+        _raise_if_cancelled(cancel_event)
         _record_multi_factor_backtest_run(config, plan, run)
         return payload
     except Exception:

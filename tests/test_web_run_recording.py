@@ -166,3 +166,47 @@ def test_multi_factor_backtest_workflow_payload_failure_leaves_no_dangling_run_r
     remaining_ids = {factor.factor_id for factor in FactorRepository(config.paths.factor_root).list()}
     assert not any(factor_id.startswith("COMPOSITE_") for factor_id in remaining_ids)
     assert RunIndex(config.paths.artifact_root).read_rows() == []
+
+
+def test_multi_factor_backtest_workflow_cancel_during_payload_assembly_records_nothing(
+    monkeypatch, tmp_path: Path
+) -> None:
+    # PF-F4 residual (re-verify probe): a cancel that flips true WHILE the
+    # response payload is being assembled is still pre-recording. The final
+    # checkpoint between payload construction and record_run must turn it
+    # into a cooperative cancel: composite cleanup runs, zero run rows land,
+    # and the job never publishes completed.
+    import threading
+
+    from quant_forge.apps.web.jobs import _WebJobCancelled
+
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig().resolve(tmp_path / "demo")
+    assert RunIndex(config.paths.artifact_root).read_rows() == []
+
+    cancel_event = threading.Event()
+    real_payload = web_api._multi_factor_backtest_payload
+
+    def _cancel_arrives_mid_assembly(*args, **kwargs):
+        cancel_event.set()
+        return real_payload(*args, **kwargs)
+
+    monkeypatch.setattr(web_api, "_multi_factor_backtest_payload", _cancel_arrives_mid_assembly)
+
+    with pytest.raises(_WebJobCancelled):
+        run_multi_factor_backtest_workflow(
+            config,
+            factor_refs=[
+                {"factor_id": "FTR_DEMO_SMALL_CAP", "direction": 1},
+                {"factor_id": "FTR_DEMO_MOMENTUM", "direction": -1},
+            ],
+            synthesis={"method": "equal_weight", "params": {}},
+            standardization={"method": "zscore", "params": {}},
+            parameters={"holding_days": 5},
+            rd_config=_rd_config(config),
+            cancel_event=cancel_event,
+        )
+
+    remaining_ids = {factor.factor_id for factor in FactorRepository(config.paths.factor_root).list()}
+    assert not any(factor_id.startswith("COMPOSITE_") for factor_id in remaining_ids)
+    assert RunIndex(config.paths.artifact_root).read_rows() == []
