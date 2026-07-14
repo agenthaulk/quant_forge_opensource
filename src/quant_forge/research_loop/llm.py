@@ -17,6 +17,15 @@ from quant_forge.research_loop.llm_contracts import (
     RD_LLM_SCHEMA_VERSION,
     normalize_review_payload,
 )
+# Closed vocabularies (SE-i/SE-ii) imported, not hand-copied, so the active_rules
+# statement-authentication grammar below can never silently drift from the
+# outcomes contract it re-authenticates against.
+from quant_forge.research_loop.outcomes import (
+    EVIDENCE_STRENGTHS,
+    ORIGINS,
+    REASON_CODES,
+    STAGES,
+)
 from quant_forge.research_loop.service import (
     ResearchGenerationMetadata,
     ResearchHypothesis,
@@ -38,6 +47,13 @@ class LLMHypothesisGenerator:
             provider=self.llm.provider,
             model=self.llm.model,
         )
+        # SE-iv visibility requirement: the active_rules channel's closed-
+        # template re-authentication must never silently drop a statement.
+        # This is the runtime-visible counter (a returned stats mapping is
+        # also independently available from `_active_rules_items_for_prompt`
+        # for direct unit testing); it reflects the most recent generation
+        # call only.
+        self.last_active_rules_stats: dict[str, int] = dict(_EMPTY_ACTIVE_RULES_STATS)
 
     def metadata(self) -> ResearchGenerationMetadata:
         return self._metadata
@@ -59,9 +75,13 @@ class LLMHypothesisGenerator:
         objective: str,
         max_candidates: int,
     ) -> tuple[ResearchHypothesis, ...]:
+        messages, active_rules_stats = _hypothesis_messages_and_stats(
+            seed, context=context, objective=objective, max_candidates=max_candidates
+        )
+        self.last_active_rules_stats = active_rules_stats
         result = generate_chat_text(
             self.llm,
-            _hypothesis_messages(seed, context=context, objective=objective, max_candidates=max_candidates),
+            messages,
             temperature=self._temperature,
             max_tokens=1200,
         )
@@ -178,6 +198,28 @@ def _hypothesis_messages(
     objective: str,
     max_candidates: int,
 ) -> list[dict[str, str]]:
+    """Thin, signature-stable wrapper over :func:`_hypothesis_messages_and_stats`.
+
+    Kept as a plain ``list[dict[str, str]]`` return (no stats tuple) because
+    existing tests call it directly and expect exactly that shape.
+    :meth:`LLMHypothesisGenerator.generate_with_context` calls
+    :func:`_hypothesis_messages_and_stats` directly instead, when it needs
+    the active_rules drop counter.
+    """
+
+    messages, _active_rules_stats = _hypothesis_messages_and_stats(
+        seed, context=context, objective=objective, max_candidates=max_candidates
+    )
+    return messages
+
+
+def _hypothesis_messages_and_stats(
+    seed: FactorDefinition,
+    *,
+    context: ResearchContext | None = None,
+    objective: str,
+    max_candidates: int,
+) -> tuple[list[dict[str, str]], dict[str, int]]:
     field_catalog = _catalog_for_prompt(
         context.field_catalog if context is not None and context.field_catalog else tuple(list_available_fields())
     )
@@ -192,6 +234,13 @@ def _hypothesis_messages(
     # statement + observation_count reach the prompt, max 5 items per tier.
     memory_failures = _memory_items_for_prompt(context.recent_failures) if context is not None else []
     memory_findings = _memory_items_for_prompt(context.recent_successes) if context is not None else []
+    # SE-iv bounded active_rules channel: its OWN closed-template
+    # re-authentication (never the plain memory gate above) and its OWN
+    # visible drop counter (S1-F11 -- a template mismatch must never
+    # silently vanish a human-activated rule without a trace).
+    active_rules, active_rules_stats = _active_rules_items_for_prompt(
+        context.active_rules if context is not None else ()
+    )
     mechanism_guidance = _mechanism_guidance_for_prompt(seed)
     system = (
         "You are Quant Forge's RD hypothesis generator. Return one JSON object only. "
@@ -213,7 +262,9 @@ def _hypothesis_messages(
         "parameter search separately. Do not use placeholder fields such as seed, seed_score, or factor_score. "
         "Mention non-ST only when the seed uses an is_st filter. "
         "Do not invent data fields or unsupported formulas. Do not request parameter-search fallback; "
-        "if no executable idea is available, return an empty hypotheses list."
+        "if no executable idea is available, return an empty hypotheses list. "
+        "Active steering rules are human-approved research guidance: honor them and do not propose a "
+        "candidate that contradicts one without naming the contradiction in the rationale."
     )
     user = (
         f"Seed factor:\n{json.dumps(_factor_summary(seed), ensure_ascii=False)}\n\n"
@@ -224,6 +275,7 @@ def _hypothesis_messages(
         f"Recent failure hints: {json.dumps(next_hints, ensure_ascii=False)}\n"
         f"Research memory failures (avoid repeating): {json.dumps(memory_failures, ensure_ascii=False)}\n"
         f"Research memory findings (build on if relevant): {json.dumps(memory_findings, ensure_ascii=False)}\n"
+        f"Active steering rules (human-activated): {json.dumps(active_rules, ensure_ascii=False)}\n"
         f"Mechanism guidance: {json.dumps(mechanism_guidance, ensure_ascii=False)}\n"
         f"Generate up to {max_candidates} distinct hypotheses. "
         "Each rationale must include: economic mechanism, formula transformation, expected failure mode, "
@@ -240,7 +292,8 @@ def _hypothesis_messages(
         "\"source_detail\":\"...\",\"parameter_search_fallback\":false}]}. "
         "Always set parameter_search_fallback=false for LLM hypotheses."
     )
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    return messages, active_rules_stats
 
 
 def _repair_messages(
@@ -371,6 +424,108 @@ def _memory_items_for_prompt(items: tuple[dict[str, Any], ...] | list[dict[str, 
         if len(bounded) >= _MEMORY_PROMPT_ITEM_LIMIT:
             break
     return bounded
+
+
+# ---------------------------------------------------------------------------
+# SE-iv: active_rules bounded prompt channel with its OWN closed-template
+# re-authentication. Rules can be promoted from EITHER the local candidate-
+# gate statements above (_MEMORY_STATEMENT_PATTERNS) OR from a
+# ResearchOutcome-derived observation (research_loop/outcomes.py, SE-i/SE-ii),
+# so the accepted-template set here is the UNION of both shapes -- everything
+# the engine can actually mint into a statement, nothing else.
+# ---------------------------------------------------------------------------
+
+
+def _closed_alternation(values: Any) -> str:
+    return "|".join(re.escape(str(value)) for value in sorted(values))
+
+
+_OUTCOME_ORIGIN_PATTERN = _closed_alternation(ORIGINS)
+_OUTCOME_STAGE_PATTERN = _closed_alternation(STAGES)
+# Narrower than the full closed VERDICTS vocabulary on purpose: outcomes.py's
+# own outcome_to_observations() mints ZERO observations for "unknown"/
+# "not_applicable" verdicts (FP-4/R-F2 -- they carry no scientific answer), so
+# a statement claiming either of those verdicts could never have been
+# genuinely minted and must not authenticate. The grammar matches shapes
+# ACTUALLY minted by the engine, not merely well-typed ones.
+_OUTCOME_VERDICT_PATTERN = "passed|blocked"
+_OUTCOME_REASON_PATTERN = _closed_alternation(REASON_CODES)
+_OUTCOME_STRENGTH_PATTERN = _closed_alternation(EVIDENCE_STRENGTHS)
+# Dimension-token grammar mirrors outcomes.OutcomeScope's own dimension regex
+# (bounded lowercase/digit/underscore/dot/hyphen token). This is a STRUCTURAL
+# grammar, not a closed string set, so it is reproduced here (with a pointer
+# comment) rather than importing outcomes.py's module-private regex object.
+_OUTCOME_TOKEN_PATTERN = r"[a-z0-9_.\-]{1,32}"
+_OUTCOME_FAMILY_PATTERN = rf"unknown|{_OUTCOME_TOKEN_PATTERN}"
+_OUTCOME_SCOPE_KEY_PATTERN = (
+    rf"global|(?:(?:asset|universe|family|horizon|settings)={_OUTCOME_TOKEN_PATTERN})"
+    rf"(?:;(?:asset|universe|family|horizon|settings)={_OUTCOME_TOKEN_PATTERN})*"
+)
+# outcomes._statement_for's closed template:
+# "[origin/stage] verdict: REASON; family=...; strength=...; scope=...".
+# Every alternation is DERIVED from outcomes.py's imported closed vocabularies
+# (ORIGINS/STAGES/REASON_CODES/EVIDENCE_STRENGTHS), never hand-copied, so this
+# cannot silently drift from the contract it re-authenticates against
+# (S1-F11: a re-authentication gate that falls out of sync with what the
+# engine actually mints would either reject legitimate statements or accept
+# foreign ones -- importing the vocabulary tuples instead of retyping their
+# members closes that drift risk structurally).
+_OUTCOME_STATEMENT_PATTERN = re.compile(
+    rf"^\[(?:{_OUTCOME_ORIGIN_PATTERN})/(?:{_OUTCOME_STAGE_PATTERN})\] "
+    rf"(?:{_OUTCOME_VERDICT_PATTERN}): (?:{_OUTCOME_REASON_PATTERN}); "
+    rf"family=(?:{_OUTCOME_FAMILY_PATTERN}); "
+    rf"strength=(?:{_OUTCOME_STRENGTH_PATTERN}); "
+    rf"scope=(?:{_OUTCOME_SCOPE_KEY_PATTERN})$"
+)
+
+# Union of every statement shape the engine can mint: the two local
+# candidate-gate templates PLUS the outcomes-contract grammar.
+_ACTIVE_RULES_STATEMENT_PATTERNS = _MEMORY_STATEMENT_PATTERNS + (_OUTCOME_STATEMENT_PATTERN,)
+
+_ACTIVE_RULES_PROMPT_ITEM_LIMIT = 5
+_EMPTY_ACTIVE_RULES_STATS: dict[str, int] = {"total": 0, "accepted": 0, "dropped": 0}
+
+
+def _active_rules_items_for_prompt(
+    items: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Bounded, closed-template-authenticated active_rules items (SE-iv).
+
+    Mirrors :func:`_memory_items_for_prompt`'s read-time authentication
+    discipline but against the WIDER accepted-template set above. Unlike that
+    passive memory-recall channel, active_rules are human-activated steering:
+    a statement failing authentication is DROPPED and counted in the returned
+    stats mapping instead of vanishing without a trace (S1-F11) --
+    ``{"total": len(items), "accepted": forwarded count, "dropped": examined
+    and rejected count}``. (``dropped`` only counts items actually examined:
+    an input longer than the prompt cap that already found enough conforming
+    statements stops early, same as the existing memory channel's cap.)
+    """
+
+    total = len(items)
+    bounded: list[dict[str, Any]] = []
+    dropped = 0
+    for item in items:
+        if not isinstance(item, dict):
+            dropped += 1
+            continue
+        statement = " ".join(str(item.get("statement") or "").split())
+        if len(statement) > _MEMORY_STATEMENT_MAX_CHARS or not any(
+            pattern.match(statement) for pattern in _ACTIVE_RULES_STATEMENT_PATTERNS
+        ):
+            dropped += 1
+            continue
+        bounded.append(
+            {
+                "statement": statement,
+                "scope": str(item.get("scope") or "global"),
+                "observation_count": int(item.get("observation_count") or 0),
+            }
+        )
+        if len(bounded) >= _ACTIVE_RULES_PROMPT_ITEM_LIMIT:
+            break
+    stats = {"total": total, "accepted": len(bounded), "dropped": dropped}
+    return bounded, stats
 
 
 def _catalog_for_prompt(items: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> list[dict[str, str]]:

@@ -18,6 +18,17 @@ Invariants:
 - statements pass :func:`quant_forge.lineage.store.redact_free_text` before
   reaching disk; evidence refs must be run ids or artifact-root-relative
   paths, never absolute paths.
+
+Review events (SE-iii, DECISIONS.md "2026-07-13 -- Self-evolution engine
+CP0"): promoted rule/finding/failure ROWS are never mutated to express human
+governance decisions. Instead ``activations.jsonl`` is a SEPARATE append-only
+event log of ``activate`` / ``deactivate`` / ``retire`` / ``unretire``
+decisions; "effective" rule activation or finding/failure retirement is a
+PURE function of the latest valid event per signature (:meth:`
+ResearchMemoryStore.rule_states`, :meth:`ResearchMemoryStore.
+retired_signatures`) and is never derivable from promotion output alone. A
+promoted rule row's ``status`` therefore stays ``needs_human_review`` forever
+(FP-2): promotion structurally cannot mint activity.
 """
 
 from __future__ import annotations
@@ -29,17 +40,33 @@ from pathlib import Path
 import re
 from typing import Any, Iterable, Mapping
 
-from quant_forge.lineage.store import canonical_fingerprint, redact_free_text
+# ``_advisory_file_lock`` is module-private in lineage.store but this reuses
+# the SAME lock primitive on purpose (SE-ix / S2-F10): the lineage store
+# already established the pattern of serializing read-then-append critical
+# sections on JSONL files with a sidecar ``fcntl.flock``; goals.py similarly
+# imports lineage.store's private relative-path guard rather than forking a
+# second implementation.
+from quant_forge.lineage.store import _advisory_file_lock, canonical_fingerprint, redact_free_text
 
 RESEARCH_MEMORY_SCHEMA_VERSION = "qf.research_memory.v1"
 MEMORY_KINDS = ("rule", "finding", "failure")
 RULE_CANDIDATE_STATUS = "needs_human_review"
 FAILURE_SIGNATURE_CLASSES = frozenset({"gate_blocked", "validation_error"})
 
+# --- review events (SE-iii): append-only activate/deactivate/retire/unretire ---
+RESEARCH_MEMORY_REVIEW_SCHEMA_VERSION = "qf.memory_review.v1"
+REVIEW_ACTIONS = ("activate", "deactivate", "retire", "unretire")
+_RULE_REVIEW_ACTIONS = frozenset({"activate", "deactivate"})
+_RETIRE_REVIEW_ACTIONS = frozenset({"retire", "unretire"})
+_RETIRE_TARGET_KINDS = frozenset({"finding", "failure"})
+
 _KIND_FILES = {"rule": "rules.jsonl", "finding": "findings.jsonl", "failure": "failures.jsonl"}
 _ACTIVE_ROW_STATUSES = frozenset({"active", RULE_CANDIDATE_STATUS})
 _MEMORY_DIR = "research_memory"
 _OBSERVATIONS_FILE = "observations.jsonl"
+_REVIEW_EVENTS_FILE = "activations.jsonl"
+_LOCK_FILE = "memory.lock"
+_EVENT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -116,6 +143,74 @@ class PromotionDecision:
         _require_iso_timestamp(self.last_seen)
         for ref in self.evidence_refs:
             _require_relative_ref(ref)
+
+
+@dataclass(frozen=True)
+class MemoryReviewEvent:
+    """One append-only human governance decision over a promoted row (SE-iii).
+
+    ``event_id`` is never a stored field: it is the kernel
+    :func:`canonical_fingerprint` over the FULL payload (:meth:`to_dict`,
+    schema_version included) computed by :meth:`event_id`, mirroring how
+    :class:`PromotionDecision` rows derive ``entry_id`` outside the dataclass.
+    Because nothing is excluded from the fingerprint (not even ``decided_at``),
+    only an EXACT byte-identical replay collapses to the same id — a genuinely
+    new decision (even one immediately reversing a prior one) always mints a
+    new event, and the previous decision remains readable in the log (FP-2:
+    rows/events are never mutated).
+    """
+
+    target_kind: str
+    target_signature: str
+    reviewed_entry_id: str
+    action: str
+    actor: str
+    decided_at: str
+    rationale: str = ""
+    supersedes: str = ""
+    schema_version: str = RESEARCH_MEMORY_REVIEW_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != RESEARCH_MEMORY_REVIEW_SCHEMA_VERSION:
+            raise ValueError(f"unsupported review event schema_version: {self.schema_version!r}")
+        if self.target_kind not in MEMORY_KINDS:
+            raise ValueError(f"unknown review target_kind: {self.target_kind!r}")
+        if self.action not in REVIEW_ACTIONS:
+            raise ValueError(f"unknown review action: {self.action!r}; must be one of {REVIEW_ACTIONS}")
+        if self.action in _RULE_REVIEW_ACTIONS and self.target_kind != "rule":
+            raise ValueError(f"action {self.action!r} is only valid for target_kind='rule', got {self.target_kind!r}")
+        if self.action in _RETIRE_REVIEW_ACTIONS and self.target_kind not in _RETIRE_TARGET_KINDS:
+            raise ValueError(
+                f"action {self.action!r} is only valid for target_kind in {sorted(_RETIRE_TARGET_KINDS)}, "
+                f"got {self.target_kind!r}"
+            )
+        if not self.target_signature.strip():
+            raise ValueError("target_signature is required")
+        if not self.reviewed_entry_id.strip():
+            raise ValueError("reviewed_entry_id is required")
+        if not self.actor.strip():
+            raise ValueError("actor is required")
+        _require_iso_timestamp(self.decided_at)
+        if self.supersedes and not _EVENT_ID_RE.fullmatch(self.supersedes):
+            raise ValueError(f"supersedes must be a sha256 hex event id or empty, got {self.supersedes!r}")
+
+    def event_id(self) -> str:
+        """Content identity of this event: fingerprint over the full payload."""
+
+        return canonical_fingerprint(self.to_dict())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "target_kind": self.target_kind,
+            "target_signature": self.target_signature,
+            "reviewed_entry_id": self.reviewed_entry_id,
+            "action": self.action,
+            "actor": self.actor,
+            "rationale": self.rationale,
+            "decided_at": self.decided_at,
+            "supersedes": self.supersedes,
+        }
 
 
 def promote(observations: Iterable[MemoryObservation]) -> tuple[PromotionDecision, ...]:
@@ -202,6 +297,20 @@ class ResearchMemoryStore:
     def observations_path(self) -> Path:
         return self.memory_root / _OBSERVATIONS_FILE
 
+    @property
+    def review_events_path(self) -> Path:
+        return self.memory_root / _REVIEW_EVENTS_FILE
+
+    @property
+    def _lock_path(self) -> Path:
+        # ONE sidecar lock file serializes every read-then-append critical
+        # section this store instance performs (observation append, the
+        # promote read-decide-append cycle, and review-event append). SE-ix /
+        # S2-F10: sharing one lock keeps cross-file interleavings (e.g. a
+        # promote() read racing an observation append) impossible, not merely
+        # each file's own append serialized in isolation.
+        return self.memory_root / _LOCK_FILE
+
     def path_for(self, kind: str) -> Path:
         if kind not in _KIND_FILES:
             raise ValueError(f"unknown memory kind: {kind!r}")
@@ -231,10 +340,14 @@ class ResearchMemoryStore:
             evidence_ref=evidence_ref,
             scope=redact_free_text(scope),
         )
-        _append_jsonl(
-            self.observations_path,
-            {"schema_version": RESEARCH_MEMORY_SCHEMA_VERSION, "record": "observation", **observation.to_dict()},
-        )
+        # Critical section (S2-F10): serialize this append against a
+        # concurrent promote_pending() read of the same file under the SAME
+        # store-wide lock, so a reader can never observe a torn write.
+        with _advisory_file_lock(self._lock_path):
+            _append_jsonl(
+                self.observations_path,
+                {"schema_version": RESEARCH_MEMORY_SCHEMA_VERSION, "record": "observation", **observation.to_dict()},
+            )
         return observation
 
     def promote_pending(self) -> tuple[dict[str, Any], ...]:
@@ -243,21 +356,67 @@ class ResearchMemoryStore:
         Duplicate submissions update ``observation_count``/``last_seen`` by
         appending a superseding row that preserves the original statement and
         ``first_seen``; nothing is ever rewritten in place. Idempotent when no
-        new observations arrived.
+        new observations arrived. NOTE: this method wraps the pure
+        :func:`promote` function's read-decide-append cycle in the store's
+        advisory lock; :func:`promote` itself stays lock-free and pure (S2-F10
+        locks the STORE method, never the pure policy function).
         """
 
-        decisions = promote(self._read_observations())
         appended: list[dict[str, Any]] = []
-        for decision in decisions:
-            row = self._row_for_decision(decision)
-            if row is not None:
-                _append_jsonl(self.path_for(decision.kind), row)
-                appended.append(row)
+        with _advisory_file_lock(self._lock_path):
+            decisions = promote(self._read_observations())
+            for decision in decisions:
+                row = self._row_for_decision(decision)
+                if row is not None:
+                    _append_jsonl(self.path_for(decision.kind), row)
+                    appended.append(row)
         return tuple(appended)
 
     def read_recent(self, kind: str, limit: int = 5) -> tuple[dict[str, Any], ...]:
         """Latest live rows for ``kind``: superseded rows dropped, newest first."""
 
+        live_by_signature = self._live_rows_by_signature(kind)
+        ordered = sorted(live_by_signature.values(), key=lambda row: str(row.get("last_seen") or ""), reverse=True)
+        return tuple(ordered[: max(limit, 0)])
+
+    def list_promoted(self, kind: str) -> tuple[dict[str, Any], ...]:
+        """Every live row for ``kind``, newest first, uncapped.
+
+        Unlike :meth:`read_recent` (bounded, for the LLM prompt feed) this is
+        the CLI/review listing path: it must show every live row so a
+        reviewer or ``qf memory rules list`` can see the whole pending/active
+        set, not just the 5 most recent.
+        """
+
+        live_by_signature = self._live_rows_by_signature(kind)
+        return tuple(sorted(live_by_signature.values(), key=lambda row: str(row.get("last_seen") or ""), reverse=True))
+
+    def resolve_signature_prefix(self, kind: str, prefix: str) -> dict[str, Any]:
+        """Resolve ``prefix`` to exactly one live row's signature for ``kind``.
+
+        An exact signature match always wins outright (so pasting a full
+        signature never trips over another signature that happens to extend
+        it as a prefix). Otherwise the prefix must match exactly one live
+        signature; zero or multiple matches raise ``ValueError`` naming the
+        candidates, which is the CLI's anti-fat-finger confirmation (R3): no
+        interactive prompts, an ambiguous or absent prefix simply fails.
+        """
+
+        if not prefix.strip():
+            raise ValueError("signature prefix must not be empty")
+        rows = self.list_promoted(kind)
+        exact = [row for row in rows if str(row.get("signature") or "") == prefix]
+        if len(exact) == 1:
+            return exact[0]
+        candidates = [row for row in rows if str(row.get("signature") or "").startswith(prefix)]
+        if not candidates:
+            raise ValueError(f"no {kind} signature matches prefix {prefix!r}")
+        if len(candidates) > 1:
+            matched = ", ".join(sorted(str(row.get("signature") or "") for row in candidates))
+            raise ValueError(f"ambiguous {kind} signature prefix {prefix!r} matches: {matched}")
+        return candidates[0]
+
+    def _live_rows_by_signature(self, kind: str) -> dict[str, dict[str, Any]]:
         rows = _read_jsonl(self.path_for(kind))
         superseded = {row.get("supersedes") for row in rows if row.get("supersedes")}
         live_by_signature: dict[str, dict[str, Any]] = {}
@@ -267,8 +426,133 @@ class ResearchMemoryStore:
             if str(row.get("status") or "") not in _ACTIVE_ROW_STATUSES:
                 continue
             live_by_signature[str(row.get("signature") or row.get("entry_id"))] = row
-        ordered = sorted(live_by_signature.values(), key=lambda row: str(row.get("last_seen") or ""), reverse=True)
-        return tuple(ordered[: max(limit, 0)])
+        return live_by_signature
+
+    # ------------------------------------------------------------------
+    # Review events (SE-iii): append-only human governance decisions layered
+    # OVER promoted rows. Rows are never mutated; "effective" state is always
+    # derived fresh from the latest valid event per signature.
+    # ------------------------------------------------------------------
+
+    def record_review_event(
+        self,
+        *,
+        target_kind: str,
+        target_signature: str,
+        reviewed_entry_id: str,
+        action: str,
+        actor: str,
+        rationale: str = "",
+        decided_at: str | None = None,
+        supersedes: str = "",
+    ) -> MemoryReviewEvent:
+        """Append one review decision. Exact-payload replays are idempotent:
+        an event whose id already exists on disk is dropped, not duplicated.
+        """
+
+        event = MemoryReviewEvent(
+            target_kind=target_kind,
+            target_signature=target_signature,
+            reviewed_entry_id=reviewed_entry_id,
+            action=action,
+            actor=redact_free_text(actor),
+            rationale=redact_free_text(rationale),
+            decided_at=decided_at if decided_at is not None else _utc_now_iso(),
+            supersedes=supersedes,
+        )
+        event_id = event.event_id()
+        with _advisory_file_lock(self._lock_path):
+            if not self._event_id_recorded(event_id):
+                _append_jsonl(self.review_events_path, {"event_id": event_id, **event.to_dict()})
+        return event
+
+    def rule_activation_events(self) -> dict[str, dict[str, Any]]:
+        """Latest 'rule' review event per signature, as dicts.
+
+        Richer than :meth:`rule_states`: callers that need more than the
+        derived active/inactive label (e.g. sorting by activation recency)
+        read ``decided_at``/``actor``/``rationale`` from here.
+        """
+
+        return {
+            signature: {"event_id": event.event_id(), **event.to_dict()}
+            for signature, event in self._latest_events_by_signature(frozenset({"rule"})).items()
+        }
+
+    def rule_states(self) -> dict[str, str]:
+        """Effective activation state per rule signature: {signature: "active"|"inactive"}.
+
+        Derived ONLY from the latest valid review event per signature
+        (activate -> active, deactivate -> inactive). A signature absent from
+        this mapping has never been reviewed and defaults to "inactive" —
+        callers must treat a missing key as inactive, never as active. This
+        is the ONLY path to "active": promoted rule ROWS keep status
+        ``needs_human_review`` forever and are never consulted here (FP-2).
+        """
+
+        return {
+            signature: ("active" if event["action"] == "activate" else "inactive")
+            for signature, event in self.rule_activation_events().items()
+        }
+
+    def retired_signatures(self, target_kind: str) -> frozenset[str]:
+        """Signatures whose latest valid review event for ``target_kind`` is
+        'retire' (never 'unretire'). ``target_kind`` must be 'finding' or
+        'failure' -- scoped per kind so retiring a finding can never also
+        hide an unrelated failure row that happens to share the signature
+        string (promote() can mint the same signature as both a rule and a
+        failure row for one signature group; kind-scoping keeps retirement
+        from unifying across kinds it was never decided for).
+        """
+
+        if target_kind not in _RETIRE_TARGET_KINDS:
+            raise ValueError(
+                f"retired_signatures target_kind must be one of {sorted(_RETIRE_TARGET_KINDS)}, got {target_kind!r}"
+            )
+        latest = self._latest_events_by_signature(frozenset({target_kind}))
+        return frozenset(signature for signature, event in latest.items() if event.action == "retire")
+
+    def _read_review_events(self) -> tuple[MemoryReviewEvent, ...]:
+        events: list[MemoryReviewEvent] = []
+        for row in _read_jsonl(self.review_events_path):
+            events.append(
+                MemoryReviewEvent(
+                    target_kind=str(row.get("target_kind") or ""),
+                    target_signature=str(row.get("target_signature") or ""),
+                    reviewed_entry_id=str(row.get("reviewed_entry_id") or ""),
+                    action=str(row.get("action") or ""),
+                    actor=str(row.get("actor") or ""),
+                    rationale=str(row.get("rationale") or ""),
+                    decided_at=str(row.get("decided_at") or ""),
+                    supersedes=str(row.get("supersedes") or ""),
+                )
+            )
+        return tuple(events)
+
+    def _event_id_recorded(self, event_id: str) -> bool:
+        for row in _read_jsonl(self.review_events_path):
+            if row.get("event_id") == event_id:
+                return True
+        return False
+
+    def _latest_events_by_signature(self, target_kinds: frozenset[str]) -> dict[str, MemoryReviewEvent]:
+        """Latest-by-``decided_at`` review event per signature, restricted to
+        ``target_kinds``. An event named by a later event's ``supersedes`` is
+        excluded from contention first, mirroring how promoted rows use
+        ``supersedes`` to identify the live end of a correction chain even
+        when timestamps alone would be ambiguous (e.g. clock skew across
+        processes); the remaining ("live") events per signature are then
+        ordered by ``decided_at`` with ``event_id`` as a stable tiebreak.
+        """
+
+        scoped = [event for event in self._read_review_events() if event.target_kind in target_kinds]
+        superseded_ids = {event.supersedes for event in scoped if event.supersedes}
+        live = [event for event in scoped if event.event_id() not in superseded_ids]
+        ordered = sorted(live, key=lambda event: (event.decided_at, event.event_id()))
+        latest: dict[str, MemoryReviewEvent] = {}
+        for event in ordered:
+            latest[event.target_signature] = event  # later in sorted order wins
+        return latest
 
     def _read_observations(self) -> tuple[MemoryObservation, ...]:
         observations: list[MemoryObservation] = []
