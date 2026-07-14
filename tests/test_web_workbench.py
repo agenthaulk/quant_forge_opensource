@@ -50,6 +50,18 @@ from quant_forge.research_loop.service import (
 )
 
 
+def _write_stub_artifact(path: Path) -> Path:
+    """BUG #007: web recording hashes the file at ``artifact_path`` the same
+    way the real evaluate_factor/run_factor_backtest always leave one there,
+    so seam fakes that only construct a result object must also leave a real
+    (if trivial) file at the path they claim.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}", encoding="utf-8")
+    return path
+
+
 # CP6-1 (D8): executable frontend code is delivered as static ES modules
 # referenced by the page (script type="module" src="/static/app.js").
 # Assertions about JS *delivery* (code text) therefore target the served
@@ -282,7 +294,7 @@ def test_web_validation_workflow_uses_edited_parameters(monkeypatch, tmp_path) -
             rank_ic_std=0.0,
             rank_icir=0.0,
             ic_days=1,
-            artifact_path=Path(artifact_root) / "evaluations" / f"{factor_id}.json",
+            artifact_path=_write_stub_artifact(Path(artifact_root) / "evaluations" / f"{factor_id}.json"),
             simulation_profile=simulation_profile,
         )
 
@@ -314,7 +326,7 @@ def test_web_validation_workflow_uses_edited_parameters(monkeypatch, tmp_path) -
             annualized_return=0.01,
             annualized_volatility=0.0,
             max_drawdown=0.0,
-            artifact_path=Path(artifact_root) / "backtests" / f"{factor_id}.json",
+            artifact_path=_write_stub_artifact(Path(artifact_root) / "backtests" / f"{factor_id}.json"),
             top_quantile=simulation_profile.top_quantile,
             transaction_costs=transaction_costs,
             simulation_profile=simulation_profile,
@@ -548,7 +560,7 @@ def test_web_run_idea_workflow_preserves_distinct_default_profiles(monkeypatch, 
             rank_ic_std=0.0,
             rank_icir=0.0,
             ic_days=1,
-            artifact_path=Path(artifact_root) / "evaluations" / f"{factor_id}.json",
+            artifact_path=_write_stub_artifact(Path(artifact_root) / "evaluations" / f"{factor_id}.json"),
             simulation_profile=simulation_profile,
         )
 
@@ -578,7 +590,7 @@ def test_web_run_idea_workflow_preserves_distinct_default_profiles(monkeypatch, 
             annualized_return=0.01,
             annualized_volatility=0.0,
             max_drawdown=0.0,
-            artifact_path=Path(artifact_root) / "backtests" / f"{factor_id}.json",
+            artifact_path=_write_stub_artifact(Path(artifact_root) / "backtests" / f"{factor_id}.json"),
             top_quantile=simulation_profile.top_quantile,
             simulation_profile=simulation_profile,
         )
@@ -1559,6 +1571,77 @@ def test_web_job_manager_fails_terminal_when_result_publication_fails(monkeypatc
     assert failed["slow"] is False
 
 
+def test_web_job_manager_cancel_before_recording_records_nothing_and_cancels() -> None:
+    # PF-F4 (completion-wins, rule a): a cancel observed BEFORE any recording
+    # call (the runner's cooperative _raise_if_cancelled checkpoint, mirrored
+    # here) finishes cancelled and records nothing.
+    manager = web_server._WebJobManager(slow_after_seconds=0.01)
+    rows: list[str] = []
+
+    def runner(cancel_event):
+        while not cancel_event.is_set():
+            time.sleep(0.005)
+        if cancel_event.is_set():
+            raise web_server._WebJobCancelled("cancelled for test")
+        rows.append("recorded")
+
+    started = manager.start("test", runner)
+    manager.cancel(started["job_id"])
+    final = _wait_for_manager_job(manager, started["job_id"])
+
+    assert final["status"] == "cancelled"
+    assert rows == []
+
+
+def test_web_job_manager_late_cancel_after_recording_keeps_completed_result() -> None:
+    # PF-F4 (completion-wins, rule b): the runner already returned here, so
+    # any recording it performed has already committed. A cancel_event that
+    # only flips true in the window between that return and terminal-state
+    # publication must not relabel the completed workflow as cancelled - the
+    # recorded row(s) would otherwise dangle under a "cancelled" job.
+    manager = web_server._WebJobManager(slow_after_seconds=0.01)
+    rows: list[str] = []
+
+    def runner(cancel_event):
+        rows.append("recorded")
+        cancel_event.set()
+        return {"ok": True}
+
+    started = manager.start("test", runner)
+    final = _wait_for_manager_job(manager, started["job_id"])
+
+    assert final["status"] == "completed"
+    assert rows == ["recorded"]
+
+
+def test_web_job_manager_publication_failure_after_recording_surfaces_failed_with_rows_standing(
+    monkeypatch,
+) -> None:
+    # PF-F4 (completion-wins, rule c): if terminal-state publication itself
+    # fails after recording already committed, the job surfaces "failed"
+    # with that error while the recorded rows stand untouched - RunIndex
+    # reflects computed truth, job state reflects delivery, and the two may
+    # honestly diverge in exactly this case.
+    manager = web_server._WebJobManager(slow_after_seconds=0.0)
+    rows: list[str] = []
+
+    def fail_public_json(value):
+        raise TypeError("bad result payload")
+
+    monkeypatch.setattr(web_server, "_web_public_json", fail_public_json)
+
+    def runner(cancel_event):
+        rows.append("recorded")
+        return {"ok": True}
+
+    started = manager.start("test", runner)
+    failed = _wait_for_manager_job(manager, started["job_id"])
+
+    assert failed["status"] == "failed"
+    assert failed["error"] == "job result serialization failed"
+    assert rows == ["recorded"]
+
+
 def test_web_public_json_normalizes_nonstandard_values(tmp_path) -> None:
     payload = web_server._web_public_json(
         {
@@ -1893,7 +1976,7 @@ def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
             rank_ic_std=0.0,
             rank_icir=0.0,
             ic_days=1,
-            artifact_path=Path(artifact_root) / "evaluations" / f"{factor_id}.json",
+            artifact_path=_write_stub_artifact(Path(artifact_root) / "evaluations" / f"{factor_id}.json"),
         )
 
     def fake_run_factor_backtest(factor_id, *, factor_root, data_root, artifact_root, simulation_profile):
@@ -1905,7 +1988,7 @@ def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
             annualized_return=0.01,
             annualized_volatility=0.0,
             max_drawdown=0.0,
-            artifact_path=Path(artifact_root) / "backtests" / f"{factor_id}.json",
+            artifact_path=_write_stub_artifact(Path(artifact_root) / "backtests" / f"{factor_id}.json"),
             simulation_profile=simulation_profile,
             net_annualized_return=0.01,
             net_long_short_sharpe=0.5,

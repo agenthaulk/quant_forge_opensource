@@ -242,3 +242,27 @@ OOS net return, rebalance rate, turnover rate, net/gross retention, and OOS
 decay. The public parameter search supports `full_grid` and
 `successive_halving`; successive halving is a two-stage budget strategy, not
 reinforcement learning.
+
+## Multi-Factor Synthesis Memory
+
+The multi-factor composite backtest is the most memory-intensive local
+workflow. Peak memory scales with panel rows times member count: it holds one
+standardized member matrix over the in-window panel, and the engine drive that
+follows is the next large allocator. `run_multi_factor_backtest_workflow` builds
+that matrix once — standardization, directions, and the per-period rank IC
+sweep are each computed a single time and shared between the fitted weight fit
+and the advisory redundancy diagnostic — and releases the per-member tidy score
+frames as soon as the matrix exists, before it drives the backtest engine, so
+the standardized matrix and the engine working set are not both at full size at
+the same instant.
+
+A Python-level `MemoryError` fails the job honestly: the background job runner
+catches `Exception` (`apps/web/jobs.py`) and records a failed job with a client
+error. A container cgroup out-of-memory kill is not the same event — the kernel
+delivers `SIGKILL`, which no in-process handler can catch, so the job vanishes
+with exit code 137 instead of a JSON error. Size container memory for the
+largest full-panel fitted run you intend to serve. Reference observation from
+integration testing: a ~3.19M-row `cn_a` panel fitted (`ic_weighted`) run
+completed in ~230 s on an unconstrained container; on a memory-tight container
+an earlier build that rebuilt the standardized matrix and the forward-return
+sweep once per consumer was OOM-killed (exit 137) before it could finish.

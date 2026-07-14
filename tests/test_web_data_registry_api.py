@@ -278,6 +278,7 @@ def test_registry_factors_lists_catalog_with_description_source_and_tags(web_app
         "description",
         "source",
         "tags",
+        "precomputed_values_present",
     }
     assert row["name"] == "demo_small_cap"
     assert row["formula"] == "-rank(market_cap)"
@@ -286,6 +287,9 @@ def test_registry_factors_lists_catalog_with_description_source_and_tags(web_app
     assert row["universe_filters"] == ["is_st == false"]
     assert row["description"] == "Small market-cap stocks receive higher scores."
     assert row["source"] == "demo"
+    # A formula-backed factor computes scores on demand: "are values present"
+    # is not a meaningful question, so the key stays null (FP-4).
+    assert row["precomputed_values_present"] is None
     tags = row["tags"]
     assert tags["schema_version"] == "qf.research_tags.v1"
     assert tags["subject_kind"] == "factor"

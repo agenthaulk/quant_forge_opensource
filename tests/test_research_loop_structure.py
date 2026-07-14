@@ -13,6 +13,7 @@ from quant_forge.core.contracts import (
     BacktestSegmentMetric,
     EvaluationResult,
     FactorDefinition,
+    MetricValue,
     SimulationProfile,
 )
 from quant_forge.data.local import create_demo_workspace
@@ -38,6 +39,7 @@ from quant_forge.research_loop.service import (
     ResearchGenerationMetadata,
     ResearchHypothesis,
     ResearchLoopService,
+    ResearchObjectiveWeights,
     ResearchSelfReview,
     _backtest_metrics,
     _candidate_from_hypothesis,
@@ -45,6 +47,7 @@ from quant_forge.research_loop.service import (
     _result_signature_from_scored,
     _result_signature_from_trace_entry,
     apply_gate,
+    score_candidate,
 )
 from quant_forge.research_loop.trace_store import ResearchTraceStore, utc_timestamp
 
@@ -2144,6 +2147,199 @@ def test_local_self_review_survives_null_backtest_metrics(tmp_path: Path) -> Non
     )
 
     assert review.source == "local_self_review"
+
+
+def test_score_candidate_skips_unavailable_metric_when_weight_is_zero() -> None:
+    # BUG #006 item 1 (weight-gated laziness): net_annualized_return is
+    # genuinely unavailable (insufficient_sample), but the objective assigns
+    # it zero weight, so score_candidate must never fetch/raise on it and
+    # must score purely from the nonzero-weighted IC/ICIR components.
+    evaluation = EvaluationResult(
+        factor_id="FTR_CAND",
+        observations=50,
+        coverage=1.0,
+        rank_ic_mean=0.04,
+        rank_ic_std=0.02,
+        rank_icir=2.0,
+        ic_days=50,
+        artifact_path=Path("eval.json"),
+    )
+    backtest = BacktestResult(
+        factor_id="FTR_CAND",
+        periods=1,
+        holding_days=90,
+        cumulative_return=0.05,
+        annualized_return=None,
+        annualized_volatility=None,
+        max_drawdown=None,
+        artifact_path=Path("backtest.json"),
+        net_annualized_return=None,
+        net_max_drawdown=None,
+        metrics={
+            "net_annualized_return": MetricValue(
+                value=None,
+                unit="return",
+                status="insufficient_sample",
+                observation_count=90,
+                minimum_required=126,
+                warning_codes=("INSUFFICIENT_ANNUALIZATION_HISTORY",),
+            )
+        },
+    )
+    ic_only_weights = ResearchObjectiveWeights(
+        weighted_split_icir=0.0,
+        rank_ic_mean=0.6,
+        rank_icir=0.4,
+        annualized_return=0.0,
+        max_drawdown=0.0,
+    )
+
+    score = score_candidate(evaluation, backtest, ic_only_weights, split_weighted_icir=0.0)
+
+    expected = evaluation.rank_ic_mean * ic_only_weights.rank_ic_mean + (
+        evaluation.rank_icir / 10.0
+    ) * ic_only_weights.rank_icir
+    assert score == pytest.approx(expected)
+
+    # Sanity check on the other side of the fix: a nonzero weight on the same
+    # unavailable metric still raises (never silently treated as 0 - FP-4),
+    # with the typed, parseable reason the rejection machinery below reads.
+    return_weighted = ResearchObjectiveWeights(
+        weighted_split_icir=0.0, rank_ic_mean=0.0, rank_icir=0.0, annualized_return=1.0, max_drawdown=0.0
+    )
+    with pytest.raises(ValueError, match=r"metric_unavailable:net_annualized_return \(insufficient_sample"):
+        score_candidate(evaluation, backtest, return_weighted, split_weighted_icir=0.0)
+
+
+def _demo_workspace_with_unscorable_seed(tmp_path: Path, *, horizon_days: int = 90) -> tuple[dict[str, Path], str]:
+    """A demo workspace whose seed (and therefore every generated candidate,
+    which inherits ``seed.horizon_days``) has a holding period long enough
+    that the 160-trading-day demo panel yields only one non-overlapping
+    backtest period. ``periods * holding_days`` (90) then falls under
+    ``MIN_ANNUALIZATION_EXPOSURE_DAYS`` (126), so ``net_annualized_return``
+    reports ``insufficient_sample`` (BUG #006 repro) while whole-sample Rank
+    IC stays available (the panel itself still has >= 126 trading dates).
+    """
+
+    paths = create_demo_workspace(tmp_path / "demo")
+    seed = FactorDefinition(
+        factor_id="FTR_DEMO_LONG_HOLD",
+        name="demo_long_hold_small_cap",
+        formula="-rank(market_cap)",
+        status="candidate",
+        description="Small market-cap thesis held long enough to trip the annualization floor.",
+        horizon_days=horizon_days,
+        universe_filters=("is_st == false",),
+        source="demo",
+    )
+    FactorRepository(paths["factor_root"]).save(seed)
+    return paths, seed.factor_id
+
+
+def test_research_loop_rejects_candidate_with_metric_unavailable_reason_and_completes(tmp_path: Path) -> None:
+    # BUG #006 item 2: a return-weighted objective plus a candidate whose
+    # in-sample backtest cannot report net_annualized_return must not raise
+    # and kill the run. The candidate is rejected with a typed
+    # metric_unavailable reason through the existing per-trial rejection
+    # machinery (final_trials loop -> blocked_plans), and the run completes.
+    paths, seed_id = _demo_workspace_with_unscorable_seed(tmp_path)
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        deduplication=ResearchDeduplicationConfig(enabled=False),
+    )
+
+    result = service.run_once(seed_id, objective="annualized_return", max_candidates=3)
+
+    assert result.candidates == ()
+    assert result.accepted_candidate_ids == ()
+    assert result.blocked_plans
+    assert all(
+        plan.error.startswith("metric_unavailable:net_annualized_return")
+        for plan in result.blocked_plans
+    )
+    assert result.trace_root is not None
+    trace_text = (result.trace_root / "trace.jsonl").read_text(encoding="utf-8")
+    assert "metric_unavailable:net_annualized_return" in trace_text
+    assert "experiment_failed" in trace_text
+
+
+def test_research_loop_completes_honestly_when_seed_and_all_candidates_unscorable(tmp_path: Path) -> None:
+    # BUG #006 item 3: when the seed's own score AND every candidate's score
+    # are unavailable (the default "balanced" objective also weights
+    # annualized_return > 0 - this is the exact CP-INT symptom), run_once must
+    # not raise. The round ends with zero scorable candidates and the run
+    # completes with the existing honest outcome semantics: no candidates, no
+    # optimization performed, a null (never fabricated) seed assessment/score.
+    paths, seed_id = _demo_workspace_with_unscorable_seed(tmp_path)
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        deduplication=ResearchDeduplicationConfig(enabled=False),
+    )
+
+    result = service.run_once(seed_id, objective="balanced", max_candidates=3)
+
+    assert result.candidates == ()
+    assert result.accepted_candidate_ids == ()
+    assert result.seed_assessment is None
+    assert result.no_optimization_performed is True
+    assert result.optimization_performed is False
+    # The seed row is omitted (never a fabricated/zero comparison row); any
+    # candidate rows would only appear for a real assessment, and there are
+    # none here.
+    assert result.comparison_rows == ()
+    assert result.report_path is not None and result.report_path.exists()
+
+    trace_text = (result.trace_root / "trace.jsonl").read_text(encoding="utf-8")
+    assert "seed_unscorable" in trace_text
+
+    run_paths = sorted((paths["artifact_root"] / "research_loop" / "runs").glob(f"rd_{seed_id}_*/run.json"))
+    assert run_paths
+    payload = json.loads(run_paths[-1].read_text(encoding="utf-8"))
+    # An honest terminal status recorded by the existing run-status logic
+    # (results empty + blocked_plans non-empty -> "partial"), never "failed"
+    # via an uncaught exception and never silently "completed".
+    assert payload["status"] in {"partial", "no_optimization_performed"}
+    assert payload["candidate_count"] == 0
+
+    # The RD run is still recorded in the run index (BUG #007-adjacent
+    # honesty: a run that scored nothing is still a run that happened), with
+    # an honest empty/unavailable evidence shape rather than a crash or a
+    # fabricated highlight.
+    from quant_forge.lineage.store import RunIndex
+
+    rows = RunIndex(paths["artifact_root"]).search(factor_id=seed_id, kind="rd")
+    assert rows
+    assert rows[-1]["metric_highlights"] == {}
+    assert rows[-1]["data_window"]["status"] == "unavailable"
+
+
+def test_research_loop_seed_assessment_non_metric_exception_fails_loudly(monkeypatch, tmp_path: Path) -> None:
+    # PF-F1: the seed-assessment except clause (BUG #006) must catch ONLY
+    # _RequiredMetricUnavailable. Any other exception - a programming error,
+    # I/O failure, or artifact corruption - is a real failure and must
+    # propagate exactly as it did before fe23744 (loud failure), never
+    # relabeled seed_unscorable. Contrast with
+    # test_research_loop_completes_honestly_when_seed_and_all_candidates_unscorable
+    # above, where the metric-unavailable path still degrades gracefully.
+    paths = create_demo_workspace(tmp_path / "demo")
+    service = ResearchLoopService(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+        artifact_root=paths["artifact_root"],
+        deduplication=ResearchDeduplicationConfig(enabled=False),
+    )
+
+    def _boom(self, factor, **kwargs):
+        raise RuntimeError("seed evaluation blew up")
+
+    monkeypatch.setattr(ResearchLoopService, "_assess_factor", _boom)
+
+    with pytest.raises(RuntimeError, match="seed evaluation blew up"):
+        service.run_once("FTR_DEMO_SMALL_CAP", objective="balanced", max_candidates=3)
 
 
 def test_hypotheses_from_payload_warns_on_schema_or_task_mismatch() -> None:

@@ -98,16 +98,29 @@ export function renderFactorPickerHtml(factors, preserved) {
     const factorId = factor.factor_id ? String(factor.factor_id) : '';
     const factorName = factor.name ? String(factor.name) : factorId;
     const prior = restore[factorId] || null;
-    const checkedAttr = prior && prior.checked ? ' checked' : '';
+    // Strictly === false: a dangling composite's DEFINITION is registered
+    // but its VALUES were only ever written to a past run's overlay, so
+    // picking it here would fail deep in a later run. null/undefined/true
+    // (not precomputed, or values confirmed present) render exactly as
+    // before — this is additive, never a guess (FP-4).
+    const valuesUnavailable = factor.precomputed_values_present === false;
+    const checkedAttr = !valuesUnavailable && prior && prior.checked ? ' checked' : '';
     const negative = Boolean(prior) && Number(prior.direction) === -1;
     const posSelected = negative ? '' : ' selected';
     const negSelected = negative ? ' selected' : '';
+    const disabledAttr = valuesUnavailable ? ' disabled' : '';
+    const unavailablePill = valuesUnavailable
+      ? ' <span class="status-pill status-pill--running">值不可用</span>'
+      : '';
+    const titleAttr = valuesUnavailable
+      ? ' title="该合成因子的数值产物属于历史运行，当前部署未持有；需重新运行合成后方可复用。"'
+      : '';
     return `
-      <div class="synth-factor-row" data-factor-id="${esc(factorId)}">
+      <div class="synth-factor-row" data-factor-id="${esc(factorId)}"${titleAttr}>
         <label class="synth-factor-name">
-          <input type="checkbox" class="synth-factor-check" data-factor-id="${esc(factorId)}" data-factor-name="${esc(factorName)}"${checkedAttr}>
+          <input type="checkbox" class="synth-factor-check" data-factor-id="${esc(factorId)}" data-factor-name="${esc(factorName)}"${checkedAttr}${disabledAttr}>
           <span>${esc(factorName)}</span>
-          ${factorStatusPillHtml(factor.status)}
+          ${factorStatusPillHtml(factor.status)}${unavailablePill}
         </label>
         <label class="synth-direction-label">
           <span>方向</span>

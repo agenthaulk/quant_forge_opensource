@@ -8,8 +8,9 @@ the server module namespace keep taking effect.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import date, datetime
+import gc
 import json
 import math
 import os
@@ -42,9 +43,11 @@ from quant_forge.factor_engine.signal_processing import (
     apply_test_period,
     prepare_factor_scores_result,
 )
-from quant_forge.factor_library.catalog import FactorCatalog
+from quant_forge.factor_engine.value_store import FactorValueStore
+from quant_forge.factor_library.catalog import FactorCatalog, is_precomputed_formula
 from quant_forge.factor_library.repository import FactorRepository
-from quant_forge.lineage.store import RUN_KINDS, RunIndex, redact_free_text
+from quant_forge.lineage.recording import record_run
+from quant_forge.lineage.store import RUN_KINDS, RunIndex, metric_highlight, redact_free_text
 from quant_forge.mcp.read_models import list_factor_research_tags
 from quant_forge.llm_factor_parser import (
     FACTOR_DESCRIPTION_MAX_CHARS,
@@ -80,17 +83,27 @@ from quant_forge.synthesis.service import (
     CoverageAccounting,
     FittedCompositeResult,
     MemberFetchSpec,
+    PeriodICSweep,
     RebalancePrescan,
-    build_apriori_composite,
-    build_fitted_composite,
+    build_directed_matrix,
     build_member_fetch_plan,
     cleanup_composite_artifacts,
+    combine_apriori,
+    combine_fitted,
+    compute_period_ic_sweep,
     derive_composite_id,
-    member_rank_ic_redundancy,
     prescan_rebalance_coverage,
+    redundancy_from_period_ics,
     require_backtest_window,
     resolve_pinned_universe,
     run_composite_backtest,
+)
+from quant_forge.workbench.service import (
+    BACKTEST_HIGHLIGHT_METRICS,
+    EVALUATION_HIGHLIGHT_METRICS,
+    backtest_data_window,
+    evaluation_data_window,
+    result_warnings_count,
 )
 
 
@@ -288,6 +301,22 @@ def _validate_factor_workflow(
     except Exception:
         _restore_factor_after_failed_validation(repo, factor.factor_id, previous_factor)
         raise
+    # BUG #007: only successful runs are recorded (mirrors WorkbenchService,
+    # which never wraps _record_run in a try/except either), and this sits
+    # OUTSIDE the try/except above so a recording failure propagates as its
+    # own error instead of triggering the compute-failure factor-restore path.
+    # PF-F4 residual: uniform last-look invariant — cancellation is observed
+    # immediately before the first record of every workflow.
+    _raise_if_cancelled(cancel_event)
+    _record_validate_factor_runs(
+        config,
+        factor,
+        settings,
+        rd_config,
+        evaluation=evaluation,
+        in_sample_backtest=in_sample_backtest,
+        backtest=backtest,
+    )
     return _validation_payload(
         factor,
         parser=parser,
@@ -296,6 +325,91 @@ def _validate_factor_workflow(
         backtest=backtest,
         parameters=settings.parameters,
     )
+
+
+def _record_validate_factor_runs(
+    config: QuantForgeConfig,
+    factor: FactorDefinition,
+    settings: _IdeaValidationSettings,
+    rd_config: ResearchLoopConfig,
+    *,
+    evaluation: EvaluationResult,
+    in_sample_backtest: BacktestResult,
+    backtest: BacktestResult,
+) -> None:
+    """Give a web-originated validate run the same lineage/run-index trail a
+    CLI/workbench run leaves (BUG #007: web runs never reached RunIndex, so
+    the registry evidence chain and 研究历史/research-history panel stayed
+    empty for web-only users).
+
+    Mirrors ``WorkbenchService.evaluate`` / ``run_backtest`` exactly: the same
+    highlight metric sets (``EVALUATION_HIGHLIGHT_METRICS`` /
+    ``BACKTEST_HIGHLIGHT_METRICS``), the same ``data_window`` / warnings-count
+    builders, and the same shared ``record_run`` helper the workbench service
+    now calls too, so a factor validated through the web leaves the same kind
+    ("evaluate" / "backtest") and highlight shape a CLI run of the same
+    artifact type would.
+    """
+
+    sample_splits_payload = [asdict(split) for split in rd_config.sample_splits] if rd_config.sample_splits else None
+    record_run(
+        factor_root=config.paths.factor_root,
+        artifact_root=config.paths.artifact_root,
+        factor_values_root=config.paths.factor_values_root,
+        factor_values_manifest_root=config.paths.factor_values_manifest_root,
+        kind="evaluate",
+        factor_id=factor.factor_id,
+        artifact_type="evaluation",
+        artifact_path=evaluation.artifact_path,
+        generated_by="web.validate_factor.evaluate",
+        request={
+            "kind": "evaluate",
+            "factor_id": factor.factor_id,
+            "horizon_days": settings.holding_days,
+            "horizon_days_matrix": list(rd_config.horizon_days_matrix) if rd_config.horizon_days_matrix else None,
+            "sample_splits": sample_splits_payload,
+            "simulation_profile": asdict(settings.evaluation_profile),
+        },
+        metric_highlights={
+            name: metric_highlight(evaluation.metrics[name])
+            for name in EVALUATION_HIGHLIGHT_METRICS
+            if name in evaluation.metrics
+        },
+        data_window=evaluation_data_window(evaluation),
+        warnings_count=result_warnings_count(evaluation),
+    )
+    for sample_role, profile, result in (
+        ("in_sample_backtest", settings.evaluation_profile, in_sample_backtest),
+        ("external_oos_backtest", settings.backtest_profile, backtest),
+    ):
+        record_run(
+            factor_root=config.paths.factor_root,
+            artifact_root=config.paths.artifact_root,
+            factor_values_root=config.paths.factor_values_root,
+            factor_values_manifest_root=config.paths.factor_values_manifest_root,
+            kind="backtest",
+            factor_id=factor.factor_id,
+            artifact_type="backtest",
+            artifact_path=result.artifact_path,
+            generated_by=f"web.validate_factor.{sample_role}",
+            request={
+                "kind": "backtest",
+                "sample_role": sample_role,
+                "factor_id": factor.factor_id,
+                "holding_days": settings.holding_days,
+                "include_partial_final_period": settings.include_partial_final_period,
+                "sample_splits": sample_splits_payload,
+                "simulation_profile": asdict(profile),
+                "transaction_costs": asdict(settings.transaction_costs),
+            },
+            metric_highlights={
+                name: metric_highlight(result.metrics[name])
+                for name in BACKTEST_HIGHLIGHT_METRICS
+                if name in result.metrics
+            },
+            data_window=backtest_data_window(result),
+            warnings_count=result_warnings_count(result),
+        )
 
 
 def run_staggered_entry_workflow(
@@ -331,7 +445,49 @@ def run_staggered_entry_workflow(
         factor_values_manifest_root=config.paths.factor_values_manifest_root,
     )
     _raise_if_cancelled(cancel_event)
+    # BUG #007: record only after a successful (non-cancelled) run, same
+    # posture as _validate_factor_workflow. run_staggered_entry_backtest
+    # returns a plain JSON-shaped dict (there is no CLI/workbench analog for
+    # this web-only surface), so there is no MetricValue-carrying metrics map
+    # to highlight from - metric_highlights is honestly empty rather than
+    # fabricated from plain floats.
+    record_run(
+        factor_root=config.paths.factor_root,
+        artifact_root=config.paths.artifact_root,
+        factor_values_root=config.paths.factor_values_root,
+        factor_values_manifest_root=config.paths.factor_values_manifest_root,
+        kind="backtest",
+        factor_id=factor.factor_id,
+        artifact_type="staggered_backtest",
+        artifact_path=Path(str(result["artifact_path"])),
+        generated_by="web.staggered_entry_backtest",
+        request={
+            "kind": "staggered_backtest",
+            "factor_id": factor.factor_id,
+            "holding_days": settings.holding_days,
+            "formation_trading_days": formation_trading_days,
+            "simulation_profile": asdict(settings.backtest_profile),
+            "transaction_costs": asdict(settings.transaction_costs),
+        },
+        metric_highlights={},
+        data_window=_staggered_data_window(result),
+        warnings_count=_staggered_warnings_count(result),
+    )
     return result
+
+
+def _staggered_data_window(result: dict[str, Any]) -> dict[str, str | None]:
+    """Observed staggered-aggregate NAV window; unavailable when there is no NAV."""
+
+    nav_rows = result.get("daily_nav") or []
+    dates = [str(row["date"]) for row in nav_rows if isinstance(row, dict) and row.get("date")]
+    if dates:
+        return {"start_date": min(dates), "end_date": max(dates), "status": "available"}
+    return {"start_date": None, "end_date": None, "status": "unavailable"}
+
+
+def _staggered_warnings_count(result: dict[str, Any]) -> int:
+    return len({str(code) for code in (result.get("warning_codes") or [])})
 
 
 def run_research_once_workflow(
@@ -636,6 +792,38 @@ def _multi_factor_backtest_settings(
     )
 
 
+def _precomputed_values_present(config: QuantForgeConfig, factor: FactorDefinition) -> bool | None:
+    """Probe whether a precomputed factor's VALUES exist under configured roots.
+
+    ``None`` for a non-precomputed formula: scores are computed from the
+    formula on demand, so "are values present" is not a meaningful question.
+    ``None`` also on any probe failure, including no ``factor_values_root``
+    or ``factor_values_overlay_root`` configured at all (FP-4: unobservable
+    is null, never guessed as True/False).
+
+    Otherwise mirrors EXACTLY how ``prepare_factor_scores_result`` builds its
+    ``FactorValueStore`` (read root = ``factor_values_root or
+    factor_values_overlay_root``, write root = ``factor_values_overlay_root``)
+    so the probe answers with the SAME roots the scoring path would actually
+    read from — a False here means selecting this factor as a synthesis
+    member would find no stored rows, not that the registry merely does not
+    know.
+    """
+
+    if not is_precomputed_formula(factor.formula):
+        return None
+    try:
+        read_root = config.paths.factor_values_root or config.paths.factor_values_overlay_root
+        store = FactorValueStore(read_root, write_root=config.paths.factor_values_overlay_root)
+        return store.has_stored_values(
+            factor_id=factor.factor_id,
+            factor_name=factor.name,
+            formula=factor.formula,
+        )
+    except Exception:
+        return None
+
+
 def _prepare_multi_factor_backtest(
     config: QuantForgeConfig,
     *,
@@ -682,6 +870,19 @@ def _prepare_multi_factor_backtest(
             members.append(repository.get(factor_id))
         except FileNotFoundError:
             raise ValueError(f"unknown factor: {factor_id}") from None
+    # A precomputed member's DEFINITION can persist in factor_root while its
+    # VALUES were only ever written to a past run's overlay directory that
+    # this run does not read. Refuse here — before any panel load or engine
+    # work — instead of letting the composite drive fail deep inside
+    # materialization with an opaque "no rows" error. Only a CONFIRMED
+    # absence (False) refuses; an unobservable probe (None) never guesses.
+    for member in members:
+        if is_precomputed_formula(member.formula) and _precomputed_values_present(config, member) is False:
+            raise ValueError(
+                f"factor {member.factor_id} is precomputed but has no stored values under "
+                "the configured factor_values_root/factor_values_overlay_root: its values "
+                "were materialized for a past run only and are not present for this run"
+            )
     # RB-6 + Codex A-1: when no member declares a universe, the pin falls back
     # to the cn_a formation default instead of an empty (unfiltered) set — an
     # empty pin would let ST names scored by every member enter the book.
@@ -805,7 +1006,7 @@ def run_multi_factor_backtest_workflow(
     _raise_if_cancelled(cancel_event)
     member_scores: dict[str, Any] = {}
     for spec in plan.member_plan:
-        member_scores[spec.factor_id] = prepare_factor_scores_result(
+        member_result_scores = prepare_factor_scores_result(
             plan.panel,
             spec.formula,
             spec.universe_filters,
@@ -815,7 +1016,25 @@ def run_multi_factor_backtest_workflow(
             factor_values_root=config.paths.factor_values_root,
             factor_values_overlay_root=config.paths.factor_values_overlay_root,
         ).scores
+        # Backstop distinct from the earlier presence refusal (which already
+        # confirmed a stored value file exists somewhere for this factor):
+        # zero rows survived the formula-signature + panel-key read filter,
+        # so the stored values do not cover THIS request's universe/dates —
+        # a different failure than "no file at all", named as such instead of
+        # surfacing as an opaque empty composite deep inside materialization.
+        if is_precomputed_formula(spec.formula) and member_result_scores.empty:
+            raise ValueError(
+                f"factor {spec.factor_id} has stored precomputed values, but none are "
+                "readable for this request's universe/date signature; rerun the synthesis "
+                "that produced it, or check factor_values_root/factor_values_overlay_root"
+            )
+        member_scores[spec.factor_id] = member_result_scores
         _raise_if_cancelled(cancel_event)
+    # The loop local still names the LAST member's full tidy frame after the
+    # loop exits; release it here so it does not outlive `member_scores.clear()`
+    # below and survive through the IC sweep and engine drive (members are
+    # validated >= 2, so the name is always bound at this point).
+    del member_result_scores
     # The working-panel close frame over the SAME in-window dates the engine
     # trades: the RB-5 forward-return source for the fitted IC estimate and
     # the advisory redundancy diagnostic.
@@ -823,12 +1042,44 @@ def run_multi_factor_backtest_workflow(
         ["trade_date", "instrument", "close"]
     ].copy()
     delay = plan.settings.profile.execution_delay_days
+    # Standardize + direction the full member panel ONCE, then release the
+    # per-member tidy frames right away: they are the largest live objects here
+    # and nothing downstream needs them once the wide matrix exists. Jobs run
+    # with gc disabled (jobs.py), so freeing is refcount-driven — clearing the
+    # mapping drops the last references and the explicit collect reclaims them.
+    directed, standardization_outcome = build_directed_matrix(
+        member_scores,
+        directions=plan.directions,
+        standardization=plan.standardization,
+    )
+    member_scores.clear()
+    gc.collect()
+
+    # Compute the per-period rank IC sweep ONCE over the sorted directed matrix
+    # and share it between the fitted weights and the advisory redundancy matrix.
+    # Both service functions would otherwise rebuild this identical sweep from
+    # the same inputs — a second full-panel forward-return pass — so threading it
+    # through is a structural single-sweep, numerics unchanged; the returned
+    # sweep also binds the ICs to a recorded fingerprint of this matrix/close/
+    # grid so combine_fitted/redundancy_from_period_ics can verify provenance
+    # instead of trusting a bare mapping (see PeriodICSweep).
+    working = directed.sort_index()
+    # Restore the pre-expensive-pass checkpoint: both method families (a-priori
+    # and fitted) pass through here BEFORE the full-panel forward-return sweep,
+    # matching where this check sat prior to the shared-sweep refactor.
+    _raise_if_cancelled(cancel_event)
+    sweep: PeriodICSweep = compute_period_ic_sweep(
+        directed,
+        close=working_close,
+        dates=plan.dates,
+        delay=delay,
+        holding=plan.settings.holding_days,
+    )
+
     composite: CompositeResult | FittedCompositeResult
     if plan.method.is_fitted:
-        composite = build_fitted_composite(
-            member_scores,
-            directions=plan.directions,
-            standardization=plan.standardization,
+        composite = combine_fitted(
+            working,
             method=plan.method.name,
             close=working_close,
             dates=plan.dates,
@@ -838,25 +1089,23 @@ def run_multi_factor_backtest_workflow(
             # the single source of truth (a service-side fallback here would
             # read as if a second constant could govern).
             ic_min_periods=int(plan.method_params["ic_min_periods"]),
+            period_ics=sweep,
         )
     else:
-        composite = build_apriori_composite(
-            member_scores,
-            directions=plan.directions,
-            standardization=plan.standardization,
+        composite = combine_apriori(
+            working,
             method=plan.method.name,
             weights=plan.weights,
         )
-    _raise_if_cancelled(cancel_event)
-    redundancy = member_rank_ic_redundancy(
-        member_scores,
-        directions=plan.directions,
+    # Enrich with the §4.2 standardization provenance exactly as the pure
+    # build_*_composite entry points do, so every payload field is byte-identical.
+    composite = replace(
+        composite,
         standardization=plan.standardization,
-        close=working_close,
-        dates=plan.dates,
-        delay=delay,
-        holding=plan.settings.holding_days,
+        degenerate_dates_by_factor=standardization_outcome.degenerate_dates_by_factor,
     )
+    _raise_if_cancelled(cancel_event)
+    redundancy = redundancy_from_period_ics(sweep)
     prescan = prescan_rebalance_coverage(
         composite.composite,
         plan.dates,
@@ -865,6 +1114,14 @@ def run_multi_factor_backtest_workflow(
         include_partial_final_period=plan.settings.include_partial_final_period,
     )
     _raise_if_cancelled(cancel_event)
+    # Release the wide-matrix working set before the engine drive — the largest
+    # allocator ahead. ``composite`` already holds the degenerate-date mapping it
+    # needs, so dropping ``standardization_outcome`` frees its standardized matrix
+    # without losing provenance; ``plan.panel`` is kept for the engine. ``sweep``
+    # replaces the old ``ic_by_period`` local here; its ``ics`` mapping is small,
+    # but it is released in the same batch anyway for a single clean cut.
+    del working_close, directed, working, sweep, standardization_outcome
+    gc.collect()
     run = run_composite_backtest(
         composite.composite,
         composite_id=plan.composite_id,
@@ -884,9 +1141,23 @@ def run_multi_factor_backtest_workflow(
         _raise_if_cancelled(cancel_event)
         evaluation_payload = _same_window_evaluation(config, plan, run, rd_config)
         _raise_if_cancelled(cancel_event)
-        return _multi_factor_backtest_payload(
+        # BUG #007: record the composite backtest run under the COMPOSITE_
+        # factor id so it reaches the registry evidence chain the same way a
+        # CLI/workbench backtest does (mirrors WorkbenchService.run_backtest's
+        # kind/highlight semantics for a BacktestResult). PF-F3: recording sits
+        # LAST, after payload construction succeeds, so a payload-build failure
+        # never leaves a success-shaped run row behind; the except-clause below
+        # still cleans up the composite definition and overlay either way.
+        payload = _multi_factor_backtest_payload(
             plan, composite, prescan, run, evaluation_payload, redundancy
         )
+        # PF-F4 residual: last look BEFORE recording begins — a cancel that
+        # arrives during payload assembly is still pre-recording, so it ends
+        # as a cooperative cancel (cleanup below, zero run rows), never a
+        # recorded-and-completed run.
+        _raise_if_cancelled(cancel_event)
+        _record_multi_factor_backtest_run(config, plan, run)
+        return payload
     except Exception:
         cleanup_composite_artifacts(
             config.paths.factor_root,
@@ -895,6 +1166,52 @@ def run_multi_factor_backtest_workflow(
             overlay_root=run.overlay_root,
         )
         raise
+
+
+def _record_multi_factor_backtest_run(
+    config: QuantForgeConfig, plan: _MultiFactorBacktestPlan, run: CompositeBacktestRun
+) -> None:
+    """Record the composite backtest under ``run.composite_id`` (BUG #007).
+
+    Mirrors ``WorkbenchService.run_backtest``'s kind/highlight semantics for a
+    ``BacktestResult`` (``kind="backtest"``, ``BACKTEST_HIGHLIGHT_METRICS``,
+    ``backtest_data_window``) so a synthesized ``COMPOSITE_*`` factor gets the
+    same registry evidence chain a single-factor backtest gets, using the
+    shared ``record_run`` helper.
+    """
+
+    record_run(
+        factor_root=config.paths.factor_root,
+        artifact_root=config.paths.artifact_root,
+        factor_values_root=config.paths.factor_values_root,
+        factor_values_manifest_root=config.paths.factor_values_manifest_root,
+        kind="backtest",
+        factor_id=run.composite_id,
+        artifact_type="backtest",
+        artifact_path=run.result.artifact_path,
+        generated_by="web.multi_factor_backtest",
+        request={
+            "kind": "multi_factor_backtest",
+            "composite_id": run.composite_id,
+            "factor_refs": [{"factor_id": factor_id, "direction": direction} for factor_id, direction in plan.factor_refs],
+            "method": plan.method.name,
+            "method_params": plan.method_params,
+            "weights": plan.weights,
+            "standardization": plan.standardization,
+            "holding_days": plan.settings.holding_days,
+            "include_partial_final_period": plan.settings.include_partial_final_period,
+            "simulation_profile": asdict(plan.settings.profile),
+            "transaction_costs": asdict(plan.settings.transaction_costs),
+            "universe_filters": list(plan.universe_filters),
+        },
+        metric_highlights={
+            name: metric_highlight(run.result.metrics[name])
+            for name in BACKTEST_HIGHLIGHT_METRICS
+            if name in run.result.metrics
+        },
+        data_window=backtest_data_window(run.result),
+        warnings_count=result_warnings_count(run.result),
+    )
 
 
 def _same_window_evaluation_meta(run: CompositeBacktestRun, *, status: str) -> dict[str, Any]:
@@ -2707,13 +3024,25 @@ def _factor_research_tags_by_id(config: QuantForgeConfig) -> dict[str, dict[str,
     return {str(tag.get("subject_id")): tag for tag in tags}
 
 
-def _registry_factor_row(factor: FactorDefinition, tags: dict[str, Any] | None) -> dict[str, Any]:
+def _registry_factor_row(
+    config: QuantForgeConfig, factor: FactorDefinition, tags: dict[str, Any] | None
+) -> dict[str, Any]:
     """Project one FactorDefinition into the Registry list/detail row shape.
 
     Extends the pinned ``read_models.list_factors`` projection (which stays
-    unchanged for LLM/CLI surfaces) with ``description``, ``source``, and the
-    joined research tags. ``tags`` is ``None`` when unobservable (FP-4);
-    precomputed formulas already render as ``precomputed:<key>`` — no paths.
+    unchanged for LLM/CLI surfaces) with ``description``, ``source``, the
+    joined research tags, and ``precomputed_values_present``. ``tags`` is
+    ``None`` when unobservable (FP-4); precomputed formulas already render
+    as ``precomputed:<key>`` — no paths.
+
+    ``precomputed_values_present`` is ``null`` for a non-precomputed formula
+    (values are computed from the formula on demand — presence is not a
+    meaningful question) and ``null`` on any probe failure (FP-4: unobservable
+    is null, never a guess). Otherwise it reports whether the value store —
+    probed with the SAME roots the scoring path uses — holds at least one
+    stored value file for this factor, so a dangling composite (definition
+    saved, values only ever written to a past run's overlay) is marked
+    ``false`` here instead of failing deep inside a synthesis run.
     """
 
     return {
@@ -2726,6 +3055,7 @@ def _registry_factor_row(factor: FactorDefinition, tags: dict[str, Any] | None) 
         "description": factor.description,
         "source": factor.source,
         "tags": tags,
+        "precomputed_values_present": _precomputed_values_present(config, factor),
     }
 
 
@@ -2748,7 +3078,7 @@ def _registry_factors_payload(config: QuantForgeConfig) -> dict[str, Any]:
     except Exception:
         factors = []
     tags_by_id = _factor_research_tags_by_id(config) if factors else {}
-    rows = [_registry_factor_row(factor, tags_by_id.get(factor.factor_id)) for factor in factors]
+    rows = [_registry_factor_row(config, factor, tags_by_id.get(factor.factor_id)) for factor in factors]
     payload = {"factors": rows, "count": len(rows)}
     return _server._web_public_json(_redact_web_text(payload))
 
@@ -2789,7 +3119,7 @@ def _registry_factor_detail_payload(
     rows = RunIndex(config.paths.artifact_root).search(factor_id=factor.factor_id, kind=parsed_kind)
     ordered = list(reversed(rows))[:parsed_limit]
     payload = {
-        "factor": _registry_factor_row(factor, tags_by_id.get(factor.factor_id)),
+        "factor": _registry_factor_row(config, factor, tags_by_id.get(factor.factor_id)),
         "runs": [_run_record_payload(row) for row in ordered],
         "count": len(ordered),
         "limit": parsed_limit,

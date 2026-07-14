@@ -83,7 +83,13 @@ def test_rd_score_does_not_treat_unavailable_as_zero_return() -> None:
         },
     )
 
-    with pytest.raises(ValueError, match="net_annualized_return is unavailable"):
+    # BUG #006: the raised message is now a typed, parseable reason
+    # (metric_unavailable:<name> (<status>: <warning codes>)) so a caller that
+    # rejects the unscorable candidate/seed can record WHY (see
+    # test_research_loop_structure.py's score_candidate/run_once coverage);
+    # the "never silently treat missing as zero" contract this test pins is
+    # otherwise unchanged.
+    with pytest.raises(ValueError, match=r"metric_unavailable:net_annualized_return \(insufficient_sample"):
         score_candidate(
             evaluation,
             backtest,

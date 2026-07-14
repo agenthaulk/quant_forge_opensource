@@ -683,6 +683,34 @@ def test_research_report_renders_metric_status_instead_of_placeholder_zero(tmp_p
     assert "| insufficient_sample | insufficient_sample " in report
 
 
+def test_research_report_comparison_table_renders_n_a_when_no_scorable_candidate(tmp_path: Path) -> None:
+    # PF-F2: reachable via #006 once a seed-unscorable run can complete with
+    # zero scorable candidates (see
+    # test_research_loop_completes_honestly_when_seed_and_all_candidates_unscorable
+    # in test_research_loop_structure.py). The "no candidate" comparison row
+    # must never fabricate 0.0000/0.00% placeholders (FP-4: unavailable is a
+    # labeled unknown, never zero).
+    result = ResearchLoopResult(
+        rd_stage="research",
+        seed_factor_id="FTR_SEED_UNSCORABLE",
+        objective="balanced",
+        objective_weights=ResearchObjectiveWeights(),
+        gate=ResearchGate(),
+        candidates=(),
+        accepted_candidate_ids=(),
+        report_path=tmp_path / "report.md",
+        optimization_performed=False,
+        no_optimization_performed=True,
+    )
+
+    report = render_research_report(result)
+
+    comparison_section = report.split("## Candidate Comparison", 1)[1].split("## Blocked", 1)[0]
+    assert "0.0000" not in comparison_section
+    assert "0.00%" not in comparison_section
+    assert "n/a" in comparison_section
+
+
 def test_workbench_run_backtest_partial_final_period_opt_in(tmp_path: Path) -> None:
     # F4: the D3 opt-in must pass through the typed workbench service; opting
     # in includes the tail marked to market and emits the legacy
