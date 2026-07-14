@@ -32,14 +32,16 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from quant_forge.lineage.store import canonical_fingerprint, redact_free_text
 from quant_forge.research_loop.memory import MemoryObservation
 
 RESEARCH_OUTCOME_SCHEMA_VERSION = "qf.research_outcome.v2"
-SIGNATURE_CONTRACT_VERSION = "sig.v2"
+RESEARCH_OUTCOME_RECORD_SCHEMA_VERSION = "qf.research_outcome_record.v1"
+SIGNATURE_CONTRACT_VERSION = "sig.v2.1"
 MEASUREMENT_CONTRACT_VERSION = "meas.v1"
 
 # --- closed vocabularies (SE-ii; extension is a reviewed contract change) ---
@@ -78,24 +80,31 @@ REASON_CODES = frozenset(
 # denominators (the priors view filters it out by stage).
 LIFECYCLE_STATUSES = ("", "submitted", "not_confirmed", "accepted", "rejected")
 
-# Evidence strength is DERIVED from the stage (owner ruling R5-3): a producer
-# cannot claim live-submission strength for a prescreen. Order is weakest to
-# strongest; ``EVIDENCE_STRENGTH_RANK`` is the steering/priors weight order.
-STAGE_EVIDENCE_STRENGTH: Mapping[str, str] = {
-    "evaluate": "local_backtest",
-    "backtest": "local_backtest",
-    "gate": "local_backtest",
-    "prescreen": "prescreen",
-    "simulate": "platform_simulated",
-    "submit": "submitted_live",
-}
+# Evidence strength is DERIVED from the stage (owner ruling R5-3): it can
+# never exceed the DECLARED stage. Stage truthfulness itself is caller-owned
+# under SE-i and is verified by the trusted ingress sink (SE-P2 derives the
+# stage from the route/result type and recomputes fingerprint/window; a
+# producer mismatch is rejected there). Registries are read-only proxies so
+# in-process code cannot remap them (review finding R-F5).
+STAGE_EVIDENCE_STRENGTH: Mapping[str, str] = MappingProxyType(
+    {
+        "evaluate": "local_backtest",
+        "backtest": "local_backtest",
+        "gate": "local_backtest",
+        "prescreen": "prescreen",
+        "simulate": "platform_simulated",
+        "submit": "submitted_live",
+    }
+)
 EVIDENCE_STRENGTHS = ("prescreen", "local_backtest", "platform_simulated", "submitted_live")
-EVIDENCE_STRENGTH_RANK: Mapping[str, int] = {name: rank for rank, name in enumerate(EVIDENCE_STRENGTHS)}
+EVIDENCE_STRENGTH_RANK: Mapping[str, int] = MappingProxyType(
+    {name: rank for rank, name in enumerate(EVIDENCE_STRENGTHS)}
+)
 
 # Closed metric-key registry: key -> (unit, description). Values carry basis /
 # method / sample count on the reading itself; the unit is fixed per key here
 # so it can never drift per row (S1-F6).
-METRIC_SPECS: Mapping[str, tuple[str, str]] = {
+METRIC_SPECS: Mapping[str, tuple[str, str]] = MappingProxyType({
     "sharpe": ("ratio", "annualized Sharpe ratio of the evaluated stage"),
     "annualized_return": ("fraction_per_year", "net annualized return unless basis says gross"),
     "max_drawdown": ("fraction", "maximum peak-to-trough drawdown, non-negative magnitude"),
@@ -106,15 +115,26 @@ METRIC_SPECS: Mapping[str, tuple[str, str]] = {
     "redundancy": ("correlation", "redundancy vs the local candidate set"),
     "ic_mean": ("correlation", "mean information coefficient"),
     "icir": ("ratio", "IC information ratio"),
-}
+})
 
 METRIC_BASES = ("", "net", "gross")
+
+# FP-G sample-role axis (review finding R-F3): closed vocabulary recorded on
+# every outcome so the priors view (SE-P5) can keep OOS-role metric values
+# out of steering without parsing prose. "unspecified" is honest-unknown.
+SAMPLE_ROLES = ("unspecified", "in_sample", "out_of_sample", "mixed")
+
+# Reserved sentinel spellings for scope dimensions: the signature renders an
+# absent dimension as "unknown"/"global", so accepting those literals as
+# VALUES would let unrelated factors unify into one signature (R-F4).
+_RESERVED_DIM_SENTINELS = frozenset({"unknown", "global"})
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
 _HEX_RE = re.compile(r"^[0-9a-f]{16,64}$")
 _DIM_RE = re.compile(r"^[a-z0-9_.\-]{0,32}$")
-_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
+_DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+_REF_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,63}$")
+_MAX_REF_LENGTH = 200
 
 
 def _require_clean_token(field_name: str, value: str, pattern: re.Pattern[str]) -> None:
@@ -127,13 +147,26 @@ def _require_clean_token(field_name: str, value: str, pattern: re.Pattern[str]) 
 
 
 def _require_relative_ref(value: str) -> None:
-    if value.startswith(("/", "\\", "~")) or _SCHEME_RE.match(value):
-        raise ValueError(f"evidence_ref must be a run id or artifact-root-relative path, got {value!r}")
-    if re.match(r"^[A-Za-z]:[\\/]", value):
-        raise ValueError(f"evidence_ref must not carry a drive letter: {value!r}")
-    if ".." in value.split("/") or ".." in value.split("\\"):
-        raise ValueError(f"evidence_ref must not traverse upward: {value!r}")
-    if redact_free_text(value) != value:
+    """Allowlist grammar (R-F8): bounded ASCII POSIX-relative paths only.
+
+    Segments must start alphanumeric/underscore (no dot segments, no hidden
+    files), separators are single forward slashes, and the printable-ASCII
+    wall kills zero-width/NFD/control/encoded tricks wholesale. The extra
+    slash-prefixed redaction probe catches home-path fragments whose leading
+    slash was hand-stripped (opus finding F4).
+    """
+
+    if len(value) > _MAX_REF_LENGTH:
+        raise ValueError(f"evidence_ref exceeds {_MAX_REF_LENGTH} characters")
+    if any(not (0x21 <= ord(char) <= 0x7E) for char in value):
+        raise ValueError(f"evidence_ref must be printable ASCII without spaces: {value!r}")
+    for banned in ("\\", ":", "%", "$", "{", "}"):
+        if banned in value:
+            raise ValueError(f"evidence_ref must not contain {banned!r}: {value!r}")
+    segments = value.split("/")
+    if not segments or any(not _REF_SEGMENT_RE.fullmatch(segment) for segment in segments):
+        raise ValueError(f"evidence_ref must be a run id or artifact-root-relative POSIX path, got {value!r}")
+    if redact_free_text(value) != value or redact_free_text("/" + value) != "/" + value:
         raise ValueError("evidence_ref would be altered by redaction; refusing to record it")
 
 
@@ -158,10 +191,17 @@ class OutcomeWindow:
         if self.status not in ("available", "unavailable"):
             raise ValueError(f"window status must be available|unavailable, got {self.status!r}")
         if self.status == "available":
+            parsed: dict[str, date] = {}
             for name, value in (("start_date", self.start_date), ("end_date", self.end_date)):
                 if not _DATE_RE.fullmatch(value):
-                    raise ValueError(f"available window needs ISO dates, bad {name}: {value!r}")
-            if self.end_date < self.start_date:
+                    raise ValueError(f"available window needs ASCII ISO dates, bad {name}: {value!r}")
+                try:
+                    parsed[name] = date.fromisoformat(value)
+                except ValueError as error:
+                    # Real calendar validation (R-F7): 2024-02-31 must die here,
+                    # not mint a fake distinct window for the rule tier.
+                    raise ValueError(f"window {name} is not a real calendar date: {value!r}") from error
+            if parsed["end_date"] < parsed["start_date"]:
                 raise ValueError("window end_date precedes start_date")
         elif self.start_date or self.end_date:
             raise ValueError("unavailable window must carry empty dates (null, never a guess)")
@@ -195,7 +235,12 @@ class OutcomeScope:
 
     def __post_init__(self) -> None:
         for name in ("asset_class", "universe", "factor_family", "horizon_bucket", "settings_profile"):
-            _require_clean_token(name, getattr(self, name), _DIM_RE)
+            value = getattr(self, name)
+            _require_clean_token(name, value, _DIM_RE)
+            if value in _RESERVED_DIM_SENTINELS:
+                raise ValueError(
+                    f"{name} must not be the reserved sentinel {value!r}; leave it empty for unknown (R-F4)"
+                )
 
     def scope_key(self) -> str:
         parts = [
@@ -266,6 +311,7 @@ class ResearchOutcome:
     observed_at: str
     reason_codes: tuple[str, ...] = (REASON_NONE,)
     lifecycle_status: str = ""
+    sample_role: str = "unspecified"
     window: OutcomeWindow = field(default_factory=OutcomeWindow)
     scope: OutcomeScope = field(default_factory=OutcomeScope)
     metric_snapshot: Mapping[str, MetricReading] = field(default_factory=dict)
@@ -273,6 +319,11 @@ class ResearchOutcome:
     schema_version: str = RESEARCH_OUTCOME_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
+        # Canonicalize caller-held mutables FIRST (R-F6 / opus F2): frozen=True
+        # is shallow, so a caller mutating its own dict/list after construction
+        # would otherwise drift outcome_id()/to_dict() past validation.
+        object.__setattr__(self, "reason_codes", tuple(self.reason_codes))
+        object.__setattr__(self, "metric_snapshot", MappingProxyType(dict(self.metric_snapshot)))
         if self.schema_version != RESEARCH_OUTCOME_SCHEMA_VERSION:
             raise ValueError(f"unsupported schema_version {self.schema_version!r}")
         if self.origin not in ORIGINS:
@@ -304,6 +355,13 @@ class ResearchOutcome:
             raise ValueError(f"lifecycle_status must be one of {LIFECYCLE_STATUSES}, got {self.lifecycle_status!r}")
         if self.lifecycle_status and self.stage != "submit":
             raise ValueError("lifecycle_status is only representable on the submit stage")
+        if self.stage == "submit" and not self.lifecycle_status:
+            # Bidirectional coherence (opus F3): a submit-stage outcome without
+            # a lifecycle would claim submitted_live strength for work that
+            # never demonstrably went live.
+            raise ValueError("submit-stage outcomes must carry a lifecycle_status")
+        if self.sample_role not in SAMPLE_ROLES:
+            raise ValueError(f"sample_role must be one of {SAMPLE_ROLES}, got {self.sample_role!r}")
 
         for key, reading in self.metric_snapshot.items():
             if key not in METRIC_SPECS:
@@ -361,8 +419,17 @@ class ResearchOutcome:
             )
             if part
         )
-        return tuple(
-            {
+        # Unknown generalization dimensions must NOT unify (R-F4): when the
+        # family or settings profile is unknown, the payload gains this
+        # outcome's evidence-run as a disambiguator, so such observations can
+        # never accumulate across factors — they stay at trace tier until the
+        # producer supplies real dimensions.
+        disambiguator = (
+            "" if (self.scope.factor_family and self.scope.settings_profile) else self.evidence_run_id()
+        )
+        payloads = []
+        for reason in self.reason_codes:
+            payload: dict[str, Any] = {
                 "v": SIGNATURE_CONTRACT_VERSION,
                 "origin": self.origin,
                 "stage": self.stage,
@@ -374,8 +441,10 @@ class ResearchOutcome:
                 "scope": scope_part or "global",
                 "measurement_contract_version": MEASUREMENT_CONTRACT_VERSION,
             }
-            for reason in self.reason_codes
-        )
+            if disambiguator:
+                payload["disambiguator"] = disambiguator
+            payloads.append(payload)
+        return tuple(payloads)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -385,6 +454,7 @@ class ResearchOutcome:
             "verdict": self.verdict,
             "reason_codes": list(self.reason_codes),
             "lifecycle_status": self.lifecycle_status,
+            "sample_role": self.sample_role,
             "factor_id": self.factor_id,
             "factor_fingerprint": self.factor_fingerprint,
             "observed_at": self.observed_at,
@@ -392,6 +462,27 @@ class ResearchOutcome:
             "scope": self.scope.to_dict(),
             "metric_snapshot": {key: reading.to_dict() for key, reading in sorted(self.metric_snapshot.items())},
             "evidence_ref": self.evidence_ref,
+        }
+
+    def to_record(self) -> dict[str, Any]:
+        """Canonical persisted envelope for the outcomes ledger (R-F3).
+
+        This — not bare ``to_dict()`` — is what the SE-P2 ingress sink appends
+        per outcome, so SE-P5 priors can count the four verdicts separately,
+        weight by strength, filter lifecycle bookkeeping and sample role, and
+        dedup by ``(signature, evidence_run_id)`` without parsing statements.
+        Note the envelope carries the LOCAL ``factor_id``/``factor_fingerprint``
+        inside ``outcome``; it lives under the owning store's local root and
+        never enters ``MemoryObservation`` rows (identity is hashed away).
+        """
+
+        return {
+            "record_schema": RESEARCH_OUTCOME_RECORD_SCHEMA_VERSION,
+            "outcome_id": self.outcome_id(),
+            "evidence_run_id": self.evidence_run_id(),
+            "evidence_strength": self.evidence_strength,
+            "signatures": [canonical_fingerprint(payload) for payload in self.signature_payloads()],
+            "outcome": self.to_dict(),
         }
 
 
@@ -430,6 +521,12 @@ def outcome_to_observations(outcome: ResearchOutcome) -> tuple[MemoryObservation
     resolution against the local registry, and outcome-id replay dropping.
     """
 
+    if outcome.verdict not in ("passed", "blocked"):
+        # FP-4 + R-F2: unknown / not-applicable verdicts carry no scientific
+        # answer, and submit lifecycle bookkeeping must never become a
+        # "success lesson" in feed-forward. Such outcomes are ledger-only
+        # (see to_record()); they mint zero observations.
+        return ()
     evidence_run = outcome.evidence_run_id()
     observations = []
     for payload, reason in zip(outcome.signature_payloads(), outcome.reason_codes):

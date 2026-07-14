@@ -147,6 +147,16 @@ def promote(observations: Iterable[MemoryObservation]) -> tuple[PromotionDecisio
     decisions: list[PromotionDecision] = []
     for signature in sorted(groups):
         group = sorted(groups[signature], key=lambda item: (item.observed_at, item.run_id, item.evidence_ref))
+        # Evidence-unit cap (SE-ii, DECISIONS 2026-07-13): at most ONE
+        # observation per (signature, run_id) reaches the thresholds. A rerun
+        # of one evidence unit — a re-simulation, a UI retry, a jittered
+        # re-measurement — is a correction of the same study, never
+        # additional confirmation. The sort above makes the kept row
+        # deterministic (earliest observed_at, then run_id/evidence_ref).
+        first_per_run: dict[str, MemoryObservation] = {}
+        for item in group:
+            first_per_run.setdefault(item.run_id, item)
+        group = sorted(first_per_run.values(), key=lambda item: (item.observed_at, item.run_id, item.evidence_ref))
         run_ids = tuple(sorted({item.run_id for item in group}))
         windows = tuple(sorted({item.data_window for item in group if item.data_window}))
         is_failure = any(item.failure_class in FAILURE_SIGNATURE_CLASSES for item in group)

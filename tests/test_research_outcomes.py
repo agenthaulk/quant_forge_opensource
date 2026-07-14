@@ -46,6 +46,19 @@ FP_B = "1a2b3c4d5e6f1a2b"
 WINDOW_1 = OutcomeWindow(status="available", start_date="2024-01-01", end_date="2024-06-30")
 WINDOW_2 = OutcomeWindow(status="available", start_date="2024-07-01", end_date="2024-12-31")
 
+FP_C = "9f8e7d6c5b4a9f8e"
+
+# Promotion-semantics tests need KNOWN generalization dimensions: unknown
+# family/settings gain a per-evidence-run signature disambiguator (R-F4) and
+# mechanically stay at trace tier, which is pinned separately below.
+SCOPE_KNOWN = OutcomeScope(
+    asset_class="us_equity",
+    universe="sp500",
+    factor_family="reversal",
+    horizon_bucket="d5",
+    settings_profile="default",
+)
+
 
 def _outcome(**overrides: Any) -> ResearchOutcome:
     """A valid baseline passed/NONE outcome; override only what a test needs."""
@@ -199,9 +212,9 @@ def test_resimulated_factor_shares_one_run_id_and_never_promotes() -> None:
     # Same fingerprint/window/stage, jittered timestamps + metrics: one
     # logical evidence run no matter how many times it is re-simulated.
     outcomes = [
-        _blocked_outcome(window=WINDOW_1, observed_at=T1, metric_snapshot={"turnover": MetricReading(value=0.65)}),
-        _blocked_outcome(window=WINDOW_1, observed_at=T2, metric_snapshot={"turnover": MetricReading(value=0.66)}),
-        _blocked_outcome(window=WINDOW_1, observed_at=T3, metric_snapshot={"turnover": MetricReading(value=0.64)}),
+        _blocked_outcome(scope=SCOPE_KNOWN, window=WINDOW_1, observed_at=T1, metric_snapshot={"turnover": MetricReading(value=0.65)}),
+        _blocked_outcome(scope=SCOPE_KNOWN, window=WINDOW_1, observed_at=T2, metric_snapshot={"turnover": MetricReading(value=0.66)}),
+        _blocked_outcome(scope=SCOPE_KNOWN, window=WINDOW_1, observed_at=T3, metric_snapshot={"turnover": MetricReading(value=0.64)}),
     ]
     observations = [row for outcome in outcomes for row in outcome_to_observations(outcome)]
 
@@ -213,10 +226,11 @@ def test_resimulated_factor_shares_one_run_id_and_never_promotes() -> None:
 
 def test_second_factor_hitting_same_reason_yields_exactly_one_failure_row() -> None:
     outcomes = [
-        _blocked_outcome(window=WINDOW_1, observed_at=T1, metric_snapshot={"turnover": MetricReading(value=0.65)}),
-        _blocked_outcome(window=WINDOW_1, observed_at=T2, metric_snapshot={"turnover": MetricReading(value=0.66)}),
-        _blocked_outcome(window=WINDOW_1, observed_at=T3, metric_snapshot={"turnover": MetricReading(value=0.64)}),
+        _blocked_outcome(scope=SCOPE_KNOWN, window=WINDOW_1, observed_at=T1, metric_snapshot={"turnover": MetricReading(value=0.65)}),
+        _blocked_outcome(scope=SCOPE_KNOWN, window=WINDOW_1, observed_at=T2, metric_snapshot={"turnover": MetricReading(value=0.66)}),
+        _blocked_outcome(scope=SCOPE_KNOWN, window=WINDOW_1, observed_at=T3, metric_snapshot={"turnover": MetricReading(value=0.64)}),
         _blocked_outcome(
+            scope=SCOPE_KNOWN,
             factor_id="FTR_SECOND",
             factor_fingerprint=FP_B,
             window=WINDOW_1,
@@ -234,13 +248,15 @@ def test_second_factor_hitting_same_reason_yields_exactly_one_failure_row() -> N
     decision = decisions[0]
     assert decision.kind == "failure"
     assert decision.status == "active"
-    assert decision.observation_count == 4
+    # SE-ii evidence-unit cap: three rows from factor A collapse to ONE unit;
+    # observation_count counts independent studies, never retries.
+    assert decision.observation_count == 2
 
 
 def test_passed_corpus_two_factors_yields_finding_not_failure() -> None:
     outcomes = [
-        _outcome(factor_id="FTR_ONE", factor_fingerprint=FP_A, observed_at=T1),
-        _outcome(factor_id="FTR_TWO", factor_fingerprint=FP_B, observed_at=T2),
+        _outcome(scope=SCOPE_KNOWN, factor_id="FTR_ONE", factor_fingerprint=FP_A, observed_at=T1),
+        _outcome(scope=SCOPE_KNOWN, factor_id="FTR_TWO", factor_fingerprint=FP_B, observed_at=T2),
     ]
     observations = [row for outcome in outcomes for row in outcome_to_observations(outcome)]
     run_ids = {observation.run_id for observation in observations}
@@ -262,9 +278,9 @@ def test_single_canonical_window_never_yields_rule_candidate() -> None:
     # 3 observations, 2 distinct evidence runs (factor A resimulated once +
     # a second factor B), but every row shares ONE canonical window.
     outcomes = [
-        _blocked_outcome(factor_fingerprint=FP_A, window=WINDOW_1, observed_at=T1),
-        _blocked_outcome(factor_fingerprint=FP_A, window=WINDOW_1, observed_at=T2),
-        _blocked_outcome(factor_fingerprint=FP_B, window=WINDOW_1, observed_at=T3),
+        _blocked_outcome(scope=SCOPE_KNOWN, factor_fingerprint=FP_A, window=WINDOW_1, observed_at=T1),
+        _blocked_outcome(scope=SCOPE_KNOWN, factor_fingerprint=FP_A, window=WINDOW_1, observed_at=T2),
+        _blocked_outcome(scope=SCOPE_KNOWN, factor_fingerprint=FP_B, window=WINDOW_1, observed_at=T3),
     ]
     observations = [row for outcome in outcomes for row in outcome_to_observations(outcome)]
     run_ids = {observation.run_id for observation in observations}
@@ -277,23 +293,41 @@ def test_single_canonical_window_never_yields_rule_candidate() -> None:
     assert len(decisions) == 1
     assert decisions[0].kind == "failure"
     assert not any(decision.kind == "rule" for decision in decisions)
-    assert decisions[0].observation_count == 3
+    assert decisions[0].observation_count == 2  # units, not rows: A's resim collapses
 
 
-def test_two_distinct_windows_yields_rule_candidate_with_failure_alongside() -> None:
-    # Same shape, but factor B's evidence lands in a second canonical window
-    # -> the rule gate opens, and mirrors memory.promote's dual-emit: the
-    # failure row must survive alongside the rule candidate.
+def test_resim_plus_second_window_cannot_reach_rule_tier() -> None:
+    # THE anti-gaming pin (SE-ii / review finding R-F1): factor A re-simulated
+    # in window 1 plus factor B in window 2 is only TWO evidence units — the
+    # jittered re-sim must not be the third observation that opens the rule
+    # gate, no matter how many retries pile up.
     outcomes = [
-        _blocked_outcome(factor_fingerprint=FP_A, window=WINDOW_1, observed_at=T1),
-        _blocked_outcome(factor_fingerprint=FP_A, window=WINDOW_1, observed_at=T2),
-        _blocked_outcome(factor_fingerprint=FP_B, window=WINDOW_2, observed_at=T3),
+        _blocked_outcome(scope=SCOPE_KNOWN, factor_fingerprint=FP_A, window=WINDOW_1, observed_at=T1),
+        _blocked_outcome(scope=SCOPE_KNOWN, factor_fingerprint=FP_A, window=WINDOW_1, observed_at=T2),
+        _blocked_outcome(scope=SCOPE_KNOWN, factor_fingerprint=FP_B, window=WINDOW_2, observed_at=T3),
     ]
     observations = [row for outcome in outcomes for row in outcome_to_observations(outcome)]
-    run_ids = {observation.run_id for observation in observations}
-    windows = {observation.data_window for observation in observations}
-    assert len(run_ids) == 2
-    assert len(windows) == 2
+    assert len({observation.run_id for observation in observations}) == 2
+    assert len({observation.data_window for observation in observations}) == 2
+
+    decisions = promote(observations)
+
+    assert [decision.kind for decision in decisions] == ["failure"]
+    assert decisions[0].observation_count == 2
+
+
+def test_three_evidence_units_over_two_windows_yield_rule_candidate_with_failure_alongside() -> None:
+    # THREE genuinely independent studies across two canonical windows open
+    # the rule gate, and mirror memory.promote's dual-emit: the failure row
+    # must survive alongside the rule candidate.
+    outcomes = [
+        _blocked_outcome(scope=SCOPE_KNOWN, factor_fingerprint=FP_A, window=WINDOW_1, observed_at=T1),
+        _blocked_outcome(scope=SCOPE_KNOWN, factor_fingerprint=FP_B, window=WINDOW_2, observed_at=T2),
+        _blocked_outcome(scope=SCOPE_KNOWN, factor_fingerprint=FP_C, window=WINDOW_2, observed_at=T3),
+    ]
+    observations = [row for outcome in outcomes for row in outcome_to_observations(outcome)]
+    assert len({observation.run_id for observation in observations}) == 3
+    assert len({observation.data_window for observation in observations}) == 2
 
     decisions = promote(observations)
 
@@ -303,6 +337,20 @@ def test_two_distinct_windows_yields_rule_candidate_with_failure_alongside() -> 
     assert by_kind["failure"].status == "active"
     assert by_kind["rule"].observation_count == 3
     assert by_kind["failure"].observation_count == 3
+
+
+def test_unknown_generalization_dims_never_promote() -> None:
+    # R-F4: without factor_family/settings_profile the signature carries a
+    # per-evidence-run disambiguator, so unrelated default-scope factors can
+    # never unify into a promoted row — they stay at trace tier.
+    outcomes = [
+        _blocked_outcome(factor_fingerprint=FP_A, window=WINDOW_1, observed_at=T1),
+        _blocked_outcome(factor_fingerprint=FP_B, window=WINDOW_1, observed_at=T2),
+        _blocked_outcome(factor_fingerprint=FP_C, window=WINDOW_2, observed_at=T3),
+    ]
+    observations = [row for outcome in outcomes for row in outcome_to_observations(outcome)]
+    assert len({observation.signature for observation in observations}) == 3
+    assert promote(observations) == ()
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +479,7 @@ def test_research_outcome_rejects_garbage_timestamp() -> None:
 
 
 def test_outcome_window_rejects_available_status_without_dates() -> None:
-    with pytest.raises(ValueError, match="needs ISO dates"):
+    with pytest.raises(ValueError, match="needs ASCII ISO dates"):
         OutcomeWindow(status="available", start_date="", end_date="")
 
 
@@ -538,7 +586,8 @@ def test_statement_contains_derived_strength_token() -> None:
 
 @pytest.mark.parametrize("stage", STAGES)
 def test_evidence_strength_matches_stage_table(stage: str) -> None:
-    outcome = _outcome(stage=stage, verdict="passed", reason_codes=(REASON_NONE,))
+    lifecycle = "submitted" if stage == "submit" else ""
+    outcome = _outcome(stage=stage, verdict="passed", reason_codes=(REASON_NONE,), lifecycle_status=lifecycle)
     assert outcome.evidence_strength == STAGE_EVIDENCE_STRENGTH[stage]
 
 
