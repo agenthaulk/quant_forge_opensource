@@ -473,3 +473,26 @@ machine-verified). Lane model verified claude-sonnet-5 per dispatch.
 Gates at close: 1228 passed / CLI OK / diff clean / release scan 237
 files (all in the FE worktree). FE-P1 is gated on the phase-f merge +
 D12 chore per SE-x.
+
+## 2026-07-14 — Workflow B / SE-P3: external-plugin producer (CLOSED, local-only)
+
+Deliverable lives entirely under the gitignored plugin tree (dual-domain,
+SE-i): result→ResearchOutcome v2 mappers with stage derived from the call
+site (SE-ix), closed reason-code mapping with case-normalized negation-aware
+classification of free-text rejection detail, provider composites excluded
+from metric snapshots, sample_role stamped from platform semantics
+(in_sample) with kernel-vocabulary mapping for local reports; plugin-rooted
+store instance with forced child-suffix + hostile-root rejection (main-store
+isolation), transactional ingest (observations first, ledger completion
+marker last) with restart-idempotence and trailing-corruption quarantine;
+owner-ruled submission margins config (inclusive semantics, boundary-pinned).
+Historical mission ledger backfill: 6/10 entries converted, 4 honestly
+skipped; converted statements verified template-only.
+
+Review trail: gpt-5.5 high (fingerprint qf-se-p3-review-20260714) →
+ACCEPT-WITH-FIXES, 4 findings (1 High transactional order, 2 Medium root
+isolation + classifier, 1 Low corruption tolerance) → all fixed with
+regressions. Offline suite at close: 209 passed (121 pre-existing + 88
+SE-P3). Zero tracked-file changes throughout (proven per round). No public
+CI coverage by design; the public synthetic-producer fixture (SE-P1 battery)
+covers the kernel seam.
