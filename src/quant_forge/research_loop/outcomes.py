@@ -80,6 +80,21 @@ REASON_CODES = frozenset(
 # denominators (the priors view filters it out by stage).
 LIFECYCLE_STATUSES = ("", "submitted", "not_confirmed", "accepted", "rejected")
 
+# Submit coherence matrix (re-verify residual, 2026-07-13): each lifecycle
+# state admits exactly ONE verdict, so contradictory pairs like
+# accepted+blocked or rejected+passed are unrepresentable and can never mint
+# a submitted_live observation. Pending states carry no scientific answer
+# yet, so they pin verdict="unknown" and the mapper's eligibility rule keeps
+# them ledger-only.
+SUBMIT_LIFECYCLE_VERDICTS: Mapping[str, str] = MappingProxyType(
+    {
+        "submitted": "unknown",
+        "not_confirmed": "unknown",
+        "accepted": "passed",
+        "rejected": "blocked",
+    }
+)
+
 # Evidence strength is DERIVED from the stage (owner ruling R5-3): it can
 # never exceed the DECLARED stage. Stage truthfulness itself is caller-owned
 # under SE-i and is verified by the trusted ingress sink (SE-P2 derives the
@@ -360,6 +375,13 @@ class ResearchOutcome:
             # a lifecycle would claim submitted_live strength for work that
             # never demonstrably went live.
             raise ValueError("submit-stage outcomes must carry a lifecycle_status")
+        if self.stage == "submit":
+            expected_verdict = SUBMIT_LIFECYCLE_VERDICTS[self.lifecycle_status]
+            if self.verdict != expected_verdict:
+                raise ValueError(
+                    f"submit lifecycle {self.lifecycle_status!r} requires verdict "
+                    f"{expected_verdict!r}, got {self.verdict!r} (coherence matrix)"
+                )
         if self.sample_role not in SAMPLE_ROLES:
             raise ValueError(f"sample_role must be one of {SAMPLE_ROLES}, got {self.sample_role!r}")
 
@@ -515,9 +537,10 @@ def outcome_to_observations(outcome: ResearchOutcome) -> tuple[MemoryObservation
     evidence_run_id`), so the existing pure ``memory.promote`` thresholds
     (>=2 distinct runs; >=2 distinct windows for the rule tier) measure
     independent studies by mechanism. Lifecycle-only submit bookkeeping
-    (``verdict="unknown"`` with a lifecycle status) still maps, but its
-    verdict keeps it out of pass/fail learning; the priors view additionally
-    filters by stage. The caller owns store routing (SE-i), factor-id
+    (``verdict="unknown"`` with a pending lifecycle) mints ZERO observations
+    — it is ledger-only via :meth:`ResearchOutcome.to_record`; only
+    ``accepted``/``rejected`` submit outcomes carry a scientific verdict and
+    can promote. The caller owns store routing (SE-i), factor-id
     resolution against the local registry, and outcome-id replay dropping.
     """
 

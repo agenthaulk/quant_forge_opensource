@@ -122,7 +122,10 @@ def promote(observations: Iterable[MemoryObservation]) -> tuple[PromotionDecisio
     """PURE deterministic promotion policy over the full observation set.
 
     - exact duplicate resubmissions of the same event (identical payload) are
-      counted ONCE: ``observation_count`` counts distinct events, never retries;
+      counted ONCE, and beyond that at most ONE observation per
+      (signature, run_id) reaches the thresholds: ``observation_count``
+      counts independent evidence units, never retries or re-measurements of
+      the same unit (SE-ii evidence-unit cap);
     - 1 distinct observation of a signature -> trace only, no decision (no row);
     - >=2 distinct observations across >=2 distinct run ids -> finding, or
       failure when the signature carries a gate-blocking/validation-error class;

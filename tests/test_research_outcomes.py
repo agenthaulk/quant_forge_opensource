@@ -592,7 +592,7 @@ def test_statement_contains_derived_strength_token() -> None:
 
 @pytest.mark.parametrize("stage", STAGES)
 def test_evidence_strength_matches_stage_table(stage: str) -> None:
-    lifecycle = "submitted" if stage == "submit" else ""
+    lifecycle = "accepted" if stage == "submit" else ""
     outcome = _outcome(stage=stage, verdict="passed", reason_codes=(REASON_NONE,), lifecycle_status=lifecycle)
     assert outcome.evidence_strength == STAGE_EVIDENCE_STRENGTH[stage]
 
@@ -1161,3 +1161,30 @@ def test_blocked_outcome_with_every_non_none_reason_code_yields_one_observation_
     assert len(observations) == len(reasons)
     signatures = {observation.signature for observation in observations}
     assert len(signatures) == len(reasons)
+
+
+# ---------------------------------------------------------------------------
+# 22. SUBMIT COHERENCE MATRIX (re-verify residual, 2026-07-13): each lifecycle
+# admits exactly one verdict; contradictory pairs are unrepresentable.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("lifecycle", ("submitted", "not_confirmed", "accepted", "rejected"))
+@pytest.mark.parametrize("verdict", ("passed", "blocked", "unknown", "not_applicable"))
+def test_submit_lifecycle_verdict_matrix_is_exhaustive(lifecycle: str, verdict: str) -> None:
+    from quant_forge.research_loop.outcomes import SUBMIT_LIFECYCLE_VERDICTS
+
+    reasons = ("TURNOVER_TOO_HIGH",) if verdict == "blocked" else (REASON_NONE,)
+    build = lambda: _outcome(  # noqa: E731 - tiny local thunk
+        stage="submit", verdict=verdict, reason_codes=reasons, lifecycle_status=lifecycle
+    )
+    if SUBMIT_LIFECYCLE_VERDICTS[lifecycle] == verdict:
+        outcome = build()
+        if verdict in ("passed", "blocked"):
+            observations = outcome_to_observations(outcome)
+            assert len(observations) == 1  # accepted/rejected: real submitted_live evidence
+        else:
+            assert outcome_to_observations(outcome) == ()  # pending: ledger-only
+    else:
+        with pytest.raises(ValueError, match="coherence matrix"):
+            build()
