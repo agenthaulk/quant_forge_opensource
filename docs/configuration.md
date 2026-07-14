@@ -567,3 +567,21 @@ qf run-backtest FTR_DEMO_SMALL_CAP --workspace ./demo --rd-config configs/rd.yam
 qf research run-once FTR_DEMO_SMALL_CAP --workspace ./demo --rd-config configs/rd.yaml
 qf web --workspace ./demo --rd-config configs/rd.yaml
 ```
+
+### Research memory: single-host writer only
+
+`artifact_root/research_memory` (the append-only observation/rule/finding/
+failure/review-event log the RD loop and `qf memory rules` read and write)
+uses a same-host advisory file lock (`fcntl.flock`) to serialize concurrent
+writers. That lock coordinates processes on ONE machine; it cannot
+coordinate across hosts and does not understand a cloud-sync tool's own
+conflict resolution. If `artifact_root` lives inside a folder synced by
+Dropbox (or a similar tool) and two hosts write to it around the same time,
+the sync tool can fork the JSONL history into a second physical file
+(Dropbox's convention: a sidecar named like `rules (name's conflicted copy
+2026-07-14).jsonl`). The store logs a loud warning naming the exact file
+when it detects one, but there is no distributed locking here — that is
+explicitly out of scope. Keep `artifact_root`, or at least its
+`research_memory` subdirectory, off a synced path if more than one host
+might write to it; a single-host setup, or a synced *read-only* mirror, is
+unaffected.

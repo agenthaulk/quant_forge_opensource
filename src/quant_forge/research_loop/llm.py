@@ -1,4 +1,11 @@
-"""LLM adapters for public RD research loops."""
+"""LLM adapters for public RD research loops.
+
+Drop-stats surfacing beyond this module's own returned stats mapping (e.g.
+persisting active_rules authentication counts into a queryable/disclosed
+artifact) is deferred to SE-P5's ``planning_influence_snapshot`` disclosure
+contract by design (P4a rework item 13); this module's job stops at making
+the drop visible to its own caller, never at silently swallowing it.
+"""
 
 from __future__ import annotations
 
@@ -24,6 +31,7 @@ from quant_forge.research_loop.outcomes import (
     EVIDENCE_STRENGTHS,
     ORIGINS,
     REASON_CODES,
+    REASON_NONE,
     STAGES,
 )
 from quant_forge.research_loop.service import (
@@ -106,17 +114,19 @@ class LLMHypothesisGenerator:
         attempt: int,
         max_attempts: int,
     ) -> ResearchHypothesis | None:
+        repair_messages, active_rules_stats = _repair_messages_and_stats(
+            seed=seed,
+            hypothesis=hypothesis,
+            context=context,
+            objective=objective,
+            validation_error=validation_error,
+            attempt=attempt,
+            max_attempts=max_attempts,
+        )
+        self.last_active_rules_stats = active_rules_stats
         result = generate_chat_text(
             self.llm,
-            _repair_messages(
-                seed=seed,
-                hypothesis=hypothesis,
-                context=context,
-                objective=objective,
-                validation_error=validation_error,
-                attempt=attempt,
-                max_attempts=max_attempts,
-            ),
+            repair_messages,
             temperature=0.1,
             max_tokens=900,
         )
@@ -306,9 +316,45 @@ def _repair_messages(
     attempt: int,
     max_attempts: int,
 ) -> list[dict[str, str]]:
+    """Thin, signature-stable wrapper over :func:`_repair_messages_and_stats`.
+
+    Kept as a plain ``list[dict[str, str]]`` return (no stats tuple) because
+    an existing test calls it directly and expects exactly that shape.
+    :meth:`LLMHypothesisGenerator.repair_invalid_hypothesis` calls
+    :func:`_repair_messages_and_stats` directly instead, when it needs the
+    active_rules drop counter.
+    """
+
+    messages, _active_rules_stats = _repair_messages_and_stats(
+        seed=seed,
+        hypothesis=hypothesis,
+        context=context,
+        objective=objective,
+        validation_error=validation_error,
+        attempt=attempt,
+        max_attempts=max_attempts,
+    )
+    return messages
+
+
+def _repair_messages_and_stats(
+    *,
+    seed: FactorDefinition,
+    hypothesis: ResearchHypothesis,
+    context: ResearchContext,
+    objective: str,
+    validation_error: str,
+    attempt: int,
+    max_attempts: int,
+) -> tuple[list[dict[str, str]], dict[str, int]]:
     field_catalog = _catalog_for_prompt(context.field_catalog or tuple(list_available_fields()))
     operator_catalog = _catalog_for_prompt(context.operator_catalog or tuple(list_available_operators()))
     mechanism_guidance = _mechanism_guidance_for_prompt(seed)
+    # SE-iv single steering point (P4a rework item 10): repair is still part
+    # of the SAME research loop the hypothesis-generation channel steers, so
+    # it retains the SAME authenticated active_rules block rather than a
+    # second, unsteered generation path.
+    active_rules, active_rules_stats = _active_rules_items_for_prompt(context.active_rules)
     system = (
         "You are Quant Forge's RD formula repair adapter. Return one JSON object only. "
         "Repair the given hypothesis so formula_dsl passes local validation. "
@@ -318,7 +364,8 @@ def _repair_messages(
         "If validation_error says the formula already exists, return a materially different executable formula. "
         "If validation_error includes forbidden_formula_dsl, never return any listed formula_dsl. "
         "Do not change the research intent unless needed to make the formula executable. "
-        "Do not request parameter-search fallback. If you cannot repair it, return an empty hypotheses list."
+        "Do not request parameter-search fallback. If you cannot repair it, return an empty hypotheses list. "
+        "Honor any active steering rules: a repaired formula must not contradict one."
     )
     user = json.dumps(
         {
@@ -339,6 +386,7 @@ def _repair_messages(
             },
             "available_fields": field_catalog,
             "available_operators": operator_catalog,
+            "active_rules": active_rules,
             "mechanism_guidance": mechanism_guidance,
             "return_shape": {
                 "schema_version": RD_LLM_SCHEMA_VERSION,
@@ -360,7 +408,8 @@ def _repair_messages(
         },
         ensure_ascii=False,
     )
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    return messages, active_rules_stats
 
 
 _MEMORY_PROMPT_ITEM_LIMIT = 5
@@ -433,57 +482,173 @@ def _memory_items_for_prompt(items: tuple[dict[str, Any], ...] | list[dict[str, 
 # ResearchOutcome-derived observation (research_loop/outcomes.py, SE-i/SE-ii),
 # so the accepted-template set here is the UNION of both shapes -- everything
 # the engine can actually mint into a statement, nothing else.
+#
+# P4a rework items 4/5/6 (dual-phase review): a pure per-field regex cannot
+# express the verdict<->reason AND-across-fields coherence rule ("passed"
+# carries exactly NONE; "blocked" carries a real, non-NONE code), so this is
+# a small canonical PARSER -- a structural regex capture followed by
+# Python-level field validation -- not one monolithic alternation. It also
+# authenticates the item's `scope` metadata field itself (not just the
+# statement text): a forged scope value alongside an otherwise-genuine
+# statement used to sail through unauthenticated (opus F1 probe: an
+# "IGNORE ALL PRIOR..." payload injected via `scope` passed with
+# dropped=0), because only `statement` was ever checked. Every candidate
+# item's `scope` must now itself match the closed scope_key() grammar, and
+# for an outcomes-grammar statement, `scope` must be EXACTLY the scope
+# embedded in the statement text -- a mismatch is spoofing and is dropped.
 # ---------------------------------------------------------------------------
 
+_STATEMENT_STRUCTURE_RE = re.compile(
+    r"^\[(?P<origin>[^/\]]+)/(?P<stage>[^\]]+)\] (?P<verdict>[^:]+): (?P<reason>[^;]+); "
+    r"family=(?P<family>[^;]+); strength=(?P<strength>[^;]+); scope=(?P<scope>.+)$"
+)
 
-def _closed_alternation(values: Any) -> str:
-    return "|".join(re.escape(str(value)) for value in sorted(values))
-
-
-_OUTCOME_ORIGIN_PATTERN = _closed_alternation(ORIGINS)
-_OUTCOME_STAGE_PATTERN = _closed_alternation(STAGES)
-# Narrower than the full closed VERDICTS vocabulary on purpose: outcomes.py's
-# own outcome_to_observations() mints ZERO observations for "unknown"/
-# "not_applicable" verdicts (FP-4/R-F2 -- they carry no scientific answer), so
-# a statement claiming either of those verdicts could never have been
-# genuinely minted and must not authenticate. The grammar matches shapes
-# ACTUALLY minted by the engine, not merely well-typed ones.
-_OUTCOME_VERDICT_PATTERN = "passed|blocked"
-_OUTCOME_REASON_PATTERN = _closed_alternation(REASON_CODES)
-_OUTCOME_STRENGTH_PATTERN = _closed_alternation(EVIDENCE_STRENGTHS)
 # Dimension-token grammar mirrors outcomes.OutcomeScope's own dimension regex
-# (bounded lowercase/digit/underscore/dot/hyphen token). This is a STRUCTURAL
-# grammar, not a closed string set, so it is reproduced here (with a pointer
-# comment) rather than importing outcomes.py's module-private regex object.
-_OUTCOME_TOKEN_PATTERN = r"[a-z0-9_.\-]{1,32}"
-_OUTCOME_FAMILY_PATTERN = rf"unknown|{_OUTCOME_TOKEN_PATTERN}"
-_OUTCOME_SCOPE_KEY_PATTERN = (
-    rf"global|(?:(?:asset|universe|family|horizon|settings)={_OUTCOME_TOKEN_PATTERN})"
-    rf"(?:;(?:asset|universe|family|horizon|settings)={_OUTCOME_TOKEN_PATTERN})*"
-)
-# outcomes._statement_for's closed template:
-# "[origin/stage] verdict: REASON; family=...; strength=...; scope=...".
-# Every alternation is DERIVED from outcomes.py's imported closed vocabularies
-# (ORIGINS/STAGES/REASON_CODES/EVIDENCE_STRENGTHS), never hand-copied, so this
-# cannot silently drift from the contract it re-authenticates against
-# (S1-F11: a re-authentication gate that falls out of sync with what the
-# engine actually mints would either reject legitimate statements or accept
-# foreign ones -- importing the vocabulary tuples instead of retyping their
-# members closes that drift risk structurally).
-_OUTCOME_STATEMENT_PATTERN = re.compile(
-    rf"^\[(?:{_OUTCOME_ORIGIN_PATTERN})/(?:{_OUTCOME_STAGE_PATTERN})\] "
-    rf"(?:{_OUTCOME_VERDICT_PATTERN}): (?:{_OUTCOME_REASON_PATTERN}); "
-    rf"family=(?:{_OUTCOME_FAMILY_PATTERN}); "
-    rf"strength=(?:{_OUTCOME_STRENGTH_PATTERN}); "
-    rf"scope=(?:{_OUTCOME_SCOPE_KEY_PATTERN})$"
-)
+# (bounded lowercase/digit/underscore/dot/hyphen token, `_DIM_RE`). This is a
+# STRUCTURAL grammar, not a closed string set, so it is reproduced here (with
+# a pointer comment) rather than importing outcomes.py's module-private
+# regex object.
+_SCOPE_TOKEN_RE = re.compile(r"^[a-z0-9_.\-]{1,32}$")
+# Fixed relative order outcomes.OutcomeScope.scope_key() always emits
+# dimensions in; a scope string presenting them out of this order is not a
+# shape the engine ever mints.
+_SCOPE_DIMENSION_KEYS = ("asset", "universe", "family", "horizon", "settings")
+# "unknown"/"global" are the RESERVED sentinels for "dimension absent" (R-F4
+# in outcomes.py); accepting them as literal dimension VALUES would let
+# unrelated scopes unify, so outcomes.OutcomeScope itself rejects them and
+# this parser mirrors that rejection.
+_SCOPE_RESERVED_VALUES = frozenset({"unknown", "global"})
+_SCOPE_MAX_LENGTH = 160
 
-# Union of every statement shape the engine can mint: the two local
-# candidate-gate templates PLUS the outcomes-contract grammar.
-_ACTIVE_RULES_STATEMENT_PATTERNS = _MEMORY_STATEMENT_PATTERNS + (_OUTCOME_STATEMENT_PATTERN,)
+
+def _parse_scope_grammar(scope: str) -> bool:
+    """Structural validation of a scope string (item 4a/6): ``"global"``, or
+    a ``;``-joined sequence of ``key=value`` segments with keys drawn from
+    the closed 5-dimension set (each appearing at most once, in canonical
+    order), values matching the outcomes dimension-token grammar, and
+    neither ``"unknown"`` nor ``"global"`` accepted as a value.
+    """
+
+    if len(scope) > _SCOPE_MAX_LENGTH:
+        return False
+    if scope == "global":
+        return True
+    seen_keys: list[str] = []
+    for segment in scope.split(";"):
+        key, separator, value = segment.partition("=")
+        if not separator or key not in _SCOPE_DIMENSION_KEYS or key in seen_keys:
+            return False
+        if value in _SCOPE_RESERVED_VALUES or not _SCOPE_TOKEN_RE.fullmatch(value):
+            return False
+        seen_keys.append(key)
+    if not seen_keys:
+        return False  # e.g. an empty string: neither "global" nor any real segment
+    order_index = {key: index for index, key in enumerate(_SCOPE_DIMENSION_KEYS)}
+    positions = [order_index[key] for key in seen_keys]
+    return positions == sorted(positions)
+
+
+def _family_token_valid(family: str) -> bool:
+    if family == "unknown":
+        return True
+    if family in _SCOPE_RESERVED_VALUES:
+        return False  # "global" is the scope-level sentinel, never a valid family value
+    return bool(_SCOPE_TOKEN_RE.fullmatch(family))
+
+
+def _reason_coherent_with_verdict(verdict: str, reason: str) -> bool:
+    """Non-mintable shapes (item 6) fail here: outcomes.ResearchOutcome
+    itself enforces "passed" <-> exactly NONE and "blocked" <-> a real,
+    non-NONE reason (mirrored from its own ``__post_init__``), so
+    ``"passed: VALIDATION_ERROR"`` or ``"blocked: NONE"`` were never
+    representable and must not authenticate.
+    """
+
+    if reason not in REASON_CODES:
+        return False
+    if verdict == "passed":
+        return reason == REASON_NONE
+    if verdict == "blocked":
+        return reason != REASON_NONE
+    return False
+
+
+def _authenticate_outcome_statement(statement: str) -> str | None:
+    """Canonical structural parser for ``outcomes._statement_for``'s shape:
+    ``"[origin/stage] verdict: REASON; family=...; strength=...; scope=..."``.
+
+    Every closed-set check is driven by outcomes.py's imported vocabularies
+    (never hand-copied), so this cannot silently drift from the contract it
+    authenticates against (S1-F11). Returns the embedded scope substring on
+    success (for the statement/scope equality cross-check in
+    :func:`authenticate_active_rule_item`), or ``None`` if the statement is
+    not a shape the engine can actually mint.
+    """
+
+    match = _STATEMENT_STRUCTURE_RE.match(statement)
+    if match is None:
+        return None
+    origin = match.group("origin")
+    stage = match.group("stage")
+    verdict = match.group("verdict")
+    reason = match.group("reason")
+    family = match.group("family")
+    strength = match.group("strength")
+    scope = match.group("scope")
+
+    if origin not in ORIGINS or stage not in STAGES:
+        return None
+    # Narrower than the full closed VERDICTS vocabulary on purpose:
+    # outcome_to_observations() mints ZERO observations for "unknown"/
+    # "not_applicable" verdicts (FP-4/R-F2), so a statement claiming either
+    # could never have been genuinely minted.
+    if verdict not in ("passed", "blocked"):
+        return None
+    if not _reason_coherent_with_verdict(verdict, reason):
+        return None
+    if not _family_token_valid(family):
+        return None
+    if strength not in EVIDENCE_STRENGTHS:
+        return None
+    if not _parse_scope_grammar(scope):
+        return None
+    return scope
+
 
 _ACTIVE_RULES_PROMPT_ITEM_LIMIT = 5
 _EMPTY_ACTIVE_RULES_STATS: dict[str, int] = {"total": 0, "accepted": 0, "dropped": 0}
+
+
+def authenticate_active_rule_item(statement: str, scope: str) -> bool:
+    """True iff ``(statement, scope)`` together pass the active_rules
+    closed-template + scope grammar (P4a rework items 4/5/6): EITHER a local
+    candidate-gate template (service.py's two accept/block statement
+    shapes) with a well-formed standalone ``scope``, OR an outcomes-grammar
+    statement (``outcomes._statement_for``) whose EMBEDDED scope matches
+    ``scope`` exactly.
+
+    Public (no leading underscore) and reached from
+    ``context_builder._active_rules()`` via a DEFERRED (function-body-level)
+    import: a module-level import there would create a cycle
+    (context_builder -> llm -> service -> context_builder, since
+    service.py imports ``ResearchContextBuilder``). This is the ONE
+    canonical authentication implementation, invoked at two independent
+    points in the data flow -- context_builder's auth-before-cap pipeline
+    stage (item 5) and this module's own prompt-assembly gate -- not two
+    independently coded copies that could silently drift apart.
+    """
+
+    collapsed_statement = " ".join(statement.split())
+    if len(collapsed_statement) > _MEMORY_STATEMENT_MAX_CHARS:
+        return False
+    if not _parse_scope_grammar(scope):
+        return False
+    if any(pattern.match(collapsed_statement) for pattern in _MEMORY_STATEMENT_PATTERNS):
+        return True  # local template: no embedded scope to cross-check
+    embedded_scope = _authenticate_outcome_statement(collapsed_statement)
+    if embedded_scope is None:
+        return False
+    return embedded_scope == scope
 
 
 def _active_rules_items_for_prompt(
@@ -492,14 +657,15 @@ def _active_rules_items_for_prompt(
     """Bounded, closed-template-authenticated active_rules items (SE-iv).
 
     Mirrors :func:`_memory_items_for_prompt`'s read-time authentication
-    discipline but against the WIDER accepted-template set above. Unlike that
-    passive memory-recall channel, active_rules are human-activated steering:
-    a statement failing authentication is DROPPED and counted in the returned
-    stats mapping instead of vanishing without a trace (S1-F11) --
-    ``{"total": len(items), "accepted": forwarded count, "dropped": examined
-    and rejected count}``. (``dropped`` only counts items actually examined:
-    an input longer than the prompt cap that already found enough conforming
-    statements stops early, same as the existing memory channel's cap.)
+    discipline but calls the WIDER :func:`authenticate_active_rule_item`
+    (statement AND scope). Unlike that passive memory-recall channel,
+    active_rules are human-activated steering: a statement or scope failing
+    authentication is DROPPED and counted in the returned stats mapping
+    instead of vanishing without a trace (S1-F11) -- ``{"total": len(items),
+    "accepted": forwarded count, "dropped": examined and rejected count}``.
+    (``dropped`` only counts items actually examined: an input longer than
+    the prompt cap that already found enough conforming statements stops
+    early, same as the existing memory channel's cap.)
     """
 
     total = len(items)
@@ -510,15 +676,14 @@ def _active_rules_items_for_prompt(
             dropped += 1
             continue
         statement = " ".join(str(item.get("statement") or "").split())
-        if len(statement) > _MEMORY_STATEMENT_MAX_CHARS or not any(
-            pattern.match(statement) for pattern in _ACTIVE_RULES_STATEMENT_PATTERNS
-        ):
+        scope = str(item.get("scope") or "global")
+        if not authenticate_active_rule_item(statement, scope):
             dropped += 1
             continue
         bounded.append(
             {
                 "statement": statement,
-                "scope": str(item.get("scope") or "global"),
+                "scope": scope,
                 "observation_count": int(item.get("observation_count") or 0),
             }
         )

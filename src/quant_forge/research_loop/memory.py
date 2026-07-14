@@ -28,7 +28,45 @@ PURE function of the latest valid event per signature (:meth:`
 ResearchMemoryStore.rule_states`, :meth:`ResearchMemoryStore.
 retired_signatures`) and is never derivable from promotion output alone. A
 promoted rule row's ``status`` therefore stays ``needs_human_review`` forever
-(FP-2): promotion structurally cannot mint activity.
+(FP-2): promotion structurally cannot mint activity. A signature that merely
+REACHES the rule tier (a live row exists, reviewed or not) already leaves the
+passive finding/failure feed — see :meth:`ResearchMemoryStore.
+rule_tier_signatures` and ``context_builder._memory_items``.
+
+"Latest valid event" (P4a rework, dual-phase review): ordering is FILE APPEND
+ORDER under the store's advisory lock (a monotonic revision index), never
+``decided_at`` — same-second or out-of-order writer clocks must not be able
+to invert the true decision sequence (a same-second activate-then-deactivate
+must yield inactive). ``decided_at`` is DISPLAY metadata only. An event
+additionally only counts if ``reviewed_entry_id`` equals the row CURRENTLY
+live for ``(target_kind, target_signature)``: once a row is superseded (new
+observations promote a new version), any event bound to the prior version
+lapses — the signature reverts to unreviewed until a human re-reviews the new
+content. ``supersedes`` is audit-trail metadata (validated same-(kind,
+signature); :meth:`ResearchMemoryStore.record_review_event` auto-populates it
+with the current live event when the caller leaves it unset); it plays no
+role in state derivation, only in the write-time referential-integrity check.
+
+Trusted boundary: this module trusts whoever already has write access to
+``artifact_root`` — that is the existing local-first security model (see
+``AGENTS.md``), unchanged here. Read-side validation in this module (event
+schema/kind/action checks, row binding, and the trailing-line-only JSON
+quarantine below) defends against ON-DISK CORRUPTION and a FOREIGN
+(non-Python) writer producing malformed rows. It is not a defense against
+another in-process caller that already holds a `ResearchMemoryStore`
+instance: that caller is, by definition, already inside the trust boundary.
+
+Single-host writers only: the advisory lock is a same-host ``fcntl.flock``;
+it does not coordinate across hosts or across a cloud-sync tool's own
+conflict resolution. :meth:`ResearchMemoryStore.__init__` warns loudly if it
+finds a Dropbox-style "conflicted copy" sidecar file under the memory
+directory (see ``docs/configuration.md`` for the operational recommendation).
+There is no distributed locking here — that is explicitly out of scope.
+
+Drop-stats surfacing beyond the ``llm.py`` active_rules prompt channel's own
+returned stats mapping (e.g. persisting counts into a queryable/disclosed
+artifact) is deferred to SE-P5's ``planning_influence_snapshot`` disclosure
+contract by design; it does not belong in this kernel module.
 """
 
 from __future__ import annotations
@@ -36,17 +74,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import json
+import logging
 from pathlib import Path
 import re
 from typing import Any, Iterable, Mapping
 
-# ``_advisory_file_lock`` is module-private in lineage.store but this reuses
-# the SAME lock primitive on purpose (SE-ix / S2-F10): the lineage store
-# already established the pattern of serializing read-then-append critical
-# sections on JSONL files with a sidecar ``fcntl.flock``; goals.py similarly
-# imports lineage.store's private relative-path guard rather than forking a
-# second implementation.
-from quant_forge.lineage.store import _advisory_file_lock, canonical_fingerprint, redact_free_text
+# ``advisory_file_lock`` is a public export of lineage.store (promoted from a
+# private name in the P4a rework, item 12) but this reuses the SAME lock
+# primitive on purpose (SE-ix / S2-F10): the lineage store already
+# established the pattern of serializing read-then-append critical sections
+# on JSONL files with a sidecar ``fcntl.flock``; goals.py similarly imports
+# lineage.store's private relative-path guard rather than forking a second
+# implementation.
+from quant_forge.lineage.store import advisory_file_lock, canonical_fingerprint, redact_free_text
+
+logger = logging.getLogger(__name__)
 
 RESEARCH_MEMORY_SCHEMA_VERSION = "qf.research_memory.v1"
 MEMORY_KINDS = ("rule", "finding", "failure")
@@ -67,6 +109,7 @@ _OBSERVATIONS_FILE = "observations.jsonl"
 _REVIEW_EVENTS_FILE = "activations.jsonl"
 _LOCK_FILE = "memory.lock"
 _EVENT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+_CONFLICTED_COPY_MARKER = "conflicted copy"
 
 
 @dataclass(frozen=True)
@@ -154,10 +197,7 @@ class MemoryReviewEvent:
     schema_version included) computed by :meth:`event_id`, mirroring how
     :class:`PromotionDecision` rows derive ``entry_id`` outside the dataclass.
     Because nothing is excluded from the fingerprint (not even ``decided_at``),
-    only an EXACT byte-identical replay collapses to the same id — a genuinely
-    new decision (even one immediately reversing a prior one) always mints a
-    new event, and the previous decision remains readable in the log (FP-2:
-    rows/events are never mutated).
+    only an EXACT byte-identical payload collapses to the same id.
     """
 
     target_kind: str
@@ -292,6 +332,7 @@ class ResearchMemoryStore:
     def __init__(self, artifact_root: str | Path) -> None:
         self.artifact_root = Path(artifact_root).expanduser()
         self.memory_root = self.artifact_root / _MEMORY_DIR
+        self._warn_of_conflicted_copies()
 
     @property
     def observations_path(self) -> Path:
@@ -304,17 +345,48 @@ class ResearchMemoryStore:
     @property
     def _lock_path(self) -> Path:
         # ONE sidecar lock file serializes every read-then-append critical
-        # section this store instance performs (observation append, the
-        # promote read-decide-append cycle, and review-event append). SE-ix /
-        # S2-F10: sharing one lock keeps cross-file interleavings (e.g. a
-        # promote() read racing an observation append) impossible, not merely
-        # each file's own append serialized in isolation.
+        # section this store instance performs: observation append, the
+        # promote read-decide-append cycle, review-event append, AND (P4a
+        # rework item 7) every public state reader below. Locking reads too
+        # means a reader can never observe a row-file / event-file pair that
+        # straddles a concurrent writer (SE-ix / S2-F10).
         return self.memory_root / _LOCK_FILE
 
     def path_for(self, kind: str) -> Path:
         if kind not in _KIND_FILES:
             raise ValueError(f"unknown memory kind: {kind!r}")
         return self.memory_root / _KIND_FILES[kind]
+
+    def _warn_of_conflicted_copies(self) -> None:
+        """Loud, specific warning if a cloud-sync conflict sidecar is present
+        under the memory directory (P4a rework item 9).
+
+        Dropbox (and similar tools) resolve a same-file write conflict by
+        creating a SECOND physical file, conventionally named like
+        ``rules (name's conflicted copy 2026-07-14).jsonl``, rather than
+        merging. This store's advisory lock only serializes writers on ONE
+        host; it cannot detect or prevent a synced conflicted-copy fork of
+        the append-only history. There is no distributed locking here
+        (explicitly out of scope) — the only honest mitigation available is
+        to name the exact file loudly so an operator notices, per the
+        single-host-writer recommendation in ``docs/configuration.md``.
+        """
+
+        if not self.memory_root.exists():
+            return
+        for candidate in sorted(self.memory_root.iterdir()):
+            if candidate.is_file() and _CONFLICTED_COPY_MARKER in candidate.name:
+                logger.warning(
+                    "Dropbox-style sync-conflict file detected under research_memory: %s -- this store "
+                    "assumes a SINGLE host writer and cannot merge a synced conflicted copy; move the "
+                    "memory root off a synced path or resolve the conflict manually before trusting "
+                    "activation/retirement state.",
+                    candidate.name,
+                )
+
+    # ------------------------------------------------------------------
+    # Observations + promotion.
+    # ------------------------------------------------------------------
 
     def record_observation(
         self,
@@ -343,7 +415,7 @@ class ResearchMemoryStore:
         # Critical section (S2-F10): serialize this append against a
         # concurrent promote_pending() read of the same file under the SAME
         # store-wide lock, so a reader can never observe a torn write.
-        with _advisory_file_lock(self._lock_path):
+        with advisory_file_lock(self._lock_path):
             _append_jsonl(
                 self.observations_path,
                 {"schema_version": RESEARCH_MEMORY_SCHEMA_VERSION, "record": "observation", **observation.to_dict()},
@@ -363,7 +435,7 @@ class ResearchMemoryStore:
         """
 
         appended: list[dict[str, Any]] = []
-        with _advisory_file_lock(self._lock_path):
+        with advisory_file_lock(self._lock_path):
             decisions = promote(self._read_observations())
             for decision in decisions:
                 row = self._row_for_decision(decision)
@@ -372,12 +444,21 @@ class ResearchMemoryStore:
                     appended.append(row)
         return tuple(appended)
 
+    # ------------------------------------------------------------------
+    # Public state readers (P4a rework item 7: every one of these takes the
+    # store lock so a read can never straddle a concurrent writer). Each
+    # delegates to an ``_..._unlocked`` internal so composed operations
+    # (e.g. :meth:`resolve_validate_append`) can hold the lock ONCE across
+    # several steps without nesting ``advisory_file_lock`` (which would
+    # deadlock: two separate ``open()`` calls on the same lock file, even
+    # from the same thread, are two independent flock holders).
+    # ------------------------------------------------------------------
+
     def read_recent(self, kind: str, limit: int = 5) -> tuple[dict[str, Any], ...]:
         """Latest live rows for ``kind``: superseded rows dropped, newest first."""
 
-        live_by_signature = self._live_rows_by_signature(kind)
-        ordered = sorted(live_by_signature.values(), key=lambda row: str(row.get("last_seen") or ""), reverse=True)
-        return tuple(ordered[: max(limit, 0)])
+        with advisory_file_lock(self._lock_path):
+            return self._read_recent_unlocked(kind, limit)
 
     def list_promoted(self, kind: str) -> tuple[dict[str, Any], ...]:
         """Every live row for ``kind``, newest first, uncapped.
@@ -388,8 +469,8 @@ class ResearchMemoryStore:
         set, not just the 5 most recent.
         """
 
-        live_by_signature = self._live_rows_by_signature(kind)
-        return tuple(sorted(live_by_signature.values(), key=lambda row: str(row.get("last_seen") or ""), reverse=True))
+        with advisory_file_lock(self._lock_path):
+            return self._list_promoted_unlocked(kind)
 
     def resolve_signature_prefix(self, kind: str, prefix: str) -> dict[str, Any]:
         """Resolve ``prefix`` to exactly one live row's signature for ``kind``.
@@ -400,11 +481,191 @@ class ResearchMemoryStore:
         signature; zero or multiple matches raise ``ValueError`` naming the
         candidates, which is the CLI's anti-fat-finger confirmation (R3): no
         interactive prompts, an ambiguous or absent prefix simply fails.
+
+        This alone does not protect against a concurrent writer changing the
+        row between resolution and a later separate append; callers that
+        need the two to happen atomically should use
+        :meth:`resolve_validate_append` instead.
         """
 
+        with advisory_file_lock(self._lock_path):
+            return self._resolve_signature_prefix_unlocked(kind, prefix)
+
+    def rule_activation_events(self) -> dict[str, dict[str, Any]]:
+        """Latest 'rule' review event per signature, as dicts.
+
+        Richer than :meth:`rule_states`: callers that need more than the
+        derived active/inactive label (e.g. sorting by activation recency)
+        read ``decided_at``/``actor``/``rationale`` from here.
+        """
+
+        with advisory_file_lock(self._lock_path):
+            return {
+                signature: {"event_id": event.event_id(), **event.to_dict()}
+                for signature, event in self._latest_events_by_signature_unlocked("rule").items()
+            }
+
+    def rule_states(self) -> dict[str, str]:
+        """Effective activation state per rule signature: {signature: "active"|"inactive"}.
+
+        Derived ONLY from the latest valid, row-bound review event per
+        signature (activate -> active, deactivate -> inactive; "latest" is
+        FILE APPEND ORDER, never ``decided_at`` — see the module docstring).
+        A signature absent from this mapping has never been (validly)
+        reviewed and defaults to "inactive" — callers must treat a missing
+        key as inactive, never as active. This is the ONLY path to "active":
+        promoted rule ROWS keep status ``needs_human_review`` forever and are
+        never consulted here (FP-2).
+        """
+
+        with advisory_file_lock(self._lock_path):
+            events = self._latest_events_by_signature_unlocked("rule")
+        return {
+            signature: ("active" if event.action == "activate" else "inactive") for signature, event in events.items()
+        }
+
+    def retired_signatures(self, target_kind: str) -> frozenset[str]:
+        """Signatures whose latest valid, row-bound review event for
+        ``target_kind`` is 'retire' (never 'unretire'). ``target_kind`` must
+        be 'finding' or 'failure' -- scoped per kind so retiring a finding
+        can never also hide an unrelated failure row that happens to share
+        the signature string (promote() can mint the same signature as both
+        a rule and a failure row for one signature group; kind-scoping keeps
+        retirement from unifying across kinds it was never decided for).
+        """
+
+        if target_kind not in _RETIRE_TARGET_KINDS:
+            raise ValueError(
+                f"retired_signatures target_kind must be one of {sorted(_RETIRE_TARGET_KINDS)}, got {target_kind!r}"
+            )
+        with advisory_file_lock(self._lock_path):
+            events = self._latest_events_by_signature_unlocked(target_kind)
+        return frozenset(signature for signature, event in events.items() if event.action == "retire")
+
+    def rule_tier_signatures(self) -> frozenset[str]:
+        """Every signature with a LIVE rule-tier row, active or pending
+        (P4a rework item 1: pre-activation silencing). A signature reaching
+        the rule tier at all has "graduated" out of the passive finding/
+        failure feed until a human reviews it — unlike :meth:`rule_states`
+        this makes no distinction between an activated row and a
+        merely-pending one; both silence their signature's lower tiers.
+        """
+
+        with advisory_file_lock(self._lock_path):
+            return frozenset(self._live_rows_by_signature("rule").keys())
+
+    # ------------------------------------------------------------------
+    # Review events (SE-iii): append-only human governance decisions layered
+    # OVER promoted rows. Rows are never mutated; "effective" state is always
+    # derived fresh from the latest valid event per signature.
+    # ------------------------------------------------------------------
+
+    def record_review_event(
+        self,
+        *,
+        target_kind: str,
+        target_signature: str,
+        reviewed_entry_id: str,
+        action: str,
+        actor: str,
+        rationale: str = "",
+        decided_at: str | None = None,
+        supersedes: str | None = None,
+    ) -> MemoryReviewEvent:
+        """Append one review decision.
+
+        ``supersedes`` defaults to ``None``, meaning "auto-populate with the
+        current live event for this (target_kind, target_signature), if any"
+        (P4a rework item 3) — pass ``""`` explicitly to force a fresh,
+        unchained event even when a prior one exists. An explicitly-supplied
+        non-empty ``supersedes`` must reference an existing event for the
+        SAME (target_kind, target_signature); a cross-signature claim raises
+        ``ValueError``.
+
+        Idempotent replay: a call whose caller-supplied fields (excluding
+        the derived ``supersedes``) exactly match the CURRENT last event for
+        this signature returns that event unchanged rather than appending a
+        new one — this preserves "exact replays are dropped" even though
+        auto-populated ``supersedes`` would otherwise differ between the
+        first call and an immediate identical retry. A byte-identical event
+        with an EXPLICIT ``supersedes`` matching an existing row is also
+        deduplicated (defense in depth, scanning the full log by event id).
+
+        Callers that need prefix resolution and this append to happen
+        atomically (no TOCTOU window between the two) should use
+        :meth:`resolve_validate_append` instead.
+        """
+
+        with advisory_file_lock(self._lock_path):
+            return self._record_review_event_unlocked(
+                target_kind=target_kind,
+                target_signature=target_signature,
+                reviewed_entry_id=reviewed_entry_id,
+                action=action,
+                actor=actor,
+                rationale=rationale,
+                decided_at=decided_at,
+                supersedes=supersedes,
+            )
+
+    def resolve_validate_append(
+        self,
+        *,
+        target_kind: str,
+        prefix: str,
+        action: str,
+        actor: str,
+        rationale: str = "",
+        decided_at: str | None = None,
+    ) -> MemoryReviewEvent:
+        """Atomic CLI-facing operation (P4a rework item 8): prefix
+        resolution, row binding, and event append all happen inside ONE
+        lock hold.
+
+        Two processes racing to review the same prefix cannot interleave
+        between "resolve the row" and "append the event": whichever
+        acquires the lock first resolves against the row state AT THAT
+        MOMENT and appends immediately, still holding the lock, so the
+        second process either observes the first's fully-applied result
+        before it starts (clean sequential behavior — no torn state, no
+        exception, the store's single append-order lock decides who is
+        "last" deterministically) or, if its request is byte-identical to
+        what just landed, gets the SAME event back via the idempotent-replay
+        path. Prefer this over separately calling
+        :meth:`resolve_signature_prefix` then :meth:`record_review_event`,
+        which leaves that exact TOCTOU window open.
+        """
+
+        with advisory_file_lock(self._lock_path):
+            row = self._resolve_signature_prefix_unlocked(target_kind, prefix)
+            return self._record_review_event_unlocked(
+                target_kind=target_kind,
+                target_signature=str(row.get("signature") or ""),
+                reviewed_entry_id=str(row.get("entry_id") or ""),
+                action=action,
+                actor=actor,
+                rationale=rationale,
+                decided_at=decided_at,
+                supersedes=None,
+            )
+
+    # ------------------------------------------------------------------
+    # Unlocked internals: never self-lock (callers hold the lock already).
+    # ------------------------------------------------------------------
+
+    def _read_recent_unlocked(self, kind: str, limit: int) -> tuple[dict[str, Any], ...]:
+        live_by_signature = self._live_rows_by_signature(kind)
+        ordered = sorted(live_by_signature.values(), key=lambda row: str(row.get("last_seen") or ""), reverse=True)
+        return tuple(ordered[: max(limit, 0)])
+
+    def _list_promoted_unlocked(self, kind: str) -> tuple[dict[str, Any], ...]:
+        live_by_signature = self._live_rows_by_signature(kind)
+        return tuple(sorted(live_by_signature.values(), key=lambda row: str(row.get("last_seen") or ""), reverse=True))
+
+    def _resolve_signature_prefix_unlocked(self, kind: str, prefix: str) -> dict[str, Any]:
         if not prefix.strip():
             raise ValueError("signature prefix must not be empty")
-        rows = self.list_promoted(kind)
+        rows = self._list_promoted_unlocked(kind)
         exact = [row for row in rows if str(row.get("signature") or "") == prefix]
         if len(exact) == 1:
             return exact[0]
@@ -428,13 +689,7 @@ class ResearchMemoryStore:
             live_by_signature[str(row.get("signature") or row.get("entry_id"))] = row
         return live_by_signature
 
-    # ------------------------------------------------------------------
-    # Review events (SE-iii): append-only human governance decisions layered
-    # OVER promoted rows. Rows are never mutated; "effective" state is always
-    # derived fresh from the latest valid event per signature.
-    # ------------------------------------------------------------------
-
-    def record_review_event(
+    def _record_review_event_unlocked(
         self,
         *,
         target_kind: str,
@@ -442,116 +697,171 @@ class ResearchMemoryStore:
         reviewed_entry_id: str,
         action: str,
         actor: str,
-        rationale: str = "",
-        decided_at: str | None = None,
-        supersedes: str = "",
+        rationale: str,
+        decided_at: str | None,
+        supersedes: str | None,
     ) -> MemoryReviewEvent:
-        """Append one review decision. Exact-payload replays are idempotent:
-        an event whose id already exists on disk is dropped, not duplicated.
-        """
+        redacted_actor = redact_free_text(actor)
+        redacted_rationale = redact_free_text(rationale)
+        resolved_decided_at = decided_at if decided_at is not None else _default_review_decided_at()
+
+        last = self._last_event_for_signature_unlocked(target_kind, target_signature)
+
+        # Idempotent replay (excluding the DERIVED `supersedes` field from
+        # the comparison, since auto-population would otherwise make an
+        # immediate identical retry compute a different value than the
+        # original call did — see the docstring on record_review_event).
+        if (
+            last is not None
+            and last.reviewed_entry_id == reviewed_entry_id
+            and last.action == action
+            and last.actor == redacted_actor
+            and last.rationale == redacted_rationale
+            and last.decided_at == resolved_decided_at
+            and (supersedes is None or supersedes == last.supersedes)
+        ):
+            return last
+
+        if supersedes is None:
+            resolved_supersedes = last.event_id() if last is not None else ""
+        else:
+            resolved_supersedes = supersedes
+            if resolved_supersedes:
+                referenced = self._find_event_by_id_unlocked(resolved_supersedes)
+                if (
+                    referenced is None
+                    or referenced.target_kind != target_kind
+                    or referenced.target_signature != target_signature
+                ):
+                    raise ValueError(
+                        f"supersedes {resolved_supersedes!r} must reference an existing event for the same "
+                        f"(target_kind={target_kind!r}, target_signature={target_signature!r})"
+                    )
 
         event = MemoryReviewEvent(
             target_kind=target_kind,
             target_signature=target_signature,
             reviewed_entry_id=reviewed_entry_id,
             action=action,
-            actor=redact_free_text(actor),
-            rationale=redact_free_text(rationale),
-            decided_at=decided_at if decided_at is not None else _utc_now_iso(),
-            supersedes=supersedes,
+            actor=redacted_actor,
+            rationale=redacted_rationale,
+            decided_at=resolved_decided_at,
+            supersedes=resolved_supersedes,
         )
         event_id = event.event_id()
-        with _advisory_file_lock(self._lock_path):
-            if not self._event_id_recorded(event_id):
-                _append_jsonl(self.review_events_path, {"event_id": event_id, **event.to_dict()})
+        if not self._event_id_recorded_unlocked(event_id):
+            _append_jsonl(self.review_events_path, {"event_id": event_id, **event.to_dict()})
         return event
 
-    def rule_activation_events(self) -> dict[str, dict[str, Any]]:
-        """Latest 'rule' review event per signature, as dicts.
+    def _read_review_events_unlocked(self) -> tuple[MemoryReviewEvent, ...]:
+        """Tolerant, natural-file-order read of ``activations.jsonl``.
 
-        Richer than :meth:`rule_states`: callers that need more than the
-        derived active/inactive label (e.g. sorting by activation recency)
-        read ``decided_at``/``actor``/``rationale`` from here.
+        Mirrors SE-P3's local-producer trailing-corruption-quarantine shape
+        (docs/coordination/ENGINEERING_PROGRESS.md, "restart-idempotence and
+        trailing-corruption quarantine"): a malformed JSON line that is the
+        LAST line in the file is the benign "writer died mid-append" shape
+        and is skipped with a warning. A malformed line ANYWHERE ELSE in the
+        file is a stronger corruption signal — not the benign shape — and
+        still raises. A line that parses as JSON but fails
+        :class:`MemoryReviewEvent`'s own schema/kind/action validation is
+        skipped with a warning too (never raised): one corrupted or
+        foreign-written row must not take the whole log down.
         """
 
-        return {
-            signature: {"event_id": event.event_id(), **event.to_dict()}
-            for signature, event in self._latest_events_by_signature(frozenset({"rule"})).items()
-        }
-
-    def rule_states(self) -> dict[str, str]:
-        """Effective activation state per rule signature: {signature: "active"|"inactive"}.
-
-        Derived ONLY from the latest valid review event per signature
-        (activate -> active, deactivate -> inactive). A signature absent from
-        this mapping has never been reviewed and defaults to "inactive" —
-        callers must treat a missing key as inactive, never as active. This
-        is the ONLY path to "active": promoted rule ROWS keep status
-        ``needs_human_review`` forever and are never consulted here (FP-2).
-        """
-
-        return {
-            signature: ("active" if event["action"] == "activate" else "inactive")
-            for signature, event in self.rule_activation_events().items()
-        }
-
-    def retired_signatures(self, target_kind: str) -> frozenset[str]:
-        """Signatures whose latest valid review event for ``target_kind`` is
-        'retire' (never 'unretire'). ``target_kind`` must be 'finding' or
-        'failure' -- scoped per kind so retiring a finding can never also
-        hide an unrelated failure row that happens to share the signature
-        string (promote() can mint the same signature as both a rule and a
-        failure row for one signature group; kind-scoping keeps retirement
-        from unifying across kinds it was never decided for).
-        """
-
-        if target_kind not in _RETIRE_TARGET_KINDS:
-            raise ValueError(
-                f"retired_signatures target_kind must be one of {sorted(_RETIRE_TARGET_KINDS)}, got {target_kind!r}"
-            )
-        latest = self._latest_events_by_signature(frozenset({target_kind}))
-        return frozenset(signature for signature, event in latest.items() if event.action == "retire")
-
-    def _read_review_events(self) -> tuple[MemoryReviewEvent, ...]:
+        path = self.review_events_path
+        if not path.exists():
+            return ()
+        lines = path.read_text(encoding="utf-8").splitlines()
+        last_line_number = len(lines)
         events: list[MemoryReviewEvent] = []
-        for row in _read_jsonl(self.review_events_path):
-            events.append(
-                MemoryReviewEvent(
-                    target_kind=str(row.get("target_kind") or ""),
-                    target_signature=str(row.get("target_signature") or ""),
-                    reviewed_entry_id=str(row.get("reviewed_entry_id") or ""),
-                    action=str(row.get("action") or ""),
-                    actor=str(row.get("actor") or ""),
-                    rationale=str(row.get("rationale") or ""),
-                    decided_at=str(row.get("decided_at") or ""),
-                    supersedes=str(row.get("supersedes") or ""),
+        for line_number, line in enumerate(lines, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                row = json.loads(stripped)
+            except json.JSONDecodeError:
+                if line_number == last_line_number:
+                    logger.warning(
+                        "quarantining malformed trailing line %d in %s (writer-died-mid-append shape)",
+                        line_number,
+                        path,
+                    )
+                    continue
+                raise ValueError(
+                    f"malformed JSONL line {line_number} in {path} is not the trailing line; this is not "
+                    "the benign writer-died-mid-append shape and is treated as corruption"
+                ) from None
+            try:
+                events.append(
+                    MemoryReviewEvent(
+                        target_kind=str(row.get("target_kind") or ""),
+                        target_signature=str(row.get("target_signature") or ""),
+                        reviewed_entry_id=str(row.get("reviewed_entry_id") or ""),
+                        action=str(row.get("action") or ""),
+                        actor=str(row.get("actor") or ""),
+                        rationale=str(row.get("rationale") or ""),
+                        decided_at=str(row.get("decided_at") or ""),
+                        supersedes=str(row.get("supersedes") or ""),
+                        schema_version=str(row.get("schema_version") or RESEARCH_MEMORY_REVIEW_SCHEMA_VERSION),
+                    )
                 )
-            )
+            except ValueError as exc:
+                logger.warning(
+                    "skipping semantically-invalid review event on line %d in %s: %s", line_number, path, exc
+                )
+                continue
         return tuple(events)
 
-    def _event_id_recorded(self, event_id: str) -> bool:
-        for row in _read_jsonl(self.review_events_path):
-            if row.get("event_id") == event_id:
-                return True
-        return False
+    def _event_id_recorded_unlocked(self, event_id: str) -> bool:
+        return any(event.event_id() == event_id for event in self._read_review_events_unlocked())
 
-    def _latest_events_by_signature(self, target_kinds: frozenset[str]) -> dict[str, MemoryReviewEvent]:
-        """Latest-by-``decided_at`` review event per signature, restricted to
-        ``target_kinds``. An event named by a later event's ``supersedes`` is
-        excluded from contention first, mirroring how promoted rows use
-        ``supersedes`` to identify the live end of a correction chain even
-        when timestamps alone would be ambiguous (e.g. clock skew across
-        processes); the remaining ("live") events per signature are then
-        ordered by ``decided_at`` with ``event_id`` as a stable tiebreak.
+    def _find_event_by_id_unlocked(self, event_id: str) -> MemoryReviewEvent | None:
+        for event in self._read_review_events_unlocked():
+            if event.event_id() == event_id:
+                return event
+        return None
+
+    def _last_event_for_signature_unlocked(self, target_kind: str, target_signature: str) -> MemoryReviewEvent | None:
+        last: MemoryReviewEvent | None = None
+        for event in self._read_review_events_unlocked():
+            if event.target_kind == target_kind and event.target_signature == target_signature:
+                last = event  # natural file order: later assignment wins
+        return last
+
+    def _latest_events_by_signature_unlocked(self, kind: str) -> dict[str, MemoryReviewEvent]:
+        """Latest-by-FILE-APPEND-ORDER, row-bound review event per signature
+        for ``kind`` (P4a rework items 2 + 3). Iterates events in their
+        natural on-disk order (the store's advisory lock guarantees this
+        equals true decision order, S2-F10) so the LAST matching, row-bound
+        event for a signature always wins — ``decided_at`` never enters the
+        comparison, closing the same-second/clock-skew inversion the
+        original decided_at-sorted design was vulnerable to.
+
+        An event only counts if ``reviewed_entry_id`` equals the row
+        CURRENTLY live for ``(kind, target_signature)``: once that row is
+        superseded, the event is ignored (with a warning) and the signature
+        reverts to unreviewed until re-reviewed against the new content.
         """
 
-        scoped = [event for event in self._read_review_events() if event.target_kind in target_kinds]
-        superseded_ids = {event.supersedes for event in scoped if event.supersedes}
-        live = [event for event in scoped if event.event_id() not in superseded_ids]
-        ordered = sorted(live, key=lambda event: (event.decided_at, event.event_id()))
+        live_rows = self._live_rows_by_signature(kind)
         latest: dict[str, MemoryReviewEvent] = {}
-        for event in ordered:
-            latest[event.target_signature] = event  # later in sorted order wins
+        for event in self._read_review_events_unlocked():
+            if event.target_kind != kind:
+                continue
+            live_row = live_rows.get(event.target_signature)
+            current_entry_id = str(live_row.get("entry_id")) if live_row is not None else None
+            if current_entry_id is None or event.reviewed_entry_id != current_entry_id:
+                logger.warning(
+                    "ignoring review event %s for %s/%s: reviewed_entry_id %r no longer matches the live "
+                    "row (row superseded, retracted, or the event references an unknown row)",
+                    event.event_id()[:12],
+                    kind,
+                    event.target_signature,
+                    event.reviewed_entry_id,
+                )
+                continue
+            latest[event.target_signature] = event  # later append order overwrites earlier
         return latest
 
     def _read_observations(self) -> tuple[MemoryObservation, ...]:
@@ -646,6 +956,18 @@ def _require_iso_timestamp(value: str) -> None:
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _default_review_decided_at() -> str:
+    """UTC now, WITH microseconds (P4a rework item 3).
+
+    Review-event ``decided_at`` is DISPLAY metadata only now — ordering is
+    file append order, never this value — but truncating to whole seconds
+    (as :func:`_utc_now_iso` does for observations) makes same-second
+    collisions needlessly common for a field reviewers still read.
+    """
+
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

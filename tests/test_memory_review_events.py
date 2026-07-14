@@ -294,10 +294,13 @@ def test_activate_deactivate_activate_chain(tmp_path: Path) -> None:
     assert [row_["actor"] for row_ in events] == ["alice", "bob", "carol"]
 
 
-def test_rule_states_derivation_is_order_independent_of_decided_at_not_append_order(tmp_path: Path) -> None:
-    # The LATEST event by decided_at wins, even if it was appended earlier in
-    # wall-clock append order than a since-superseded one (defensive: the
-    # store must sort by decided_at, not merely take the last-appended row).
+def test_latest_event_is_file_append_order_never_decided_at(tmp_path: Path) -> None:
+    # P4a rework item 3 (opus probe C2 regression): "latest valid event" is
+    # FILE APPEND ORDER under the lock, never decided_at. A deactivate
+    # appended AFTER an activate must win even when its decided_at is NOT
+    # chronologically later -- same-second timestamps, clock skew across
+    # writers, or a caller-supplied timestamp that is flatly "earlier" must
+    # never invert the true decision sequence.
     store = ResearchMemoryStore(tmp_path / "artifacts")
     row = _promote_rule(store)
 
@@ -309,8 +312,37 @@ def test_rule_states_derivation_is_order_independent_of_decided_at_not_append_or
         target_kind="rule", target_signature="sig_rule", reviewed_entry_id=row["entry_id"],
         action="deactivate", actor="bob", decided_at=T1,
     )
-    # T3 (activate) is chronologically LATER than T1 (deactivate) even though
-    # deactivate was appended second; activate must still win.
+    # T3 (activate) is chronologically LATER than T1 (deactivate) by
+    # decided_at, but deactivate was appended SECOND -- append order wins,
+    # so the rule is inactive. (Under the pre-rework decided_at-sorted
+    # design this incorrectly asserted "active".)
+    assert store.rule_states() == {"sig_rule": "inactive"}
+
+
+def test_same_second_activate_then_deactivate_yields_inactive(tmp_path: Path) -> None:
+    # The literal probe scenario: IDENTICAL decided_at values (the
+    # same-second collision) must still resolve correctly via append order,
+    # with no hash-based or otherwise arbitrary tiebreak.
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    row = _promote_rule(store)
+    same_instant = "2026-07-01T00:00:00.500000+00:00"
+
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_rule", reviewed_entry_id=row["entry_id"],
+        action="activate", actor="alice", decided_at=same_instant,
+    )
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_rule", reviewed_entry_id=row["entry_id"],
+        action="deactivate", actor="bob", decided_at=same_instant,
+    )
+    assert store.rule_states() == {"sig_rule": "inactive"}
+
+    # A THIRD event with a decided_at that is even "earlier" on paper must
+    # still win: it was appended last.
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_rule", reviewed_entry_id=row["entry_id"],
+        action="activate", actor="carol", decided_at="2026-01-01T00:00:00+00:00",
+    )
     assert store.rule_states() == {"sig_rule": "active"}
 
 
@@ -350,6 +382,190 @@ def test_retired_signatures_rejects_rule_target_kind(tmp_path: Path) -> None:
     store = ResearchMemoryStore(tmp_path / "artifacts")
     with pytest.raises(ValueError, match="finding.*failure|failure.*finding"):
         store.retired_signatures("rule")
+
+
+# ---------------------------------------------------------------------------
+# P4a rework items 2 + 3: row binding, supersedes integrity, and the row-
+# content-change activation lapse.
+# ---------------------------------------------------------------------------
+
+
+def test_supersedes_auto_population_chains_correctly(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    row = _promote_rule(store)
+
+    first = store.record_review_event(
+        target_kind="rule", target_signature="sig_rule", reviewed_entry_id=row["entry_id"],
+        action="activate", actor="alice", decided_at=T1,
+    )
+    second = store.record_review_event(
+        target_kind="rule", target_signature="sig_rule", reviewed_entry_id=row["entry_id"],
+        action="deactivate", actor="bob", decided_at=T2,
+    )
+    third = store.record_review_event(
+        target_kind="rule", target_signature="sig_rule", reviewed_entry_id=row["entry_id"],
+        action="activate", actor="carol", decided_at=T3,
+    )
+
+    assert first.supersedes == ""
+    assert second.supersedes == first.event_id()
+    assert third.supersedes == second.event_id()
+
+
+def test_cross_signature_supersedes_is_rejected(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    row_a = _promote_rule(store, signature="sig_a")
+    row_b = _promote_rule(store, signature="sig_b")
+
+    event_a = store.record_review_event(
+        target_kind="rule", target_signature="sig_a", reviewed_entry_id=row_a["entry_id"],
+        action="activate", actor="alice", decided_at=T1,
+    )
+    # An explicit supersedes claim pointing at a DIFFERENT signature's event
+    # must be rejected -- the chain is per-(kind, signature), never global.
+    with pytest.raises(ValueError, match="same"):
+        store.record_review_event(
+            target_kind="rule", target_signature="sig_b", reviewed_entry_id=row_b["entry_id"],
+            action="activate", actor="bob", decided_at=T2, supersedes=event_a.event_id(),
+        )
+    # A supersedes value that references NO event at all is equally rejected.
+    with pytest.raises(ValueError, match="must reference an existing event"):
+        store.record_review_event(
+            target_kind="rule", target_signature="sig_b", reviewed_entry_id=row_b["entry_id"],
+            action="activate", actor="bob", decided_at=T2, supersedes="f" * 64,
+        )
+    # Neither rejected attempt appended anything.
+    assert store.rule_states().get("sig_b", "inactive") == "inactive"
+
+
+def test_dangling_event_reviewed_entry_id_is_ignored_with_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # An event whose reviewed_entry_id never matched ANY row for its
+    # signature (a forged or corrupted row, not merely a superseded one) is
+    # ignored the same way a stale-superseded-row event is: it never counts
+    # toward effective state, and the ignore is logged, not silent.
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    row = _promote_rule(store, signature="sig_dangling")
+    bogus_entry_id = "0" * 64
+    assert bogus_entry_id != row["entry_id"]
+
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_dangling", reviewed_entry_id=bogus_entry_id,
+        action="activate", actor="mallory", decided_at=T1,
+    )
+    with caplog.at_level("WARNING", logger="quant_forge.research_loop.memory"):
+        states = store.rule_states()
+    assert states.get("sig_dangling", "inactive") == "inactive"
+    assert any("sig_dangling" in message and "no longer matches" in message for message in caplog.messages)
+
+    # A genuine, correctly-bound event for the SAME signature still works
+    # normally alongside the ignored dangling one.
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_dangling", reviewed_entry_id=row["entry_id"],
+        action="activate", actor="alice", decided_at=T2,
+    )
+    assert store.rule_states() == {"sig_dangling": "active"}
+
+
+def test_row_content_change_lapses_activation_until_re_review(tmp_path: Path) -> None:
+    # Item 2's headline scenario: once a promoted row is SUPERSEDED (new
+    # observations promote a new version with a new entry_id), any event
+    # bound to the PRIOR version stops counting -- the signature reverts to
+    # unreviewed, not to whatever the old event said, until a human
+    # re-reviews the new content.
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    row = _promote_rule(store, signature="sig_lapse")
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_lapse", reviewed_entry_id=row["entry_id"],
+        action="activate", actor="alice", decided_at=T1,
+    )
+    assert store.rule_states() == {"sig_lapse": "active"}
+
+    # A new observation with a new window supersedes the row.
+    store.record_observation(
+        signature="sig_lapse", statement="rule statement for sig_lapse", run_id="sig_lapse-4",
+        observed_at=T4, data_window="2025-01-01:2025-06-30",
+    )
+    store.promote_pending()
+    new_row = store.resolve_signature_prefix("rule", "sig_lapse")
+    assert new_row["entry_id"] != row["entry_id"]
+
+    assert store.rule_states().get("sig_lapse", "inactive") == "inactive"
+
+    # Re-reviewing against the NEW content re-activates it.
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_lapse", reviewed_entry_id=new_row["entry_id"],
+        action="activate", actor="bob", decided_at="2026-07-05T00:00:00+00:00",
+    )
+    assert store.rule_states() == {"sig_lapse": "active"}
+
+
+# ---------------------------------------------------------------------------
+# P4a rework item 7: trailing-line quarantine vs interior corruption.
+# ---------------------------------------------------------------------------
+
+
+def test_trailing_corrupt_line_is_quarantined_not_raised(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    row = _promote_rule(store)
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_rule", reviewed_entry_id=row["entry_id"],
+        action="activate", actor="alice", decided_at=T1,
+    )
+    with store.review_events_path.open("a", encoding="utf-8") as handle:
+        handle.write("}{ not valid json at all {\n")
+
+    with caplog.at_level("WARNING", logger="quant_forge.research_loop.memory"):
+        events = store._read_review_events_unlocked()  # noqa: SLF001
+    assert len(events) == 1
+    assert any("quarantining" in message for message in caplog.messages)
+    # The public read path is equally tolerant.
+    assert store.rule_states() == {"sig_rule": "active"}
+
+
+def test_interior_corrupt_line_still_raises(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    row = _promote_rule(store)
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_rule", reviewed_entry_id=row["entry_id"],
+        action="activate", actor="alice", decided_at=T1,
+    )
+    good_content = store.review_events_path.read_text(encoding="utf-8")
+    store.review_events_path.write_text("}{ not valid json at all {\n" + good_content, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not the trailing line"):
+        store._read_review_events_unlocked()  # noqa: SLF001
+
+
+def test_semantically_invalid_line_is_skipped_with_a_warning(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    # Valid JSON, but fails MemoryReviewEvent's own schema/action/kind
+    # validation (an unknown action here) -- skipped, never raised.
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    row = _promote_rule(store)
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_rule", reviewed_entry_id=row["entry_id"],
+        action="activate", actor="alice", decided_at=T1,
+    )
+    bad_row = {
+        "event_id": "b" * 64,
+        "schema_version": RESEARCH_MEMORY_REVIEW_SCHEMA_VERSION,
+        "target_kind": "rule",
+        "target_signature": "sig_rule",
+        "reviewed_entry_id": row["entry_id"],
+        "action": "not_a_real_action",
+        "actor": "mallory",
+        "rationale": "",
+        "decided_at": T2,
+        "supersedes": "",
+    }
+    with store.review_events_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(bad_row, sort_keys=True) + "\n")
+
+    with caplog.at_level("WARNING", logger="quant_forge.research_loop.memory"):
+        events = store._read_review_events_unlocked()  # noqa: SLF001
+    assert len(events) == 1
+    assert any("semantically-invalid" in message for message in caplog.messages)
 
 
 # ---------------------------------------------------------------------------
@@ -520,11 +736,13 @@ def test_cli_memory_rules_round_trip(tmp_path: Path, capsys: pytest.CaptureFixtu
 
     # list: both rules pending (no --active/--pending filter -> everything),
     # identified by their (untruncated) statement text since the displayed
-    # "signature_prefix" column is intentionally truncated to 12 chars.
+    # "signature_prefix" column is intentionally truncated to 12 chars. A
+    # pending row's state is spelled out (P4a rework item 1: reaching the
+    # rule tier at all already silences lower tiers, not just activation).
     exit_code = cli_main.main(["memory", "rules", "list", *root_arg])
     listed_all = capsys.readouterr().out
     assert exit_code == 0
-    assert listed_all.count("inactive") == 2
+    assert listed_all.count("pending -- lower tiers silenced") == 2
     assert "rule statement for sig_one_alpha" in listed_all
     assert "rule statement for sig_two_beta" in listed_all
 
@@ -645,3 +863,80 @@ def test_cli_memory_rules_require_actor(tmp_path: Path) -> None:
     _promote_rule(store)
     with pytest.raises(SystemExit):
         cli_main.main(["memory", "rules", "activate", "sig_rule", "--artifact-root", str(artifact_root)])
+
+
+def test_cli_memory_rules_unretire(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # P4a rework item 8: CLI parity for the store's unretire action (the
+    # store method already existed; only the CLI surface was missing).
+    artifact_root = tmp_path / "artifacts"
+    root_arg = ["--artifact-root", str(artifact_root)]
+    store = ResearchMemoryStore(artifact_root)
+    _promote_finding(store, signature="sig_unretire_me")
+
+    _cli_json(capsys, ["memory", "rules", "retire", "finding", "sig_unretire_me", "--actor", "erin", *root_arg])
+    assert store.retired_signatures("finding") == frozenset({"sig_unretire_me"})
+
+    unretired = _cli_json(
+        capsys, ["memory", "rules", "unretire", "finding", "sig_unretire_me", "--actor", "frank", *root_arg]
+    )
+    assert unretired["action"] == "unretire"
+    assert store.retired_signatures("finding") == frozenset()
+
+    # unretire only accepts finding|failure at the argparse level, same as
+    # retire.
+    with pytest.raises(SystemExit):
+        cli_main.main(["memory", "rules", "unretire", "rule", "sig_unretire_me", "--actor", "erin", *root_arg])
+
+
+def test_cli_atomic_race_two_processes_activating_the_same_prefix(tmp_path: Path) -> None:
+    # P4a rework item 8: resolve_validate_append (which the CLI now uses)
+    # closes the resolve-then-append TOCTOU window. Two threads racing to
+    # activate the SAME unambiguous prefix must never raise, never leave a
+    # torn/malformed line, and must leave the store in a single well-defined
+    # end state decided by the store's own append-order lock -- not by
+    # whichever thread the OS scheduler happened to favor at the Python
+    # level producing inconsistent output.
+    artifact_root = tmp_path / "artifacts"
+    store = ResearchMemoryStore(artifact_root)
+    row = _promote_rule(store, signature="sig_race")
+
+    results: list[int] = []
+    errors: list[str] = []
+    barrier = threading.Barrier(2)
+
+    def activate(actor: str) -> None:
+        try:
+            barrier.wait(timeout=30)
+        except threading.BrokenBarrierError:
+            return
+        exit_code = cli_main.main(
+            [
+                "memory", "rules", "activate", "sig_race", "--actor", actor,
+                "--artifact-root", str(artifact_root),
+            ]
+        )
+        results.append(exit_code)
+
+    threads = [threading.Thread(target=activate, args=(actor,)) for actor in ("alice", "bob")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    for thread in threads:
+        assert not thread.is_alive()
+
+    assert errors == []
+    # Both CLI invocations complete cleanly (no crash from either side of
+    # the race); the store resolves the ordering deterministically via its
+    # own lock, not by which thread "wins" at the Python level.
+    assert results == [0, 0]
+
+    # No torn state: every line in activations.jsonl parses as JSON, and the
+    # store lands in a single well-defined active state for sig_race.
+    for line in store.review_events_path.read_text(encoding="utf-8").splitlines():
+        json.loads(line)
+    assert store.rule_states() == {"sig_race": "active"}
+    # Both events are bound to the SAME (only) live row -- no fork.
+    events = [event for event in store._read_review_events_unlocked() if event.target_signature == "sig_race"]  # noqa: SLF001
+    assert all(event.reviewed_entry_id == row["entry_id"] for event in events)
+    assert len(events) in (1, 2)  # 2 distinct actors -> 2 distinct events, unless a timestamp collision deduped them

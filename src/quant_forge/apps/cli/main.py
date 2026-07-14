@@ -403,6 +403,17 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_options(memory_rules_retire)
     memory_rules_retire.add_argument("--artifact-root", type=Path)
     memory_rules_retire.set_defaults(handler=_cmd_memory_rules_retire)
+
+    memory_rules_unretire = memory_rules_subcommands.add_parser(
+        "unretire", help="reverse a retirement for a finding or failure signature (or unambiguous prefix)"
+    )
+    memory_rules_unretire.add_argument("target_kind", choices=["finding", "failure"])
+    memory_rules_unretire.add_argument("signature_prefix", metavar="signature-prefix")
+    memory_rules_unretire.add_argument("--actor", required=True, help="reviewer identity (redacted, required)")
+    memory_rules_unretire.add_argument("--rationale", default="", help="optional review rationale (redacted)")
+    _add_config_options(memory_rules_unretire)
+    memory_rules_unretire.add_argument("--artifact-root", type=Path)
+    memory_rules_unretire.set_defaults(handler=_cmd_memory_rules_unretire)
     # ---------------------- end research memory review -----------------
 
     backends = subcommands.add_parser(
@@ -1351,14 +1362,20 @@ def _cmd_memory_rules_retire(args: argparse.Namespace) -> int:
     return _cmd_memory_rule_review(args, target_kind=args.target_kind, action="retire")
 
 
+def _cmd_memory_rules_unretire(args: argparse.Namespace) -> int:
+    return _cmd_memory_rule_review(args, target_kind=args.target_kind, action="unretire")
+
+
 def _cmd_memory_rule_review(args: argparse.Namespace, *, target_kind: str, action: str) -> int:
     store = ResearchMemoryStore(_runtime_paths(args).artifact_root)
     try:
-        row = store.resolve_signature_prefix(target_kind, args.signature_prefix)
-        event = store.record_review_event(
+        # Atomic (P4a rework item 8): prefix resolution, row binding, and
+        # event append all happen inside ONE lock hold, so two processes
+        # racing to review the same prefix cannot interleave between
+        # "resolve" and "append" -- see resolve_validate_append's docstring.
+        event = store.resolve_validate_append(
             target_kind=target_kind,
-            target_signature=str(row.get("signature") or ""),
-            reviewed_entry_id=str(row.get("entry_id") or ""),
+            prefix=args.signature_prefix,
             action=action,
             actor=args.actor,
             rationale=args.rationale,
@@ -1369,6 +1386,17 @@ def _cmd_memory_rule_review(args: argparse.Namespace, *, target_kind: str, actio
         return 2
     _print_json({"event_id": event.event_id(), **event.to_dict()})
     return 0
+
+
+def _memory_rule_state_label(state: str) -> str:
+    # P4a rework item 1: a signature that merely reached the rule tier --
+    # activated or not -- already silences its lower tiers. Spell this out
+    # for a "pending" row so a reviewer does not assume silencing waits for
+    # activation; an "active" row's steering effect was already the
+    # documented behavior and keeps its plain label.
+    if state == "active":
+        return "active"
+    return "pending -- lower tiers silenced"
 
 
 def _print_memory_rules_table(entries: list[tuple[dict[str, Any], str]]) -> None:
@@ -1383,7 +1411,7 @@ def _print_memory_rules_table(entries: list[tuple[dict[str, Any], str]]) -> None
             # `or` form would still misrender a genuine 0 as blank -- matches
             # _print_runs_table's own null-not-falsy convention.
             str(row.get("observation_count", "")),
-            state,
+            _memory_rule_state_label(state),
         ]
         for row, state in entries
     ]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,8 @@ from quant_forge.research_loop.contracts import ResearchContext
 from quant_forge.research_loop.feedback_builder import NEXT_HYPOTHESIS_HINT_TEMPLATES
 from quant_forge.research_loop.memory import ResearchMemoryStore
 from quant_forge.research_loop.trace_store import ResearchTraceStore
+
+logger = logging.getLogger(__name__)
 
 _MEMORY_CONTEXT_LIMIT = 5
 
@@ -71,12 +74,20 @@ class ResearchContextBuilder:
         successes = tuple(item for item in terminal if _trace_passed(item))
         failures = tuple(item for item in terminal if not _trace_passed(item))
         active_rules = self._active_rules()
-        # Cross-tier dedup (SE-iv): a signature already steering as an active
-        # rule is excluded from the passive finding/failure feed in the same
-        # context so the same lesson never appears twice under two labels.
-        active_rule_signatures = frozenset(str(row.get("signature") or "") for row in active_rules)
-        memory_failures = self._memory_items("failure", exclude_signatures=active_rule_signatures)
-        memory_findings = self._memory_items("finding", exclude_signatures=active_rule_signatures)
+        # Pre-activation silencing (P4a rework item 1) + full-set cross-tier
+        # dedup (item 5): ANY rule-tier signature -- pending OR active, and
+        # regardless of whether the bounded `active_rules` pipeline below
+        # ends up DISPLAYING it after authentication/eligibility/cap -- is
+        # excluded from the passive finding/failure feed. This is computed
+        # from the store's UNBOUNDED rule-tier signature set, never from the
+        # (possibly capped-out or authentication-dropped) `active_rules`
+        # tuple, so a signature can never leak into the lower tiers just
+        # because it lost a cap slot or failed template authentication.
+        rule_tier_signatures = (
+            self.memory_store.rule_tier_signatures() if self.memory_store is not None else frozenset()
+        )
+        memory_failures = self._memory_items("failure", exclude_signatures=rule_tier_signatures)
+        memory_findings = self._memory_items("finding", exclude_signatures=rule_tier_signatures)
         field_catalog = tuple(dict(field) for field in list_available_fields())
         operator_catalog = tuple(dict(operator) for operator in list_available_operators())
         return ResearchContext(
@@ -108,7 +119,8 @@ class ResearchContextBuilder:
 
         Retired finding/failure signatures (SE-iii review events) and any
         signature already surfaced through ``exclude_signatures`` (the
-        active_rules cross-tier dedup, SE-iv) never reach this feed.
+        rule-tier pre-activation-silencing + cross-tier dedup set, P4a
+        rework items 1/5) never reach this feed.
         """
 
         if self.memory_store is None:
@@ -127,17 +139,38 @@ class ResearchContextBuilder:
         )
 
     def _active_rules(self) -> tuple[dict[str, object], ...]:
-        """Bounded, human-activated steering rules (SE-iv).
+        """Bounded, human-activated steering rules (SE-iv; P4a rework items
+        4/5/6/11).
 
-        Only rule signatures whose LATEST review event is ``activate`` reach
-        this feed (:meth:`ResearchMemoryStore.rule_activation_events` —
-        promoted rule ROWS stay ``needs_human_review`` forever and are never
-        consulted for activity, FP-2). Rows with an exact scope match to this
-        builder's own scope context sort before global rows, then by
-        activation recency (most recently activated first), then by a stable
-        row key; the result is capped at ``_ACTIVE_RULES_LIMIT`` so this
-        channel can never dominate the prompt. Zero activated rules is zero
-        effect: an empty tuple, same as if the channel did not exist.
+        Pipeline, in order (item 5 -- AUTH-BEFORE-CAP so a malformed or
+        foreign row can never consume a cap slot a valid rule could have
+        used, and dedup elsewhere in :meth:`build` is computed from the
+        store's unbounded rule-tier signatures rather than this method's
+        capped output):
+
+        1. Effective activations: only rule signatures whose LATEST,
+           ROW-BOUND review event is ``activate`` reach this feed at all
+           (:meth:`ResearchMemoryStore.rule_activation_events` already
+           applies the row-binding + file-append-order derivation; promoted
+           rule ROWS stay ``needs_human_review`` forever and are never
+           consulted for activity, FP-2).
+        2. Statement + scope authentication: each candidate row's statement
+           AND scope must pass :func:`~quant_forge.research_loop.llm.
+           authenticate_active_rule_item` (the canonical closed-template
+           parser, items 4/6) -- a malformed or foreign row is dropped here,
+           logged, and never reaches ordering or the cap.
+        3. Scope eligibility (item 4b): only a row whose scope is an EXACT
+           match to this builder's own scope context, or ``"global"``,
+           survives -- a mismatched scope (e.g. a ``asset=us`` rule steering
+           a ``cn_a`` run) is DISCARDED here, not merely deprioritized.
+        4. Ordering: exact-scope-match rows sort before global rows, then by
+           activation recency (most recently activated first), then by a
+           stable row key.
+        5. Global-slot reservation (item 11): see :func:`_reserve_global_slot`.
+        6. Cap at ``_ACTIVE_RULES_LIMIT``.
+
+        Zero activated rules is zero effect: an empty tuple, same as if the
+        channel did not exist.
         """
 
         if self.memory_store is None:
@@ -151,24 +184,57 @@ class ResearchContextBuilder:
         rows = [row for row in self.memory_store.list_promoted("rule") if str(row.get("signature")) in activated]
         if not rows:
             return ()
+
+        # Deferred import (not module-level): context_builder -> llm would
+        # otherwise cycle back through llm -> service -> context_builder
+        # (service.py imports ResearchContextBuilder). See
+        # authenticate_active_rule_item's own docstring for the full
+        # rationale; this is the SAME canonical parser llm.py's own prompt
+        # gate calls, not an independently-coded copy.
+        from quant_forge.research_loop.llm import authenticate_active_rule_item
+
+        authenticated_rows: list[dict[str, Any]] = []
+        for row in rows:
+            statement = str(row.get("statement") or "")
+            scope = str(row.get("scope") or "global")
+            if authenticate_active_rule_item(statement, scope):
+                authenticated_rows.append(row)
+            else:
+                logger.warning(
+                    "dropping active rule entry_id=%s signature=%s: statement/scope failed the closed-"
+                    "template authentication gate",
+                    str(row.get("entry_id") or "")[:12],
+                    row.get("signature"),
+                )
+        if not authenticated_rows:
+            return ()
+
         builder_scope = self._builder_scope_key()
+        eligible_rows = [
+            row for row in authenticated_rows if str(row.get("scope") or "global") in ("global", builder_scope)
+        ]
+        if not eligible_rows:
+            return ()
 
         def _activated_at(row: dict[str, Any]) -> datetime:
             event = activated[str(row.get("signature"))]
             return _parse_iso_timestamp(str(event.get("decided_at") or ""))
 
         def _scope_rank(row: dict[str, Any]) -> int:
-            row_scope = str(row.get("scope") or "global")
-            return 0 if (builder_scope != "global" and row_scope == builder_scope) else 1
+            # Every surviving row's scope is already either an exact match
+            # or "global" (the eligibility filter above discarded anything
+            # else), so this only distinguishes those two buckets.
+            return 0 if (builder_scope != "global" and str(row.get("scope") or "global") == builder_scope) else 1
 
         # Stable multi-pass sort (least-significant key first): Python's
         # sorted() is stable, so applying passes in reverse priority order
         # yields a correct combined ordering even though activation-recency
         # must sort descending while scope-rank and the row-key tiebreak sort
         # ascending.
-        ordered = sorted(rows, key=lambda row: str(row.get("entry_id") or ""))
+        ordered = sorted(eligible_rows, key=lambda row: str(row.get("entry_id") or ""))
         ordered = sorted(ordered, key=_activated_at, reverse=True)
         ordered = sorted(ordered, key=_scope_rank)
+        ordered = _reserve_global_slot(ordered, limit=_ACTIVE_RULES_LIMIT)
         return tuple(dict(row) for row in ordered[:_ACTIVE_RULES_LIMIT])
 
     def _builder_scope_key(self) -> str:
@@ -182,6 +248,32 @@ class ResearchContextBuilder:
 
         market = (self.market or "").strip()
         return f"asset={market}" if market else "global"
+
+
+def _reserve_global_slot(ordered: list[dict[str, object]], *, limit: int) -> list[dict[str, object]]:
+    """Global-safety-rule slot reservation (P4a rework item 11, Fable ruling
+    on an opus review observation).
+
+    When the top ``limit`` rows of ``ordered`` (already scope-rank-then-
+    activation-recency sorted, so exact-scope-match rows sort before global
+    ones) are ALL exact-scope matches -- i.e. enough narrower rules are
+    active to fill the entire cap on their own -- a human-activated GLOBAL
+    safety rule must not be silently starved just because it always sorts
+    after exact matches. If no global row makes the natural top-``limit``
+    cut, this reserves the LAST slot for the most recently activated global
+    row instead (the first global entry in ``ordered``, since that ordering
+    is already recency-descending within the global bucket). If a global
+    row already appears naturally (fewer than ``limit`` exact-scope rows
+    exist, or the cap was not even reached), nothing changes.
+    """
+
+    capped = ordered[:limit]
+    if len(capped) < limit or any(row.get("scope") == "global" for row in capped):
+        return capped
+    global_rows = [row for row in ordered if row.get("scope") == "global"]
+    if not global_rows:
+        return capped  # no global rule exists among the eligible set at all
+    return capped[: limit - 1] + [global_rows[0]]
 
 
 def _factor_summary(factor: object) -> dict[str, object]:
