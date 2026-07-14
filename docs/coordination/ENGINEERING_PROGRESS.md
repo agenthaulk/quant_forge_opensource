@@ -585,3 +585,33 @@ regressions. Offline suite at close: 209 passed (121 pre-existing + 88
 SE-P3). Zero tracked-file changes throughout (proven per round). No public
 CI coverage by design; the public synthetic-producer fixture (SE-P1 battery)
 covers the kernel seam.
+
+## 2026-07-14 — Workflow B / SE-P4a: rule-activation governance (CLOSED)
+
+Trunk chain `b72f9b1` (initial: activations.jsonl review events, store-wide
+advisory lock, active_rules bounded context channel, llm closed-template
+authentication, CLI qf memory rules) → `9cd3145` (14-item dual-review
+rework: pre-activation silencing of rule-tier signatures from passive
+feeds; event row-binding; append-order recency + supersedes
+auto-population; scope grammar + statement/scope equality;
+auth-before-cap with full-set dedup; verdict/reason coherence parser;
+locked readers + trailing quarantine; atomic resolve_validate_append +
+unretire; Dropbox conflicted-copy detection; repair-prompt retention;
+global-slot reservation; public advisory_file_lock) → `d451548` (R2:
+single-lock effective_active_rules/rule_review_snapshot kills the
+split-snapshot TOCTOU; event-id fingerprint readback rejection; strict
+schema; activation_seq ranking; stage/strength coherence; uniform tail
+tolerance; traceability fields; four-state CLI + real two-process race)
+→ `955d98b` (R3: append-safe torn-tail repair under the lock with
+heal-in-place for newline-only tears; honest dangling-vs-lapsed labels).
+
+Review trail (all model pins verified): sol-high REWORK 12 ∥ opus verify
+probe-executed 5 → rv2 8/14 closed → rv3 all prior closed + 2 residuals
+→ R3 → adjudicated CLOSED (reviewer probe sequences are regressions).
+Threat-model ruling recorded: in-process context forgery is out of scope
+(equivalent trust to patching promote()); artifact-root write access is
+the trusted boundary; read-side validation defends files. Drop-stats
+surfacing deferred to SE-P5 planning_influences by design.
+
+Gates at close: 1494 passed / CLI OK / diff clean / release scan 245
+files. Governance battery: 111 review-event + memory tests.
