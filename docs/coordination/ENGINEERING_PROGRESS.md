@@ -447,3 +447,29 @@ gpt-5.5 ×1 on the FE side).
 Gates at close: 1370 passed / CLI OK / diff-check clean / release scan 241
 files. Next SE phase (P2 ingress sink) is gated on the phase-f branch merge
 per SE-x.
+
+## 2026-07-13 — Workflow A / FE-P0: mode shell (CLOSED)
+
+Branch `fable/fe-p0-mode-shell` @ `3fe4307` (chain `774023f` → rework
+`b47837e` → residuals `3fe4307`, forked from main `3d98230`). Deliverable:
+simple/expert mode shell per WORKORDER §5 P0 — persistent `#mode-header`
+toggle (hoisted after the FE0 trap finding), idea box + seeds + runtime
+strip, 11-param grid folded into 高级 details, term tooltips
+(column-aware positioning after the 375px left-clip finding), deep-link >
+saved-preference > default-simple precedence with non-persistent
+simple-run handoff, sticky-element offset audit (3 pinned), CN-first
+strings, 44px targets. Tests: mode-shell suite incl. a stdlib Node
+DOM-stub harness importing the REAL app.js (vacuity self-checked) + an
+html.parser containment check.
+
+Review trail: gpt-5.5 high round 1 REWORK (FE0 BLOCKING toggle trap +
+FE1 preference overwrite + FE2/FE3/FE4/FE5) → rework `b47837e` →
+gpt-5.5 re-verify (5/6 closed; FE3 left-edge residual + sticky collision)
+→ `3fe4307` with two-edge numeric evidence for all five tooltips and
+four-scroll-position rail/tab measurements. Adjudicated CLOSED by the
+steward (both residual fixes implement the reviewer's own proposals,
+machine-verified). Lane model verified claude-sonnet-5 per dispatch.
+
+Gates at close: 1228 passed / CLI OK / diff clean / release scan 237
+files (all in the FE worktree). FE-P1 is gated on the phase-f merge +
+D12 chore per SE-x.
