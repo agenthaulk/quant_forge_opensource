@@ -18,6 +18,19 @@
 > adjudicates them into `docs/coordination/DECISIONS.md` at CP0 before coding,
 > and that register (not this file) becomes authoritative. If this doc and
 > `AGENTS.md`/DECISIONS ever disagree, they win.
+>
+> **CP0 STATUS (2026-07-13): ADJUDICATED.** `SE-i..SE-viii` are now ruled in
+> `docs/coordination/DECISIONS.md` §"2026-07-13 — Self-evolution engine CP0"
+> (plus new `SE-ix`/`SE-x`), incorporating two `gpt-5.6-sol` adversarial
+> rounds (S1: 21 findings, §5+§9 REJECT → v2 contract; S2: 15 cross-doc
+> findings) and owner rulings R1–R6. THAT REGISTER OVERRIDES §4/§5/§8/§9 of
+> this file wherever they differ — notably: dual-domain stores (external
+> outcomes never enter the main store; no `RUN_KINDS` extension),
+> `ResearchOutcome` v2 (kernel `outcome_id` + `observed_at`, four-axis codes,
+> `evidence_strength`, typed window, logical evidence-run dedup, 10-field
+> signature), review-surface governance (Web tab; rules must pass review),
+> single steering point (planner stays blind), and the corrected phase order.
+> A full v2 revision of this document is queued with SE-P1.
 
 ---
 
@@ -36,9 +49,9 @@
 4. Produce the **CP0 output first**: adjudicate `SE-i..SE-viii` (§8) into a new
    dated `DECISIONS.md` section, plus branch/model-routing/phasing — *then*
    implement. Do not start P1 before CP0 is recorded and owner-approved.
-5. This file lives under `docs/design/`, which is **blanket-gitignored**; it
-   needs `git add -f` to be tracked (CP0 amendment 7, 2026-07-09). It is
-   currently untracked by design.
+5. `docs/design/` is **blanket-gitignored**, so NEW files there need
+   `git add -f` (CP0 amendment 7, 2026-07-09). This file itself is ALREADY
+   TRACKED (committed at `c1a20c2`); ordinary edits need no force-add.
 
 ---
 
