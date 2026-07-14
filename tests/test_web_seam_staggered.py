@@ -22,7 +22,19 @@ def test_web_staggered_entry_workflow_routes_backtest_through_server_seam(monkey
     config = QuantForgeConfig().resolve(tmp_path / "demo")
 
     calls: dict[str, object] = {}
-    sentinel = {"sample_role": "staggered_entry_backtest", "seam": "server"}
+    # BUG #007: the workflow now also records this run (lineage + run index),
+    # which hashes the artifact at "artifact_path" the same way the real
+    # run_staggered_entry_backtest always provides - so the sentinel carries a
+    # real (if trivial) file at that path instead of only the two probe keys
+    # the seam assertion below reads.
+    artifact_path = config.paths.artifact_root / "staggered_backtests" / "FTR_DEMO_SMALL_CAP.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text("{}", encoding="utf-8")
+    sentinel = {
+        "sample_role": "staggered_entry_backtest",
+        "seam": "server",
+        "artifact_path": str(artifact_path),
+    }
 
     def spy_run_staggered_entry_backtest(factor_id, **kwargs):
         calls["factor_id"] = factor_id

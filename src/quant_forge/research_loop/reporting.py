@@ -76,9 +76,13 @@ def render_research_report(result: ResearchLoopResult, *, generated_at: datetime
         for candidate in result.candidates:
             lines.append(_candidate_row(candidate))
     else:
+        # FP-4 (PF-F2): reachable via #006 when the seed and every candidate
+        # are unscorable - every metric cell is a labeled unknown (matching
+        # what _fmt/_pct already render for a None value), never a
+        # fabricated 0.0000/0.00% placeholder.
         lines.append(
-            "| none | - | - | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.00% "
-            "| 0.00% | 0.0000 | 0.00% | 0.00% | - |"
+            "| none | - | - | n/a | n/a | n/a | n/a | n/a | n/a "
+            "| n/a | n/a | n/a | n/a | - |"
         )
     lines.extend(["", "## Blocked / Skipped Plans", ""])
     lines.extend(_blocked_plan_lines(result))

@@ -606,6 +606,31 @@ const CATALOG = {
   const fresh = mod.renderFactorPickerHtml(factors);
   check('picker.no_preserved_all_default', (fresh.match(/<option value="1" selected>/g) || []).length === 3 && !fresh.includes(' checked'));
 }
+// precomputed_values_present === false disables the checkbox, drops the
+// checked-state restore, and appends a 值不可用 pill + row title naming the
+// past-run-only cause; null (not precomputed, or the presence probe itself
+// failed) and true render exactly as before — no disabled attribute, no pill.
+{
+  const factors = [
+    { factor_id: 'FTR_A', name: 'alpha one', formula: 'rank(volume)', status: 'active', horizon_days: 5, precomputed_values_present: null },
+    { factor_id: 'FTR_B', name: 'composite dead', formula: 'precomputed:factor_id=COMPOSITE_DEAD', status: 'candidate', horizon_days: 5, precomputed_values_present: false },
+    { factor_id: 'FTR_C', name: 'composite live', formula: 'precomputed:factor_id=COMPOSITE_LIVE', status: 'candidate', horizon_days: 5, precomputed_values_present: true }
+  ];
+  const preserved = {
+    FTR_A: { checked: true, direction: 1 },
+    FTR_B: { checked: true, direction: -1 }
+  };
+  const html = mod.renderFactorPickerHtml(factors, preserved);
+  const rowA = html.slice(html.indexOf('data-factor-id="FTR_A"'), html.indexOf('data-factor-id="FTR_B"'));
+  const rowB = html.slice(html.indexOf('data-factor-id="FTR_B"'), html.indexOf('data-factor-id="FTR_C"'));
+  const rowC = html.slice(html.indexOf('data-factor-id="FTR_C"'));
+  check('picker.unavailable_checkbox_disabled', /synth-factor-check[^>]*disabled/.test(rowB));
+  check('picker.unavailable_pill', rowB.includes('值不可用'));
+  check('picker.unavailable_title', rowB.includes('该合成因子的数值产物属于历史运行'));
+  check('picker.unavailable_no_checked_restore', !rowB.includes(' checked'));
+  check('picker.available_true_untouched', !rowC.includes('disabled') && !rowC.includes('值不可用'));
+  check('picker.null_untouched_and_checked_restored', !rowA.includes('值不可用') && !rowA.includes('disabled') && rowA.includes(' checked'));
+}
 
 // --- degraded methods catalog: explicit, escaped, never empty --------------
 {
@@ -798,5 +823,13 @@ def test_node_fixture_driven_renderers(tmp_path) -> None:
         "PASS form.unknown_type_no_number_input",
         "PASS hint.standardization_missing",
         "PASS hint.standardization_ready_silent",
+        # Dangling-composite honesty: precomputed_values_present === false
+        # disables the picker row; null/true render unchanged.
+        "PASS picker.unavailable_checkbox_disabled",
+        "PASS picker.unavailable_pill",
+        "PASS picker.unavailable_title",
+        "PASS picker.unavailable_no_checked_restore",
+        "PASS picker.available_true_untouched",
+        "PASS picker.null_untouched_and_checked_restored",
     ):
         assert marker in result.stdout, result.stdout

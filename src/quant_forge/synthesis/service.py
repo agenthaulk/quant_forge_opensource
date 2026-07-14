@@ -149,6 +149,7 @@ from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 import hashlib
+from types import MappingProxyType
 import json
 from pathlib import Path
 import re
@@ -554,6 +555,32 @@ def apply_directions(matrix: pd.DataFrame, directions: Mapping[str, int]) -> pd.
     return matrix.mul(multiplier, axis=1)
 
 
+def build_directed_matrix(
+    member_scores: Mapping[str, pd.DataFrame],
+    *,
+    directions: Mapping[str, int],
+    standardization: str,
+) -> tuple[pd.DataFrame, StandardizationOutcome]:
+    """Shared prefix of every combiner: matrix -> standardize -> direction.
+
+    Runs :func:`build_score_matrix`, :func:`standardize_matrix`, and
+    :func:`apply_directions` in that exact order and returns the standardized,
+    direction-applied matrix together with the :class:`StandardizationOutcome`
+    so callers keep the §4.2 per-factor degenerate marks without recomputing
+    them. This is the identical sequence :func:`build_apriori_composite`,
+    :func:`build_fitted_composite`, and :func:`member_rank_ic_redundancy` each
+    run before they diverge, factored out so ONE build can feed all of them —
+    the web workflow standardizes the full member panel a single time and
+    releases the per-member tidy frames before combining, rather than rebuilding
+    the wide-matrix pipeline once per consumer.
+    """
+
+    matrix = build_score_matrix(member_scores)
+    standardized = standardize_matrix(matrix, standardization=standardization)
+    directed = apply_directions(standardized.matrix, directions)
+    return directed, standardized
+
+
 def _resolve_apriori_weights(
     columns: Sequence[str],
     *,
@@ -762,9 +789,9 @@ def build_apriori_composite(
     level RB-9 dates so provenance can report both.
     """
 
-    matrix = build_score_matrix(member_scores)
-    standardized = standardize_matrix(matrix, standardization=standardization)
-    directed = apply_directions(standardized.matrix, directions)
+    directed, standardized = build_directed_matrix(
+        member_scores, directions=directions, standardization=standardization
+    )
     result = combine_apriori(
         directed,
         method=method,
@@ -976,6 +1003,248 @@ def _period_rank_ic_by_signal_index(
     return by_period
 
 
+# ---------------------------------------------------------------------------
+# Public reuse seams (single-build orchestration)
+#
+# The fitted combiner and the redundancy diagnostic each rebuild the same
+# per-period rank IC sweep from the same inputs. These thin wrappers expose the
+# exact internal helpers so an orchestrator (the web workflow) can run the sort,
+# calendar/close validation, grid, and IC sweep ONCE and thread the result into
+# both consumers instead of paying for the wide-matrix pipeline twice. The IC
+# wrapper delegates to the module-level ``_period_rank_ic_by_signal_index`` by
+# name so a test double patched onto that name is honored through this seam too.
+#
+# ``compute_period_ic_sweep`` / ``PeriodICSweep`` (below) are the single-call
+# form of this same sequence: an orchestrator runs ONE call instead of hand-
+# threading calendar/grid/close validation, and the returned object binds the
+# ICs to a recorded fingerprint of exactly what they were computed from, so
+# ``combine_fitted``/``fitted_weights_by_rebalance`` and
+# ``redundancy_from_period_ics`` can verify provenance instead of trusting an
+# untyped mapping that could silently carry a different panel's numbers into
+# the §4.4 point-in-time fit.
+# ---------------------------------------------------------------------------
+
+
+def period_rank_ic_by_signal_index(
+    directed_matrix: pd.DataFrame,
+    *,
+    close: pd.DataFrame,
+    calendar: Sequence[pd.Timestamp],
+    grid: Sequence[int],
+    delay: int,
+    holding: int,
+) -> dict[int, dict[str, float]]:
+    """Public seam over the per-member per-period rank IC sweep (RB-5)."""
+
+    return _period_rank_ic_by_signal_index(
+        directed_matrix,
+        close=close,
+        calendar=calendar,
+        grid=grid,
+        delay=delay,
+        holding=holding,
+    )
+
+
+def validated_calendar(dates: Sequence[object]) -> list[pd.Timestamp]:
+    """Public seam over the strictly-increasing trade-date calendar check."""
+
+    return _validated_calendar(dates)
+
+
+def validated_close_frame(close: pd.DataFrame) -> pd.DataFrame:
+    """Public seam over the close-frame column/dtype normalization."""
+
+    return _validated_close_frame(close)
+
+
+def require_matrix_dates_on_calendar(
+    matrix: pd.DataFrame, calendar: Sequence[pd.Timestamp]
+) -> None:
+    """Public seam over the matrix-dates-on-calendar precondition."""
+
+    _require_matrix_dates_on_calendar(matrix, calendar)
+
+
+@dataclass(frozen=True)
+class PeriodICSweep:
+    """Provenance-bound result of ONE per-period rank IC sweep (reuse seam).
+
+    Built ONLY by :func:`compute_period_ic_sweep`. Binds ``ics`` — the
+    per-signal-index per-factor rank IC mapping — to a fingerprint of
+    exactly what it was computed from, so a consumer
+    (:func:`fitted_weights_by_rebalance` via :func:`combine_fitted`,
+    :func:`redundancy_from_period_ics`) can verify hard that the sweep it
+    was handed actually came from THIS run's matrix and grid instead of
+    trusting an untyped mapping that could silently carry a different
+    panel's numbers into the §4.4 point-in-time fit. ``dates``/``grid`` are
+    the validated calendar and the ``rebalance_indices`` grid the sweep was
+    walked over; ``columns``/``matrix_row_count``/``matrix_first_key``/
+    ``matrix_last_key``/``matrix_content_hash`` fingerprint the SORTED
+    directed matrix the sweep read (first/last ``(trade_date, instrument)``
+    index tuples, plus a whole-frame content hash so a foreign matrix with
+    matching shape and edge keys but REVISED interior scores is caught, not
+    just a resized or reordered one); ``close_row_count``/``close_first``/
+    ``close_last``/``close_content_hash`` fingerprint the validated close
+    frame the sweep actually swept (first/last ``(trade_date, instrument,
+    close)`` rows, plus the same kind of whole-frame content hash) —
+    recorded for audit and, on the ``period_ics`` reuse path, re-checked
+    hard against an independently re-validated close frame rather than
+    trusted on the sweep's say-so (see :func:`_validate_period_ic_sweep`).
+    Both content hashes are
+    ``int(pandas.util.hash_pandas_object(frame, index=True).sum())``:
+    deterministic within a single process/pandas version, which is the
+    seam's whole lifetime — a sweep is produced and consumed inside one run,
+    never persisted or shared across a version boundary; ``index=True`` so
+    index identity is part of the content, not just the column values.
+
+    The ``ics`` PAYLOAD is guarded too, not just the inputs it came from: a
+    frozen dataclass only freezes attribute REBINDING, so without more, an
+    honest sweep's nested IC dict could be mutated in place after
+    construction and every input fingerprint would still pass. Two layers
+    close that: the constructor deep-wraps ``ics`` in ``MappingProxyType``
+    over fresh copies (in-place assignment raises ``TypeError``), and
+    ``ics_content_hash`` records a canonical hash of the payload at
+    construction which the consumer recomputes from the ``ics`` it actually
+    received (see ``_ics_payload_hash``) — so even a payload swapped in via
+    ``dataclasses.replace`` or reached through some aliasing hole is
+    rejected naming ``ics_content_hash``.
+    """
+
+    ics: Mapping[int, Mapping[str, float]]
+    dates: tuple[pd.Timestamp, ...]
+    grid: tuple[int, ...]
+    delay: int
+    holding: int
+    start_signal_index: int
+    columns: tuple[str, ...]
+    matrix_row_count: int
+    matrix_first_key: tuple
+    matrix_last_key: tuple
+    matrix_content_hash: int
+    close_row_count: int
+    close_first: tuple
+    close_last: tuple
+    close_content_hash: int
+    ics_content_hash: int
+
+
+def _ics_payload_hash(ics: Mapping[int, Mapping[str, float]]) -> int:
+    """Canonical content hash of a per-period IC payload.
+
+    Signal indices sorted numerically, factor keys sorted lexically, every
+    value rendered through ``float.hex()`` (with NaN normalized to the
+    literal ``"nan"`` — ``float("nan").hex()`` is platform-stable but the
+    explicit branch keeps the canonical form self-evident) so the digest is
+    deterministic for exactly the payload content: any added/removed period
+    or factor key and any changed value — including sign-of-zero and inf —
+    changes the digest. SHA-256 truncated to 64 bits, matching the int width
+    of the frame content hashes.
+    """
+
+    parts: list[str] = []
+    for signal_index in sorted(int(key) for key in ics):
+        parts.append(str(signal_index))
+        row = ics[signal_index]
+        for factor in sorted(str(key) for key in row):
+            value = float(row[factor])
+            parts.append(factor)
+            parts.append("nan" if value != value else value.hex())
+    # Length-prefixed encoding: a plain delimiter join is not injective when a
+    # factor key may itself contain the delimiter, so every part carries its
+    # own length and no crafted key can straddle a boundary.
+    encoded = "".join(f"{len(part)}:{part}" for part in parts)
+    digest = hashlib.sha256(encoded.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
+def compute_period_ic_sweep(
+    directed_matrix: pd.DataFrame,
+    *,
+    close: pd.DataFrame,
+    dates: Sequence[object],
+    delay: int,
+    holding: int,
+    start_signal_index: int = 0,
+) -> PeriodICSweep:
+    """Sort, validate, and sweep ONCE — the single-build orchestration entry point.
+
+    Runs exactly the sequence an orchestrator used to run inline: sort the
+    matrix (``sort_index()``), validate the calendar and the close frame,
+    derive the shared ``rebalance_indices`` grid, and run the per-period rank
+    IC sweep — then returns a :class:`PeriodICSweep` fingerprinting every
+    input the sweep depended on, INCLUDING a whole-frame content hash of the
+    sorted matrix and of the validated close frame (not just their shape and
+    edge rows), so a foreign sweep built from a REVISED close series or
+    REVISED scores with an otherwise matching shape cannot pass downstream
+    provenance checks. This is the ONLY supported way to build a
+    ``PeriodICSweep``: :func:`combine_fitted` / :func:`fitted_weights_by_rebalance`
+    and :func:`redundancy_from_period_ics` accept nothing else for their
+    sweep argument, so a caller cannot hand in a hand-rolled or foreign
+    mapping (see ``_validate_period_ic_sweep``) — the close-frame provenance
+    is bound by construction because this is the one place that reads and
+    fingerprints ``close``.
+    """
+
+    working = directed_matrix.sort_index()
+    calendar = _validated_calendar(dates)
+    _require_matrix_dates_on_calendar(working, calendar)
+    grid = rebalance_indices(
+        calendar, delay=delay, holding=holding, start_signal_index=start_signal_index
+    )
+    validated_close = _validated_close_frame(close)
+    ics = _period_rank_ic_by_signal_index(
+        working,
+        close=validated_close,
+        calendar=calendar,
+        grid=grid,
+        delay=delay,
+        holding=holding,
+    )
+    columns = tuple(str(column) for column in working.columns)
+    if len(working):
+        matrix_first_key = tuple(working.index[0])
+        matrix_last_key = tuple(working.index[-1])
+    else:
+        matrix_first_key = ()
+        matrix_last_key = ()
+    matrix_content_hash = int(pd.util.hash_pandas_object(working, index=True).sum())
+    close_columns = list(_CLOSE_COLUMNS)
+    if len(validated_close):
+        close_first = tuple(validated_close[close_columns].iloc[0])
+        close_last = tuple(validated_close[close_columns].iloc[-1])
+    else:
+        close_first = ()
+        close_last = ()
+    close_content_hash = int(pd.util.hash_pandas_object(validated_close, index=True).sum())
+    # Deep-freeze the payload: fresh inner copies (no caller-visible alias to
+    # the mutable originals) wrapped in read-only proxies, so an in-place
+    # mutation attempt raises instead of silently rewriting fitted inputs;
+    # the recorded payload hash is what catches anything that gets around
+    # the proxies (see PeriodICSweep's docstring).
+    frozen_ics: Mapping[int, Mapping[str, float]] = MappingProxyType(
+        {int(signal_index): MappingProxyType(dict(row)) for signal_index, row in ics.items()}
+    )
+    return PeriodICSweep(
+        ics=frozen_ics,
+        dates=tuple(calendar),
+        grid=tuple(grid),
+        delay=delay,
+        holding=holding,
+        start_signal_index=start_signal_index,
+        columns=columns,
+        matrix_row_count=len(working),
+        matrix_first_key=matrix_first_key,
+        matrix_last_key=matrix_last_key,
+        matrix_content_hash=matrix_content_hash,
+        close_row_count=len(validated_close),
+        close_first=close_first,
+        close_last=close_last,
+        close_content_hash=close_content_hash,
+        ics_content_hash=_ics_payload_hash(frozen_ics),
+    )
+
+
 def _normalize_ic_weights(
     raw: Mapping[str, float], factors: Sequence[str]
 ) -> tuple[dict[str, float], str | None]:
@@ -1004,6 +1273,131 @@ def _normalize_ic_weights(
     return {factor: value / total for factor, value in clipped.items()}, None
 
 
+def _validate_period_ic_sweep(
+    period_ics: object,
+    *,
+    calendar: Sequence[pd.Timestamp],
+    grid: Sequence[int],
+    delay: int,
+    holding: int,
+    start_signal_index: int,
+    matrix: pd.DataFrame,
+    close: pd.DataFrame,
+) -> dict[int, dict[str, float]]:
+    """Guard the ``period_ics`` reuse seam against a foreign sweep (provenance check).
+
+    Returns the validated payload as a fresh private SNAPSHOT, and the caller
+    must fit from that snapshot, never from ``period_ics.ics`` — validating
+    an aliased mutable mapping and then reading it again is a check-then-use
+    hole: a payload swapped in via ``dataclasses.replace`` can hash-match at
+    validation time and still be mutated through the alias afterwards (web
+    jobs run threads). The hash below is computed OVER THE SNAPSHOT, so the
+    bytes verified are exactly the bytes consumed.
+
+    The seam exists only so a caller that already ran
+    :func:`compute_period_ic_sweep` over the SAME sorted directed matrix /
+    close frame / calendar / grid / delay / holding / ``start_signal_index``
+    can hand the result back and skip a second sweep. Feeding a sweep built
+    from any OTHER matrix or grid would silently break the §4.4 point-in-time
+    honesty — the weights would be fit off numbers that do not match the
+    returns the engine realizes. A bare mapping carries no way to prove that,
+    so ``period_ics`` accepts ONLY a :class:`PeriodICSweep`: anything else is
+    a caller programming error, raised as ``TypeError`` naming the required
+    builder. Every fingerprint field the sweep recorded is then compared
+    against the value THIS call computed independently (dates, grid, delay,
+    holding, start_signal_index, matrix columns, matrix row count, first/last
+    matrix index key); a single mismatch raises ``ValueError`` naming the
+    field.
+
+    Shape and edge-key equality alone are not enough: a foreign sweep built
+    from a REVISED close series or REVISED score values, but with matching
+    dates/grid/params/columns/row-count/edge keys, would otherwise pass and
+    silently supply foreign IC weights to the §4.4 fit. Two content hashes
+    close that gap. ``matrix_content_hash`` is recomputed over THIS call's
+    own sorted ``matrix`` and compared against the sweep's recorded value.
+    The close frame is independently re-validated here via
+    ``_validated_close_frame`` — yes, this reinstates that validation/copy on
+    the reuse-seam path; integrity beats trusting the sweep's saved copy,
+    and the cost is a cheap column-select/copy, not the expensive full-panel
+    forward-return pass the seam exists to avoid paying twice — and its row
+    count, first/last row fingerprints, and content hash are compared
+    against ``close_row_count`` / ``close_first`` / ``close_last`` /
+    ``close_content_hash``. And the sweep's OWN payload is re-hashed from
+    the ``ics`` actually received and compared against the construction-time
+    ``ics_content_hash``, so a nested IC value mutated or swapped after
+    construction cannot ride an otherwise-honest sweep (the payload is also
+    proxy-frozen at construction; the hash is the backstop for anything that
+    gets around the proxies). Every mismatch — matrix, close, or payload —
+    raises ``ValueError`` naming that specific field.
+    """
+
+    if not isinstance(period_ics, PeriodICSweep):
+        raise TypeError(
+            "period_ics must be a PeriodICSweep built by compute_period_ic_sweep, "
+            f"not {type(period_ics).__name__}"
+        )
+    ics_snapshot: dict[int, dict[str, float]] = {
+        int(signal_index): {str(factor): float(value) for factor, value in row.items()}
+        for signal_index, row in period_ics.ics.items()
+    }
+    columns = tuple(str(column) for column in matrix.columns)
+    if len(matrix):
+        matrix_first_key = tuple(matrix.index[0])
+        matrix_last_key = tuple(matrix.index[-1])
+    else:
+        matrix_first_key = ()
+        matrix_last_key = ()
+    matrix_content_hash = int(pd.util.hash_pandas_object(matrix, index=True).sum())
+    # Re-derive the close fingerprints from the ACTUAL close frame this call
+    # was handed, rather than trusting the sweep's recorded copy: the frame
+    # returned here is function-local and dropped when this call returns
+    # (never retained past the existing release points in the caller).
+    validated_close = _validated_close_frame(close)
+    close_columns = list(_CLOSE_COLUMNS)
+    if len(validated_close):
+        close_first = tuple(validated_close[close_columns].iloc[0])
+        close_last = tuple(validated_close[close_columns].iloc[-1])
+    else:
+        close_first = ()
+        close_last = ()
+    close_content_hash = int(pd.util.hash_pandas_object(validated_close, index=True).sum())
+    expected: dict[str, object] = {
+        "dates": tuple(calendar),
+        "grid": tuple(grid),
+        "delay": delay,
+        "holding": holding,
+        "start_signal_index": start_signal_index,
+        "columns": columns,
+        "matrix_row_count": len(matrix),
+        "matrix_first_key": matrix_first_key,
+        "matrix_last_key": matrix_last_key,
+        "matrix_content_hash": matrix_content_hash,
+        "close_row_count": len(validated_close),
+        "close_first": close_first,
+        "close_last": close_last,
+        "close_content_hash": close_content_hash,
+        # Payload self-integrity: unlike the input fingerprints above (sweep-
+        # recorded vs THIS call's own computation), this one recomputes the
+        # canonical hash from the private SNAPSHOT of the payload as RECEIVED
+        # and compares it to the hash recorded at construction — a payload
+        # mutated in place (past the read-only proxies) or swapped via
+        # dataclasses.replace no longer matches what compute_period_ic_sweep
+        # actually measured, and hashing the snapshot (not the caller-visible
+        # mapping) closes the check-then-use window.
+        "ics_content_hash": _ics_payload_hash(ics_snapshot),
+    }
+    for name, value in expected.items():
+        actual = getattr(period_ics, name)
+        if actual != value:
+            raise ValueError(
+                f"period_ics sweep field {name!r} does not match this call: expected "
+                f"{value!r}, got {actual!r}; period_ics must come from "
+                "compute_period_ic_sweep over this SAME directed matrix, close frame, "
+                "dates, delay, holding, and start_signal_index"
+            )
+    return ics_snapshot
+
+
 def fitted_weights_by_rebalance(
     directed_matrix: pd.DataFrame,
     *,
@@ -1014,6 +1408,7 @@ def fitted_weights_by_rebalance(
     method: str,
     ic_min_periods: int = DEFAULT_IC_MIN_PERIODS,
     start_signal_index: int = 0,
+    period_ics: PeriodICSweep | None = None,
 ) -> tuple[FittedWeightEntry, ...]:
     """§4.4 point-in-time weight vectors for EVERY shared-grid rebalance.
 
@@ -1028,6 +1423,23 @@ def fitted_weights_by_rebalance(
     weight rule; the finite-check clip, the ICIR ``std == 0`` guard
     (population std, matching the pseudocode's ``np.std``), the all-zero
     equal-weight fallback and the warm-up fallback are implemented verbatim.
+
+    ``period_ics`` is an advanced reuse seam: when supplied it REPLACES the
+    internal sweep with the caller's precomputed :class:`PeriodICSweep`, built
+    ONLY by :func:`compute_period_ic_sweep` over the SAME sorted directed
+    matrix, close frame, calendar, grid, delay, holding, and
+    ``start_signal_index`` — a bare mapping is rejected with ``TypeError``
+    (foreign or hand-rolled ICs would silently break the point-in-time fit),
+    and every provenance field the sweep recorded is checked hard against the
+    values THIS call computes, by :func:`_validate_period_ic_sweep`,
+    INCLUDING a whole-frame content hash of the sorted matrix and of the
+    close frame — not just their shape and edge rows — so a foreign sweep
+    built from a REVISED close series or REVISED scores with a matching
+    shape cannot pass as this run's provenance. ``close`` IS re-read on this
+    path (re-run through :func:`_validated_close_frame`, a cheap
+    column-select/copy) specifically to make that content check possible;
+    the sweep's saved close fingerprints are audit metadata, never trusted
+    on their own.
     """
 
     _require_score_matrix(directed_matrix)
@@ -1042,14 +1454,43 @@ def fitted_weights_by_rebalance(
     calendar = _validated_calendar(dates)
     working = directed_matrix.sort_index()
     _require_matrix_dates_on_calendar(working, calendar)
-    close_frame = _validated_close_frame(close)
 
     grid = rebalance_indices(
         calendar, delay=delay, holding=holding, start_signal_index=start_signal_index
     )
-    ic_by_period = _period_rank_ic_by_signal_index(
-        working, close=close_frame, calendar=calendar, grid=grid, delay=delay, holding=holding
-    )
+    if period_ics is None:
+        ic_by_period = _period_rank_ic_by_signal_index(
+            working,
+            close=_validated_close_frame(close),
+            calendar=calendar,
+            grid=grid,
+            delay=delay,
+            holding=holding,
+        )
+    else:
+        # Reuse seam (see _validate_period_ic_sweep): the caller already ran
+        # this exact sweep via compute_period_ic_sweep and hands it back so
+        # the expensive full-panel forward-return pass runs once, not once
+        # per consumer. ``close`` IS re-read here (a cheap column-select/
+        # copy through _validated_close_frame, not the expensive pass the
+        # seam exists to avoid paying twice) so a foreign sweep built from a
+        # REVISED close series with matching shape and edge keys cannot pass
+        # as this run's provenance — integrity beats trusting the sweep's
+        # saved copy.
+        # The fit consumes the validator's returned snapshot, never the
+        # sweep's own mapping: the snapshot is what the payload hash was
+        # computed over, so no alias can change the ICs between the check
+        # and their use.
+        ic_by_period = _validate_period_ic_sweep(
+            period_ics,
+            calendar=calendar,
+            grid=grid,
+            delay=delay,
+            holding=holding,
+            start_signal_index=start_signal_index,
+            matrix=working,
+            close=close,
+        )
     equal = {factor: 1.0 / len(factors) for factor in factors}
 
     entries: list[FittedWeightEntry] = []
@@ -1127,6 +1568,7 @@ def combine_fitted(
     ic_min_periods: int = DEFAULT_IC_MIN_PERIODS,
     min_factor_coverage: int | None = None,
     start_signal_index: int = 0,
+    period_ics: PeriodICSweep | None = None,
 ) -> FittedCompositeResult:
     """Combine with §4.4 point-in-time fitted weights, folded in pre-materialization.
 
@@ -1148,6 +1590,21 @@ def combine_fitted(
     fitted vector the run traded per-date equal weight throughout —
     ``is_fitted`` is ``False`` and ``NO_FITTED_PERIODS`` is flagged; the
     result never advertises fitting on an all-fallback run.
+
+    ``period_ics`` is the advanced reuse seam threaded to
+    :func:`fitted_weights_by_rebalance`: when supplied, it must be a
+    :class:`PeriodICSweep` built by :func:`compute_period_ic_sweep` over the
+    SAME sorted directed matrix, close frame, calendar, grid, delay, holding,
+    and ``start_signal_index`` this call would have built internally
+    (``combine_fitted`` sorts with ``directed_matrix.sort_index()``, so the
+    sweep must be computed from that same sorted frame). A bare mapping is
+    rejected with ``TypeError``, and every provenance field the sweep
+    recorded — INCLUDING a content hash of the matrix and of the close frame,
+    not just their shape and edge rows — is validated hard against this
+    call's own freshly computed values, so the seam cannot silently corrupt
+    the point-in-time weights with a foreign sweep built from a REVISED
+    close series or REVISED scores. ``close`` IS re-read on this path (see
+    :func:`_validate_period_ic_sweep`) to make that content check possible.
     """
 
     entries = fitted_weights_by_rebalance(
@@ -1159,6 +1616,7 @@ def combine_fitted(
         method=method,
         ic_min_periods=ic_min_periods,
         start_signal_index=start_signal_index,
+        period_ics=period_ics,
     )
     calendar = _validated_calendar(dates)
     working = directed_matrix.sort_index()
@@ -1259,9 +1717,9 @@ def build_fitted_composite(
     realizes (RB-5).
     """
 
-    matrix = build_score_matrix(member_scores)
-    standardized = standardize_matrix(matrix, standardization=standardization)
-    directed = apply_directions(standardized.matrix, directions)
+    directed, standardized = build_directed_matrix(
+        member_scores, directions=directions, standardization=standardization
+    )
     result = combine_fitted(
         directed,
         method=method,
@@ -1278,6 +1736,68 @@ def build_fitted_composite(
         standardization=standardization,
         degenerate_dates_by_factor=standardized.degenerate_dates_by_factor,
     )
+
+
+def redundancy_from_period_ics(sweep: PeriodICSweep) -> dict[str, object]:
+    """Advisory §4.5 crowding matrix from a precomputed per-period IC sweep.
+
+    The tail of :func:`member_rank_ic_redundancy`, split out so a caller that
+    already built a :class:`PeriodICSweep` once via
+    :func:`compute_period_ic_sweep` (over the SAME sorted directed matrix,
+    close frame, calendar, grid, delay, and holding) can build the redundancy
+    matrix from it directly — identical numbers and identical key order —
+    instead of paying for a second sweep. ``sweep.columns`` fixes the
+    row/column order (the directed matrix columns). Unobservable cells —
+    fewer than 2 common finite periods, or a zero-variance series — stay a
+    real ``None`` (FP-4), never a fabricated number.
+
+    The advisory surface verifies the payload's SELF-integrity before
+    rendering from it: the crowding matrix is user-facing diagnostics, so a
+    payload mutated or swapped after construction must refuse here exactly
+    as it does on the weight-driving seam — this function has no matrix or
+    close frame to re-derive input provenance from (that binding lives in
+    ``_validate_period_ic_sweep``), but the construction-time
+    ``ics_content_hash`` needs nothing beyond the sweep itself.
+    """
+
+    ic_by_period: dict[int, dict[str, float]] = {
+        int(signal_index): {str(factor): float(value) for factor, value in row.items()}
+        for signal_index, row in sweep.ics.items()
+    }
+    # Hash the snapshot, then render only from the snapshot — same
+    # check-then-use discipline as the weight-driving seam.
+    if _ics_payload_hash(ic_by_period) != sweep.ics_content_hash:
+        raise ValueError(
+            "period_ics sweep field 'ics_content_hash' does not match the payload: "
+            "the ics mapping was mutated or replaced after compute_period_ic_sweep "
+            "recorded it; rebuild the sweep instead of editing it"
+        )
+    factors = list(sweep.columns)
+    closed_periods = sorted(ic_by_period)
+    series = {
+        factor: np.asarray([ic_by_period[s][factor] for s in closed_periods], dtype=float)
+        for factor in factors
+    }
+    matrix_rows: list[list[float | None]] = []
+    for row_factor in factors:
+        row: list[float | None] = []
+        for column_factor in factors:
+            both_finite = np.isfinite(series[row_factor]) & np.isfinite(series[column_factor])
+            if int(both_finite.sum()) < 2:
+                row.append(None)
+                continue
+            pair = np.corrcoef(
+                series[row_factor][both_finite], series[column_factor][both_finite]
+            )[0, 1]
+            row.append(float(pair) if np.isfinite(pair) else None)
+        matrix_rows.append(row)
+    return {
+        "advisory": True,
+        "basis": "pearson_correlation_of_realized_period_rank_ic_series",
+        "period_count": len(closed_periods),
+        "factors": factors,
+        "matrix": matrix_rows,
+    }
 
 
 def member_rank_ic_redundancy(
@@ -1306,48 +1826,18 @@ def member_rank_ic_redundancy(
     """
 
     _validate_grid_params(delay, holding, start_signal_index)
-    matrix = build_score_matrix(member_scores)
-    standardized = standardize_matrix(matrix, standardization=standardization)
-    directed = apply_directions(standardized.matrix, directions).sort_index()
-    calendar = _validated_calendar(dates)
-    _require_matrix_dates_on_calendar(directed, calendar)
-    grid = rebalance_indices(
-        calendar, delay=delay, holding=holding, start_signal_index=start_signal_index
+    directed, _standardized = build_directed_matrix(
+        member_scores, directions=directions, standardization=standardization
     )
-    ic_by_period = _period_rank_ic_by_signal_index(
+    sweep = compute_period_ic_sweep(
         directed,
-        close=_validated_close_frame(close),
-        calendar=calendar,
-        grid=grid,
+        close=close,
+        dates=dates,
         delay=delay,
         holding=holding,
+        start_signal_index=start_signal_index,
     )
-    factors = [str(column) for column in directed.columns]
-    closed_periods = sorted(ic_by_period)
-    series = {
-        factor: np.asarray([ic_by_period[s][factor] for s in closed_periods], dtype=float)
-        for factor in factors
-    }
-    matrix_rows: list[list[float | None]] = []
-    for row_factor in factors:
-        row: list[float | None] = []
-        for column_factor in factors:
-            both_finite = np.isfinite(series[row_factor]) & np.isfinite(series[column_factor])
-            if int(both_finite.sum()) < 2:
-                row.append(None)
-                continue
-            pair = np.corrcoef(
-                series[row_factor][both_finite], series[column_factor][both_finite]
-            )[0, 1]
-            row.append(float(pair) if np.isfinite(pair) else None)
-        matrix_rows.append(row)
-    return {
-        "advisory": True,
-        "basis": "pearson_correlation_of_realized_period_rank_ic_series",
-        "period_count": len(closed_periods),
-        "factors": factors,
-        "matrix": matrix_rows,
-    }
+    return redundancy_from_period_ics(sweep)
 
 
 def prescan_rebalance_coverage(
