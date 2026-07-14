@@ -204,3 +204,13 @@ transcripts; owner deep interview ×2 (2026-07-13).
 | SE-viii | Submission margins (owner R4) | Sharpe ≥ 1.28, Fitness ≥ 1.05, Turnover ≤ 60% — INCLUSIVE semantics; instance lives ONLY in the local adapter config (gitignored), kernel zero hardcode; tuning changes logged with provenance. | `worldquant/adapter/` config (SE-P3) |
 | SE-ix | Cross-track contract (A×B) | `planning_influence_snapshot` captured at pipeline confirm (cutoff revision, eligible activated-rule ids, priors query fingerprints, overall hash); hash joins pipeline `input_hash` (same-nonce ⇒ same search policy); disclosure persisted in trace/result/report/web payload and rendered ONLY by canonical components (FE-P3). Sidecar v1 gets NO general memory-read tool — only the run-local snapshot projection. Memory-store appends and promote/activate critical sections adopt the lineage advisory-lock pattern. | SE-P5 freeze before FE-P3 review |
 | SE-x | Transformation sequencing | Step 0: phase-f closure + owner merge precedes every `service.py`/`api.py`-touching phase; Step 0b: D12-compliance chore (extract fe23744's api.py additions into a module; api.py net-shrinks). SE-P4 after FE-P1 (html.py). Temp integration branch runs the full CP-INT (incl. two-run activation/steering determinism fixture) before final merges; integration/architecture/workflow docs update FIRST (they currently contradict D11's auto-cycle deletion). Fable is the coordination-doc steward (DECISIONS/WORKING_STATE/EP appends serialized). Public synthetic-producer fixture (no provider vocabulary) drives the REAL ingress chain in CI; SE-P3 completion claim requires public CI proof + local BRAIN offline suite both green. | master sequence; Step F |
+
+**Amendment (2026-07-13, owner): two-workflow / two-PR topology.** The two
+tracks develop as two workflows and land as exactly TWO pull requests:
+Workflow A = frontend sidecar (one branch accumulating P0→P3) and Workflow B =
+self-evolution engine v2 (continues `fable/self-evolution-design`: design +
+CP0 + SE-P1..P5 code; the SE-P3 plugin producer is gitignored local-only and
+contributes no tracked diff). Phase discipline inside each track is unchanged:
+per-phase dev → adversarial review → fixes, sequential within a track. The
+SE-x temp-integration-branch CP-INT runs over the union of both PR heads
+before either merges; owner approval gates both merges.
