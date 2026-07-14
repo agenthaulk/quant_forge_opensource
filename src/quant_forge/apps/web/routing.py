@@ -44,6 +44,16 @@ from quant_forge.apps.web.api import (
 )
 from quant_forge.apps.web.html import _index_html
 from quant_forge.apps.web.jobs import LOGGER, RequestBodyTooLarge, _WebJobManager, _client_error_message
+from quant_forge.apps.web.pipeline import (
+    PipelineStore,
+    cancel_pipeline,
+    confirm_pipeline,
+    create_pipeline,
+    get_pipeline,
+    list_active_pipelines,
+    retry_pipeline,
+    update_pipeline_parameters,
+)
 from quant_forge.config import QuantForgeConfig
 from quant_forge.mcp.read_models import list_available_fields, list_available_operators
 from quant_forge.research_loop.config import ResearchLoopConfig, load_research_loop_config
@@ -103,6 +113,20 @@ def _static_asset(url_path: str) -> tuple[bytes, str]:
     return body, content_type
 
 
+def _pipeline_id_from_path(path: str) -> str:
+    parts = path.strip("/").split("/")
+    if len(parts) != 3 or parts[:2] != ["api", "pipelines"] or not parts[2]:
+        raise KeyError(f"unknown pipeline path: {path}")
+    return parts[2]
+
+
+def _pipeline_id_from_action_path(path: str, action: str) -> str:
+    parts = path.strip("/").split("/")
+    if len(parts) != 4 or parts[:2] != ["api", "pipelines"] or parts[3] != action or not parts[2]:
+        raise KeyError(f"unknown pipeline path: {path}")
+    return parts[2]
+
+
 def create_local_web_server(
     *, host: str, port: int, config: QuantForgeConfig, rd_config: ResearchLoopConfig | None = None
 ) -> ThreadingHTTPServer:
@@ -130,6 +154,7 @@ def create_local_web_server(
         allowed_interval_days=research_config.allowed_interval_days,
     )
     job_manager = _WebJobManager()
+    pipeline_store = PipelineStore(config.paths.artifact_root)
     control_token = _control_token_for_bind(host, config)
     control_token_required = bool(control_token)
 
@@ -228,6 +253,23 @@ def create_local_web_server(
                 elif path.startswith("/api/jobs/"):
                     self._require_control_token()
                     self._json(job_manager.get(_job_id_from_path(path)))
+                elif path == "/api/pipelines":
+                    # Rejoin (spec §2.3): the frontend queries active
+                    # pipelines on load and re-attaches; refresh and server
+                    # restart never silently strand a running computation.
+                    self._require_control_token()
+                    self._json(
+                        {
+                            "pipelines": [
+                                record.to_dict()
+                                for record in list_active_pipelines(pipeline_store, job_manager=job_manager)
+                            ]
+                        }
+                    )
+                elif path.startswith("/api/pipelines/"):
+                    self._require_control_token()
+                    record = get_pipeline(pipeline_store, _pipeline_id_from_path(path), job_manager=job_manager)
+                    self._json(record.to_dict())
                 elif path.startswith(STATIC_URL_PREFIX):
                     # Static frontend modules are public like the index page
                     # itself; they contain no runtime values or secrets.
@@ -438,6 +480,52 @@ def create_local_web_server(
                     return
                 if path.startswith("/api/jobs/") and path.endswith("/cancel"):
                     self._json(job_manager.cancel(_job_id_from_cancel_path(path)))
+                    return
+                if path == "/api/pipelines":
+                    # create_pipeline takes a job id, never a client-supplied
+                    # parser/factor payload (FE-L3): the parser/factor this
+                    # pipeline stores comes from job_manager's OWN stored
+                    # result for parse_job_id, not from this request body.
+                    record = create_pipeline(
+                        pipeline_store,
+                        job_manager=job_manager,
+                        parse_job_id=str(payload.get("parse_job_id", "")),
+                        rd_config=research_config,
+                        kind=str(payload.get("kind", "factor_study")),
+                    )
+                    self._json(record.to_dict(), status=201)
+                    return
+                if path.startswith("/api/pipelines/") and path.endswith("/confirm"):
+                    record = confirm_pipeline(
+                        config,
+                        pipeline_store,
+                        _pipeline_id_from_action_path(path, "confirm"),
+                        nonce=str(payload.get("nonce", "")),
+                        version=_int_parameter(payload.get("version", 0), "version"),
+                        job_manager=job_manager,
+                        rd_config=research_config,
+                        parameters=_optional_parameters_payload(payload.get("parameters")),
+                    )
+                    self._json(record.to_dict())
+                    return
+                if path.startswith("/api/pipelines/") and path.endswith("/cancel"):
+                    record = cancel_pipeline(
+                        pipeline_store, _pipeline_id_from_action_path(path, "cancel"), job_manager=job_manager
+                    )
+                    self._json(record.to_dict())
+                    return
+                if path.startswith("/api/pipelines/") and path.endswith("/retry"):
+                    record = retry_pipeline(pipeline_store, _pipeline_id_from_action_path(path, "retry"))
+                    self._json(record.to_dict())
+                    return
+                if path.startswith("/api/pipelines/") and path.endswith("/parameters"):
+                    record = update_pipeline_parameters(
+                        pipeline_store,
+                        _pipeline_id_from_action_path(path, "parameters"),
+                        dict(payload.get("parameters") or {}),
+                        job_manager=job_manager,
+                    )
+                    self._json(record.to_dict())
                     return
                 if path == "/api/research/schedule":
                     action = str(payload.get("action", "")).strip().lower()

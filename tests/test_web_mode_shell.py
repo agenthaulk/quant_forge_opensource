@@ -208,17 +208,19 @@ def test_simple_shell_subtitle_is_chinese_first(web_config) -> None:
     assert "Factor research console" not in simple_shell_html
 
 
-def test_advanced_params_details_wraps_the_11_parameter_grid(web_config) -> None:
+def test_advanced_params_grid_is_no_longer_server_rendered(web_config) -> None:
+    # P1 (agent_sidecar_frontend.md §5.1/§8, WORKORDER P1 减法): the resident
+    # #validation-controls grid (and its #advanced-params <details> wrapper)
+    # is ABSORBED into the pipeline confirm card's expert density and
+    # DELETED from the server-rendered shell. The card is rendered
+    # client-side by static/views/pipeline.js, which reuses the SAME
+    # .param-grid / .term-tip CSS classes (still defined in html.py, see
+    # test_mode_shell_css_is_token_only_and_ships_both_themes) -- the
+    # absorbed markers themselves are pinned in
+    # tests/test_web_pipeline_view.py, not on this server-rendered page.
     html = web_server._index_html(web_config)
-    assert '<details class="advanced-params" id="advanced-params">' in html
-    assert "<summary>高级参数" in html
-    details_start = html.index('id="advanced-params"')
-    controls_start = html.index('id="validation-controls"', details_start)
-    details_end = html.index("</details>", controls_start)
-    # The full existing 11-parameter grid lives INSIDE the disclosure, with
-    # every input id and its disabled-by-default state unchanged (P0 does
-    # no deletions; the grid is absorbed into a collapsed section, not
-    # rewritten).
+    assert 'id="advanced-params"' not in html
+    assert 'id="validation-controls"' not in html
     for param_id in (
         "param-holding-days",
         "param-decay-days",
@@ -232,33 +234,7 @@ def test_advanced_params_details_wraps_the_11_parameter_grid(web_config) -> None
         "param-slippage-bps",
         "param-short-borrow-bps",
     ):
-        marker_start = html.index(f'id="{param_id}"', controls_start)
-        assert marker_start < details_end, param_id
-        assert "disabled" in html[marker_start : html.index(">", marker_start)], param_id
-
-
-def test_terminology_tooltips_cover_the_jargon_labelled_parameters(web_config) -> None:
-    html = web_server._index_html(web_config)
-    # A term-tip is a focusable span carrying a plain-language data-tip; it
-    # wraps the SAME visible label text as before (no string-contract
-    # regression on the label wording), just adds an explanation surface.
-    # Each is asserted as one exact, distinct span so five separate
-    # attachment points are proven (not one match re-found five times).
-    exact_spans = (
-        '<span class="term-tip" tabindex="0" data-tip="每次调仓后，持有多头组合的交易日数">持有期 / 天</span>',
-        '<span class="term-tip" tabindex="0" data-tip="信号衰减天数：0 表示不衰减，数值越大权重越平滑">Decay / 天</span>',
-        '<span class="term-tip" tabindex="0" data-tip="按因子值排序后，用于构建多头组合的头部比例">Top Quantile</span>',
-        '<span class="term-tip" tabindex="0" data-tip="信号生成到实际下单之间的执行延迟天数">Delay / 天</span>',
-        '<span class="term-tip" tabindex="0" data-tip="做空部分的年化融券成本，以基点计">融券成本 bps/年</span>',
-    )
-    assert len(set(exact_spans)) == 5, "test fixture bug: expected 5 distinct spans"
-    for span in exact_spans:
-        assert span in html, span
-    assert html.count('class="term-tip"') == 5
-    # Untouched labels (no jargon ambiguity) keep their plain <span>, never
-    # gaining an unnecessary tooltip.
-    for plain_label in ("评测开始", "评测结束", "回测开始", "回测结束", "手续费 bps", "滑点 bps"):
-        assert f"<span>{plain_label}</span>" in html, plain_label
+        assert f'id="{param_id}"' not in html, param_id
 
 
 # ---------------------------------------------------------------------------
@@ -479,15 +455,21 @@ def test_sticky_elements_offset_below_the_persistent_header(web_config) -> None:
 
 
 def test_app_module_imports_the_hash_recognizer_from_lab_module() -> None:
+    # P1: setStep is DELETED from lab.js's export surface alongside
+    # .lab-stepper (WORKORDER P1 减法); app.js's import line drops it too.
     app_js = _static_module_text("app.js")
     assert (
-        "import { activateModule, activateTab, initLabTabs, isRecognizedExpertHash, setStep, setTabDot } "
+        "import { activateModule, activateTab, initLabTabs, isRecognizedExpertHash, setTabDot } "
         "from './views/lab.js';" in app_js
     )
+    assert "setStep" not in app_js
 
 
 def test_mode_shell_dom_refs_bind_to_the_new_html_elements() -> None:
+    # P1: #advanced-params is DELETED from the served page (WORKORDER P1
+    # 减法); app.js no longer binds a DOM ref to it.
     app_js = _static_module_text("app.js")
+    assert "getElementById('advanced-params')" not in app_js
     for ref in (
         "const simpleShell = document.getElementById('simple-shell');",
         "const expertShell = document.getElementById('expert-shell');",
@@ -496,7 +478,6 @@ def test_mode_shell_dom_refs_bind_to_the_new_html_elements() -> None:
         "const ideaEl = document.getElementById('idea');",
         "const simpleIdeaEl = document.getElementById('simple-idea');",
         "const simpleRunButton = document.getElementById('simple-run');",
-        "const advancedParamsDetails = document.getElementById('advanced-params');",
     ):
         assert ref in app_js, ref
 
@@ -578,12 +559,20 @@ def test_hydrate_runtime_status_keeps_the_simple_status_line_in_sync() -> None:
     assert "setRuntimeText('simple-runtime-status', `LLM ${llmLabel} · RD ${rdLabel}`);" in body
 
 
-def test_advanced_params_auto_opens_once_parse_defaults_are_enabled() -> None:
+def test_confirm_card_appears_immediately_after_parse_without_an_extra_click() -> None:
+    # P1 supersedes the deleted disclosure-auto-open behavior this test used
+    # to pin: the confirm card (static/views/pipeline.js) is not a collapsed
+    # <details> a completed parse has to reveal -- createPipelineFromParseJob
+    # renders it directly into #pipeline-card-mount right after the parse
+    # payload arrives, in the SAME #run success path, so real values (and
+    # their provenance badges) are visible the moment parsing finishes.
     app_js = _static_module_text("app.js")
-    fn_start = app_js.index("function setValidationInputsEnabled(enabled) {")
-    fn_end = app_js.index("\n}", fn_start)
-    body = app_js[fn_start:fn_end]
-    assert "if (enabled) advancedParamsDetails.open = true;" in body
+    parse_click = app_js.index("button.addEventListener('click', async () => {")
+    validate_click = app_js.index("validateButton.addEventListener('click', async () => {")
+    handler = app_js[parse_click:validate_click]
+    assert "renderParsed(payload);" in handler
+    assert "await createPipelineFromParseJob(payload.job_id);" in handler
+    assert handler.index("renderParsed(payload);") < handler.index("await createPipelineFromParseJob(payload.job_id);")
 
 
 # ---------------------------------------------------------------------------
@@ -591,11 +580,16 @@ def test_advanced_params_auto_opens_once_parse_defaults_are_enabled() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_existing_run_handler_body_is_unmodified_by_the_mode_shell() -> None:
-    # Regression guard for the delegation design above: the ORIGINAL #run
-    # click handler must still contain its own full activate/submit/render
-    # sequence verbatim (test_web_lab_view.py already pins the ordering;
-    # this just confirms the mode-shell change didn't fork or shadow it).
+def test_run_handler_keeps_its_core_activate_submit_render_sequence() -> None:
+    # Regression guard for the delegation design above: the #run click
+    # handler still contains its core activate/submit/render sequence
+    # (test_web_lab_view.py pins the ordering in more detail) so the
+    # simple-mode handoff's delegated click keeps landing on real output.
+    # P1 (agent_sidecar_frontend.md §2.3) adds pipeline-aggregate creation
+    # to this SAME handler (test_web_mode_shell.py's own
+    # test_confirm_card_appears_immediately_after_parse_without_an_extra_click
+    # pins that addition) -- this test only protects the part that must
+    # keep working underneath it, not a claim that the handler is frozen.
     app_js = _static_module_text("app.js")
     parse_click = app_js.index("button.addEventListener('click', async () => {")
     validate_click = app_js.index("validateButton.addEventListener('click', async () => {")

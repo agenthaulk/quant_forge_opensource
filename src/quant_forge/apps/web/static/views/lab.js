@@ -1,6 +1,5 @@
 /* Lab workbench chrome (CP6-2, D8; CP9-2 IA consolidation): surface-tab
- * controller, workbench module nav, research-flow stepper state, hash
- * routing, and per-tab status dots.
+ * controller, workbench module nav, hash routing, and per-tab status dots.
  *
  * Pure client-side state over the existing panels — no fetch calls, no new
  * endpoints. The tab panels only host per-view mounts (#result,
@@ -20,9 +19,12 @@
  * #lab-tab-bench hashes migrate through LEGACY_HASH_ALIASES — no deep link
  * dead-ends.
  *
- * Known flow-step gaps (documented, intentionally not wired to new
- * endpoints): there is no job re-attach after reload and no
- * research-history artifact detail endpoint. The factor-catalog listing and
+ * P1 (agent_sidecar_frontend.md §8): the former research-flow stepper
+ * (.lab-stepper, setStep/STEP_IDS) is DELETED — semantically duplicated by
+ * the server-owned pipeline card (static/views/pipeline.js), which also
+ * closes the "no job re-attach after reload" gap this module used to
+ * document here via its own rejoin-on-load. There is still no
+ * research-history artifact detail endpoint; the factor-catalog listing and
  * per-factor evidence chain live in the CP6-3 registry view over their
  * GET-only endpoints.
  */
@@ -32,7 +34,6 @@ const TAB_IDS = [
   'lab-tab-registry', 'lab-tab-docs', 'lab-tab-extensions'
 ];
 const MODULE_IDS = ['lab-module-single', 'lab-module-multi'];
-const STEP_IDS = ['idea', 'parse', 'validate', 'report', 'rd'];
 const REPORT_SECTION_IDS = [
   'report-hero',
   'report-params',
@@ -170,18 +171,6 @@ export function setTabDot(tabId, state) {
   tab.setAttribute('aria-label', `${tabBaseLabel(tab)}，${label}`);
 }
 
-export function setStep(stepId, state) {
-  if (!STEP_IDS.includes(stepId)) return;
-  const step = document.querySelector(`.lab-stepper .step[data-step="${stepId}"]`);
-  if (!step) return;
-  step.classList.remove('is-done', 'is-active', 'is-pending');
-  step.classList.add(state === 'done' ? 'is-done' : state === 'active' ? 'is-active' : 'is-pending');
-  // 因子报告 is the only step whose affordance depends on its state: its
-  // step-link only becomes clickable once a full report exists.
-  const link = step.querySelector('.step-link');
-  if (link && stepId === 'report') link.disabled = state !== 'done';
-}
-
 function scrollToReportSection(sectionId) {
   const section = document.getElementById(sectionId);
   if (!section) return;
@@ -311,10 +300,6 @@ function onModuleNavKeydown(event) {
   }
 }
 
-function syncIdeaStep(ideaEl) {
-  setStep('idea', ideaEl.value.trim() ? 'done' : 'active');
-}
-
 export function initLabTabs(options) {
   onTabActivate = (options && options.onActivate) || null;
   const tablist = document.querySelector('.lab-tabs');
@@ -337,26 +322,4 @@ export function initLabTabs(options) {
   }
   window.addEventListener('hashchange', () => applyHash(window.location.hash));
   applyHash(window.location.hash);
-  const ideaEl = document.getElementById('idea');
-  if (ideaEl) {
-    syncIdeaStep(ideaEl);
-    ideaEl.addEventListener('input', () => syncIdeaStep(ideaEl));
-  }
-  const stepper = document.querySelector('.lab-stepper');
-  if (stepper) {
-    stepper.addEventListener('click', event => {
-      const link = event.target.closest('.step-link');
-      if (!link || link.disabled) return;
-      const action = link.dataset.stepAction;
-      if (action === 'report') {
-        activateTab('lab-tab-factor');
-        activateModule('lab-module-single');
-        scrollToReportSection('report-hero');
-      } else if (action === 'rd') {
-        activateTab('lab-tab-factor');
-        activateModule('lab-module-single');
-        scrollToReportSection('workbench-rd');
-      }
-    });
-  }
 }

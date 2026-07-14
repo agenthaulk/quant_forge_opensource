@@ -393,9 +393,12 @@ def test_lab_module_adds_only_tab_ids_and_registry_hash_prefix() -> None:
     assert "data-factor-id" not in lab_js
     assert "data-relpath" not in lab_js
     assert "data-extension-id" not in lab_js
-    # The research-flow stepper is untouched: data/registry/docs/extensions
-    # are views, not research-flow steps.
-    assert "const STEP_IDS = ['idea', 'parse', 'validate', 'report', 'rd'];" in lab_js
+    # P1 (WORKORDER P1 减法): the former research-flow stepper (STEP_IDS)
+    # is DELETED from lab.js entirely -- superseded by the pipeline card
+    # (tests/test_web_pipeline_view.py). data/registry/docs/extensions were
+    # never stepper concerns either way. (lab.js's own header comment names
+    # the deleted identifier in prose, so this checks the CODE form only.)
+    assert "const STEP_IDS" not in lab_js
 
 
 def test_app_module_wires_data_and_registry_lazy_panels() -> None:

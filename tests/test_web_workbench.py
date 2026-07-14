@@ -1068,7 +1068,13 @@ allowed_interval_days: [5]
     assert '<script type="module" src="/static/app.js"></script>' in html
     assert "/api/jobs/research-run-once" in bundle
     assert "/api/jobs/parse-idea" in bundle
-    assert "/api/jobs/validate-idea" in bundle
+    # P1 (agent_sidecar_frontend.md §2.3, WORKORDER P1 pin: idempotent
+    # confirm): #validate-run now posts to the pipeline aggregate's own
+    # confirm endpoint (/api/pipelines/<id>/confirm, pinned in
+    # tests/test_web_pipeline_view.py) instead of /api/jobs/validate-idea
+    # directly, so a double click carries a server-issued idempotency token
+    # instead of racing two bare job starts.
+    assert "/api/jobs/validate-idea" not in bundle
     assert "/api/jobs/staggered-entry" in bundle
     assert "/api/research/campaign" not in html
     assert "/api/research/campaign" not in bundle
@@ -1076,13 +1082,16 @@ allowed_interval_days: [5]
     assert "解析因子" in html
     assert "验证并评测" in html
     assert "首月逐日建仓稳健性回测" in html
-    assert "param-holding-days" in html
-    assert "param-decay-days" in html
-    assert "param-top-quantile" in html
-    assert "param-evaluation-start" in html
-    assert "param-evaluation-end" in html
-    assert "param-backtest-start" in html
-    assert "param-backtest-end" in html
+    # P1 (WORKORDER P1 减法): the resident #validation-controls 11-parameter
+    # grid is DELETED from the served page -- absorbed into the pipeline
+    # confirm card's expert density (tests/test_web_pipeline_view.py pins
+    # the replacement markers there, both presence and absence). Matched by
+    # the full id="..." form: the CP10 synthesis module's OWN, unrelated
+    # #synth-backtest-params grid uses the same short suffixes (e.g.
+    # id="synth-param-holding-days"), which a bare substring check would
+    # false-positive on.
+    for param_id in ("param-holding-days", "param-decay-days", "param-top-quantile", "param-evaluation-start", "param-evaluation-end", "param-backtest-start", "param-backtest-end"):
+        assert f'id="{param_id}"' not in html, param_id
     assert "llm-api-key-mode" in html
     assert "llm-api-key" in html
     assert 'data-secret-policy="not-submitted"' in html

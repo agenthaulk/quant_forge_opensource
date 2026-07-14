@@ -715,21 +715,6 @@ def _index_html(
       font-size: 13px;
       letter-spacing: .08em;
     }}
-    .lab-stepper ol {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 14px; padding: 0; list-style: none; }}
-    .lab-stepper .step {{ display: inline-flex; align-items: center; gap: 6px;
-      padding: 5px 10px; border: 1px solid var(--line); border-radius: 999px;
-      background: var(--panel); color: var(--muted); font-size: 12px; font-weight: 800; }}
-    .lab-stepper .step-index {{ display: inline-grid; place-items: center; width: 16px; height: 16px;
-      border-radius: 50%; background: var(--wash); font-family: var(--mono); font-size: 10px; }}
-    .lab-stepper .step.is-done   {{ border-color: var(--accent-2); color: var(--accent-2); }}
-    .lab-stepper .step.is-done .step-index {{ background: var(--ok-wash); }}
-    .lab-stepper .step.is-active {{ border-color: var(--accent); background: var(--accent); color: var(--accent-ink); }}
-    .lab-stepper .step.is-active .step-index {{ background: rgba(255,255,255,.2); }}
-    .lab-stepper .step-link {{ width: auto; margin: 0; padding: 0; border: 0;
-      background: transparent; color: inherit; font: inherit; cursor: pointer; }}
-    .lab-stepper .step-link:disabled {{ opacity: 1; cursor: default; }}
-    .lab-stepper .step-link:not(:disabled):hover {{ text-decoration: underline; }}
-    .lab-stepper .step-link:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
     /* R2 audit (phase review, binding): .lab-tabs is ALSO `position:
        sticky; top: 0` inside .workbench (the app-shell's right column),
        so it collides with .mode-header exactly like .control-rail did —
@@ -828,6 +813,55 @@ def _index_html(
     .tile-range {{ display: block; margin-top: 10px; color: var(--ink);
       font-family: var(--mono); font-size: 13px; line-height: 1.4; }}
     .tag-chips  {{ margin-top: 6px; }}
+    /* P1 pipeline card + provenance badges (agent_sidecar_frontend.md
+       §2.3/§5.1/§9; static/views/pipeline.js + static/views/provenance.js):
+       token-referencing declarations only (zero new color literals), so
+       both themes come from the variables above; every row wraps so a true
+       375px viewport stays overflow-free (spec §9). */
+    .pipeline-card {{ border-top: 4px solid var(--accent); }}
+    .pipeline-card-status-row {{ display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; margin-bottom: 10px; }}
+    .pipeline-card-title {{ margin: 0; font-size: 15px; }}
+    .pipeline-frozen-note {{ display: inline-flex; align-items: center; gap: 4px;
+      border: 1px solid var(--warn-line); background: var(--warn-wash); color: var(--warn);
+      border-radius: 999px; padding: 2px 9px; font-size: 11px; font-weight: 800; }}
+    .pipeline-density-toggle {{ display: inline-flex; flex-wrap: wrap; gap: 4px; padding: 4px;
+      border: 1px solid var(--line); border-radius: 10px; background: var(--wash); margin-bottom: 10px; }}
+    .pipeline-density-btn {{ width: auto; min-height: 44px; margin: 0; padding: 6px 14px;
+      display: inline-flex; align-items: center; border: 1px solid transparent; border-radius: 7px;
+      background: transparent; color: var(--muted); font-size: 12px; font-weight: 800; cursor: pointer; }}
+    .pipeline-density-btn:hover {{ color: var(--ink); background: var(--wash); }}
+    .pipeline-density-btn[aria-pressed="true"] {{ background: var(--panel); border-color: var(--accent); color: var(--accent); }}
+    .pipeline-density-btn:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .pipeline-summary-lines {{ display: grid; gap: 10px; }}
+    .pipeline-summary-line {{ display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline;
+      min-width: 0; padding-bottom: 8px; border-bottom: 1px solid var(--line); }}
+    .pipeline-summary-line:last-child {{ border-bottom: 0; padding-bottom: 0; }}
+    .pipeline-summary-label {{ color: var(--muted); font-size: 12px; font-weight: 800; min-width: 84px; }}
+    .pipeline-summary-value {{ font-family: var(--mono); font-size: 13px; color: var(--ink); overflow-wrap: anywhere; }}
+    .pipeline-expert-grid input {{ min-width: 0; }}
+    .pipeline-field-badges {{ display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }}
+    .provenance-badge {{ display: inline-flex; align-items: center; border-radius: 999px;
+      padding: 1px 8px; font-size: 10px; font-weight: 800; border: 1px solid var(--line);
+      color: var(--muted); background: var(--panel); white-space: nowrap; }}
+    .provenance-badge--profile_default, .provenance-badge--fixed_policy {{ color: var(--muted); border-color: var(--line-strong); }}
+    .provenance-badge--user_explicit, .provenance-badge--user_answer {{ color: var(--accent); border-color: var(--accent); background: var(--ok-wash); }}
+    .provenance-badge--data_resolved {{ color: var(--blue); border-color: var(--blue); }}
+    .provenance-badge--agent_inferred {{ color: var(--accent-2); border-color: var(--accent-2); }}
+    .provenance-badge--human_override {{ color: var(--warn); border-color: var(--warn-line); background: var(--warn-wash); }}
+    .pipeline-negative-evidence {{ display: grid; gap: 6px; margin-bottom: 10px; }}
+    .pipeline-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }}
+    .pipeline-actions button {{ width: auto; margin: 0; min-height: 44px; flex: 1 1 auto; }}
+    .pipeline-card[hidden] {{ display: none; }}
+    .pipeline-stage-strip {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; padding: 0; list-style: none; }}
+    .pipeline-stage {{ display: inline-flex; align-items: center; gap: 6px;
+      padding: 5px 10px; border: 1px solid var(--line); border-radius: 999px;
+      background: var(--panel); color: var(--muted); font-size: 12px; font-weight: 800; }}
+    .pipeline-stage--completed {{ border-color: var(--accent-2); color: var(--accent-2); background: var(--ok-wash); }}
+    .pipeline-stage--active {{ border-color: var(--accent); background: var(--accent); color: var(--accent-ink); }}
+    .pipeline-stage--failed {{ border-color: var(--bad); color: var(--bad); background: var(--bad-wash); }}
+    @media (max-width: 480px) {{
+      .pipeline-summary-label {{ min-width: 0; }}
+    }}
     .registry-layout {{ display: grid; grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
       gap: 14px; align-items: start; }}
     .registry-list {{ display: grid; gap: 8px; align-content: start; }}
@@ -1048,22 +1082,13 @@ def _index_html(
       </select>
       <input id="llm-api-key" type="password" autocomplete="off" data-secret-policy="not-submitted" disabled>
       <p id="llm-api-key-status" class="meta"></p>
-      <details class="advanced-params" id="advanced-params">
-        <summary>高级参数 <span class="meta">11 项评测参数，解析后自动填充默认值</span></summary>
-        <div class="param-grid" id="validation-controls">
-          <label><span class="term-tip" tabindex="0" data-tip="每次调仓后，持有多头组合的交易日数">持有期 / 天</span><input id="param-holding-days" type="number" min="1" step="1" disabled></label>
-          <label><span class="term-tip" tabindex="0" data-tip="信号衰减天数：0 表示不衰减，数值越大权重越平滑">Decay / 天</span><input id="param-decay-days" type="number" min="0" step="1" disabled></label>
-          <label><span class="term-tip" tabindex="0" data-tip="按因子值排序后，用于构建多头组合的头部比例">Top Quantile</span><input id="param-top-quantile" type="number" min="0.01" max="0.5" step="0.01" disabled></label>
-          <label><span class="term-tip" tabindex="0" data-tip="信号生成到实际下单之间的执行延迟天数">Delay / 天</span><input id="param-delay-days" type="number" min="1" step="1" disabled></label>
-          <label><span>评测开始</span><input id="param-evaluation-start" type="date" disabled></label>
-          <label><span>评测结束</span><input id="param-evaluation-end" type="date" disabled></label>
-          <label><span>回测开始</span><input id="param-backtest-start" type="date" disabled></label>
-          <label><span>回测结束</span><input id="param-backtest-end" type="date" disabled></label>
-          <label><span>手续费 bps</span><input id="param-commission-bps" type="number" min="0" step="0.1" disabled></label>
-          <label><span>滑点 bps</span><input id="param-slippage-bps" type="number" min="0" step="0.1" disabled></label>
-          <label><span class="term-tip" tabindex="0" data-tip="做空部分的年化融券成本，以基点计">融券成本 bps/年</span><input id="param-short-borrow-bps" type="number" min="0" step="1" disabled></label>
-        </div>
-      </details>
+      <!-- P1 (agent_sidecar_frontend.md §5.1/§8): the resident 11-parameter
+           grid (formerly #validation-controls, wrapped in #advanced-params)
+           is ABSORBED into the pipeline confirm card's expert density
+           (static/views/pipeline.js, rendered into #pipeline-card-mount
+           below) and DELETED from here -- the same .param-grid / .term-tip
+           / .advanced-params CSS classes are reused by the card's rendered
+           markup, so this deletion costs no styling. -->
       <button id="run">解析因子</button>
       <button id="validate-run" class="secondary" disabled>验证并评测</button>
       <button id="staggered-run" class="secondary" disabled>首月逐日建仓稳健性回测</button>
@@ -1099,15 +1124,6 @@ def _index_html(
     </div>
   </aside>
   <section class="workbench">
-    <nav class="lab-stepper" aria-label="研究流程">
-      <ol>
-        <li class="step is-active" data-step="idea"><span class="step-index">1</span>想法</li>
-        <li class="step is-pending" data-step="parse"><span class="step-index">2</span>解析</li>
-        <li class="step is-pending" data-step="validate"><span class="step-index">3</span>验证</li>
-        <li class="step is-pending" data-step="report"><span class="step-index">4</span><button type="button" class="step-link" data-step-action="report" disabled>因子报告</button></li>
-        <li class="step is-pending" data-step="rd"><span class="step-index">5</span><button type="button" class="step-link" data-step-action="rd">RD 循环</button></li>
-      </ol>
-    </nav>
     <div class="lab-tabs" role="tablist" aria-label="工作台视图">
       <button class="lab-tab" role="tab" id="lab-tab-factor" aria-controls="lab-panel-factor" aria-selected="true">LLM 因子工作台 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-history" aria-controls="lab-panel-history" aria-selected="false" tabindex="-1">研究历史 <span class="lab-tab-dot" hidden></span></button>
@@ -1123,6 +1139,16 @@ def _index_html(
         <button class="lab-module-tab" role="tab" id="lab-module-multi" aria-controls="lab-module-panel-multi" aria-selected="false" tabindex="-1">多因子策略回测</button>
       </div>
       <div class="lab-module-panel" role="tabpanel" id="lab-module-panel-single" aria-labelledby="lab-module-single" tabindex="0">
+        <!-- P1 pipeline card mount (agent_sidecar_frontend.md §2.3/§3 G1):
+             replaces .lab-stepper's "show where the current run is" role
+             with the real server-owned pipeline aggregate -- state machine
+             + card rendering + rejoin-on-load live in
+             static/views/pipeline.js; provenance badges live in
+             static/views/provenance.js. Throttled aria-live (spec §9): the
+             controller only writes here on an actual status/content change,
+             never on every poll tick. Empty and [hidden] until a pipeline
+             exists for this page view. -->
+        <div id="pipeline-card-mount" aria-live="polite" aria-atomic="false"></div>
         <div class="section-title">
           <h2>Factor Tape</h2>
           <p>解析、评价、回测集中展示</p>

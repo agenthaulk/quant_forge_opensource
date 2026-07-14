@@ -39,9 +39,9 @@ HTML_CONTENT_TYPE = "text/html; charset=utf-8"
 JS_CONTENT_TYPE = "text/javascript; charset=utf-8"
 
 # The complete CP6-1 module set (+ CP6-2 Lab chrome + CP6-3 data/registry
-# views + CP6-4 docs/extensions views + CP10 synthesis module). A new module
-# must be added here so the no-external-resources and single-renderer sweeps
-# keep covering everything.
+# views + CP6-4 docs/extensions views + CP10 synthesis module + P1 pipeline
+# aggregate views). A new module must be added here so the no-external-
+# resources and single-renderer sweeps keep covering everything.
 EXPECTED_STATIC_MODULES = (
     "api.js",
     "app.js",
@@ -55,6 +55,8 @@ EXPECTED_STATIC_MODULES = (
     "views/factor.js",
     "views/history.js",
     "views/lab.js",
+    "views/pipeline.js",
+    "views/provenance.js",
     "views/registry.js",
     "views/research.js",
     "views/spark.js",
@@ -170,14 +172,10 @@ def test_index_page_keeps_all_panel_sections_and_controls(web_app) -> None:
     # lab-tab-factor under the LLM 因子工作台 label; the former RD 循环 /
     # Benchmark tabs live on inside its 单因子研究 module as the
     # #workbench-rd / #report-comparison sections; 多因子策略回测 is the
-    # reserved CP10 module slot).
+    # reserved CP10 module slot). P1: .lab-stepper is DELETED (WORKORDER P1
+    # 减法, absorbed by the pipeline card) -- its absence is pinned in
+    # tests/test_web_pipeline_view.py, not re-asserted here.
     for marker in (
-        'class="lab-stepper"',
-        'data-step="idea"',
-        'data-step="parse"',
-        'data-step="validate"',
-        'data-step="report"',
-        'data-step="rd"',
         'role="tablist"',
         'id="lab-tab-factor"',
         'id="lab-tab-history"',
@@ -198,8 +196,9 @@ def test_index_page_keeps_all_panel_sections_and_controls(web_app) -> None:
         '单因子研究',
         '多因子策略回测',
         '工作台模块',
-        'RD 循环',
-        '研究流程',
+        # P1 pipeline card mount (agent_sidecar_frontend.md §2.3) -- absorbs
+        # .lab-stepper's former "show where the current run is" role.
+        'id="pipeline-card-mount"',
     ):
         assert marker in html, marker
     # CP6-3 Data console + Registry tabs, panels, and mounts.
@@ -215,14 +214,16 @@ def test_index_page_keeps_all_panel_sections_and_controls(web_app) -> None:
         '等待加载',
     ):
         assert marker in html, marker
-    # Control rail forms and runtime strip.
+    # Control rail forms and runtime strip. P1: #validation-controls (the
+    # resident 11-parameter grid) is DELETED -- absorbed into the pipeline
+    # confirm card's expert density; its absence is pinned in
+    # tests/test_web_pipeline_view.py alongside the card's own markers.
     for marker in (
         'id="idea"',
         'id="parser"',
         'id="llm-provider"',
         'id="llm-api-key-mode"',
         'id="llm-api-key"',
-        'id="validation-controls"',
         'id="run"',
         'id="validate-run"',
         'id="staggered-run"',

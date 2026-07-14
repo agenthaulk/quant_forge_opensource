@@ -6,10 +6,11 @@
  * resources, no inline application script).
  */
 
-import { esc, valueOr } from './metric.js';
+import { esc } from './metric.js';
 import {
   cancelJob,
   configureApi,
+  getJob,
   onControlTokenStored,
   postJson,
   waitForJob
@@ -29,8 +30,17 @@ import { refreshDataPanel } from './views/data.js';
 import { refreshRegistryPanel } from './views/registry.js';
 import { refreshDocsPanel } from './views/docs.js';
 import { refreshExtensionsPanel } from './views/extensions.js';
-import { activateModule, activateTab, initLabTabs, isRecognizedExpertHash, setStep, setTabDot } from './views/lab.js';
+import { activateModule, activateTab, initLabTabs, isRecognizedExpertHash, setTabDot } from './views/lab.js';
 import { initSynthesisModule, refreshSynthesisPanel } from './views/synthesis.js';
+import {
+  confirmCurrentPipeline,
+  createPipelineFromParseJob,
+  currentPipelineParameters,
+  hasActivePipeline,
+  initPipelineModule,
+  rejoinActivePipelines,
+  resetPipelineCard
+} from './views/pipeline.js';
 
 const pageConfig = JSON.parse(document.getElementById('qf-page-config').textContent || '{}');
 const controlTokenRequired = Boolean(pageConfig.controlTokenRequired);
@@ -47,19 +57,6 @@ const llmApiKeyMode = document.getElementById('llm-api-key-mode');
 const llmApiKeyInput = document.getElementById('llm-api-key');
 const llmApiKeyStatus = document.getElementById('llm-api-key-status');
 let llmProviderOptions = pageConfig.llmProviderOptions || [];
-const validationInputs = {
-  holding_days: document.getElementById('param-holding-days'),
-  decay_days: document.getElementById('param-decay-days'),
-  top_quantile: document.getElementById('param-top-quantile'),
-  execution_delay_days: document.getElementById('param-delay-days'),
-  evaluation_start: document.getElementById('param-evaluation-start'),
-  evaluation_end: document.getElementById('param-evaluation-end'),
-  backtest_start: document.getElementById('param-backtest-start'),
-  backtest_end: document.getElementById('param-backtest-end'),
-  commission_bps: document.getElementById('param-commission-bps'),
-  slippage_bps: document.getElementById('param-slippage-bps'),
-  short_borrow_bps_annual: document.getElementById('param-short-borrow-bps')
-};
 const rdRun = document.getElementById('rd-run');
 const rdStart = document.getElementById('rd-start');
 const rdStop = document.getElementById('rd-stop');
@@ -81,7 +78,6 @@ const modeExpertBtn = document.getElementById('mode-expert-btn');
 const ideaEl = document.getElementById('idea');
 const simpleIdeaEl = document.getElementById('simple-idea');
 const simpleRunButton = document.getElementById('simple-run');
-const advancedParamsDetails = document.getElementById('advanced-params');
 
 // Mode precedence (component contract 5.6): recognized expert deep link >
 // saved preference > default simple. localStorage access is guarded: a
@@ -116,10 +112,6 @@ function applyMode(mode) {
     simpleIdeaEl.value = ideaEl.value;
   } else {
     ideaEl.value = simpleIdeaEl.value;
-    // Programmatic .value assignment fires no native 'input' event; the
-    // idea-step listener (views/lab.js syncIdeaStep) needs one to stay
-    // honest about whether the stepper's first step is done.
-    ideaEl.dispatchEvent(new Event('input', { bubbles: true }));
   }
   simpleShell.hidden = !simple;
   expertShell.hidden = simple;
@@ -189,16 +181,6 @@ function showJobFailureNotice(mountId, reason) {
   const mount = document.getElementById(mountId);
   if (!mount) return;
   mount.innerHTML = `<div class="notice err"><span class="status-pill status-pill--fail">失败</span> ${esc(reason)}</div>`;
-}
-function setValidationInputsEnabled(enabled) {
-  Object.values(validationInputs).forEach(input => {
-    input.disabled = !enabled;
-  });
-  validateButton.disabled = !enabled;
-  // Reveal the advanced-params disclosure once parsing has filled it with
-  // real defaults, so the (now-enabled) values are not hidden behind an
-  // extra click right when they first become relevant.
-  if (enabled) advancedParamsDetails.open = true;
 }
 function setStaggeredEnabled(enabled) {
   staggeredButton.disabled = !enabled;
@@ -280,89 +262,14 @@ function syncLlmApiKeyControls() {
     ? 'API key 已由配置文件 / 环境变量加载，前端不展示密钥'
     : 'LLM 运行前需要在本地配置 API key 环境变量名并设置对应环境变量';
 }
-function fillValidationInputs(parameters) {
-  const values = parameters || {};
-  const evaluationPeriod = ((values.evaluation || {}).test_period) || {};
-  const backtest = values.backtest || {};
-  const backtestSimulation = backtest.simulation || {};
-  const backtestPeriod = backtest.test_period || {};
-  const costs = values.transaction_costs || {};
-  const resolved = {
-    holding_days: values.holding_days,
-    decay_days: valueOr(values.decay_days, backtestSimulation.decay_days),
-    top_quantile: valueOr(values.top_quantile, backtestSimulation.top_quantile),
-    execution_delay_days: valueOr(values.execution_delay_days, backtestSimulation.execution_delay_days),
-    evaluation_start: valueOr(values.evaluation_start, evaluationPeriod.start),
-    evaluation_end: valueOr(values.evaluation_end, evaluationPeriod.end),
-    backtest_start: valueOr(values.backtest_start, backtestPeriod.start),
-    backtest_end: valueOr(values.backtest_end, backtestPeriod.end),
-    commission_bps: valueOr(values.commission_bps, costs.commission_bps),
-    slippage_bps: valueOr(values.slippage_bps, costs.slippage_bps),
-    short_borrow_bps_annual: valueOr(values.short_borrow_bps_annual, costs.short_borrow_bps_annual)
-  };
-  Object.entries(validationInputs).forEach(([name, input]) => {
-    const value = resolved[name];
-    input.value = value === undefined || value === null ? '' : value;
-  });
-}
-function currentEvaluationSimulation() {
-  const source = (parsedIdea && parsedIdea.parameters && parsedIdea.parameters.evaluation) || {};
-  const simulation = source.simulation || {};
-  return {
-    decay_days: simulation.decay_days,
-    top_quantile: simulation.top_quantile,
-    execution_delay_days: simulation.execution_delay_days
-  };
-}
+// P1 (agent_sidecar_frontend.md §2.3/§5.1, WORKORDER P1 减法): the resident
+// 11-input #validation-controls grid this used to read is deleted; the
+// confirm card (static/views/pipeline.js) is now the single source for
+// these 11 values (its own expert-density inputs, or the server-resolved
+// defaults when the user hasn't touched anything). Staggered-entry is the
+// remaining caller -- it reuses whatever the pipeline card currently shows.
 function validationParameters() {
-  const evaluationStart = validationInputs.evaluation_start.value || null;
-  const evaluationEnd = validationInputs.evaluation_end.value || null;
-  const backtestStart = validationInputs.backtest_start.value || null;
-  const backtestEnd = validationInputs.backtest_end.value || null;
-  const decayDays = Number(validationInputs.decay_days.value);
-  const topQuantile = Number(validationInputs.top_quantile.value);
-  const executionDelayDays = Number(validationInputs.execution_delay_days.value);
-  const commissionBps = Number(validationInputs.commission_bps.value);
-  const slippageBps = Number(validationInputs.slippage_bps.value);
-  const shortBorrowBpsAnnual = Number(validationInputs.short_borrow_bps_annual.value);
-  const payload = {
-    holding_days: Number(validationInputs.holding_days.value),
-    decay_days: decayDays,
-    top_quantile: topQuantile,
-    execution_delay_days: executionDelayDays,
-    evaluation_start: evaluationStart,
-    evaluation_end: evaluationEnd,
-    backtest_start: backtestStart,
-    backtest_end: backtestEnd,
-    commission_bps: commissionBps,
-    slippage_bps: slippageBps,
-    short_borrow_bps_annual: shortBorrowBpsAnnual,
-    evaluation: {
-      test_period: { start: evaluationStart, end: evaluationEnd }
-    },
-    backtest: {
-      simulation: {
-        decay_days: decayDays,
-        top_quantile: topQuantile,
-        execution_delay_days: executionDelayDays
-      },
-      test_period: { start: backtestStart, end: backtestEnd }
-    },
-    transaction_costs: {
-      commission_bps: commissionBps,
-      slippage_bps: slippageBps,
-      short_borrow_bps_annual: shortBorrowBpsAnnual
-    }
-  };
-  const evaluationSimulation = currentEvaluationSimulation();
-  if (
-    evaluationSimulation.decay_days !== undefined ||
-    evaluationSimulation.top_quantile !== undefined ||
-    evaluationSimulation.execution_delay_days !== undefined
-  ) {
-    payload.evaluation.simulation = evaluationSimulation;
-  }
-  return payload;
+  return currentPipelineParameters() || {};
 }
 function rdPayload() {
   return {
@@ -380,27 +287,40 @@ async function submitParse(parserMode) {
   });
   activeIdeaJobId = job.job_id;
   cancelButton.disabled = false;
-  return waitForJob(
+  const result = await waitForJob(
     job.job_id,
     statusEl,
     '已运行超过10秒，LLM 仍在解析因子',
     jobId => activeIdeaJobId === jobId
   );
+  // job_id rides along so the caller can hand this SAME completed job to
+  // the pipeline aggregate (createPipelineFromParseJob) without a second
+  // parse -- FE-L3: the pipeline reads its parser/factor from the job
+  // manager's own stored result for this id, never from this object.
+  return { ...result, job_id: job.job_id };
 }
+// P1 (agent_sidecar_frontend.md §2.3, WORKORDER P1 pin: idempotent confirm):
+// the resident #validate-run button now triggers the pipeline aggregate's
+// own confirm action (see pipeline.js) instead of starting a bare compute
+// job directly, so a double click / a reload-then-click carries the SAME
+// server-issued nonce and resolves to the SAME run rather than starting a
+// second compute. The confirm response's compute-stage child_job_id is a
+// real job id, so the rest of this function (activeIdeaJobId + waitForJob)
+// is unchanged.
 async function submitValidation() {
   if (!parsedIdea) throw new Error('请先解析因子');
-  const job = await postJson('/api/jobs/validate-idea', {
-      factor: parsedIdea.factor,
-      parser: parsedIdea.parser,
-      parameters: validationParameters()
-  });
-  activeIdeaJobId = job.job_id;
+  if (!hasActivePipeline()) throw new Error('请先解析因子');
+  const confirmed = await confirmCurrentPipeline();
+  const computeStage = confirmed.stages.find(stage => stage.stage_id === 'compute');
+  const jobId = computeStage && computeStage.child_job_id;
+  if (!jobId) throw new Error('管线未能启动计算任务');
+  activeIdeaJobId = jobId;
   cancelButton.disabled = false;
   return waitForJob(
-    job.job_id,
+    jobId,
     statusEl,
     '已运行超过10秒，系统仍在计算因子或回测',
-    jobId => activeIdeaJobId === jobId
+    activeJobId => activeIdeaJobId === activeJobId
   );
 }
 async function submitStaggeredEntry() {
@@ -483,6 +403,33 @@ const extensionsPanel = trackedPanelRefresh(refreshExtensionsPanel);
 // "module-panel not hidden", not "the module is actually visible".
 const synthesisPanel = trackedPanelRefresh(refreshSynthesisPanel);
 initSynthesisModule({ onJobComplete: invalidateJobDependentPanels });
+// P1 rejoin (agent_sidecar_frontend.md §2.3): a pipeline can reach
+// `completed` without this page view ever calling submitValidation() itself
+// -- e.g. the compute stage finished while a REJOINED card (after a
+// refresh) was still polling. The canonical report renderer (render(), the
+// same one submitValidation()'s own success path uses) still owns turning
+// that job's result into pixels (FE-L2); this callback only fetches the
+// already-completed job and hands it over.
+async function onPipelineCompleted(pipeline) {
+  const computeStage = (pipeline.stages || []).find(stage => stage.stage_id === 'compute');
+  const jobId = computeStage && computeStage.child_job_id;
+  if (!jobId) return;
+  try {
+    const job = await getJob(jobId);
+    if (job.status !== 'completed' || !job.result) return;
+    render(job.result);
+    parsedIdea = { parser: job.result.parser, factor: job.result.factor, parameters: job.result.parameters };
+    validatedFactorId = job.result.factor && job.result.factor.factor_id;
+    document.getElementById('rd-seed').value = validatedFactorId || document.getElementById('rd-seed').value;
+    setStaggeredEnabled(Boolean(validatedFactorId));
+    invalidateJobDependentPanels();
+  } catch (error) {
+    // Best-effort mirror: the pipeline card itself already shows "completed"
+    // truthfully regardless of whether this legacy Factor Tape refresh
+    // succeeds.
+  }
+}
+initPipelineModule({ onCompleted: onPipelineCompleted });
 const multiModulePanel = document.getElementById('lab-module-panel-multi');
 function refreshSynthesisPanelIfDue() {
   if (!multiModulePanel || multiModulePanel.hidden) return;
@@ -548,6 +495,17 @@ initLabTabs({
     if (tabId === 'lab-tab-factor') refreshSynthesisPanelIfDue();
   }
 });
+// P1 rejoin (spec §2.3): mirrors refreshRuntimeStatus()'s own token guard --
+// skip silently (never prompt) until a token is already stored, so a fresh
+// page load with no rejoin candidate never surprises the user with an
+// unrelated auth prompt; onControlTokenStored below retries once one exists.
+async function maybeRejoinActivePipelines() {
+  if (controlTokenRequired) {
+    const token = window.sessionStorage.getItem('qf_control_token') || '';
+    if (!token) return;
+  }
+  await rejoinActivePipelines();
+}
 onControlTokenStored(() => {
   refreshRuntimeStatus().catch(() => {});
   historyPanel.refresh();
@@ -556,6 +514,7 @@ onControlTokenStored(() => {
   registryPanel.refresh();
   docsPanel.refresh();
   extensionsPanel.refresh();
+  maybeRejoinActivePipelines().catch(() => {});
   // CP10 stays lazy even on token arrival: only fetch when the multi module
   // panel is not hidden; otherwise the next activation retries.
   refreshSynthesisPanelIfDue();
@@ -564,6 +523,7 @@ llmProviderSelect.addEventListener('change', syncLlmApiKeyControls);
 llmApiKeyMode.addEventListener('change', syncLlmApiKeyControls);
 syncLlmApiKeyControls();
 refreshRuntimeStatus().catch(() => {});
+maybeRejoinActivePipelines().catch(() => {});
 historyPanel.refresh();
 benchPanel.refresh();
 dataPanel.refresh();
@@ -577,32 +537,29 @@ button.addEventListener('click', async () => {
   activateTab('lab-tab-factor');
   activateModule('lab-module-single');
   setWorkbenchDot('idea', 'running');
-  setStep('parse', 'active');
-  setStep('validate', 'pending');
-  setStep('report', 'pending');
   clearGlobalError();
   resetIdeaResult('解析中', '因子解析完成后，公式和默认评测参数会在这里刷新。');
+  resetPipelineCard();
   statusEl.textContent = '解析中...';
   parsedIdea = null;
   validatedFactorId = null;
-  fillValidationInputs({});
-  setValidationInputsEnabled(false);
   setStaggeredEnabled(false);
   resetStaggeredResult();
   const parserMode = document.getElementById('parser').value;
   try {
     const payload = await submitParse(parserMode);
     parsedIdea = payload;
-    fillValidationInputs(payload.parameters);
-    setValidationInputsEnabled(true);
     renderParsed(payload);
-    setStep('parse', 'done');
+    // P1: wraps the just-completed parse job into a server-owned pipeline
+    // (awaiting_confirm) and renders the confirm card -- FE-L3, the
+    // pipeline reads its own parser/factor from this job id, never from
+    // `payload` itself (see createPipelineFromParseJob / apps/web/pipeline.py).
+    await createPipelineFromParseJob(payload.job_id);
     setWorkbenchDot('idea', 'done');
     invalidateJobDependentPanels();
     statusEl.innerHTML = '<span class="ok">解析完成，等待确认参数</span>';
   } catch (error) {
     if (error.message === '运行已中断') {
-      setStep('parse', 'pending');
       setWorkbenchDot('idea', 'clear');
       statusEl.innerHTML = '<span class="warn">运行已中断</span>';
       return;
@@ -613,17 +570,14 @@ button.addEventListener('click', async () => {
         try {
           const payload = await submitParse('rule');
           parsedIdea = payload;
-          fillValidationInputs(payload.parameters);
-          setValidationInputsEnabled(true);
           renderParsed(payload);
-          setStep('parse', 'done');
+          await createPipelineFromParseJob(payload.job_id);
           setWorkbenchDot('idea', 'done');
           invalidateJobDependentPanels();
           statusEl.innerHTML = '<span class="ok">已使用本地规则解析，等待确认参数</span>';
           return;
         } catch (fallbackError) {
           const reason = jobFailureReason(fallbackError);
-          setStep('parse', 'pending');
           setWorkbenchDot('idea', 'error');
           showJobFailureNotice('result', reason);
           errorEl.textContent = reason;
@@ -633,7 +587,6 @@ button.addEventListener('click', async () => {
       }
     }
     const reason = jobFailureReason(error);
-    setStep('parse', 'pending');
     setWorkbenchDot('idea', 'error');
     showJobFailureNotice('result', reason);
     errorEl.textContent = reason;
@@ -651,7 +604,6 @@ validateButton.addEventListener('click', async () => {
   activateTab('lab-tab-factor');
   activateModule('lab-module-single');
   setWorkbenchDot('idea', 'running');
-  setStep('validate', 'active');
   clearGlobalError();
   resetIdeaResult('验证与评测中', '评测完成后，IC、回测收益和 artifact 路径会在这里刷新。');
   statusEl.textContent = '验证与评测中...';
@@ -664,23 +616,18 @@ validateButton.addEventListener('click', async () => {
       parameters: payload.parameters || validationParameters()
     };
     validatedFactorId = payload.factor.factor_id;
-    fillValidationInputs(parsedIdea.parameters);
     document.getElementById('rd-seed').value = payload.factor.factor_id;
     setStaggeredEnabled(true);
-    setStep('validate', 'done');
-    setStep('report', 'done');
     setWorkbenchDot('idea', 'done');
     invalidateJobDependentPanels();
     statusEl.innerHTML = '<span class="ok">验证完成</span>';
   } catch (error) {
     if (error.message === '运行已中断') {
-      setStep('validate', 'pending');
       setWorkbenchDot('idea', 'clear');
       statusEl.innerHTML = '<span class="warn">运行已中断</span>';
       return;
     }
     const reason = jobFailureReason(error);
-    setStep('validate', 'pending');
     setWorkbenchDot('idea', 'error');
     showJobFailureNotice('result', reason);
     errorEl.textContent = reason;
@@ -689,7 +636,6 @@ validateButton.addEventListener('click', async () => {
     activeIdeaJobId = null;
     button.disabled = false;
     cancelButton.disabled = true;
-    setValidationInputsEnabled(Boolean(parsedIdea));
     setStaggeredEnabled(Boolean(validatedFactorId));
   }
 });
@@ -727,7 +673,6 @@ staggeredButton.addEventListener('click', async () => {
     activeIdeaJobId = null;
     button.disabled = false;
     cancelButton.disabled = true;
-    setValidationInputsEnabled(Boolean(parsedIdea));
     setStaggeredEnabled(Boolean(validatedFactorId));
   }
 });
@@ -753,7 +698,6 @@ rdRun.addEventListener('click', async () => {
   const rdSection = document.getElementById('workbench-rd');
   if (rdSection) rdSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
   setWorkbenchDot('rd', 'running');
-  setStep('rd', 'active');
   clearGlobalError();
   resetRdResult('RD 运行中', 'RD 候选、gate、report path 和分段证据会在本次运行完成后刷新。');
   rdStatusEl.textContent = 'RD 运行中...';
@@ -768,20 +712,17 @@ rdRun.addEventListener('click', async () => {
       jobId => activeRdJobId === jobId
     );
     renderResearch(payload);
-    setStep('rd', 'done');
     setWorkbenchDot('rd', 'done');
     invalidateJobDependentPanels();
     clearGlobalError();
     rdStatusEl.innerHTML = '<span class="ok">RD 完成</span>';
   } catch (error) {
     if (error.message === '运行已中断') {
-      setStep('rd', 'pending');
       setWorkbenchDot('rd', 'clear');
       resetRdResult('RD 已中断', '本次 RD 已取消，未产生新的候选结果。');
       rdStatusEl.textContent = 'RD 已中断';
     } else {
       const reason = jobFailureReason(error);
-      setStep('rd', 'pending');
       setWorkbenchDot('rd', 'error');
       showJobFailureNotice('rd-result', reason);
       rdStatusEl.innerHTML = `<span class="err">${esc(reason)}</span>`;
@@ -821,7 +762,6 @@ rdStart.addEventListener('click', async () => {
     rdStatusEl.innerHTML = '<span class="ok">调度已开启</span>';
     if (status.last_result) {
       renderResearch(status.last_result);
-      setStep('rd', 'done');
     }
   } catch (error) {
     rdStatusEl.textContent = error.message;
