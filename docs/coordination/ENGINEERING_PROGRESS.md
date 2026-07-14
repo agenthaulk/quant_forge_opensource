@@ -424,3 +424,26 @@ pytest -q` + `python3 scripts/release_safety_scan.py` + CLI `--help` +
   platform call anywhere).
 - **Integration line:** `fable/phase-de-integration` (local-only) carries
   both fix batches; combined image `qf-de:r2`.
+
+## 2026-07-13 — Workflow B / SE-P1: ResearchOutcome v2 contract (CLOSED)
+
+Branch `fable/self-evolution-design` @ `4a42972` (chain: design `c1a20c2` →
+CP0 rulings `6bbef79`/`e12b894` → contract `9cb0967` → battery `d01073d` →
+review rework `3fb734d` → extended battery `80f7ab4` → coherence matrix
+`4a42972`). Deliverable: `research_loop/outcomes.py` (neutral four-axis
+contract, logical evidence-run identity, derived strength, structural
+de-identification, sample_role + to_record envelope, sig.v2.1) +
+`memory.promote` evidence-unit cap + 167-test battery incl. golden frozen
+vectors.
+
+Review trail: S1 sol-xhigh design round (21 findings, §5/§9 REJECT → v2) →
+implementation → sol-high REWORK (R-F1..R-F9) ∥ opus verify REWORK-scoped
+(F1..F5, probe-executed) → rework batch → sol-high re-verify
+(13/14 CLOSED, 1 HIGH residual: submit verdict×lifecycle contradictions) →
+coherence-matrix fix + exhaustive 4×4 regression. All 14 findings closed;
+model pins verified per dispatch (sonnet lanes ×2, sol ×3, opus ×1,
+gpt-5.5 ×1 on the FE side).
+
+Gates at close: 1370 passed / CLI OK / diff-check clean / release scan 241
+files. Next SE phase (P2 ingress sink) is gated on the phase-f branch merge
+per SE-x.
