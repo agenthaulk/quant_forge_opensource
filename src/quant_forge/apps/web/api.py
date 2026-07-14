@@ -22,6 +22,12 @@ from urllib.parse import parse_qs, unquote
 
 from quant_forge.apps.web.jobs import _IdeaValidationSettings, _WebJobCancelled, _client_error_message
 from quant_forge.apps.web.markdown import extract_markdown_title, render_markdown_html
+from quant_forge.apps.web.run_recording import (
+    _record_multi_factor_backtest_run,
+    _record_validate_factor_runs,
+    _staggered_data_window,
+    _staggered_warnings_count,
+)
 from quant_forge.backtesting.service import EXTERNAL_OOS_ROLE
 from quant_forge.config import QuantForgeConfig, simulation_profile_from_mapping, validate_llm_runtime
 from quant_forge.core.contracts import (
@@ -47,7 +53,7 @@ from quant_forge.factor_engine.value_store import FactorValueStore
 from quant_forge.factor_library.catalog import FactorCatalog, is_precomputed_formula
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.lineage.recording import record_run
-from quant_forge.lineage.store import RUN_KINDS, RunIndex, metric_highlight, redact_free_text
+from quant_forge.lineage.store import RUN_KINDS, RunIndex, redact_free_text
 from quant_forge.mcp.read_models import list_factor_research_tags
 from quant_forge.llm_factor_parser import (
     FACTOR_DESCRIPTION_MAX_CHARS,
@@ -97,13 +103,6 @@ from quant_forge.synthesis.service import (
     require_backtest_window,
     resolve_pinned_universe,
     run_composite_backtest,
-)
-from quant_forge.workbench.service import (
-    BACKTEST_HIGHLIGHT_METRICS,
-    EVALUATION_HIGHLIGHT_METRICS,
-    backtest_data_window,
-    evaluation_data_window,
-    result_warnings_count,
 )
 
 
@@ -327,91 +326,6 @@ def _validate_factor_workflow(
     )
 
 
-def _record_validate_factor_runs(
-    config: QuantForgeConfig,
-    factor: FactorDefinition,
-    settings: _IdeaValidationSettings,
-    rd_config: ResearchLoopConfig,
-    *,
-    evaluation: EvaluationResult,
-    in_sample_backtest: BacktestResult,
-    backtest: BacktestResult,
-) -> None:
-    """Give a web-originated validate run the same lineage/run-index trail a
-    CLI/workbench run leaves (BUG #007: web runs never reached RunIndex, so
-    the registry evidence chain and 研究历史/research-history panel stayed
-    empty for web-only users).
-
-    Mirrors ``WorkbenchService.evaluate`` / ``run_backtest`` exactly: the same
-    highlight metric sets (``EVALUATION_HIGHLIGHT_METRICS`` /
-    ``BACKTEST_HIGHLIGHT_METRICS``), the same ``data_window`` / warnings-count
-    builders, and the same shared ``record_run`` helper the workbench service
-    now calls too, so a factor validated through the web leaves the same kind
-    ("evaluate" / "backtest") and highlight shape a CLI run of the same
-    artifact type would.
-    """
-
-    sample_splits_payload = [asdict(split) for split in rd_config.sample_splits] if rd_config.sample_splits else None
-    record_run(
-        factor_root=config.paths.factor_root,
-        artifact_root=config.paths.artifact_root,
-        factor_values_root=config.paths.factor_values_root,
-        factor_values_manifest_root=config.paths.factor_values_manifest_root,
-        kind="evaluate",
-        factor_id=factor.factor_id,
-        artifact_type="evaluation",
-        artifact_path=evaluation.artifact_path,
-        generated_by="web.validate_factor.evaluate",
-        request={
-            "kind": "evaluate",
-            "factor_id": factor.factor_id,
-            "horizon_days": settings.holding_days,
-            "horizon_days_matrix": list(rd_config.horizon_days_matrix) if rd_config.horizon_days_matrix else None,
-            "sample_splits": sample_splits_payload,
-            "simulation_profile": asdict(settings.evaluation_profile),
-        },
-        metric_highlights={
-            name: metric_highlight(evaluation.metrics[name])
-            for name in EVALUATION_HIGHLIGHT_METRICS
-            if name in evaluation.metrics
-        },
-        data_window=evaluation_data_window(evaluation),
-        warnings_count=result_warnings_count(evaluation),
-    )
-    for sample_role, profile, result in (
-        ("in_sample_backtest", settings.evaluation_profile, in_sample_backtest),
-        ("external_oos_backtest", settings.backtest_profile, backtest),
-    ):
-        record_run(
-            factor_root=config.paths.factor_root,
-            artifact_root=config.paths.artifact_root,
-            factor_values_root=config.paths.factor_values_root,
-            factor_values_manifest_root=config.paths.factor_values_manifest_root,
-            kind="backtest",
-            factor_id=factor.factor_id,
-            artifact_type="backtest",
-            artifact_path=result.artifact_path,
-            generated_by=f"web.validate_factor.{sample_role}",
-            request={
-                "kind": "backtest",
-                "sample_role": sample_role,
-                "factor_id": factor.factor_id,
-                "holding_days": settings.holding_days,
-                "include_partial_final_period": settings.include_partial_final_period,
-                "sample_splits": sample_splits_payload,
-                "simulation_profile": asdict(profile),
-                "transaction_costs": asdict(settings.transaction_costs),
-            },
-            metric_highlights={
-                name: metric_highlight(result.metrics[name])
-                for name in BACKTEST_HIGHLIGHT_METRICS
-                if name in result.metrics
-            },
-            data_window=backtest_data_window(result),
-            warnings_count=result_warnings_count(result),
-        )
-
-
 def run_staggered_entry_workflow(
     config: QuantForgeConfig,
     factor_id: str,
@@ -474,20 +388,6 @@ def run_staggered_entry_workflow(
         warnings_count=_staggered_warnings_count(result),
     )
     return result
-
-
-def _staggered_data_window(result: dict[str, Any]) -> dict[str, str | None]:
-    """Observed staggered-aggregate NAV window; unavailable when there is no NAV."""
-
-    nav_rows = result.get("daily_nav") or []
-    dates = [str(row["date"]) for row in nav_rows if isinstance(row, dict) and row.get("date")]
-    if dates:
-        return {"start_date": min(dates), "end_date": max(dates), "status": "available"}
-    return {"start_date": None, "end_date": None, "status": "unavailable"}
-
-
-def _staggered_warnings_count(result: dict[str, Any]) -> int:
-    return len({str(code) for code in (result.get("warning_codes") or [])})
 
 
 def run_research_once_workflow(
@@ -1166,52 +1066,6 @@ def run_multi_factor_backtest_workflow(
             overlay_root=run.overlay_root,
         )
         raise
-
-
-def _record_multi_factor_backtest_run(
-    config: QuantForgeConfig, plan: _MultiFactorBacktestPlan, run: CompositeBacktestRun
-) -> None:
-    """Record the composite backtest under ``run.composite_id`` (BUG #007).
-
-    Mirrors ``WorkbenchService.run_backtest``'s kind/highlight semantics for a
-    ``BacktestResult`` (``kind="backtest"``, ``BACKTEST_HIGHLIGHT_METRICS``,
-    ``backtest_data_window``) so a synthesized ``COMPOSITE_*`` factor gets the
-    same registry evidence chain a single-factor backtest gets, using the
-    shared ``record_run`` helper.
-    """
-
-    record_run(
-        factor_root=config.paths.factor_root,
-        artifact_root=config.paths.artifact_root,
-        factor_values_root=config.paths.factor_values_root,
-        factor_values_manifest_root=config.paths.factor_values_manifest_root,
-        kind="backtest",
-        factor_id=run.composite_id,
-        artifact_type="backtest",
-        artifact_path=run.result.artifact_path,
-        generated_by="web.multi_factor_backtest",
-        request={
-            "kind": "multi_factor_backtest",
-            "composite_id": run.composite_id,
-            "factor_refs": [{"factor_id": factor_id, "direction": direction} for factor_id, direction in plan.factor_refs],
-            "method": plan.method.name,
-            "method_params": plan.method_params,
-            "weights": plan.weights,
-            "standardization": plan.standardization,
-            "holding_days": plan.settings.holding_days,
-            "include_partial_final_period": plan.settings.include_partial_final_period,
-            "simulation_profile": asdict(plan.settings.profile),
-            "transaction_costs": asdict(plan.settings.transaction_costs),
-            "universe_filters": list(plan.universe_filters),
-        },
-        metric_highlights={
-            name: metric_highlight(run.result.metrics[name])
-            for name in BACKTEST_HIGHLIGHT_METRICS
-            if name in run.result.metrics
-        },
-        data_window=backtest_data_window(run.result),
-        warnings_count=result_warnings_count(run.result),
-    )
 
 
 def _same_window_evaluation_meta(run: CompositeBacktestRun, *, status: str) -> dict[str, Any]:
