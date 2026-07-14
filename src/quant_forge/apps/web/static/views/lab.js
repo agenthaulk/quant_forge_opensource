@@ -230,6 +230,28 @@ function applyHash(hash) {
   // Unknown hashes are ignored; the server-rendered default tab stays.
 }
 
+// P0 mode-shell precedence (agent_sidecar_frontend.md §5.6): "recognized
+// expert deep link" reuses the SAME hash vocabulary applyHash already
+// routes into the six-tab expert workbench (tabs, modules, report/RD
+// anchors, and the registry/docs/extensions per-item deep links) — kept as
+// an independent READ-ONLY predicate (no history/DOM mutation) so app.js
+// can decide the landing mode BEFORE any navigation side effect runs, and
+// so a recognized link wins only that navigation without ever touching the
+// saved mode preference. Deliberately does not call applyHash or mutate
+// anything; applyHash's own routing/normalization behavior stays untouched.
+export function isRecognizedExpertHash(hash) {
+  let target = (hash || '').replace(/^#/, '');
+  target = LEGACY_HASH_ALIASES[target] || target;
+  return (
+    TAB_IDS.includes(target) ||
+    MODULE_IDS.includes(target) ||
+    WORKBENCH_ANCHOR_IDS.includes(target) ||
+    REGISTRY_FACTOR_HASH.test(target) ||
+    DOCS_DOC_HASH.test(target) ||
+    EXTENSIONS_MANIFEST_HASH.test(target)
+  );
+}
+
 function focusTabByOffset(currentId, offset) {
   const index = TAB_IDS.indexOf(currentId);
   if (index === -1) return;

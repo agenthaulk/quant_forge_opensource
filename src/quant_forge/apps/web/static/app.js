@@ -29,7 +29,7 @@ import { refreshDataPanel } from './views/data.js';
 import { refreshRegistryPanel } from './views/registry.js';
 import { refreshDocsPanel } from './views/docs.js';
 import { refreshExtensionsPanel } from './views/extensions.js';
-import { activateModule, activateTab, initLabTabs, setStep, setTabDot } from './views/lab.js';
+import { activateModule, activateTab, initLabTabs, isRecognizedExpertHash, setStep, setTabDot } from './views/lab.js';
 import { initSynthesisModule, refreshSynthesisPanel } from './views/synthesis.js';
 
 const pageConfig = JSON.parse(document.getElementById('qf-page-config').textContent || '{}');
@@ -69,6 +69,85 @@ let activeIdeaJobId = null;
 let activeRdJobId = null;
 let parsedIdea = null;
 let validatedFactorId = null;
+
+// P0 mode shell (agent_sidecar_frontend.md §5.6): simple landing + expert
+// workbench toggle. #idea stays the single source of truth for the idea
+// text; #simple-idea is a separate presentational surface synced on every
+// mode switch (never a duplicate id, never a second parse pipeline).
+const simpleShell = document.getElementById('simple-shell');
+const expertShell = document.getElementById('expert-shell');
+const modeSimpleBtn = document.getElementById('mode-simple-btn');
+const modeExpertBtn = document.getElementById('mode-expert-btn');
+const ideaEl = document.getElementById('idea');
+const simpleIdeaEl = document.getElementById('simple-idea');
+const simpleRunButton = document.getElementById('simple-run');
+const advancedParamsDetails = document.getElementById('advanced-params');
+
+// Mode precedence (component contract 5.6): recognized expert deep link >
+// saved preference > default simple. localStorage access is guarded: a
+// Storage exception (privacy mode, quota, disabled storage) degrades to
+// "no saved preference" / "cannot persist" rather than breaking the module.
+const MODE_STORAGE_KEY = 'qf_ui_mode';
+function readSavedMode() {
+  try {
+    const saved = window.localStorage.getItem(MODE_STORAGE_KEY);
+    return saved === 'expert' || saved === 'simple' ? saved : null;
+  } catch (error) {
+    return null;
+  }
+}
+function writeSavedMode(mode) {
+  try {
+    window.localStorage.setItem(MODE_STORAGE_KEY, mode);
+  } catch (error) {
+    // Storage unavailable: the mode still applies for this page view, it
+    // just cannot persist across reloads.
+  }
+}
+// Pure DOM application, no persistence: used for the deep-link-forced
+// landing so a shared/bookmarked expert link wins ONLY that navigation
+// without rewriting the saved preference (component contract 5.6). #idea
+// is the shared draft; whichever surface is becoming hidden hands its
+// current text to the surface becoming visible so mode switches never
+// destroy state.
+function applyMode(mode) {
+  const simple = mode !== 'expert';
+  if (simple) {
+    simpleIdeaEl.value = ideaEl.value;
+  } else {
+    ideaEl.value = simpleIdeaEl.value;
+    // Programmatic .value assignment fires no native 'input' event; the
+    // idea-step listener (views/lab.js syncIdeaStep) needs one to stay
+    // honest about whether the stepper's first step is done.
+    ideaEl.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  simpleShell.hidden = !simple;
+  expertShell.hidden = simple;
+  modeSimpleBtn.setAttribute('aria-pressed', String(simple));
+  modeExpertBtn.setAttribute('aria-pressed', String(!simple));
+}
+// Applies AND persists: used for every explicit mode decision (toggle
+// clicks, the simple-run handoff into the expert view) but never for the
+// deep-link-forced initial landing.
+function setMode(mode) {
+  applyMode(mode);
+  writeSavedMode(mode);
+}
+// Initial landing. A recognized expert deep link (views/lab.js hash
+// vocabulary) wins this navigation via applyMode (no write); otherwise the
+// saved preference wins, defaulting to simple when nothing is saved yet.
+const deepLinkIsExpert = isRecognizedExpertHash(window.location.hash);
+applyMode(deepLinkIsExpert ? 'expert' : (readSavedMode() || 'simple'));
+// Same-document hash navigation (e.g. the address bar's fragment edited
+// while the page is already open) fires 'hashchange' WITHOUT re-running
+// the module's top-level code above, so the initial-landing precedence
+// never re-evaluates on its own. A later recognized expert hash still
+// wins THAT navigation via applyMode (never setMode, same no-write rule);
+// an unrecognized/cleared hash intentionally does nothing here — it must
+// not force a user who deliberately toggled modes back to simple.
+window.addEventListener('hashchange', () => {
+  if (isRecognizedExpertHash(window.location.hash)) applyMode('expert');
+});
 
 // The workbench tab hosts two concurrent job families that share one status
 // dot: the idea lane (parse / validate / staggered, all on activeIdeaJobId)
@@ -116,6 +195,10 @@ function setValidationInputsEnabled(enabled) {
     input.disabled = !enabled;
   });
   validateButton.disabled = !enabled;
+  // Reveal the advanced-params disclosure once parsing has filled it with
+  // real defaults, so the (now-enabled) values are not hidden behind an
+  // extra click right when they first become relevant.
+  if (enabled) advancedParamsDetails.open = true;
 }
 function setStaggeredEnabled(enabled) {
   staggeredButton.disabled = !enabled;
@@ -149,6 +232,7 @@ function hydrateRuntimeStatus(status) {
   setRuntimeText('runtime-artifact-root', paths.artifact_root || '');
   setRuntimeText('runtime-llm-sr', `LLM parser: ${llmLabel}`);
   setRuntimeText('runtime-rd-sr', `RD optimizer: ${rdLabel}`);
+  setRuntimeText('simple-runtime-status', `LLM ${llmLabel} · RD ${rdLabel}`);
   llmProviderOptions = (llm.providers || []).map(option => ({
     provider: option.provider || '',
     model: option.model || '',
@@ -757,3 +841,30 @@ rdStop.addEventListener('click', async () => {
     rdStop.disabled = false;
   }
 });
+modeSimpleBtn.addEventListener('click', () => setMode('simple'));
+modeExpertBtn.addEventListener('click', () => setMode('expert'));
+document.querySelectorAll('.simple-seed-btn').forEach(seedButton => {
+  seedButton.addEventListener('click', () => {
+    simpleIdeaEl.value = seedButton.dataset.seedText || '';
+    simpleIdeaEl.focus();
+  });
+});
+// The simple-mode entry point delegates to the EXISTING #run handler
+// (button.click()) instead of duplicating its parse/activate/error/panel
+// wiring, so every pin on that handler's behavior stays intact. Switching
+// to expert mode first (FE-L1: no second canvas) reveals the real
+// renderers the delegated run writes into; a no-provider-ready runtime
+// forces the rule parser (no-LLM-key degradation, spec §10) instead of
+// attempting an LLM call the user never chose.
+simpleRunButton.addEventListener('click', () => {
+  const anyProviderReady = llmProviderOptions.some(option => option.runtimeReady === 'true');
+  document.getElementById('parser').value = anyProviderReady ? 'llm' : 'rule';
+  setMode('expert');
+  button.click();
+});
+// Mirrors the CP10 attribute-observer pattern above (MutationObserver on
+// #lab-module-panel-multi's `hidden`): the simple button tracks the
+// delegated #run button's disabled state instead of duplicating its
+// try/finally bookkeeping.
+new MutationObserver(() => { simpleRunButton.disabled = button.disabled; })
+  .observe(button, { attributes: true, attributeFilter: ['disabled'] });

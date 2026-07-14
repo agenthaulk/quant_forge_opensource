@@ -146,6 +146,14 @@ def _index_html(
         if seed_factor_id
         else '<input id="rd-seed" value="" placeholder="先创建或配置一个因子">'
     )
+    # P0 mode shell (agent_sidecar_frontend.md §5.6): the simple landing's
+    # idea box shares the SAME default seed text as the expert control
+    # rail's #idea textarea (single Python source, not a second literal) so
+    # both surfaces stay in sync without runtime wiring, and the one-line
+    # runtime status reuses the identical provider/model/rd_optimizer_label
+    # values already computed above for the runtime strip.
+    default_idea_text = "非ST的小市值股票未来表现更好"
+    simple_runtime_line = f"LLM {provider} / {model} · RD {rd_optimizer_label}"
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -194,6 +202,103 @@ def _index_html(
       min-height: 100vh;
       display: grid;
       grid-template-columns: minmax(300px, 388px) minmax(0, 1fr);
+    }}
+    /* P0 mode shell (agent_sidecar_frontend.md §5.6): simple-mode landing +
+       mode toggle + advanced-params disclosure + terminology tooltips.
+       Token-referencing declarations only, so both themes come from the
+       variables; no fixed widths beyond the centered reading column, and
+       every row wraps so 375px stays overflow-free. */
+    /* Both shells declare their own `display` (grid), so the UA's [hidden]
+       rule (also display:none at equal 0-1-0 specificity) loses to the
+       author stylesheet regardless of source order — the same gotcha
+       .lab-tab-dot[hidden] documents above. An explicit id+[hidden]
+       override (0-1-1/1-0-1, decisively higher) is required or app.js's
+       mode toggle silently has no visual effect. */
+    #simple-shell[hidden], #expert-shell[hidden] {{ display: none; }}
+    .simple-shell {{
+      box-sizing: border-box;
+      max-width: 640px;
+      min-height: 100vh;
+      margin: 0 auto;
+      padding: 48px 22px;
+      display: grid;
+      align-content: start;
+      gap: 18px;
+    }}
+    .simple-shell .brand {{ border-bottom: 0; padding-bottom: 0; text-align: center; }}
+    .simple-shell .brand-mark {{ margin-inline: auto; }}
+    .mode-toggle {{
+      justify-self: center;
+      display: inline-flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--wash);
+    }}
+    .mode-toggle-btn {{
+      width: auto;
+      margin: 0;
+      padding: 8px 16px;
+      border: 1px solid transparent;
+      border-radius: 7px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+    }}
+    .mode-toggle-btn:hover {{ color: var(--ink); background: var(--wash); }}
+    .mode-toggle-btn[aria-pressed="true"] {{ background: var(--panel); border-color: var(--accent); color: var(--accent); }}
+    .mode-toggle-btn:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .simple-idea-panel {{ border-top: 4px solid var(--accent); }}
+    .simple-idea-panel textarea {{ min-height: 96px; }}
+    .simple-seeds {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 10px 0 4px; }}
+    .simple-seeds-label {{ color: var(--muted); font-size: 12px; font-weight: 800; }}
+    .simple-seed-btn {{
+      width: auto; margin: 0; padding: 6px 10px; border: 1px solid var(--line);
+      border-radius: 999px; background: var(--panel); color: var(--muted);
+      font-size: 12px; font-weight: 700; cursor: pointer;
+    }}
+    .simple-seed-btn:hover {{ color: var(--accent); border-color: var(--accent-2); background: var(--wash); }}
+    .simple-seed-btn:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .simple-run-btn {{ margin-top: 16px; }}
+    .simple-runtime-status {{ text-align: center; overflow-wrap: anywhere; }}
+    .advanced-params {{ margin: 14px 0; }}
+    .advanced-params summary {{
+      cursor: pointer; color: var(--muted); font-size: 12px; font-weight: 800;
+      letter-spacing: .02em; padding: 4px 0;
+    }}
+    .advanced-params summary .meta {{ font-weight: 400; }}
+    .advanced-params summary:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .advanced-params[open] summary {{ margin-bottom: 4px; }}
+    .term-tip {{
+      position: relative;
+      border-bottom: 1px dotted var(--line-strong);
+      cursor: help;
+    }}
+    .term-tip:hover::after, .term-tip:focus-visible::after {{
+      content: attr(data-tip);
+      position: absolute;
+      left: 0;
+      bottom: 100%;
+      margin-bottom: 6px;
+      padding: 6px 8px;
+      max-width: 220px;
+      width: max-content;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      background: var(--panel);
+      color: var(--ink);
+      font-size: 11px;
+      font-weight: 400;
+      line-height: 1.4;
+      z-index: 10;
+    }}
+    .term-tip:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    @media (max-width: 480px) {{
+      .simple-shell {{ padding: 28px 16px; }}
     }}
     .control-rail {{
       position: sticky;
@@ -793,7 +898,32 @@ def _index_html(
   </style>
 </head>
 <body>
-<main class="app-shell">
+<section id="simple-shell" class="simple-shell" aria-label="简洁模式">
+  <div class="brand">
+    <div class="brand-mark">QF</div>
+    <h1>Quant Forge</h1>
+    <p class="brand-subtitle">Factor research console</p>
+  </div>
+  <div class="mode-toggle" role="group" aria-label="界面模式">
+    <button type="button" id="mode-simple-btn" class="mode-toggle-btn" aria-pressed="true">简洁模式</button>
+    <button type="button" id="mode-expert-btn" class="mode-toggle-btn" aria-pressed="false">专家模式</button>
+  </div>
+  <div class="panel simple-idea-panel">
+    <h2>一句话，开始研究</h2>
+    <p class="meta">输入你的选股想法，系统会自动解析成可回测的因子；没有配置 LLM 时自动改用本地规则解析。</p>
+    <label for="simple-idea" class="sr-only">因子观点</label>
+    <textarea id="simple-idea" aria-describedby="simple-runtime-status">{default_idea_text}</textarea>
+    <div class="simple-seeds" aria-label="示例想法">
+      <span class="simple-seeds-label">试试：</span>
+      <button type="button" class="simple-seed-btn" data-seed-text="非ST的小市值股票未来表现更好">非ST 小市值</button>
+      <button type="button" class="simple-seed-btn" data-seed-text="过去5天涨幅较大的股票，短期动量继续">短期动量</button>
+      <button type="button" class="simple-seed-btn" data-seed-text="估值越低的股票，长期收益越好">低估值</button>
+    </div>
+    <button type="button" id="simple-run" class="simple-run-btn">开始研究</button>
+    <p id="simple-runtime-status" class="meta simple-runtime-status" aria-live="polite">{simple_runtime_line}</p>
+  </div>
+</section>
+<main id="expert-shell" class="app-shell" hidden>
   <aside class="control-rail">
     <div class="brand">
       <div class="brand-mark">QF</div>
@@ -817,7 +947,7 @@ def _index_html(
         <p>idea → factor</p>
       </div>
       <label for="idea">因子观点</label>
-      <textarea id="idea">非ST的小市值股票未来表现更好</textarea>
+      <textarea id="idea">{default_idea_text}</textarea>
       <label for="parser">解析方式</label>
       <select id="parser">
         <option value="llm">LLM 语义解析: {parser_label}</option>
@@ -834,20 +964,22 @@ def _index_html(
       </select>
       <input id="llm-api-key" type="password" autocomplete="off" data-secret-policy="not-submitted" disabled>
       <p id="llm-api-key-status" class="meta"></p>
-      <label>评测参数</label>
-      <div class="param-grid" id="validation-controls">
-        <label><span>持有期 / 天</span><input id="param-holding-days" type="number" min="1" step="1" disabled></label>
-        <label><span>Decay / 天</span><input id="param-decay-days" type="number" min="0" step="1" disabled></label>
-        <label><span>Top Quantile</span><input id="param-top-quantile" type="number" min="0.01" max="0.5" step="0.01" disabled></label>
-        <label><span>Delay / 天</span><input id="param-delay-days" type="number" min="1" step="1" disabled></label>
-        <label><span>评测开始</span><input id="param-evaluation-start" type="date" disabled></label>
-        <label><span>评测结束</span><input id="param-evaluation-end" type="date" disabled></label>
-        <label><span>回测开始</span><input id="param-backtest-start" type="date" disabled></label>
-        <label><span>回测结束</span><input id="param-backtest-end" type="date" disabled></label>
-        <label><span>手续费 bps</span><input id="param-commission-bps" type="number" min="0" step="0.1" disabled></label>
-        <label><span>滑点 bps</span><input id="param-slippage-bps" type="number" min="0" step="0.1" disabled></label>
-        <label><span>融券成本 bps/年</span><input id="param-short-borrow-bps" type="number" min="0" step="1" disabled></label>
-      </div>
+      <details class="advanced-params" id="advanced-params">
+        <summary>高级参数 <span class="meta">11 项评测参数，解析后自动填充默认值</span></summary>
+        <div class="param-grid" id="validation-controls">
+          <label><span class="term-tip" tabindex="0" data-tip="每次调仓后，持有多头组合的交易日数">持有期 / 天</span><input id="param-holding-days" type="number" min="1" step="1" disabled></label>
+          <label><span class="term-tip" tabindex="0" data-tip="信号衰减天数：0 表示不衰减，数值越大权重越平滑">Decay / 天</span><input id="param-decay-days" type="number" min="0" step="1" disabled></label>
+          <label><span class="term-tip" tabindex="0" data-tip="按因子值排序后，用于构建多头组合的头部比例">Top Quantile</span><input id="param-top-quantile" type="number" min="0.01" max="0.5" step="0.01" disabled></label>
+          <label><span class="term-tip" tabindex="0" data-tip="信号生成到实际下单之间的执行延迟天数">Delay / 天</span><input id="param-delay-days" type="number" min="1" step="1" disabled></label>
+          <label><span>评测开始</span><input id="param-evaluation-start" type="date" disabled></label>
+          <label><span>评测结束</span><input id="param-evaluation-end" type="date" disabled></label>
+          <label><span>回测开始</span><input id="param-backtest-start" type="date" disabled></label>
+          <label><span>回测结束</span><input id="param-backtest-end" type="date" disabled></label>
+          <label><span>手续费 bps</span><input id="param-commission-bps" type="number" min="0" step="0.1" disabled></label>
+          <label><span>滑点 bps</span><input id="param-slippage-bps" type="number" min="0" step="0.1" disabled></label>
+          <label><span class="term-tip" tabindex="0" data-tip="做空部分的年化融券成本，以基点计">融券成本 bps/年</span><input id="param-short-borrow-bps" type="number" min="0" step="1" disabled></label>
+        </div>
+      </details>
       <button id="run">解析因子</button>
       <button id="validate-run" class="secondary" disabled>验证并评测</button>
       <button id="staggered-run" class="secondary" disabled>首月逐日建仓稳健性回测</button>
