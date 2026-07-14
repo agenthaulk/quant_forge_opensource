@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 import logging
 from pathlib import Path
 from typing import Any
@@ -139,8 +138,8 @@ class ResearchContextBuilder:
         )
 
     def _active_rules(self) -> tuple[dict[str, object], ...]:
-        """Bounded, human-activated steering rules (SE-iv; P4a rework items
-        4/5/6/11).
+        """Bounded, human-activated steering rules (SE-iv; P4a + R2 rework
+        items 1/4/5/6/11 and R2-1/R2-3/R2-6).
 
         Pipeline, in order (item 5 -- AUTH-BEFORE-CAP so a malformed or
         foreign row can never consume a cap slot a valid rule could have
@@ -148,12 +147,17 @@ class ResearchContextBuilder:
         store's unbounded rule-tier signatures rather than this method's
         capped output):
 
-        1. Effective activations: only rule signatures whose LATEST,
-           ROW-BOUND review event is ``activate`` reach this feed at all
-           (:meth:`ResearchMemoryStore.rule_activation_events` already
-           applies the row-binding + file-append-order derivation; promoted
-           rule ROWS stay ``needs_human_review`` forever and are never
-           consulted for activity, FP-2).
+        1. Effective activations: :meth:`ResearchMemoryStore.
+           effective_active_rules` is the ONLY row/event read this method
+           performs (R2-1) -- it returns, from a SINGLE lock hold, every
+           rule signature whose LATEST event is CURRENTLY row-bound and
+           says ``activate``, each item carrying the row's own fields plus
+           ``event_id``/``reviewed_entry_id`` (R2-6 traceability) and
+           ``activation_seq`` (R2-3's ranking key). This closes a
+           split-snapshot race the previous two-call design had: reading
+           events, then separately reading rows, let a ``promote_pending()``
+           landing between the two calls pair a STALE activation with
+           unreviewed NEW row content.
         2. Statement + scope authentication: each candidate row's statement
            AND scope must pass :func:`~quant_forge.research_loop.llm.
            authenticate_active_rule_item` (the canonical closed-template
@@ -164,8 +168,10 @@ class ResearchContextBuilder:
            survives -- a mismatched scope (e.g. a ``asset=us`` rule steering
            a ``cn_a`` run) is DISCARDED here, not merely deprioritized.
         4. Ordering: exact-scope-match rows sort before global rows, then by
-           activation recency (most recently activated first), then by a
-           stable row key.
+           ``activation_seq`` descending (R2-3: file-append order, NEVER
+           ``decided_at`` -- a future-dated or clock-skewed ``decided_at``
+           must not outrank a genuinely later-appended activation), then by
+           a stable row key.
         5. Global-slot reservation (item 11): see :func:`_reserve_global_slot`.
         6. Cap at ``_ACTIVE_RULES_LIMIT``.
 
@@ -175,13 +181,7 @@ class ResearchContextBuilder:
 
         if self.memory_store is None:
             return ()
-        activation_events = self.memory_store.rule_activation_events()
-        activated = {
-            signature: event for signature, event in activation_events.items() if event.get("action") == "activate"
-        }
-        if not activated:
-            return ()
-        rows = [row for row in self.memory_store.list_promoted("rule") if str(row.get("signature")) in activated]
+        rows = self.memory_store.effective_active_rules()
         if not rows:
             return ()
 
@@ -216,9 +216,12 @@ class ResearchContextBuilder:
         if not eligible_rows:
             return ()
 
-        def _activated_at(row: dict[str, Any]) -> datetime:
-            event = activated[str(row.get("signature"))]
-            return _parse_iso_timestamp(str(event.get("decided_at") or ""))
+        def _activation_seq(row: dict[str, Any]) -> int:
+            # R2-3: append-order index from effective_active_rules(), NEVER
+            # decided_at -- a future-dated or otherwise clock-skewed
+            # decided_at must not be able to outrank a genuinely
+            # later-appended activation.
+            return int(row.get("activation_seq") or 0)
 
         def _scope_rank(row: dict[str, Any]) -> int:
             # Every surviving row's scope is already either an exact match
@@ -228,11 +231,11 @@ class ResearchContextBuilder:
 
         # Stable multi-pass sort (least-significant key first): Python's
         # sorted() is stable, so applying passes in reverse priority order
-        # yields a correct combined ordering even though activation-recency
+        # yields a correct combined ordering even though activation_seq
         # must sort descending while scope-rank and the row-key tiebreak sort
         # ascending.
         ordered = sorted(eligible_rows, key=lambda row: str(row.get("entry_id") or ""))
-        ordered = sorted(ordered, key=_activated_at, reverse=True)
+        ordered = sorted(ordered, key=_activation_seq, reverse=True)
         ordered = sorted(ordered, key=_scope_rank)
         ordered = _reserve_global_slot(ordered, limit=_ACTIVE_RULES_LIMIT)
         return tuple(dict(row) for row in ordered[:_ACTIVE_RULES_LIMIT])
@@ -298,18 +301,6 @@ def _trace_passed(entry: dict[str, object]) -> bool:
 
 def _is_terminal_trace(entry: dict[str, object]) -> bool:
     return str(entry.get("phase") or "") in {"experiment_result", "plan_blocked"}
-
-
-def _parse_iso_timestamp(value: str) -> datetime:
-    """Parse a tz-aware ISO timestamp for chronological sorting.
-
-    Lexicographic string comparison is not reliable across differing UTC
-    offsets, so activation-recency ordering parses into real ``datetime``
-    values (mirroring the ``Z``-suffix normalization memory.py already uses
-    for its own timestamps) rather than comparing raw strings.
-    """
-
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def _next_focus_hints(failures: tuple[dict[str, object], ...]) -> tuple[str, ...]:

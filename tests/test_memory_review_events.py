@@ -11,13 +11,17 @@ the latest valid event per signature.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import re
+import subprocess
+import sys
 import threading
 
 import pytest
 
 import quant_forge.apps.cli.main as cli_main
+from quant_forge.lineage.store import canonical_fingerprint
 from quant_forge.research_loop.memory import (
     RESEARCH_MEMORY_REVIEW_SCHEMA_VERSION,
     REVIEW_ACTIONS,
@@ -569,6 +573,150 @@ def test_semantically_invalid_line_is_skipped_with_a_warning(tmp_path: Path, cap
 
 
 # ---------------------------------------------------------------------------
+# R2 rework item R2-2: readback integrity -- recomputed fingerprint mismatch
+# and missing/non-current schema_version are rejected, never defaulted.
+# ---------------------------------------------------------------------------
+
+
+def test_wrong_event_id_line_is_ignored_with_a_warning(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    # A line that is valid JSON AND passes MemoryReviewEvent's own field
+    # validation, but whose stored event_id does NOT match the recomputed
+    # content fingerprint (a tampered or corrupted single field -- e.g. the
+    # actor field silently altered without the id being recomputed), is
+    # rejected rather than trusted.
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    row = _promote_rule(store)
+    genuine = store.record_review_event(
+        target_kind="rule", target_signature="sig_rule", reviewed_entry_id=row["entry_id"],
+        action="activate", actor="alice", decided_at=T1,
+    )
+    rows = _read_jsonl(store.review_events_path)
+    assert len(rows) == 1
+    tampered = dict(rows[0])
+    tampered["actor"] = "mallory"  # content changed...
+    # ...but event_id is NOT recomputed, so it now mismatches.
+    store.review_events_path.write_text(json.dumps(tampered, sort_keys=True) + "\n", encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="quant_forge.research_loop.memory"):
+        events = store._read_review_events_unlocked()  # noqa: SLF001
+    assert events == ()
+    assert any("event_id" in message and "does not match" in message for message in caplog.messages)
+    # The public read path is equally protected: the tampered "activation"
+    # is not merely rejected in isolation, it also means the signature
+    # reverts to unreviewed rather than trusting the tampered actor's claim.
+    assert store.rule_states().get("sig_rule", "inactive") == "inactive"
+    assert genuine.event_id() == canonical_fingerprint(genuine.to_dict())  # sanity: the ORIGINAL id was correct
+
+
+def test_missing_schema_version_line_is_ignored_never_defaulted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    row = _promote_rule(store)
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_rule", reviewed_entry_id=row["entry_id"],
+        action="activate", actor="alice", decided_at=T1,
+    )
+    rows = _read_jsonl(store.review_events_path)
+    stripped = dict(rows[0])
+    del stripped["schema_version"]
+    store.review_events_path.write_text(json.dumps(stripped, sort_keys=True) + "\n", encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="quant_forge.research_loop.memory"):
+        events = store._read_review_events_unlocked()  # noqa: SLF001
+    assert events == ()
+    assert any("schema_version" in message for message in caplog.messages)
+    assert store.rule_states().get("sig_rule", "inactive") == "inactive"
+
+
+def test_non_current_schema_version_line_is_ignored_never_defaulted(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    row = _promote_rule(store)
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_rule", reviewed_entry_id=row["entry_id"],
+        action="activate", actor="alice", decided_at=T1,
+    )
+    rows = _read_jsonl(store.review_events_path)
+    stale = dict(rows[0])
+    stale["schema_version"] = "qf.memory_review.v0"  # a real, but NOT current, version string
+    store.review_events_path.write_text(json.dumps(stale, sort_keys=True) + "\n", encoding="utf-8")
+
+    events = store._read_review_events_unlocked()  # noqa: SLF001
+    assert events == ()
+
+
+# ---------------------------------------------------------------------------
+# R2 rework item R2-5: uniform tail tolerance across every memory JSONL file
+# kind, not just review events -- trailing-only recovery, interior raises.
+# ---------------------------------------------------------------------------
+
+
+def test_observations_jsonl_trailing_corruption_is_tolerated(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    store.record_observation(signature="sig_obs", statement="obs statement", run_id="rd-1", observed_at=T1)
+    with store.observations_path.open("a", encoding="utf-8") as handle:
+        handle.write("}{ not valid json at all {\n")
+
+    with caplog.at_level("WARNING", logger="quant_forge.research_loop.memory"):
+        observations = store._read_observations()  # noqa: SLF001
+    assert len(observations) == 1
+    assert any("quarantining" in message for message in caplog.messages)
+
+
+def test_observations_jsonl_interior_corruption_still_raises(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    store.record_observation(signature="sig_obs", statement="obs statement", run_id="rd-1", observed_at=T1)
+    good = store.observations_path.read_text(encoding="utf-8")
+    store.observations_path.write_text("}{ not valid json at all {\n" + good, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not the trailing line"):
+        store._read_observations()  # noqa: SLF001
+
+
+def test_rules_jsonl_trailing_corruption_is_tolerated(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    _promote_rule(store)
+    with store.path_for("rule").open("a", encoding="utf-8") as handle:
+        handle.write("}{ not valid json at all {\n")
+
+    with caplog.at_level("WARNING", logger="quant_forge.research_loop.memory"):
+        rows = store.list_promoted("rule")
+    assert len(rows) == 1
+    assert any("quarantining" in message for message in caplog.messages)
+
+
+def test_rules_jsonl_interior_corruption_still_raises(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    _promote_rule(store)
+    good = store.path_for("rule").read_text(encoding="utf-8")
+    store.path_for("rule").write_text("}{ not valid json at all {\n" + good, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not the trailing line"):
+        store.list_promoted("rule")
+
+
+def test_findings_and_failures_jsonl_trailing_corruption_is_tolerated(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    _promote_finding(store, signature="sig_finding_tail")
+    with store.path_for("finding").open("a", encoding="utf-8") as handle:
+        handle.write("}{ not valid json at all {\n")
+    assert len(store.list_promoted("finding")) == 1
+
+    store.record_observation(
+        signature="sig_failure_tail", statement="failure statement", run_id="rd-f1", observed_at=T1,
+        failure_class="gate_blocked",
+    )
+    store.record_observation(
+        signature="sig_failure_tail", statement="failure statement", run_id="rd-f2", observed_at=T2,
+        failure_class="gate_blocked",
+    )
+    store.promote_pending()
+    with store.path_for("failure").open("a", encoding="utf-8") as handle:
+        handle.write("}{ not valid json at all {\n")
+    assert len(store.list_promoted("failure")) == 1
+
+
+# ---------------------------------------------------------------------------
 # FP-2 regression: promotion structurally cannot mint activity; a hand-
 # tampered row status is irrelevant because state derives from events only.
 # ---------------------------------------------------------------------------
@@ -888,10 +1036,12 @@ def test_cli_memory_rules_unretire(tmp_path: Path, capsys: pytest.CaptureFixture
         cli_main.main(["memory", "rules", "unretire", "rule", "sig_unretire_me", "--actor", "erin", *root_arg])
 
 
-def test_cli_atomic_race_two_processes_activating_the_same_prefix(tmp_path: Path) -> None:
+def test_cli_atomic_race_two_threads_activating_the_same_prefix(tmp_path: Path) -> None:
     # P4a rework item 8: resolve_validate_append (which the CLI now uses)
-    # closes the resolve-then-append TOCTOU window. Two threads racing to
-    # activate the SAME unambiguous prefix must never raise, never leave a
+    # closes the resolve-then-append TOCTOU window. Two THREADS (see
+    # test_cli_atomic_race_two_real_processes_activating_the_same_prefix
+    # below for a genuine two-OS-process version, R2-7) racing to activate
+    # the SAME unambiguous prefix must never raise, never leave a
     # torn/malformed line, and must leave the store in a single well-defined
     # end state decided by the store's own append-order lock -- not by
     # whichever thread the OS scheduler happened to favor at the Python
@@ -938,5 +1088,66 @@ def test_cli_atomic_race_two_processes_activating_the_same_prefix(tmp_path: Path
     assert store.rule_states() == {"sig_race": "active"}
     # Both events are bound to the SAME (only) live row -- no fork.
     events = [event for event in store._read_review_events_unlocked() if event.target_signature == "sig_race"]  # noqa: SLF001
+    assert all(event.reviewed_entry_id == row["entry_id"] for event in events)
+    assert len(events) in (1, 2)  # 2 distinct actors -> 2 distinct events, unless a timestamp collision deduped them
+
+
+def test_cli_atomic_race_two_real_processes_activating_the_same_prefix(tmp_path: Path) -> None:
+    # R2 rework item R2-7: a REAL two-OS-process race, not threads, on
+    # resolve_validate_append. The threaded test above proves the Python-
+    # level call sequencing is correct; it does NOT prove the underlying
+    # fcntl.flock actually serializes independent OS processes (two threads
+    # share one process's file-descriptor table and GIL, which is a weaker
+    # claim than "two processes"). This launches the ACTUAL `qf` CLI as two
+    # separate subprocesses racing to activate the same unambiguous prefix:
+    # no torn/malformed line, and the store lands in one well-defined final
+    # state regardless of which process the OS scheduled first.
+    artifact_root = tmp_path / "artifacts"
+    store = ResearchMemoryStore(artifact_root)
+    row = _promote_rule(store, signature="sig_real_race")
+
+    repo_src = Path(__file__).resolve().parents[1] / "src"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(repo_src)
+
+    def _cli_command(actor: str) -> list[str]:
+        return [
+            sys.executable,
+            "-m",
+            "quant_forge.apps.cli.main",
+            "memory",
+            "rules",
+            "activate",
+            "sig_real_race",
+            "--actor",
+            actor,
+            "--artifact-root",
+            str(artifact_root),
+        ]
+
+    processes = [
+        subprocess.Popen(  # noqa: S603 - fixed argv, no shell, test-controlled interpreter path
+            _cli_command(actor), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        for actor in ("alice", "bob")
+    ]
+    # communicate() (not wait()) avoids the classic PIPE-buffer deadlock if
+    # either process writes enough output to fill the pipe before exiting.
+    outcomes = [proc.communicate(timeout=30) for proc in processes]
+    exit_codes = [proc.returncode for proc in processes]
+
+    # Both real OS processes complete cleanly; the store's own lock (a real
+    # fcntl.flock, not merely Python-level thread sequencing) resolves the
+    # ordering deterministically regardless of which process the OS
+    # scheduled first -- no crash on either side of the race.
+    assert exit_codes == [0, 0], list(zip(exit_codes, outcomes, strict=True))
+
+    # No torn state: every line in activations.jsonl parses as JSON.
+    for line in store.review_events_path.read_text(encoding="utf-8").splitlines():
+        json.loads(line)
+    assert store.rule_states() == {"sig_real_race": "active"}
+    events = [
+        event for event in store._read_review_events_unlocked() if event.target_signature == "sig_real_race"  # noqa: SLF001
+    ]
     assert all(event.reviewed_entry_id == row["entry_id"] for event in events)
     assert len(events) in (1, 2)  # 2 distinct actors -> 2 distinct events, unless a timestamp collision deduped them

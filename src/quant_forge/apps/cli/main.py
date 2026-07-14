@@ -1334,18 +1334,26 @@ def _goal_evidence_refs(args: argparse.Namespace, artifact_root: Path) -> tuple[
 
 def _cmd_memory_rules_list(args: argparse.Namespace) -> int:
     store = ResearchMemoryStore(_runtime_paths(args).artifact_root)
-    states = store.rule_states()
+    # Atomic (R2 rework items R2-1/R2-7): ONE snapshot read from the store,
+    # never a separately-locked row read layered on a separately-locked
+    # event read -- the split-snapshot race that fix closes applies to this
+    # listing path exactly as much as it applies to the active_rules
+    # steering channel (a promote_pending() landing between two separate
+    # reads could otherwise pair a stale activation label with new,
+    # unreviewed row content).
+    snapshot = store.rule_review_snapshot()
     entries: list[tuple[dict[str, Any], str]] = []
-    for row in store.list_promoted("rule"):
-        state = states.get(str(row.get("signature") or ""), "inactive")
+    for info in snapshot.values():
+        state = info["state"]
         if args.active and state != "active":
             continue
         if args.pending and state == "active":
             continue
-        entries.append((row, state))
+        entries.append((info["row"], state))
     if not entries:
         print("no rules recorded")
         return 0
+    entries.sort(key=lambda pair: str(pair[0].get("last_seen") or ""), reverse=True)
     _print_memory_rules_table(entries)
     return 0
 
@@ -1388,15 +1396,23 @@ def _cmd_memory_rule_review(args: argparse.Namespace, *, target_kind: str, actio
     return 0
 
 
+_MEMORY_RULE_STATE_LABELS = {
+    "active": "active",
+    # P4a rework item 1 + R2-7: a signature that merely reached the rule
+    # tier -- in ANY non-active state -- already silences its lower tiers;
+    # every label below says so, and additionally names WHY it is not
+    # currently steering (never reviewed at all, explicitly deactivated, or
+    # reviewed once but the row's content has since changed and needs
+    # re-review -- three genuinely different reasons a reviewer would act
+    # on differently).
+    "never_reviewed": "pending -- lower tiers silenced",
+    "deactivated": "deactivated -- lower tiers silenced",
+    "lapsed_pending_re_review": "lapsed -- needs re-review (row content changed) -- lower tiers silenced",
+}
+
+
 def _memory_rule_state_label(state: str) -> str:
-    # P4a rework item 1: a signature that merely reached the rule tier --
-    # activated or not -- already silences its lower tiers. Spell this out
-    # for a "pending" row so a reviewer does not assume silencing waits for
-    # activation; an "active" row's steering effect was already the
-    # documented behavior and keeps its plain label.
-    if state == "active":
-        return "active"
-    return "pending -- lower tiers silenced"
+    return _MEMORY_RULE_STATE_LABELS.get(state, state)
 
 
 def _print_memory_rules_table(entries: list[tuple[dict[str, Any], str]]) -> None:

@@ -50,11 +50,25 @@ role in state derivation, only in the write-time referential-integrity check.
 Trusted boundary: this module trusts whoever already has write access to
 ``artifact_root`` — that is the existing local-first security model (see
 ``AGENTS.md``), unchanged here. Read-side validation in this module (event
-schema/kind/action checks, row binding, and the trailing-line-only JSON
-quarantine below) defends against ON-DISK CORRUPTION and a FOREIGN
-(non-Python) writer producing malformed rows. It is not a defense against
-another in-process caller that already holds a `ResearchMemoryStore`
-instance: that caller is, by definition, already inside the trust boundary.
+schema/kind/action checks, row binding, readback fingerprint verification,
+and the trailing-line-only JSON quarantine below) defends against ON-DISK
+CORRUPTION and a FOREIGN (non-Python) writer producing malformed rows. It is
+not a defense against another in-process caller that already holds a
+`ResearchMemoryStore` instance: that caller is, by definition, already
+inside the trust boundary. In particular (R2 rework item R2-6, Fable
+ruling): in-process forgery of ``ResearchContext.active_rules`` — a caller
+constructing a ``ResearchContext`` with fabricated ``active_rules`` content
+directly, bypassing this module's read path entirely — is OUT OF THREAT
+MODEL. That requires the same in-process code execution as patching
+:func:`promote` itself; this module's validation was never designed to
+defend against a caller already inside the trust boundary, and no amount of
+additional shape-only checking changes that. What this module DOES provide
+against that scenario is traceability, not prevention: every active_rules
+item :meth:`ResearchMemoryStore.effective_active_rules` returns (and
+``llm.py`` forwards to the prompt) carries its ``event_id`` and
+``reviewed_entry_id``, so any rule accepted into a prompt is traceable to
+the exact review event that activated it in trace/debug output. No further
+"authentication theater" is added beyond that.
 
 Single-host writers only: the advisory lock is a same-host ``fcntl.flock``;
 it does not coordinate across hosts or across a cloud-sync tool's own
@@ -491,20 +505,6 @@ class ResearchMemoryStore:
         with advisory_file_lock(self._lock_path):
             return self._resolve_signature_prefix_unlocked(kind, prefix)
 
-    def rule_activation_events(self) -> dict[str, dict[str, Any]]:
-        """Latest 'rule' review event per signature, as dicts.
-
-        Richer than :meth:`rule_states`: callers that need more than the
-        derived active/inactive label (e.g. sorting by activation recency)
-        read ``decided_at``/``actor``/``rationale`` from here.
-        """
-
-        with advisory_file_lock(self._lock_path):
-            return {
-                signature: {"event_id": event.event_id(), **event.to_dict()}
-                for signature, event in self._latest_events_by_signature_unlocked("rule").items()
-            }
-
     def rule_states(self) -> dict[str, str]:
         """Effective activation state per rule signature: {signature: "active"|"inactive"}.
 
@@ -553,6 +553,129 @@ class ResearchMemoryStore:
 
         with advisory_file_lock(self._lock_path):
             return frozenset(self._live_rows_by_signature("rule").keys())
+
+    def effective_active_rules(self) -> tuple[dict[str, Any], ...]:
+        """Atomic, store-owned read of every rule signature whose LATEST
+        event is CURRENTLY row-bound and says ``activate`` (R2 rework item
+        R2-1, MAJOR: closes the split-snapshot race).
+
+        Rows and events are read under ONE lock hold via
+        :meth:`_rule_snapshot_unlocked`. The bug this fixes: the previous
+        design read events (one locked call) and then separately read rows
+        (a second locked call); a ``promote_pending()`` landing a NEW
+        superseding row between the two calls could pair a STALE activation
+        event with UNREVIEWED new row content, since the second call only
+        filtered rows by signature membership, never re-checked the
+        binding. ``context_builder._active_rules()`` and the CLI list/label
+        paths (:meth:`rule_review_snapshot`) consume ONLY the atomic
+        snapshot this method (and its sibling) are built from -- no
+        separately-locked row read is ever combined with a separately-read
+        event to answer "is this rule effectively active".
+
+        Each item is the row's own fields PLUS:
+
+        - ``event_id``: the binding event's content-identity fingerprint
+          (R2-6: forwarded all the way to the LLM prompt so any accepted
+          rule is traceable to its event).
+        - ``reviewed_entry_id``: the row entry_id the event was bound to
+          (== the row's own current ``entry_id``, by construction).
+        - ``activation_seq``: the event's index in the file-append-order
+          sequence of VALID events (R2-3's ranking key -- NEVER
+          ``decided_at``, which stays display metadata only).
+        - ``decided_at``: display metadata only.
+        """
+
+        with advisory_file_lock(self._lock_path):
+            snapshot = self._rule_snapshot_unlocked()
+        results: list[dict[str, Any]] = []
+        for info in snapshot.values():
+            if info["state"] != "active":
+                continue
+            results.append(
+                {
+                    **info["row"],
+                    "event_id": info["event_id"],
+                    "reviewed_entry_id": info["reviewed_entry_id"],
+                    "activation_seq": info["activation_seq"],
+                    "decided_at": info["decided_at"],
+                }
+            )
+        return tuple(results)
+
+    def rule_review_snapshot(self) -> dict[str, dict[str, Any]]:
+        """Atomic, full state classification of every LIVE rule row (R2-7):
+        ``{signature: {"row": ..., "state": ..., "event_id": ...,
+        "reviewed_entry_id": ..., "activation_seq": ..., "decided_at": ...}}``
+        where ``state`` is one of:
+
+        - ``"active"``: latest event for this signature is row-bound and
+          says ``activate``.
+        - ``"deactivated"``: latest event for this signature is row-bound
+          and says ``deactivate``.
+        - ``"lapsed_pending_re_review"``: at least one event exists for this
+          signature, but NONE is bound to the row's CURRENT content (the
+          row was superseded since the last review).
+        - ``"never_reviewed"``: no event has ever targeted this signature.
+
+        Built from the EXACT SAME single-lock-hold traversal
+        :meth:`effective_active_rules` uses (:meth:`_rule_snapshot_unlocked`),
+        so the CLI's full listing and the active_rules steering channel can
+        never observe two different snapshots of the same instant -- the CLI
+        list/label paths (R2-1, R2-7) consume ONLY this method (plus
+        :meth:`effective_active_rules`), never a second separately-locked
+        row read.
+        """
+
+        with advisory_file_lock(self._lock_path):
+            return self._rule_snapshot_unlocked()
+
+    def _rule_snapshot_unlocked(self) -> dict[str, dict[str, Any]]:
+        """Shared snapshot builder (callers must already hold the lock): for
+        every LIVE rule row, resolve its currently-bound event (if any) and
+        classify its state, all from ONE traversal of the SAME
+        already-in-memory rows + events -- :meth:`effective_active_rules`
+        and :meth:`rule_review_snapshot` are thin filters/formatters over
+        this, never a second disk read (R2-1).
+        """
+
+        live_rows = self._live_rows_by_signature("rule")
+        events = self._read_review_events_unlocked()  # natural file order = append order
+        bound_by_signature: dict[str, tuple[int, MemoryReviewEvent]] = {}
+        ever_reviewed: set[str] = set()
+        for index, event in enumerate(events):
+            if event.target_kind != "rule":
+                continue
+            ever_reviewed.add(event.target_signature)
+            live_row = live_rows.get(event.target_signature)
+            current_entry_id = str(live_row.get("entry_id")) if live_row is not None else None
+            if current_entry_id is None or event.reviewed_entry_id != current_entry_id:
+                continue
+            bound_by_signature[event.target_signature] = (index, event)  # later append order overwrites earlier
+
+        snapshot: dict[str, dict[str, Any]] = {}
+        for signature, row in live_rows.items():
+            bound = bound_by_signature.get(signature)
+            if bound is not None:
+                seq, event = bound
+                snapshot[signature] = {
+                    "row": row,
+                    "state": "active" if event.action == "activate" else "deactivated",
+                    "event_id": event.event_id(),
+                    "reviewed_entry_id": event.reviewed_entry_id,
+                    "activation_seq": seq,
+                    "decided_at": event.decided_at,
+                }
+            else:
+                state = "lapsed_pending_re_review" if signature in ever_reviewed else "never_reviewed"
+                snapshot[signature] = {
+                    "row": row,
+                    "state": state,
+                    "event_id": "",
+                    "reviewed_entry_id": "",
+                    "activation_seq": None,
+                    "decided_at": "",
+                }
+        return snapshot
 
     # ------------------------------------------------------------------
     # Review events (SE-iii): append-only human governance decisions layered
@@ -754,63 +877,66 @@ class ResearchMemoryStore:
         return event
 
     def _read_review_events_unlocked(self) -> tuple[MemoryReviewEvent, ...]:
-        """Tolerant, natural-file-order read of ``activations.jsonl``.
+        """Tolerant, natural-file-order read of ``activations.jsonl``, in
+        REVIEW ORDER (append order): line-level JSON tolerance is the shared
+        :func:`_read_jsonl` behavior (R2-5, trailing quarantine / interior
+        raise); this layer adds readback-integrity checks specific to review
+        events (R2-2):
 
-        Mirrors SE-P3's local-producer trailing-corruption-quarantine shape
-        (docs/coordination/ENGINEERING_PROGRESS.md, "restart-idempotence and
-        trailing-corruption quarantine"): a malformed JSON line that is the
-        LAST line in the file is the benign "writer died mid-append" shape
-        and is skipped with a warning. A malformed line ANYWHERE ELSE in the
-        file is a stronger corruption signal — not the benign shape — and
-        still raises. A line that parses as JSON but fails
-        :class:`MemoryReviewEvent`'s own schema/kind/action validation is
-        skipped with a warning too (never raised): one corrupted or
-        foreign-written row must not take the whole log down.
+        - ``schema_version`` must be PRESENT and equal to the current
+          :data:`RESEARCH_MEMORY_REVIEW_SCHEMA_VERSION` exactly -- missing or
+          stale is skipped-with-a-warning, never silently defaulted to
+          "current" (a defaulted schema_version would let a genuinely
+          different historical shape masquerade as validated-current).
+        - the row must pass :class:`MemoryReviewEvent`'s own schema/kind/
+          action validation -- skipped-with-a-warning, never raised (one
+          corrupted or foreign-written row must not take the whole log
+          down).
+        - the row's stored ``event_id`` must equal the RECOMPUTED content
+          fingerprint of the reconstructed event -- skipped-with-a-warning
+          on mismatch (a single tampered or corrupted field would otherwise
+          be silently trusted, since JSON parsing alone cannot catch it).
         """
 
         path = self.review_events_path
-        if not path.exists():
-            return ()
-        lines = path.read_text(encoding="utf-8").splitlines()
-        last_line_number = len(lines)
         events: list[MemoryReviewEvent] = []
-        for line_number, line in enumerate(lines, start=1):
-            stripped = line.strip()
-            if not stripped:
+        for row in _read_jsonl(path):
+            schema_version = row.get("schema_version")
+            if schema_version != RESEARCH_MEMORY_REVIEW_SCHEMA_VERSION:
+                logger.warning(
+                    "skipping review event in %s: missing or non-current schema_version %r (expected %r)",
+                    path,
+                    schema_version,
+                    RESEARCH_MEMORY_REVIEW_SCHEMA_VERSION,
+                )
                 continue
             try:
-                row = json.loads(stripped)
-            except json.JSONDecodeError:
-                if line_number == last_line_number:
-                    logger.warning(
-                        "quarantining malformed trailing line %d in %s (writer-died-mid-append shape)",
-                        line_number,
-                        path,
-                    )
-                    continue
-                raise ValueError(
-                    f"malformed JSONL line {line_number} in {path} is not the trailing line; this is not "
-                    "the benign writer-died-mid-append shape and is treated as corruption"
-                ) from None
-            try:
-                events.append(
-                    MemoryReviewEvent(
-                        target_kind=str(row.get("target_kind") or ""),
-                        target_signature=str(row.get("target_signature") or ""),
-                        reviewed_entry_id=str(row.get("reviewed_entry_id") or ""),
-                        action=str(row.get("action") or ""),
-                        actor=str(row.get("actor") or ""),
-                        rationale=str(row.get("rationale") or ""),
-                        decided_at=str(row.get("decided_at") or ""),
-                        supersedes=str(row.get("supersedes") or ""),
-                        schema_version=str(row.get("schema_version") or RESEARCH_MEMORY_REVIEW_SCHEMA_VERSION),
-                    )
+                event = MemoryReviewEvent(
+                    target_kind=str(row.get("target_kind") or ""),
+                    target_signature=str(row.get("target_signature") or ""),
+                    reviewed_entry_id=str(row.get("reviewed_entry_id") or ""),
+                    action=str(row.get("action") or ""),
+                    actor=str(row.get("actor") or ""),
+                    rationale=str(row.get("rationale") or ""),
+                    decided_at=str(row.get("decided_at") or ""),
+                    supersedes=str(row.get("supersedes") or ""),
+                    schema_version=schema_version,
                 )
             except ValueError as exc:
+                logger.warning("skipping semantically-invalid review event in %s: %s", path, exc)
+                continue
+            stored_event_id = row.get("event_id")
+            recomputed_event_id = event.event_id()
+            if stored_event_id != recomputed_event_id:
                 logger.warning(
-                    "skipping semantically-invalid review event on line %d in %s: %s", line_number, path, exc
+                    "skipping review event in %s: stored event_id %r does not match the recomputed "
+                    "content fingerprint %r (tampered or corrupted field)",
+                    path,
+                    stored_event_id,
+                    recomputed_event_id,
                 )
                 continue
+            events.append(event)
         return tuple(events)
 
     def _event_id_recorded_unlocked(self, event_id: str) -> bool:
@@ -971,13 +1097,40 @@ def _default_review_decided_at() -> str:
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Tolerant JSONL read shared by EVERY memory file kind (rules, findings,
+    failures, observations, review events -- R2 rework item R2-5, "uniform
+    tail tolerance"): a malformed JSON line that is the LAST line in the file
+    is the benign "writer died mid-append" shape and is quarantined with a
+    warning, dropped from the read, never rewritten away (append-only). A
+    malformed line found ANYWHERE ELSE is a stronger corruption signal --
+    not the benign shape -- and still raises, mirroring SE-P3's local-
+    producer trailing-corruption-quarantine pattern
+    (docs/coordination/ENGINEERING_PROGRESS.md).
+    """
+
     if not path.exists():
         return []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    last_line_number = len(lines)
     rows: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line_number, line in enumerate(lines, start=1):
         stripped = line.strip()
-        if stripped:
+        if not stripped:
+            continue
+        try:
             rows.append(json.loads(stripped))
+        except json.JSONDecodeError:
+            if line_number == last_line_number:
+                logger.warning(
+                    "quarantining malformed trailing line %d in %s (writer-died-mid-append shape)",
+                    line_number,
+                    path,
+                )
+                continue
+            raise ValueError(
+                f"malformed JSONL line {line_number} in {path} is not the trailing line; this is not "
+                "the benign writer-died-mid-append shape and is treated as corruption"
+            ) from None
     return rows
 
 

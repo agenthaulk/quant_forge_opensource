@@ -32,6 +32,7 @@ from quant_forge.research_loop.outcomes import (
     ORIGINS,
     REASON_CODES,
     REASON_NONE,
+    STAGE_EVIDENCE_STRENGTH,
     STAGES,
 )
 from quant_forge.research_loop.service import (
@@ -610,6 +611,16 @@ def _authenticate_outcome_statement(statement: str) -> str | None:
         return None
     if strength not in EVIDENCE_STRENGTHS:
         return None
+    # Stage/strength coherence (R2 rework item R2-4): outcomes.py derives
+    # evidence_strength FROM the stage (owner ruling R5-3, "it can never
+    # exceed the DECLARED stage") -- a statement is only mintable if its
+    # strength is EXACTLY the one STAGE_EVIDENCE_STRENGTH maps that stage
+    # to, not merely any closed-vocabulary value. This closes the gap where
+    # a weak stage (e.g. "evaluate") paired with an inflated strength (e.g.
+    # "submitted_live") would otherwise pass -- that combination can never
+    # be genuinely minted by outcome_to_observations().
+    if strength != STAGE_EVIDENCE_STRENGTH[stage]:
+        return None
     if not _parse_scope_grammar(scope):
         return None
     return scope
@@ -666,6 +677,15 @@ def _active_rules_items_for_prompt(
     (``dropped`` only counts items actually examined: an input longer than
     the prompt cap that already found enough conforming statements stops
     early, same as the existing memory channel's cap.)
+
+    Traceability, not prevention (R2 rework item R2-6): each accepted item
+    also carries ``event_id``/``reviewed_entry_id`` straight through from
+    ``ResearchMemoryStore.effective_active_rules()`` (via
+    ``context.active_rules``), so any rule this channel forwards to the
+    prompt is traceable to the exact review event that activated it in
+    trace/debug output. See the module-docstring boundary note in
+    ``memory.py`` for why this is traceability rather than an in-process-
+    forgery defense.
     """
 
     total = len(items)
@@ -685,6 +705,8 @@ def _active_rules_items_for_prompt(
                 "statement": statement,
                 "scope": scope,
                 "observation_count": int(item.get("observation_count") or 0),
+                "event_id": str(item.get("event_id") or ""),
+                "reviewed_entry_id": str(item.get("reviewed_entry_id") or ""),
             }
         )
         if len(bounded) >= _ACTIVE_RULES_PROMPT_ITEM_LIMIT:

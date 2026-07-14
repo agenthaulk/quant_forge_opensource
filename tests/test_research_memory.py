@@ -612,6 +612,33 @@ def test_active_rules_excludes_mismatched_scope_entirely(tmp_path: Path) -> None
     assert "sig_mismatched" not in signatures
 
 
+def test_active_rules_ranking_uses_append_order_not_decided_at_clock_poisoning(tmp_path: Path) -> None:
+    # R2 rework item R2-3: ranking is activation_seq (file append order),
+    # NEVER decided_at. A FUTURE-DATED activation (appended FIRST, i.e. a
+    # poisoned or simply wrong clock claiming a much later timestamp) must
+    # NOT outrank a genuinely LATER-appended activation that carries an
+    # ordinary (chronologically "earlier") decided_at.
+    paths = create_demo_workspace(tmp_path / "demo")
+    memory = ResearchMemoryStore(paths["artifact_root"])
+    # sig_future is APPENDED FIRST but claims a decided_at far in the future.
+    _activate_rule(memory, signature="sig_future", scope="global", activated_at="2099-01-01T00:00:00+00:00")
+    # sig_normal is APPENDED SECOND with an ordinary, chronologically
+    # "earlier" decided_at -- if ranking used decided_at, sig_future would
+    # incorrectly outrank sig_normal.
+    _activate_rule(memory, signature="sig_normal", scope="global", activated_at="2026-07-01T00:00:00+00:00")
+
+    context = ResearchContextBuilder(
+        factor_root=paths["factor_root"], data_root=paths["data_root"], memory_store=memory
+    ).build()
+
+    signatures = [row["signature"] for row in context.active_rules]
+    assert signatures == ["sig_normal", "sig_future"], signatures
+    # decided_at is present but purely informational: activation_seq is what
+    # actually drove the ordering above.
+    decided_ats = {row["signature"]: row["decided_at"] for row in context.active_rules}
+    assert decided_ats["sig_future"] == "2099-01-01T00:00:00+00:00"
+
+
 def test_active_rules_pre_activation_silencing_and_cross_tier_dedup(tmp_path: Path) -> None:
     # P4a rework item 1 (pre-activation silencing) + the original cross-tier
     # dedup: a signature that REACHES the rule tier -- pending review or
@@ -706,7 +733,7 @@ def test_active_rules_silencing_is_signature_specific(tmp_path: Path) -> None:
 
 
 def test_active_rules_dedup_uses_the_full_effective_set_not_the_capped_five(tmp_path: Path) -> None:
-    # P4a rework item 5: cross-tier dedup is computed from the store's
+    # P4a + R2 rework item 5: cross-tier dedup is computed from the store's
     # UNBOUNDED rule-tier signature set, never from the (capped-to-5)
     # `active_rules` tuple this method itself returns. Six dual-tier
     # signatures (each BOTH a live finding row and a live, activated rule
@@ -715,20 +742,21 @@ def test_active_rules_dedup_uses_the_full_effective_set_not_the_capped_five(tmp_
     #
     # "sig_dual_tier_5" is deliberately given the LATEST finding
     # observations (guaranteeing it lands inside read_recent("finding", 5)'s
-    # own top-5 window, so it is genuinely a CANDIDATE for leaking) but the
-    # EARLIEST rule activation (guaranteeing it is the one signature the
-    # cap-5 active_rules pipeline cannot display). If dedup were computed
-    # from the capped `active_rules` tuple instead of the full effective
-    # set, this specific signature's finding would incorrectly reappear.
+    # own top-5 window, so it is genuinely a CANDIDATE for leaking) but is
+    # ACTIVATED FIRST, before any other signature (R2-3: ranking is
+    # activation_seq -- file append order -- never decided_at, so being
+    # appended first guarantees the lowest rank and being the one signature
+    # the cap-5 active_rules pipeline cannot display). If dedup were
+    # computed from the capped `active_rules` tuple instead of the full
+    # effective set, this specific signature's finding would incorrectly
+    # reappear.
     paths = create_demo_workspace(tmp_path / "demo")
     memory = ResearchMemoryStore(paths["artifact_root"])
     dual_tier_signatures = [f"sig_dual_tier_{index}" for index in range(6)]
     finding_base_day = {signature: (1 + index) for index, signature in enumerate(dual_tier_signatures)}
     finding_base_day["sig_dual_tier_5"] = 20  # latest finding of all -> guaranteed top-5 candidate
-    activation_day = {signature: (10 + index) for index, signature in enumerate(dual_tier_signatures)}
-    activation_day["sig_dual_tier_5"] = 1  # earliest activation of all -> guaranteed capped out
 
-    for signature in dual_tier_signatures:
+    def _promote(signature: str) -> dict:
         statement = _conforming_local_statement(signature)
         day = finding_base_day[signature]
         memory.record_observation(
@@ -747,11 +775,19 @@ def test_active_rules_dedup_uses_the_full_effective_set_not_the_capped_five(tmp_
             observed_at=f"2026-05-{day + 2:02d}T00:00:00+00:00", data_window=WINDOW_B,
         )
         memory.promote_pending()
-        rule_row = memory.resolve_signature_prefix("rule", signature)
+        return memory.resolve_signature_prefix("rule", signature)
+
+    rows = {signature: _promote(signature) for signature in dual_tier_signatures}
+
+    # Activation APPEND ORDER (not decided_at) decides rank: sig_dual_tier_5
+    # is activated FIRST (lowest activation_seq), then the rest in order.
+    # decided_at is deliberately IDENTICAL for every event, to prove it
+    # plays no role in the ranking whatsoever.
+    activation_order = ["sig_dual_tier_5", *dual_tier_signatures[:5]]
+    for signature in activation_order:
         memory.record_review_event(
-            target_kind="rule", target_signature=signature, reviewed_entry_id=rule_row["entry_id"],
-            action="activate", actor="alice",
-            decided_at=f"2026-07-{activation_day[signature]:02d}T00:00:00+00:00",
+            target_kind="rule", target_signature=signature, reviewed_entry_id=rows[signature]["entry_id"],
+            action="activate", actor="alice", decided_at="2026-07-01T00:00:00+00:00",
         )
 
     context = ResearchContextBuilder(
@@ -759,7 +795,7 @@ def test_active_rules_dedup_uses_the_full_effective_set_not_the_capped_five(tmp_
     ).build()
 
     # Only 5 of the 6 activated rules fit in the displayed, capped channel,
-    # and it is specifically the earliest-activated one that is excluded.
+    # and it is specifically the FIRST-appended activation that is excluded.
     assert len(context.active_rules) == 5
     displayed_signatures = {row["signature"] for row in context.active_rules}
     assert "sig_dual_tier_5" not in displayed_signatures
@@ -900,6 +936,92 @@ def test_active_rules_items_for_prompt_authenticates_outcomes_grammar_and_local_
     assert genuine_local_statement in accepted_statements
     assert foreign_statement not in accepted_statements
     assert not any("IGNORE" in item["scope"] for item in accepted)
+
+
+def test_stage_strength_coherence_drops_mismatched_pairing_with_counter() -> None:
+    # R2 rework item R2-4: strength must equal outcomes.STAGE_EVIDENCE_STRENGTH
+    # [stage] exactly, not merely be ANY closed-vocabulary value. A weak
+    # stage ("evaluate", whose true strength is "local_backtest") paired
+    # with an inflated strength ("submitted_live", the submit-stage-only
+    # value) can never be genuinely minted by outcome_to_observations() and
+    # must be dropped -- counted, not silently forwarded.
+    import quant_forge.research_loop.llm as rd_llm
+    from quant_forge.research_loop.outcomes import STAGE_EVIDENCE_STRENGTH, STAGES
+
+    coherent = (
+        f"[local/evaluate] blocked: SHARPE_BELOW_GATE; family=unknown; "
+        f"strength={STAGE_EVIDENCE_STRENGTH['evaluate']}; scope=global"
+    )
+    inflated = "[local/evaluate] blocked: SHARPE_BELOW_GATE; family=unknown; strength=submitted_live; scope=global"
+    assert STAGE_EVIDENCE_STRENGTH["evaluate"] != "submitted_live"
+
+    items = [
+        {"source": "research_memory", "statement": coherent, "scope": "global", "observation_count": 2},
+        {"source": "research_memory", "statement": inflated, "scope": "global", "observation_count": 1},
+    ]
+    accepted, stats = rd_llm._active_rules_items_for_prompt(items)  # noqa: SLF001
+
+    assert stats == {"total": 2, "accepted": 1, "dropped": 1}
+    accepted_statements = [item["statement"] for item in accepted]
+    assert coherent in accepted_statements
+    assert inflated not in accepted_statements
+
+    # Every stage's OWN correctly-derived strength authenticates; every
+    # OTHER strength value, for that same stage, does not.
+    for stage in STAGES:
+        correct = STAGE_EVIDENCE_STRENGTH[stage]
+        assert rd_llm.authenticate_active_rule_item(
+            f"[local/{stage}] blocked: SHARPE_BELOW_GATE; family=unknown; strength={correct}; scope=global", "global"
+        )
+        for wrong in {"prescreen", "local_backtest", "platform_simulated", "submitted_live"} - {correct}:
+            assert not rd_llm.authenticate_active_rule_item(
+                f"[local/{stage}] blocked: SHARPE_BELOW_GATE; family=unknown; strength={wrong}; scope=global",
+                "global",
+            )
+
+
+def test_active_rules_carry_event_id_and_reviewed_entry_id_for_traceability(tmp_path: Path) -> None:
+    # R2 rework item R2-6 (Fable ruling, auditability not security): every
+    # active_rules item forwarded to the LLM prompt carries its event_id and
+    # reviewed_entry_id, so any accepted rule is traceable to the exact
+    # review event that activated it.
+    import quant_forge.research_loop.llm as rd_llm
+    from quant_forge.core.contracts import FactorDefinition
+
+    paths = create_demo_workspace(tmp_path / "demo")
+    memory = ResearchMemoryStore(paths["artifact_root"])
+    statement = "accepted candidate formula family AB12CD34EF56 passed the research gate"
+    for run_id, observed_at, window in (("rd-1", T1, WINDOW_A), ("rd-2", T2, WINDOW_A), ("rd-3", T3, WINDOW_B)):
+        memory.record_observation(
+            signature="sig_trace", statement=statement, run_id=run_id, observed_at=observed_at, data_window=window
+        )
+    memory.promote_pending()
+    row = memory.resolve_signature_prefix("rule", "sig_trace")
+    event = memory.record_review_event(
+        target_kind="rule", target_signature="sig_trace", reviewed_entry_id=row["entry_id"],
+        action="activate", actor="alice", decided_at=T3,
+    )
+
+    context = ResearchContextBuilder(
+        factor_root=paths["factor_root"], data_root=paths["data_root"], memory_store=memory
+    ).build()
+    assert len(context.active_rules) == 1
+    assert context.active_rules[0]["event_id"] == event.event_id()
+    assert context.active_rules[0]["reviewed_entry_id"] == row["entry_id"]
+
+    seed = FactorDefinition(factor_id="FTR_SEED", name="seed", formula="rank(close)", status="candidate")
+    messages, stats = rd_llm._hypothesis_messages_and_stats(  # noqa: SLF001
+        seed, context=context, objective="balanced", max_candidates=2
+    )
+    assert stats == {"total": 1, "accepted": 1, "dropped": 0}
+    accepted, _ = rd_llm._active_rules_items_for_prompt(context.active_rules)  # noqa: SLF001
+    assert accepted[0]["event_id"] == event.event_id()
+    assert accepted[0]["reviewed_entry_id"] == row["entry_id"]
+    # The trace-visible prompt payload itself carries the ids, not just the
+    # intermediate stats mapping.
+    user = messages[1]["content"]
+    assert event.event_id() in user
+    assert row["entry_id"] in user
 
 
 def test_active_rules_drops_a_legitimately_activated_but_nonconforming_statement_with_counter(
