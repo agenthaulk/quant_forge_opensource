@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import random
 import re
 import subprocess
 import sys
@@ -20,11 +21,16 @@ from typing import Any
 import pytest
 
 from quant_forge.lineage.store import canonical_fingerprint, redact_free_text
-from quant_forge.research_loop.memory import RULE_CANDIDATE_STATUS, promote
+from quant_forge.research_loop.memory import RULE_CANDIDATE_STATUS, MemoryObservation, promote
 from quant_forge.research_loop.outcomes import (
     EVIDENCE_STRENGTH_RANK,
     EVIDENCE_STRENGTHS,
+    METRIC_SPECS,
+    REASON_CODES,
     REASON_NONE,
+    RESEARCH_OUTCOME_SCHEMA_VERSION,
+    SAMPLE_ROLES,
+    SIGNATURE_CONTRACT_VERSION,
     STAGE_EVIDENCE_STRENGTH,
     STAGES,
     MetricReading,
@@ -679,3 +685,479 @@ def test_outcomes_module_source_has_no_forbidden_imports() -> None:
             assert module != forbidden and not module.startswith(f"{forbidden}."), (
                 f"line {line_number} imports forbidden module {forbidden!r}: {stripped!r}"
             )
+
+
+# ---------------------------------------------------------------------------
+# SE-P1 EXTENSION BATTERY (adjudicated spec, items 1-12 below). Each section
+# banner cites the originating item number so the coverage map in the task
+# report can point straight at these tests.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 10. GOLDEN FROZEN-VECTOR PINS (item 1): hard-coded literals freeze
+# cross-version identity for persisted memory. Unlike the relative
+# invariant/differs tests in section 1 above (which only ever compare two
+# freshly-computed hashes to each other), these compare the REAL output to a
+# hex literal computed once and hard-coded here, so a silent change to field
+# ordering, canonicalization, or a version constant fails loudly.
+# ---------------------------------------------------------------------------
+
+_GOLDEN_FINGERPRINT = "0123456789abcdef"
+_GOLDEN_OBSERVED_AT = "2026-01-01T00:00:00+00:00"
+_GOLDEN_SCOPE = OutcomeScope(
+    asset_class="us_equity",
+    universe="sp500",
+    factor_family="reversal",
+    horizon_bucket="d5",
+    settings_profile="default",
+)
+_GOLDEN_WINDOW = OutcomeWindow(status="available", start_date="2024-01-01", end_date="2024-06-30")
+
+# Computed once (PYTHONPATH=src python3, this exact fixture) and pinned as a
+# literal. Do NOT "fix" a failing golden test by recomputing and pasting a new
+# value here without understanding why identity moved -- that is precisely
+# the silent-drift failure mode this test exists to catch.
+_GOLDEN_OUTCOME_ID = "05fc36e757f9d9ce1c3a748f3d5acc863ff30c325a49945e172b5fb8f0d65be6"
+_GOLDEN_EVIDENCE_RUN_ID = "721d791a4a35f0a6f9b288691652184c8a74f9c3620f3fc23637bb9a29600469"
+_GOLDEN_FIRST_SIGNATURE = "6b901e8690a25c5091672d195ccb80b0b56898853e659cb074471e6e3c9b3fc0"
+
+
+def _golden_outcome() -> ResearchOutcome:
+    """Fully-specified fixture pinned by the golden-vector tests below."""
+
+    return ResearchOutcome(
+        origin="local",
+        stage="evaluate",
+        verdict="blocked",
+        factor_id="FTR_GOLDEN",
+        factor_fingerprint=_GOLDEN_FINGERPRINT,
+        observed_at=_GOLDEN_OBSERVED_AT,
+        reason_codes=("SHARPE_BELOW_GATE", "TURNOVER_TOO_HIGH"),
+        sample_role="out_of_sample",
+        window=_GOLDEN_WINDOW,
+        scope=_GOLDEN_SCOPE,
+        metric_snapshot={
+            "sharpe": MetricReading(value=0.42, basis="net", sample_count=252),
+            "turnover": MetricReading(value=0.55),
+        },
+        evidence_ref="runs/n2/prescreen.json",
+    )
+
+
+def test_golden_schema_and_signature_contract_version_literals_are_pinned() -> None:
+    assert RESEARCH_OUTCOME_SCHEMA_VERSION == "qf.research_outcome.v2"
+    assert SIGNATURE_CONTRACT_VERSION == "sig.v2.1"
+
+
+def test_golden_outcome_id_matches_frozen_hex_vector() -> None:
+    assert _golden_outcome().outcome_id() == _GOLDEN_OUTCOME_ID
+
+
+def test_golden_evidence_run_id_matches_frozen_hex_vector() -> None:
+    assert _golden_outcome().evidence_run_id() == _GOLDEN_EVIDENCE_RUN_ID
+
+
+def test_golden_first_signature_matches_frozen_hex_vector() -> None:
+    assert _sig(_golden_outcome(), 0) == _GOLDEN_FIRST_SIGNATURE
+
+
+# ---------------------------------------------------------------------------
+# 11. HEX BOUNDARIES (item 2): factor_fingerprint's ``_HEX_RE`` is
+# ``^[0-9a-f]{16,64}$``. Length is isolated from character-class validity
+# (already covered by ``_BAD_FACTOR_FINGERPRINTS`` above) by holding every
+# character fixed at ``"a"`` and varying only the string length.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("length", [16, 64])
+def test_research_outcome_accepts_factor_fingerprint_at_hex_length_boundaries(length: int) -> None:
+    fingerprint = "a" * length
+    outcome = _outcome(factor_fingerprint=fingerprint)
+    assert outcome.factor_fingerprint == fingerprint
+
+
+@pytest.mark.parametrize("length", [15, 65, 12])
+def test_research_outcome_rejects_factor_fingerprint_outside_hex_length_boundaries(length: int) -> None:
+    # 15/65 probe the boundary edges; 12 is the opus probe M short-fingerprint case.
+    with pytest.raises(ValueError):
+        _outcome(factor_fingerprint="a" * length)
+
+
+# ---------------------------------------------------------------------------
+# 12. DIM BOUNDARIES (item 3): ``OutcomeScope``'s ``_DIM_RE`` is
+# ``^[a-z0-9_.\-]{0,32}$``; ``factor_id``'s ``_ID_RE`` is
+# ``^[A-Za-z0-9_.\-]{1,64}$``. The 65-char factor_id rejection already exists
+# in ``_BAD_FACTOR_IDS`` (``"A" * 65``) above; only the missing accepted
+# boundary is added here.
+# ---------------------------------------------------------------------------
+
+
+def test_outcome_scope_accepts_32_char_dim() -> None:
+    value = "a" * 32
+    scope = OutcomeScope(asset_class=value)
+    assert scope.asset_class == value
+
+
+def test_outcome_scope_rejects_33_char_dim() -> None:
+    with pytest.raises(ValueError):
+        OutcomeScope(asset_class="a" * 33)
+
+
+def test_research_outcome_accepts_64_char_factor_id() -> None:
+    factor_id = "A" * 64
+    outcome = _outcome(factor_id=factor_id)
+    assert outcome.factor_id == factor_id
+
+
+# ---------------------------------------------------------------------------
+# 13. WINDOW (item 4): equal start==end, leap-day handling, and real calendar
+# validation (R-F7) -- ``date.fromisoformat`` rejects the invalid dates
+# rather than the module minting a fake distinct window for them.
+# ---------------------------------------------------------------------------
+
+
+def test_outcome_window_accepts_equal_start_and_end_date() -> None:
+    window = OutcomeWindow(status="available", start_date="2024-03-15", end_date="2024-03-15")
+    assert window.canonical() == "2024-03-15:2024-03-15"
+
+
+def test_outcome_window_accepts_leap_day_2024_02_29() -> None:
+    window = OutcomeWindow(status="available", start_date="2024-02-29", end_date="2024-02-29")
+    assert window.canonical() == "2024-02-29:2024-02-29"
+
+
+def test_outcome_window_rejects_non_leap_year_february_29() -> None:
+    with pytest.raises(ValueError, match="not a real calendar date"):
+        OutcomeWindow(status="available", start_date="2023-02-29", end_date="2023-02-29")
+
+
+def test_outcome_window_rejects_february_31() -> None:
+    with pytest.raises(ValueError, match="not a real calendar date"):
+        OutcomeWindow(status="available", start_date="2024-02-31", end_date="2024-02-31")
+
+
+def test_outcome_window_rejects_month_99_day_99() -> None:
+    with pytest.raises(ValueError, match="not a real calendar date"):
+        OutcomeWindow(status="available", start_date="2024-99-99", end_date="2024-99-99")
+
+
+def test_outcome_window_rejects_arabic_indic_digit_date() -> None:
+    # Arabic-Indic digits (U+0660-U+0669) look like digits to a human eye but
+    # do not match the ASCII-only ``[0-9]`` character class in ``_DATE_RE``;
+    # this renders as "2024-01-01" but must be rejected, not silently coerced.
+    arabic_2024_01_01 = "٢٠٢٤-٠١-٠١"
+    with pytest.raises(ValueError, match="needs ASCII ISO dates"):
+        OutcomeWindow(status="available", start_date=arabic_2024_01_01, end_date="2024-01-01")
+
+
+# ---------------------------------------------------------------------------
+# 14. MUTATION REGRESSIONS (item 5, R-F5/R-F6): frozen=True is shallow, so
+# the constructor must defensively copy caller-held mutables, and every
+# read-only registry must reject item assignment.
+# ---------------------------------------------------------------------------
+
+
+def test_metric_snapshot_mutation_after_construction_does_not_affect_identity() -> None:
+    source: dict[str, MetricReading] = {"sharpe": MetricReading(value=1.0)}
+    outcome = _outcome(metric_snapshot=source)
+    original_outcome_id = outcome.outcome_id()
+    original_to_dict = outcome.to_dict()
+
+    source["turnover"] = MetricReading(value=0.9)  # forbidden: mutate the caller's dict post-construction
+
+    assert outcome.outcome_id() == original_outcome_id
+    assert outcome.to_dict() == original_to_dict
+    assert "turnover" not in outcome.to_dict()["metric_snapshot"]
+
+
+def test_metric_snapshot_item_assignment_raises_type_error() -> None:
+    outcome = _outcome(metric_snapshot={"sharpe": MetricReading(value=1.0)})
+    with pytest.raises(TypeError):
+        outcome.metric_snapshot["sharpe"] = MetricReading(value=99.0)  # type: ignore[index]
+
+
+def test_reason_codes_list_input_is_stored_as_tuple_and_detached_from_source() -> None:
+    source: list[str] = ["TURNOVER_TOO_HIGH"]
+    outcome = _blocked_outcome(reason_codes=source)
+    assert isinstance(outcome.reason_codes, tuple)
+    assert outcome.reason_codes == ("TURNOVER_TOO_HIGH",)
+
+    source.append("REDUNDANCY_HIGH")  # mutate the caller's list after construction
+
+    assert outcome.reason_codes == ("TURNOVER_TOO_HIGH",)
+
+
+def test_stage_evidence_strength_item_assignment_raises_type_error() -> None:
+    with pytest.raises(TypeError):
+        STAGE_EVIDENCE_STRENGTH["evaluate"] = "submitted_live"  # type: ignore[index]
+
+
+def test_evidence_strength_rank_item_assignment_raises_type_error() -> None:
+    with pytest.raises(TypeError):
+        EVIDENCE_STRENGTH_RANK["prescreen"] = 99  # type: ignore[index]
+
+
+def test_metric_specs_item_assignment_raises_type_error() -> None:
+    with pytest.raises(TypeError):
+        METRIC_SPECS["sharpe"] = ("ratio", "tampered")  # type: ignore[index]
+
+
+# ---------------------------------------------------------------------------
+# 15. LIFECYCLE/VERDICT ELIGIBILITY (item 6, R-F2): lifecycle bookkeeping and
+# unknown/not_applicable verdicts carry no scientific answer and must mint
+# zero observations; submit-stage bidirectional coherence (opus F3) is
+# enforced both ways.
+# ---------------------------------------------------------------------------
+
+
+def test_submit_stage_unknown_verdict_with_submitted_lifecycle_yields_no_observations() -> None:
+    outcome = _outcome(
+        stage="submit",
+        verdict="unknown",
+        reason_codes=(REASON_NONE,),
+        lifecycle_status="submitted",
+    )
+    assert outcome_to_observations(outcome) == ()
+
+
+def test_not_applicable_verdict_yields_no_observations() -> None:
+    outcome = _outcome(stage="evaluate", verdict="not_applicable", reason_codes=(REASON_NONE,))
+    assert outcome_to_observations(outcome) == ()
+
+
+def test_submit_stage_passed_accepted_yields_one_observation_with_submitted_live_strength() -> None:
+    outcome = _outcome(
+        stage="submit",
+        verdict="passed",
+        reason_codes=(REASON_NONE,),
+        lifecycle_status="accepted",
+    )
+    observations = outcome_to_observations(outcome)
+    assert len(observations) == 1
+    assert outcome.evidence_strength == "submitted_live"
+    assert outcome.to_record()["evidence_strength"] == "submitted_live"
+
+
+def test_submit_stage_with_empty_lifecycle_status_raises() -> None:
+    with pytest.raises(ValueError, match="must carry a lifecycle_status"):
+        _outcome(stage="submit", verdict="passed", reason_codes=(REASON_NONE,), lifecycle_status="")
+
+
+_NON_SUBMIT_STAGES = tuple(stage for stage in STAGES if stage != "submit")
+
+
+@pytest.mark.parametrize("stage", _NON_SUBMIT_STAGES)
+def test_non_submit_stage_rejects_any_non_empty_lifecycle_status(stage: str) -> None:
+    with pytest.raises(ValueError, match="only representable on the submit stage"):
+        _outcome(stage=stage, verdict="passed", reason_codes=(REASON_NONE,), lifecycle_status="submitted")
+
+
+# ---------------------------------------------------------------------------
+# 16. SENTINELS (item 7, R-F4): "unknown"/"global" are the signature's own
+# absent-dimension renderings, so accepting them as VALUES would let
+# unrelated factors unify into one signature. Checked across all five scope
+# dimensions x both reserved sentinels (10 cases).
+# ---------------------------------------------------------------------------
+
+_RESERVED_SCOPE_SENTINELS = ("unknown", "global")
+
+
+@pytest.mark.parametrize("dim_field", _SCOPE_DIM_FIELDS)
+@pytest.mark.parametrize("sentinel", _RESERVED_SCOPE_SENTINELS)
+def test_outcome_scope_rejects_reserved_sentinel_in_every_dim(sentinel: str, dim_field: str) -> None:
+    with pytest.raises(ValueError, match="reserved sentinel"):
+        OutcomeScope(**{dim_field: sentinel})
+
+
+# ---------------------------------------------------------------------------
+# 17. REF ALLOWLIST CORPUS (item 8, R-F8/opus F4).
+#
+# DEVIATION FROM THE LITERAL ADJUDICATED SPEC TEXT: the spec's rejected-corpus
+# list included a fragment shaped like "Users" + slash + a real local account
+# name + "/artifacts/run.json". That exact literal is not used here. Two
+# independent rules in the same task forbid it: this task's own gate
+# instruction (no leading-slash-Users-style or private-path-shaped strings in
+# test data -- use "/opt/example" or Users-less fragments per the existing
+# corpus convention) and AGENTS.md's Coding Rules ("Never commit ... local
+# absolute paths"). Substituted with "opt/example/artifacts/run.json"
+# (Users-less, per the gate's own suggested style), which exercises the
+# IDENTICAL mechanism: prefixing a leading slash still resolves to an
+# allowlisted root name ("opt", alongside "Users" in ``_POSIX_PATH_RE``)
+# followed by >=1 more "/segment" groups, so
+# ``redact_free_text("/" + value) != "/" + value`` fires the same
+# slash-stripped-absolute-path probe the finding is about. Flagged in the
+# task report per the escalation clause.
+# ---------------------------------------------------------------------------
+
+_REF_ALLOWLIST_REJECTED = (
+    "opt/example/artifacts/run.json",  # slash-stripped absolute-path shape (see deviation note above)
+    "home/user/x",  # slash-stripped absolute-path shape, second allowlisted root name
+    "runs/n2/pre​screen.json",  # zero-width space (U+200B) embedded mid-segment
+    "$HOME/x",  # banned char '$'
+    "%2e%2e/x",  # banned char '%'
+    "a b",  # space is outside the printable-ASCII wall
+    "a//b",  # double slash -> empty segment
+    ".hidden/x",  # dot-segment: first char must be alnum/underscore
+    "a/./b",  # "." segment, same rule as above
+    "a/b/",  # trailing slash -> empty final segment
+    "/a/b",  # leading slash -> empty first segment
+    "a\\b",  # banned char '\\'
+    "C:/x",  # banned char ':'
+    "a" * 201,  # exceeds the 200-char ceiling
+)
+
+
+@pytest.mark.parametrize("bad_ref", _REF_ALLOWLIST_REJECTED)
+def test_research_outcome_rejects_ref_allowlist_corpus(bad_ref: str) -> None:
+    with pytest.raises(ValueError):
+        _outcome(evidence_ref=bad_ref)
+
+
+_REF_ALLOWLIST_ACCEPTED = (
+    "runs/n2/prescreen.json",
+    "run_0001",
+    "a" * 64,  # single segment exactly at the per-segment length ceiling
+)
+
+
+@pytest.mark.parametrize("good_ref", _REF_ALLOWLIST_ACCEPTED)
+def test_research_outcome_accepts_ref_allowlist_corpus(good_ref: str) -> None:
+    outcome = _outcome(evidence_ref=good_ref)
+    assert outcome.evidence_ref == good_ref
+
+
+# ---------------------------------------------------------------------------
+# 18. TO_RECORD ENVELOPE (item 9, R-F3): the persisted ledger envelope, not
+# bare ``to_dict()``, is what SE-P2 ingress appends per outcome.
+# ---------------------------------------------------------------------------
+
+
+def test_to_record_envelope_has_exact_keys_and_pinned_schema_literal() -> None:
+    outcome = _blocked_outcome(reason_codes=("REDUNDANCY_HIGH", "TURNOVER_TOO_HIGH"))
+    record = outcome.to_record()
+
+    assert record["record_schema"] == "qf.research_outcome_record.v1"
+    assert set(record.keys()) == {
+        "record_schema",
+        "outcome_id",
+        "evidence_run_id",
+        "evidence_strength",
+        "signatures",
+        "outcome",
+    }
+    assert len(record["signatures"]) == len(outcome.reason_codes)
+    assert "sample_role" in record["outcome"]
+
+
+def test_research_outcome_rejects_invalid_sample_role() -> None:
+    with pytest.raises(ValueError, match="sample_role must be one of"):
+        _outcome(sample_role="oos_garbage")
+
+
+@pytest.mark.parametrize("sample_role", SAMPLE_ROLES)
+def test_research_outcome_accepts_every_sample_role(sample_role: str) -> None:
+    outcome = _outcome(sample_role=sample_role)
+    assert outcome.sample_role == sample_role
+
+
+# ---------------------------------------------------------------------------
+# 19. FULL-KEY SNAPSHOT (item 10): every registered metric key at once, and
+# ``to_dict()`` output order is independent of construction/insertion order.
+# ---------------------------------------------------------------------------
+
+
+def test_outcome_accepts_full_metric_snapshot_with_every_registered_key() -> None:
+    snapshot = {key: MetricReading(value=0.1) for key in METRIC_SPECS}
+    outcome = _outcome(metric_snapshot=snapshot)
+    assert set(outcome.metric_snapshot.keys()) == set(METRIC_SPECS.keys())
+
+
+def test_full_metric_snapshot_to_dict_keys_emerge_sorted_regardless_of_shuffled_insertion() -> None:
+    keys = list(METRIC_SPECS.keys())
+    shuffled_keys = list(keys)
+    random.Random(20260713).shuffle(shuffled_keys)
+    assert shuffled_keys != keys  # sanity: the shuffle actually reordered insertion
+
+    snapshot = {key: MetricReading(value=0.2) for key in shuffled_keys}
+    outcome = _outcome(metric_snapshot=snapshot)
+
+    assert list(outcome.to_dict()["metric_snapshot"].keys()) == sorted(keys)
+
+
+# ---------------------------------------------------------------------------
+# 20. PROMOTE() DEDUP DIRECT (item 11, R-F1): the SE-ii evidence-unit cap
+# pinned directly against raw ``MemoryObservation`` rows, independent of the
+# outcomes.py mapper -- this is memory.py's own contract, not a derived one.
+# ---------------------------------------------------------------------------
+
+
+def test_promote_dedups_same_signature_same_run_id_to_one_kept_row_with_earliest_first_seen() -> None:
+    signature = "sig_promote_dedup_direct"
+    rows = [
+        MemoryObservation(
+            signature=signature,
+            statement="s",
+            run_id="run_a",
+            observed_at=T2,
+            evidence_ref="ev_a_t2",
+            failure_class="gate_blocked",
+        ),
+        MemoryObservation(
+            signature=signature,
+            statement="s",
+            run_id="run_a",
+            observed_at=T1,  # earliest of the three run_a rows
+            evidence_ref="ev_a_t1",
+            failure_class="gate_blocked",
+        ),
+        MemoryObservation(
+            signature=signature,
+            statement="s",
+            run_id="run_a",
+            observed_at=T3,
+            evidence_ref="ev_a_t3",
+            failure_class="gate_blocked",
+        ),
+        MemoryObservation(
+            signature=signature,
+            statement="s",
+            run_id="run_b",
+            observed_at=T4,
+            evidence_ref="ev_b_t4",
+            failure_class="gate_blocked",
+        ),
+    ]
+
+    decisions = promote(rows)
+
+    assert len(decisions) == 1
+    decision = decisions[0]
+    assert decision.kind == "failure"
+    assert decision.status == "active"
+    # Three run_a rows collapse to ONE evidence unit; only run_a + run_b remain.
+    assert decision.observation_count == 2
+    # First-kept determinism: the EARLIEST observed_at among the duplicate
+    # run_a rows (T1, not the list-literal-first T2) is the one retained.
+    assert decision.first_seen == T1
+    assert "ev_a_t1" in decision.evidence_refs
+    assert "ev_a_t2" not in decision.evidence_refs
+    assert "ev_a_t3" not in decision.evidence_refs
+
+
+# ---------------------------------------------------------------------------
+# 21. ALL-REASONS (item 12): a blocked outcome carrying every non-NONE reason
+# code in canonical sorted order fans out to one distinct-signature
+# observation per reason.
+# ---------------------------------------------------------------------------
+
+
+def test_blocked_outcome_with_every_non_none_reason_code_yields_one_observation_per_reason() -> None:
+    reasons = tuple(sorted(REASON_CODES - {REASON_NONE}))
+    outcome = _blocked_outcome(reason_codes=reasons)
+
+    observations = outcome_to_observations(outcome)
+
+    assert len(observations) == len(reasons)
+    signatures = {observation.signature for observation in observations}
+    assert len(signatures) == len(reasons)
