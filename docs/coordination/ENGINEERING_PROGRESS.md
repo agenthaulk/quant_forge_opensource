@@ -424,3 +424,88 @@ pytest -q` + `python3 scripts/release_safety_scan.py` + CLI `--help` +
   platform call anywhere).
 - **Integration line:** `fable/phase-de-integration` (local-only) carries
   both fix batches; combined image `qf-de:r2`.
+## Phase F — CP-INT bug-fix batch (BUG_LIST #001–#005) — 2026-07-10/11
+
+Branch `fable/phase-f-cpint-bugfixes` (base `06a4bf2`). Source: the owner-
+requested post-merge deep integration test registered five defects in
+`docs/coordination/BUG_LIST.md` (the canonical bug registry, first tracked
+in this phase). Process per the standing owner rules: Fable adjudicated
+every fix design before dispatch; implementation lanes (sonnet/opus) built
+to binding specs; gpt-5.6-terra served as the strict reviewer across four
+adversarial rounds.
+
+- **#001 (MAJOR, OOM):** single-build seam — `build_directed_matrix`, one
+  shared per-period rank-IC sweep (`compute_period_ic_sweep` →
+  `PeriodICSweep`), redundancy from the same sweep; member frames released
+  early with explicit `gc.collect()` (web jobs disable gc); wide-matrix
+  working set dropped before the engine drive. Numerics bit-identical
+  (identity + single-sweep regressions; goldens unchanged).
+  `docs/architecture.md` records memory behavior + container sizing.
+- **Reuse-seam integrity (terra rounds 2–4):** the sweep is provenance-
+  bound (dates/grid/params/columns/row-count/edge keys), content-bound
+  (whole-frame hashes of the sorted matrix and validated close), payload-
+  self-certifying (`ics_content_hash` + proxy-frozen payload), and consumed
+  via validated private snapshots on BOTH the weight-driving and advisory
+  surfaces (check-then-use closed). Final verdict T2-FINAL3: PASS.
+- **#003 (MINOR, dangling composites):** tri-state
+  `precomputed_values_present` on registry rows (FP-4 null-not-guessed,
+  probe through the scoring path's own store roots, I/O failure propagates
+  — False only on readable confirmed absence); early `_prepare` refusal +
+  distinct fetch-loop backstop; picker disables 值不可用 rows; registry
+  badges. Value retention/GC stays a recorded open decision.
+- **#005 (NIT):** `_concat_score_frames` empty-frame exclusion (pandas
+  remediation class; original warning not locally reproducible — recorded
+  as such in the register).
+- **#002/#004 (local adapter, never ships):** recursive derive expansion
+  (parenthesized, cycle-guarded, depth-capped, per-occurrence
+  `applied_derives` audit trail) + presence-branched mapping resolution
+  (blank env var errors honestly; repo-layout fallback; README section).
+  121 offline tests.
+- **Commits:** `fe87642` → `332d0c7` (T-1..T-4) → `6fdfa9b` (content
+  hashes) → `0d77bea` (payload self-integrity) → `0a9d8ac` (snapshot
+  consumption). Gates at tip: 1239 passed / release scan 237 files / CLI
+  OK / leak sweeps clean. In-container (fresh image off the tip archive):
+  1235 passed, 4 skipped.
+- **CP-INT (this phase):** fresh `qf-f:r1` image from `git archive` of the
+  tip; demo-workspace new-user mode (external cn_a volume not mounted this
+  run — recorded); real desktop Chrome via the Claude-in-Chrome extension
+  (real-Chrome control; embedded-browser shortcut NOT used); §3 preflights
+  all green incl. a real DeepSeek `llm-smoke` parse. Results recorded in
+  the phase-F CP-INT report block below when the walk completes.
+
+### Phase F closure — #006/#007 + failure-path hardening (2026-07-11 → 07-14)
+
+- **#006 (rd/research_loop, `fe23744`):** the demo-workspace RD wholesale
+  failure's true root cause was the SEED self-assessment lacking exception
+  handling when a required metric is unavailable on short histories
+  (candidate scoring was already weight-gated). Fix: typed
+  `metric_unavailable:<name>` reasons, seed failure → `seed_assessment=None`
+  + `seed_unscorable` trace + None-safe consumers; zero-weight components
+  never fetch; runs complete with the existing honest outcome fields.
+- **#007 (web/lineage, `fe23744`):** pure-Web runs never wrote RunIndex.
+  Fix: the workbench recording block extracted byte-identically into
+  `lineage/recording.record_run` (CLI path unchanged); web validate records
+  1 evaluate + 2 backtests, staggered 1 backtest, multi-factor 1 under the
+  COMPOSITE_ id inside the cleanup envelope.
+- **CP-INT (fresh-container, real Chrome):** all core acceptance passed on
+  the rebuilt image, incl. the #003 end-to-end refusal path and honest n/a
+  annualization; both fixes live-verified (evidence chain 0→3 rows; the
+  previously-fatal balanced RD run completes with structured honest
+  outcomes).
+- **Review (sol-high, replacing the discontinued terra lane):** round
+  `qf-phasef-solR5-20260714` FAIL with PF-F1..F4 → `bfce31f` (narrowed
+  seed-recovery catch so non-metric exceptions fail loudly again; report
+  renders n/a instead of synthetic zeros; composite recording moved after
+  payload construction; late-cancel no longer relabels completed runs) →
+  re-verify `qf-phasef-reverify-20260714b` (F1–F3 CLOSED, one residual
+  window) → `e2aa2f4` uniform last-look checkpoint before every recording
+  site + a regression reproducing the reviewer's probe. Adjudicated CLOSED.
+- **Batch state at closure:** all seven BUG_LIST rows ✅ DONE (register
+  synced into this branch); merged with main (`3b107c5`, docs-only); gates
+  1252 passed / CLI / diff-check / release scan 241 files. Known follow-up
+  (recorded, not in this batch): fe23744 adds net +203 lines to
+  apps/web/api.py, predating the D12 freeze — the D12 compliance chore
+  extracts them into a module right after this branch merges.
+- **Continuity note:** the repo migrated Desktop→Dropbox mid-phase
+  (2026-07-12, `mv` with .git intact); this closure resumed from the
+  migrated branch after forensic verification that nothing was lost.

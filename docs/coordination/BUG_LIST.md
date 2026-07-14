@@ -21,11 +21,13 @@
 
 | ID | Sev | Area | Summary | Source | Opened | Status | Fix (commit/PR) | Verified-by |
 |---|---|---|---|---|---|---|---|---|
-| #001 | MAJOR | synthesis / backtest | 多因子回测（尤其 fitted `ic_weighted`）在全 panel 上内存无界，容器内存紧张时被 **OOMKilled (exit 137)**，job 静默变 failed | CP-INT 自动化 | 2026-07-10 | FIXED (review-pending) | phase-f 分支：单次构建共享缝（build_directed_matrix + period_ics 复用 + redundancy_from_period_ics）+ 成员帧及早释放与定点 gc.collect（jobs 关 GC）+ architecture.md 容器内存说明；数值逐位不变（12 项新回归 + 金样全绿） | — |
-| #002 | MAJOR | integrations / worldquant translator | QF→BRAIN 翻译器**拒绝 `derive/review/none` 置信度字段**（如 `return_5d` 有 derive 公式仍报 `NOT_TRANSLATABLE`）；仅 exact/rename 字段可翻译 ⇒ 多数 cn_a 因子无法翻译 | CP-INT 手工 | 2026-07-10 | FIXED (review-pending) | 本地 worldquant/adapter（按设计不入库）：translate_formula_tracked + 递归 derive 展开（括号化、环检测、深度≤8、applied_derives 全记录）；review/none/未知照旧拒绝 | — |
-| #003 | MINOR | synthesis / registry+picker | 注册表/picker 列出临时 `COMPOSITE_*` 合成因子，但其物化值在 per-run overlay（易失）；把它当成员再合成 → `composite frame has no rows to materialize` | CP-INT 自动化 | 2026-07-10 | IN-PROGRESS | — | — |
-| #004 | MINOR | integrations / worldquant adapter | BRAIN 适配器包只装代码、不带 `worldquant/mapping/*.yaml`；翻译需 `QF_WQ_MAPPING_DIR`，缺失时降级 `BACKEND_NOT_CONFIGURED` | CP-INT 手工 | 2026-07-10 | FIXED (review-pending) | 本地 adapter：解析序 env（无效即报错不穿透）→ 包相对 repo-layout 回退（验 YAML 存在）→ 诚实 BACKEND_NOT_CONFIGURED；README 新增 Mapping data 节 | — |
-| #005 | NIT | factor_engine / value_store | `value_store.py:146` 空/全 NA `pd.concat` 触发 `FutureWarning`（无害但污染日志） | CP-INT 手工 | 2026-07-10 | FIXED (review-pending) | phase-f 分支：_concat_score_frames 先剔除空帧（pandas 官方补救类）；两处调用点收敛；注：pinned pandas 2.2.3 下未能本地复现原警告（dtype 全路径一致），容器内触发条件存疑但风险类已消除 | — |
+| #001 | MAJOR | synthesis / backtest | 多因子回测（尤其 fitted `ic_weighted`）在全 panel 上内存无界，容器内存紧张时被 **OOMKilled (exit 137)**，job 静默变 failed | CP-INT 自动化 | 2026-07-10 | ✅ DONE | fe87642（单次构建缝+及早释放+文档）→ 332d0c7 T-1/T-3（末位帧滞留、取消检查点）→ 6fdfa9b/0d77bea/0a9d8ac（period_ics 溯源+内容哈希+载荷自证+快照式消费） | terra R1(7项发现)→R2(6/7)→R3/R4 全 CLOSED，T2-FINAL3: PASS 2026-07-11 |
+| #002 | MAJOR | integrations / worldquant translator | QF→BRAIN 翻译器**拒绝 `derive/review/none` 置信度字段**（如 `return_5d` 有 derive 公式仍报 `NOT_TRANSLATABLE`）；仅 exact/rename 字段可翻译 ⇒ 多数 cn_a 因子无法翻译 | CP-INT 手工 | 2026-07-10 | ✅ DONE | 本地 worldquant/adapter（按设计不入库）：递归 derive 展开 + T-5/T-6（右侧同优先级括号、逐次审计留痕） | terra R1(7项发现)→R2(6/7)→R3/R4 全 CLOSED，T2-FINAL3: PASS 2026-07-11 |
+| #003 | MINOR | synthesis / registry+picker | 注册表/picker 列出临时 `COMPOSITE_*` 合成因子，但其物化值在 per-run overlay（易失）；把它当成员再合成 → `composite frame has no rows to materialize` | CP-INT 自动化 | 2026-07-10 | ✅ DONE | fe87642：注册表 precomputed_values_present 三态（FP-4）+ _prepare 前置拒绝 + 取数后备拒绝 + picker 禁用/registry 徽标 → 332d0c7 T-4（探针 I/O 异常穿透，False 仅限可读确无） | terra R1(7项发现)→R2(6/7)→R3/R4 全 CLOSED，T2-FINAL3: PASS 2026-07-11 |
+| #004 | MINOR | integrations / worldquant adapter | BRAIN 适配器包只装代码、不带 `worldquant/mapping/*.yaml`；翻译需 `QF_WQ_MAPPING_DIR`，缺失时降级 `BACKEND_NOT_CONFIGURED` | CP-INT 手工 | 2026-07-10 | ✅ DONE | 本地 adapter：三级解析序 → T-7（存在性分支，空白值诚实报错）；README Mapping data 节 | terra R1(7项发现)→R2(6/7)→R3/R4 全 CLOSED，T2-FINAL3: PASS 2026-07-11 |
+| #005 | NIT | factor_engine / value_store | `value_store.py:146` 空/全 NA `pd.concat` 触发 `FutureWarning`（无害但污染日志） | CP-INT 手工 | 2026-07-10 | ✅ DONE | fe87642：_concat_score_frames 空帧剔除（pandas 官方补救类；本地未复现原警告，已如实注记） | terra R1(7项发现)→R2(6/7)→R3/R4 全 CLOSED，T2-FINAL3: PASS 2026-07-11 |
+| #006 | MAJOR | rd / research_loop | demo 工作区（documented 新用户路径，160 交易日）Web RD **任一目标**（balanced 与纯 rank_ic 实测）均整体失败 `net_annualized_return is unavailable (insufficient_sample: INSUFFICIENT_ANNUALIZATION_HISTORY)`——年化指标被无条件强制、与所选目标无关；且以 job-failed 裸串呈现而非结构化 RD 结局（no_optimization_performed / stopped_reason） | Phase-F CP-INT 真 Chrome（双目标复现） | 2026-07-11 | ✅ DONE | fe23744：真根因=种子自评估无异常处理（候选侧本有权重门控）；typed metric_unavailable 理由 + seed_unscorable 降级 + None-safe 消费端，run 以既有诚实结局字段完成；零权重组件不再取数 → bfce31f PF-F1 窄化捕获(非指标异常复响)+ PF-F2 报告 n/a 取代合成零 | sol R5 (qf-phasef-solR5-20260714): #006 关闭曲线 PF-F1/F2 → 修复; #007 PF-F3/F4 → 修复+复验(qf-phasef-reverify-20260714b: F1-F3 CLOSED, F4 残余窗口)→ e2aa2f4 终检查点+生产窗口回归, adjudicated CLOSED 2026-07-14 |
+| #007 | MAJOR | web / lineage | 纯 Web 用户的验证/回测/稳健性运行**从不写 RunIndex**（`_validate_factor_workflow` 直连 evaluate/backtest，绕过 workbench 记录路径）⇒ 注册表证据链与「研究历史」页对 Web 用户恒空（FP-H 溯源缺口；实测 3 因子验证+2 次稳健性后 runs/index.jsonl 不存在） | Phase-F CP-INT 真 Chrome + API/容器核对 | 2026-07-11 | ✅ DONE | fe23744：workbench 记录段逐字节抽为 lineage/recording.record_run 共享；web 三工作流成功即记录（validate=1 evaluate+2 backtest；staggered=1；multi-factor=1 under COMPOSITE_ id）；5 个幻影 artifact 假缝测试改为守约 → bfce31f PF-F3 记录后置于 payload 成功之后 + PF-F4 completion-wins 边界 → e2aa2f4 全工作流记录前最后一望检查点 | sol R5 (qf-phasef-solR5-20260714): #006 关闭曲线 PF-F1/F2 → 修复; #007 PF-F3/F4 → 修复+复验(qf-phasef-reverify-20260714b: F1-F3 CLOSED, F4 残余窗口)→ e2aa2f4 终检查点+生产窗口回归, adjudicated CLOSED 2026-07-14 |
 
 ## 详情 / Detail
 
@@ -52,6 +54,31 @@
 ### #005 — pandas FutureWarning
 - **Repro**：容器日志反复出现 `value_store.py:146 ... concat ... FutureWarning`。
 - **Suggested fix**：concat 前排除空/全 NA 列，或按新语义显式指定 dtype。
+
+## 评审记录 / Review trail
+
+### Round 1 — terra (gpt-5.6-terra, xhigh, 2026-07-10, fingerprint qf-phasef-review-20260710)
+
+判词：#005 **ACCEPT**；#001/#003/#002/#004 **REWORK**（7 项 MAJOR，0 BLOCKING；
+猎项 no-finding 清单见评审输出：IC 排序奇偶、探针/取分同根构造、注册表探测范围、
+前端三态、单存活帧别名、标识符碰撞、间接环旁路均无发现）。
+
+| 发现 | 位置 | 缺陷 | 状态 |
+|---|---|---|---|
+| T-1 | api.py 取数循环 | 局部变量滞留末位成员整帧，穿透释放点 | 返工中（暂停时 in-flight） |
+| T-2 | service.py period_ics | 只验形状不验溯源，外来 IC 可污染 PIT 拟合 | 返工中（PeriodICSweep 指纹绑定方案） |
+| T-3 | api.py | 先验路径取消检查点被挪到昂贵扫描之后 | 返工中 |
+| T-4 | value_store.has_stored_values | I/O 失败被折叠为 False（误报确证缺失→错误拒绝） | 返工中 |
+| T-5 | adapter translator._render | `+`/`*` 右侧同优先级括号被丢弃，浮点求值序改变 | ✅ 已修（121 测试） |
+| T-6 | adapter applied_derives | 去重丢失重复代换审计记录 | ✅ 已修（逐次留痕） |
+| T-7 | adapter default_mapping_dir | 空白 QF_WQ_MAPPING_DIR 静默穿透到回退 | ✅ 已修（存在性分支+诚实报错） |
+
+闭环规则已履行：T-1..T-4 落地于 332d0c7；T-2 的三层收口（内容哈希 6fdfa9b、载荷自证 0d77bea、快照式消费 0a9d8ac）经 terra R3/R4 聚焦复核，终判 **T2-FINAL3: PASS**（2026-07-11，指纹 qf-phasef-t2final3-20260711a，模型经 rollout 核验）。五行据此翻 ✅ DONE。
+
+### Rounds 2–4 — terra 复核链
+- R2（reverify）：T-1/3/4/5/6/7 CLOSED；T-2 NOT-CLOSED（结构指纹不验内容）。
+- R3（t2final）：内容哈希确认有效无新病理；发现载荷本身可变未哈希 → 0d77bea。
+- R4（t2final2/3）：发现冗余面未验载荷 + 校验-使用竞态 → 0a9d8ac 快照式消费；终判 PASS。
 
 ## 观察 / 非缺陷（记录但不作为 OPEN bug）
 
