@@ -27,6 +27,8 @@ from quant_forge.research_loop.memory import (
     REVIEW_ACTIONS,
     MemoryReviewEvent,
     ResearchMemoryStore,
+    _quarantine_path_for,
+    _repair_torn_tail,
 )
 
 SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
@@ -506,6 +508,159 @@ def test_row_content_change_lapses_activation_until_re_review(tmp_path: Path) ->
 
 
 # ---------------------------------------------------------------------------
+# R3 rework item R3-2 (MINOR): honest dangling labels. rule_review_snapshot()
+# (built from _rule_snapshot_unlocked()) must tell apart three genuinely
+# different reasons an event fails to bind the CURRENT row: (i) it doesn't
+# fail at all -- it binds the current row, active-eligible; (ii) it binds a
+# REAL row this signature once had (rules.jsonl is append-only, so a
+# superseded row's entry_id is still on disk) -- lapsed_pending_re_review,
+# where the CLI's "row content changed" explanation is true by construction;
+# (iii) it binds NO row this signature has EVER had -- a forged, corrupted,
+# or wrong-signature copy-paste -- never_reviewed, not a false "content
+# changed" claim, with a dangling-reference warning logged instead.
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_case_i_event_bound_to_current_row_is_active(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    row = _promote_rule(store, signature="sig_current")
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_current", reviewed_entry_id=row["entry_id"],
+        action="activate", actor="alice", decided_at=T1,
+    )
+    snapshot = store.rule_review_snapshot()
+    assert snapshot["sig_current"]["state"] == "active"
+    assert snapshot["sig_current"]["reviewed_entry_id"] == row["entry_id"]
+
+
+def test_snapshot_case_ii_event_bound_to_a_superseded_row_is_lapsed(tmp_path: Path) -> None:
+    # The event's reviewed_entry_id matches a REAL row this signature once
+    # held, but a newer observation has since superseded it -- the content
+    # genuinely changed since the review, so lapsed_pending_re_review (and
+    # its "row content changed" label) is true by construction.
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    old_row = _promote_rule(store, signature="sig_lapsed")
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_lapsed", reviewed_entry_id=old_row["entry_id"],
+        action="activate", actor="alice", decided_at=T1,
+    )
+    assert store.rule_review_snapshot()["sig_lapsed"]["state"] == "active"
+
+    store.record_observation(
+        signature="sig_lapsed", statement="rule statement for sig_lapsed", run_id="sig_lapsed-4",
+        observed_at=T4, data_window="2025-01-01:2025-06-30",
+    )
+    store.promote_pending()
+    new_row = store.resolve_signature_prefix("rule", "sig_lapsed")
+    assert new_row["entry_id"] != old_row["entry_id"]
+
+    snapshot = store.rule_review_snapshot()
+    assert snapshot["sig_lapsed"]["state"] == "lapsed_pending_re_review"
+
+
+def test_snapshot_case_iii_event_bound_to_no_row_ever_is_never_reviewed_not_lapsed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The event's reviewed_entry_id never matched ANY row this signature has
+    # EVER had. Before R3-2 this was indistinguishable from case (ii) and
+    # yielded lapsed_pending_re_review, falsely implying real content had
+    # changed. It must instead read as never_reviewed -- no REAL review ever
+    # bound to this signature -- with a warning logged for visibility.
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    row = _promote_rule(store, signature="sig_dangling_only")
+    bogus_entry_id = "f" * 64
+    assert bogus_entry_id != row["entry_id"]
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_dangling_only", reviewed_entry_id=bogus_entry_id,
+        action="activate", actor="mallory", decided_at=T1,
+    )
+
+    with caplog.at_level("WARNING", logger="quant_forge.research_loop.memory"):
+        snapshot = store.rule_review_snapshot()
+    assert snapshot["sig_dangling_only"]["state"] == "never_reviewed"
+    assert any(
+        "dangling" in message and "sig_dangling_only" in message and "never matched" in message
+        for message in caplog.messages
+    )
+
+
+def test_snapshot_signature_with_both_a_lapsed_and_a_dangling_event_is_lapsed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A signature can accumulate BOTH kinds of non-binding event over its
+    # history: one genuinely bound to a row it once had (now superseded),
+    # and, separately, a dangling one that never matched anything real. The
+    # genuine review history wins the classification -- lapsed_pending_re_review,
+    # which is true -- while the dangling event is still independently
+    # flagged by its own warning; one bad reference does not erase a real
+    # review's evidentiary weight, but it is not silently swallowed either.
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    old_row = _promote_rule(store, signature="sig_mixed")
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_mixed", reviewed_entry_id=old_row["entry_id"],
+        action="activate", actor="alice", decided_at=T1,
+    )
+    store.record_observation(
+        signature="sig_mixed", statement="rule statement for sig_mixed", run_id="sig_mixed-4",
+        observed_at=T4, data_window="2025-01-01:2025-06-30",
+    )
+    store.promote_pending()  # supersedes old_row: the activate event above is now lapsed, not current-bound
+
+    bogus_entry_id = "e" * 64
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_mixed", reviewed_entry_id=bogus_entry_id,
+        action="deactivate", actor="mallory", decided_at=T2,
+    )
+
+    with caplog.at_level("WARNING", logger="quant_forge.research_loop.memory"):
+        snapshot = store.rule_review_snapshot()
+    assert snapshot["sig_mixed"]["state"] == "lapsed_pending_re_review"
+    assert any("dangling" in message and "sig_mixed" in message for message in caplog.messages)
+
+
+def test_cli_lists_honest_labels_for_lapsed_vs_dangling_never_reviewed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # End-to-end confirmation through the actual CLI surface (R3-2's stated
+    # goal: "CLI labels must follow"): a genuinely lapsed signature shows the
+    # "row content changed" wording, and a dangling-only signature shows the
+    # plain pending wording -- never the reverse -- in the SAME listing.
+    artifact_root = tmp_path / "artifacts"
+    root_arg = ["--artifact-root", str(artifact_root)]
+    store = ResearchMemoryStore(artifact_root)
+
+    old_row = _promote_rule(store, signature="sig_cli_lapsed")
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_cli_lapsed", reviewed_entry_id=old_row["entry_id"],
+        action="activate", actor="alice", decided_at=T1,
+    )
+    store.record_observation(
+        signature="sig_cli_lapsed", statement="rule statement for sig_cli_lapsed", run_id="sig_cli_lapsed-4",
+        observed_at=T4, data_window="2025-01-01:2025-06-30",
+    )
+    store.promote_pending()  # lapses the activation above
+
+    dangling_row = _promote_rule(store, signature="sig_cli_dangling")
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_cli_dangling", reviewed_entry_id="d" * 64,
+        action="activate", actor="mallory", decided_at=T1,
+    )
+    assert "d" * 64 != dangling_row["entry_id"]
+
+    exit_code = cli_main.main(["memory", "rules", "list", *root_arg])
+    listing = capsys.readouterr().out
+    assert exit_code == 0
+    assert "rule statement for sig_cli_lapsed" in listing
+    assert "rule statement for sig_cli_dangling" in listing
+
+    lapsed_line = next(line for line in listing.splitlines() if "sig_cli_lapsed" in line)
+    dangling_line = next(line for line in listing.splitlines() if "sig_cli_dangling" in line)
+    assert "row content changed" in lapsed_line
+    assert "row content changed" not in dangling_line
+    assert "pending -- lower tiers silenced" in dangling_line
+
+
+# ---------------------------------------------------------------------------
 # P4a rework item 7: trailing-line quarantine vs interior corruption.
 # ---------------------------------------------------------------------------
 
@@ -714,6 +869,179 @@ def test_findings_and_failures_jsonl_trailing_corruption_is_tolerated(tmp_path: 
     with store.path_for("failure").open("a", encoding="utf-8") as handle:
         handle.write("}{ not valid json at all {\n")
     assert len(store.list_promoted("failure")) == 1
+
+
+# ---------------------------------------------------------------------------
+# R3 rework item R3-1 (MAJOR): append-safe quarantine on the WRITE side.
+# _read_jsonl's trailing tolerance (R2-5 above) leaves a torn tail ON DISK;
+# without a write-side repair the very NEXT blind append either merges into
+# the torn bytes (the new row is silently lost on the following read -- the
+# reviewer's "lost retry" probe) or, once a further line follows, turns the
+# merged garbage into INTERIOR corruption, which _read_jsonl() raises on (a
+# promote_pending() outage -- the reviewer's "next-append-raises" probe).
+# _repair_torn_tail() runs from _append_jsonl(), inside the caller's existing
+# advisory-lock hold, before every append.
+# ---------------------------------------------------------------------------
+
+
+def test_torn_tail_is_repaired_before_the_next_append(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    store.record_observation(signature="sig_a", statement="first obs", run_id="rd-a", observed_at=T1)
+
+    # A writer dies mid-append: the next line is only partially flushed --
+    # no closing brace, no trailing newline.
+    with store.observations_path.open("a", encoding="utf-8") as handle:
+        handle.write('{"signature": "sig_torn", "statement": "incomplete wri')
+    assert not store.observations_path.read_text(encoding="utf-8").endswith("\n")
+
+    # The next append -- a brand-new, unrelated observation -- must repair
+    # the torn tail FIRST, then land its own data cleanly.
+    store.record_observation(
+        signature="sig_retry", statement="the retry that must not be lost", run_id="rd-retry", observed_at=T2
+    )
+
+    content = store.observations_path.read_text(encoding="utf-8")
+    assert content.endswith("\n")
+    lines = [line for line in content.splitlines() if line.strip()]
+    parsed = [json.loads(line) for line in lines]  # every remaining line parses cleanly
+    assert [row["signature"] for row in parsed] == ["sig_a", "sig_retry"]
+
+    # The torn fragment is preserved for forensics, not silently destroyed.
+    sidecar = _quarantine_path_for(store.observations_path)
+    assert sidecar.exists()
+    assert "sig_torn" in sidecar.read_text(encoding="utf-8")
+
+    # The read path every real caller uses is equally clean.
+    observations = store._read_observations()  # noqa: SLF001
+    assert [o.signature for o in observations] == ["sig_a", "sig_retry"]
+
+    # promote_pending() succeeds cleanly -- no outage.
+    store.record_observation(
+        signature="sig_retry", statement="the retry that must not be lost", run_id="rd-retry-2", observed_at=T3
+    )
+    store.promote_pending()
+    assert store.resolve_signature_prefix("finding", "sig_retry")["signature"] == "sig_retry"
+
+
+def test_reviewers_two_failure_probe_sequence_is_dead(tmp_path: Path) -> None:
+    """The exact two-failure probe from the R3 review: (1) "lost retry" -- a
+    torn trailing line already on disk silently swallows the very next
+    append (the torn fragment and the new line merge into ONE still-torn
+    trailing line, so the new row never comes back on a subsequent read);
+    (2) "next-append-raises" -- a FURTHER append turns that merged garbage
+    into INTERIOR corruption, which _read_jsonl() raises on (a
+    promote_pending()-equivalent outage for review events). Both must be
+    dead: no exception anywhere in the sequence, and every appended
+    signature is recoverable afterwards.
+    """
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    row_a = _promote_rule(store, signature="sig_probe_a")
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_probe_a", reviewed_entry_id=row_a["entry_id"],
+        action="activate", actor="alice", decided_at=T1,
+    )
+
+    # A writer dies mid-append against review_events_path specifically.
+    with store.review_events_path.open("a", encoding="utf-8") as handle:
+        handle.write('{"event_id": "deadbeef", "action": "activate_but_never_fin')
+
+    # Probe 1 ("lost retry"): the next append to THIS file must not be
+    # silently swallowed into the torn bytes.
+    row_b = _promote_rule(store, signature="sig_probe_b")
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_probe_b", reviewed_entry_id=row_b["entry_id"],
+        action="activate", actor="bob", decided_at=T2,
+    )
+    after_first_retry = store._read_review_events_unlocked()  # noqa: SLF001
+    assert {event.target_signature for event in after_first_retry} == {"sig_probe_a", "sig_probe_b"}
+
+    # Probe 2 ("next-append-raises"): a further append -- what would, pre-
+    # fix, complete the merge into a genuinely interior-corrupt line -- must
+    # not raise either.
+    row_c = _promote_rule(store, signature="sig_probe_c")
+    store.record_review_event(
+        target_kind="rule", target_signature="sig_probe_c", reviewed_entry_id=row_c["entry_id"],
+        action="activate", actor="carol", decided_at=T3,
+    )
+    after_second_retry = store._read_review_events_unlocked()  # noqa: SLF001
+    assert {event.target_signature for event in after_second_retry} == {
+        "sig_probe_a", "sig_probe_b", "sig_probe_c",
+    }
+
+    # And the read path every real caller uses (rule_states -> context
+    # builder's steering channel) is equally healthy: no lost activations.
+    assert store.rule_states() == {"sig_probe_a": "active", "sig_probe_b": "active", "sig_probe_c": "active"}
+
+
+def test_repair_torn_tail_alone_leaves_a_clean_file_if_the_append_never_happens(tmp_path: Path) -> None:
+    # _append_jsonl() calls _repair_torn_tail() and THEN performs its own
+    # write as two separate filesystem operations. If the process dies in
+    # between -- after the repair's truncate, before the caller's new data
+    # is appended -- the file left behind must be immediately clean and
+    # valid on its own, never torn, with the pre-existing good data intact.
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    store.record_observation(signature="sig_a", statement="obs a", run_id="rd-a", observed_at=T1)
+    with store.observations_path.open("a", encoding="utf-8") as handle:
+        handle.write('{"signature": "torn", "statem')
+
+    _repair_torn_tail(store.observations_path)  # the "crash" lands exactly HERE -- no append follows
+
+    content = store.observations_path.read_text(encoding="utf-8")
+    assert content.endswith("\n")
+    lines = [line for line in content.splitlines() if line.strip()]
+    for line in lines:
+        json.loads(line)  # every remaining line parses -- no torn or interior corruption
+    assert len(lines) == 1  # only the pre-existing good row; the torn one never lands half-written
+
+    # The store keeps working from this state with no special recovery step.
+    observations = store._read_observations()  # noqa: SLF001
+    assert [o.signature for o in observations] == ["sig_a"]
+
+
+def test_valid_json_tail_missing_only_its_newline_is_healed_not_quarantined(tmp_path: Path) -> None:
+    # A tail that IS valid JSON -- merely missing its trailing newline
+    # terminator -- is not the corruption shape _read_jsonl()'s tolerance
+    # exists for (splitlines() accepts it as a normal row either way). The
+    # write-side repair must not misclassify and quarantine a perfectly
+    # good row just because the writer stopped one byte early.
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    store.record_observation(signature="sig_x", statement="obs x", run_id="rd-x", observed_at=T1)
+    content = store.observations_path.read_text(encoding="utf-8")
+    assert content.endswith("\n")
+    store.observations_path.write_text(content.rstrip("\n"), encoding="utf-8")  # strip ONLY the terminator
+
+    store.record_observation(signature="sig_y", statement="obs y", run_id="rd-y", observed_at=T2)
+
+    sidecar = _quarantine_path_for(store.observations_path)
+    assert not sidecar.exists(), "a fully valid row must never be quarantined"
+    observations = store._read_observations()  # noqa: SLF001
+    assert [o.signature for o in observations] == ["sig_x", "sig_y"]
+
+
+def test_repairing_the_same_torn_tail_twice_does_not_duplicate_the_sidecar_fragment(tmp_path: Path) -> None:
+    # Idempotency: if the process dies AFTER the sidecar write but BEFORE
+    # the truncate (or the repair helper otherwise runs twice against the
+    # same on-disk state), the fragment must not be appended to the sidecar
+    # a second time.
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    store.record_observation(signature="sig_y", statement="obs y", run_id="rd-y", observed_at=T1)
+    with store.observations_path.open("a", encoding="utf-8") as handle:
+        handle.write('{"signature": "torn_y", "bad')
+
+    _repair_torn_tail(store.observations_path)
+    sidecar = _quarantine_path_for(store.observations_path)
+    first_sidecar_content = sidecar.read_text(encoding="utf-8")
+
+    # Re-running the repair against the now-clean file is a pure no-op.
+    _repair_torn_tail(store.observations_path)
+    assert sidecar.read_text(encoding="utf-8") == first_sidecar_content
+
+    # Re-appending the IDENTICAL torn fragment (simulating a crash that
+    # re-lands the same bytes on retry) still does not duplicate it.
+    with store.observations_path.open("ab") as handle:
+        handle.write(b'{"signature": "torn_y", "bad')
+    _repair_torn_tail(store.observations_path)
+    assert sidecar.read_text(encoding="utf-8") == first_sidecar_content
 
 
 # ---------------------------------------------------------------------------

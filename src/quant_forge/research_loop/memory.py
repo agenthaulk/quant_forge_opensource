@@ -612,10 +612,20 @@ class ResearchMemoryStore:
           says ``activate``.
         - ``"deactivated"``: latest event for this signature is row-bound
           and says ``deactivate``.
-        - ``"lapsed_pending_re_review"``: at least one event exists for this
-          signature, but NONE is bound to the row's CURRENT content (the
-          row was superseded since the last review).
-        - ``"never_reviewed"``: no event has ever targeted this signature.
+        - ``"lapsed_pending_re_review"``: at least one event for this
+          signature is bound to a REAL row it once held (its
+          ``reviewed_entry_id`` matches some entry_id this signature's
+          append-only history actually contains), but none is bound to the
+          row's CURRENT content -- the row was genuinely superseded since
+          the last review (R3-2: "row content changed" is therefore always
+          true for this state).
+        - ``"never_reviewed"``: either no event has ever targeted this
+          signature, or every event that has is dangling -- its
+          ``reviewed_entry_id`` never matched ANY row this signature has
+          ever had, live or superseded (R3-2: a forged/corrupted/stale
+          reference is not treated as a real review that later lapsed;
+          such events are logged as warnings, not surfaced as a false
+          "content changed" claim).
 
         Built from the EXACT SAME single-lock-hold traversal
         :meth:`effective_active_rules` uses (:meth:`_rule_snapshot_unlocked`),
@@ -629,6 +639,30 @@ class ResearchMemoryStore:
         with advisory_file_lock(self._lock_path):
             return self._rule_snapshot_unlocked()
 
+    def _all_entry_ids_by_signature(self, kind: str) -> dict[str, set[str]]:
+        """Every entry_id EVER recorded for a signature in ``kind``'s file,
+        LIVE or superseded (R3 rework item R3-2). ``kind``'s JSONL is
+        append-only, so a superseded row's entry_id is still on disk; this
+        reads the raw rows directly (not filtered through
+        :meth:`_live_rows_by_signature`'s supersede-chain/status logic) so a
+        signature's FULL history of ever-promoted content is visible. Used
+        by :meth:`_rule_snapshot_unlocked` to tell apart a dangling review
+        event (``reviewed_entry_id`` never matched ANY row this signature has
+        ever had -- a forged, corrupted, or copy-pasted-wrong reference) from
+        a lapsed one (matched a row that is real but has since been
+        superseded) -- only the latter makes "row content changed" a TRUE
+        statement.
+        """
+
+        rows = _read_jsonl(self.path_for(kind))
+        by_signature: dict[str, set[str]] = {}
+        for row in rows:
+            signature = str(row.get("signature") or "")
+            entry_id = str(row.get("entry_id") or "")
+            if signature and entry_id:
+                by_signature.setdefault(signature, set()).add(entry_id)
+        return by_signature
+
     def _rule_snapshot_unlocked(self) -> dict[str, dict[str, Any]]:
         """Shared snapshot builder (callers must already hold the lock): for
         every LIVE rule row, resolve its currently-bound event (if any) and
@@ -636,21 +670,49 @@ class ResearchMemoryStore:
         already-in-memory rows + events -- :meth:`effective_active_rules`
         and :meth:`rule_review_snapshot` are thin filters/formatters over
         this, never a second disk read (R2-1).
+
+        R3-2: an event that fails to bind the CURRENT row is further split
+        into two genuinely different cases rather than one catch-all
+        "reviewed at some point" flag:
+
+        - the event's ``reviewed_entry_id`` matches some OTHER row this
+          signature has held in the past (rules.jsonl is append-only, so a
+          superseded row's entry_id is still on disk) -- the row's content
+          really did change since that review, so
+          ``"lapsed_pending_re_review"`` and its "row content changed" label
+          (see the CLI's ``_MEMORY_RULE_STATE_LABELS``) are true by
+          construction;
+        - the event's ``reviewed_entry_id`` never matched ANY row this
+          signature has EVER had -- this is not a lifecycle transition, so
+          it is treated as if the signature had never been reviewed
+          (``"never_reviewed"``) rather than falsely implying content
+          changed that never existed; a warning is logged so the dangling
+          reference is still visible operationally.
         """
 
         live_rows = self._live_rows_by_signature("rule")
+        all_entry_ids = self._all_entry_ids_by_signature("rule")
         events = self._read_review_events_unlocked()  # natural file order = append order
         bound_by_signature: dict[str, tuple[int, MemoryReviewEvent]] = {}
-        ever_reviewed: set[str] = set()
+        lapsed_signatures: set[str] = set()  # bound to a REAL, now-superseded row at some point
         for index, event in enumerate(events):
             if event.target_kind != "rule":
                 continue
-            ever_reviewed.add(event.target_signature)
             live_row = live_rows.get(event.target_signature)
             current_entry_id = str(live_row.get("entry_id")) if live_row is not None else None
-            if current_entry_id is None or event.reviewed_entry_id != current_entry_id:
+            if current_entry_id is not None and event.reviewed_entry_id == current_entry_id:
+                bound_by_signature[event.target_signature] = (index, event)  # later append order overwrites earlier
                 continue
-            bound_by_signature[event.target_signature] = (index, event)  # later append order overwrites earlier
+            if event.reviewed_entry_id in all_entry_ids.get(event.target_signature, ()):
+                lapsed_signatures.add(event.target_signature)
+            else:
+                logger.warning(
+                    "dangling review event %s for rule/%s: reviewed_entry_id %r never matched any row ever "
+                    "recorded for this signature (treated as never_reviewed, not lapsed)",
+                    event.event_id()[:12],
+                    event.target_signature,
+                    event.reviewed_entry_id,
+                )
 
         snapshot: dict[str, dict[str, Any]] = {}
         for signature, row in live_rows.items():
@@ -666,7 +728,7 @@ class ResearchMemoryStore:
                     "decided_at": event.decided_at,
                 }
             else:
-                state = "lapsed_pending_re_review" if signature in ever_reviewed else "never_reviewed"
+                state = "lapsed_pending_re_review" if signature in lapsed_signatures else "never_reviewed"
                 snapshot[signature] = {
                     "row": row,
                     "state": state,
@@ -1134,8 +1196,89 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+_QUARANTINE_SUFFIX = ".corrupt"
+
+
+def _quarantine_path_for(path: Path) -> Path:
+    return path.with_name(path.name + _QUARANTINE_SUFFIX)
+
+
+def _repair_torn_tail(path: Path) -> None:
+    """Write-side companion to :func:`_read_jsonl`'s trailing tolerance
+    (R3 rework item R3-1, MAJOR).
+
+    The read side SKIPS a torn trailing line but never removes it from
+    disk, so the NEXT blind append either concatenates onto the torn bytes
+    (the old fragment and the new line become ONE still-torn trailing
+    line -- the new data is silently lost on the following read) or, once
+    a THIRD line follows, turns the merged garbage into INTERIOR
+    corruption, which :func:`_read_jsonl` raises on (a ``promote_pending()``
+    outage). Called from :func:`_append_jsonl`, already inside the caller's
+    advisory-lock hold, before every append: if ``path`` exists and its
+    last byte is not a newline, the trailing segment (everything after the
+    last ``\\n``) is inspected.
+
+    "Exactly like the read-side quarantine does": only a segment that FAILS
+    to parse as JSON is torn. A segment that parses fine but is merely
+    missing its newline terminator (the read side would have accepted it
+    as a normal row) is healed in place -- the terminator is restored, and
+    nothing is quarantined or lost. A segment that fails to parse is moved
+    to a ``.corrupt`` sidecar file and the main file is truncated to the
+    last complete line, so the caller's append lands on a clean boundary.
+
+    Idempotent: if the sidecar's own tail already ends with this exact
+    fragment, it is not written again -- a repeated repair attempt against
+    the same torn tail (e.g. a retry after a crash mid-repair) never
+    duplicates the fragment.
+
+    Crash-safety: quarantining the fragment happens BEFORE truncating the
+    main file, truncating happens BEFORE the caller's new-data append, and
+    truncation itself is a single in-place ``ftruncate`` (no bytes
+    rewritten, so no "half-written" intermediate state). Each step only
+    ever makes the main file's on-disk state MORE valid; the new-data
+    append is always the LAST filesystem operation, so a crash at any
+    point up to (but not including) that final append leaves a clean,
+    valid (if incomplete) file, never a torn one.
+    """
+
+    if not path.exists():
+        return
+    with path.open("r+b") as handle:
+        handle.seek(0, 2)
+        if handle.tell() == 0:
+            return
+        handle.seek(0)
+        data = handle.read()
+        if data.endswith(b"\n"):
+            return  # already newline-terminated: nothing to repair
+        last_newline = data.rfind(b"\n")
+        tail = data[last_newline + 1 :]
+        try:
+            json.loads(tail.strip())
+        except json.JSONDecodeError:
+            pass
+        else:
+            # Valid JSON, merely missing its newline terminator: not the
+            # corruption case the read-side tolerance exists for. Restore
+            # the terminator in place.
+            handle.seek(0, 2)
+            handle.write(b"\n")
+            return
+
+        sidecar = _quarantine_path_for(path)
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        existing_tail = sidecar.read_bytes() if sidecar.exists() else b""
+        if not (existing_tail.endswith(tail) or existing_tail.endswith(tail + b"\n")):
+            with sidecar.open("ab") as sidecar_handle:
+                sidecar_handle.write(tail)
+                if not tail.endswith(b"\n"):
+                    sidecar_handle.write(b"\n")
+        handle.truncate(last_newline + 1)
+
+
 def _append_jsonl(path: Path, row: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    _repair_torn_tail(path)  # R3-1: quarantine any torn trailing fragment BEFORE appending
     line = json.dumps(row, ensure_ascii=False, sort_keys=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(line + "\n")
