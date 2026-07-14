@@ -509,3 +509,7 @@ adversarial rounds.
 - **Continuity note:** the repo migrated Desktop→Dropbox mid-phase
   (2026-07-12, `mv` with .git intact); this closure resumed from the
   migrated branch after forensic verification that nothing was lost.
+- **Dark/375px residual (closed 2026-07-14):** L2 ladder per the integration
+  prompt — Playwright `channel:"chrome"` (real Chrome), colorScheme dark +
+  true 375×812 viewport (innerWidth==375 asserted): all six tabs render the
+  dark surface token with zero horizontal overflow.
