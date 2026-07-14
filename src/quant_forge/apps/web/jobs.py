@@ -87,20 +87,31 @@ class _WebJobManager:
                     LOGGER.exception("web job %s failed", job_id)
                     self._finish(job_id, status="failed", error=_client_error_message(exc, fallback="job failed"))
             else:
-                if job.cancel_event.is_set():
-                    self._finish(job_id, status="cancelled", error="run cancelled by user")
+                # PF-F4 (completion-wins): runner() already returned here, so
+                # any recording it performed (record_run) already committed
+                # before this point. A cancel_event that only flips true in
+                # the window between that return and this publication step
+                # must not relabel a completed workflow as cancelled — a
+                # recorded RunIndex row would otherwise dangle under a
+                # "cancelled" job. A cancel observed BEFORE recording begins
+                # still lands in the _WebJobCancelled branch above (raised
+                # cooperatively inside the runner) and records nothing.
+                # Only serialization of the already-final result can still
+                # fail below; if it does, the job surfaces "failed" with that
+                # error while any recorded rows stand — RunIndex reflects
+                # computed truth, job state reflects delivery, and the two
+                # may honestly diverge in exactly this case.
+                try:
+                    public_result = _server._web_public_json(result)
+                except Exception as exc:
+                    LOGGER.exception("web job %s result serialization failed", job_id)
+                    self._finish(
+                        job_id,
+                        status="failed",
+                        error=_client_error_message(exc, fallback="job result serialization failed"),
+                    )
                 else:
-                    try:
-                        public_result = _server._web_public_json(result)
-                    except Exception as exc:
-                        LOGGER.exception("web job %s result serialization failed", job_id)
-                        self._finish(
-                            job_id,
-                            status="failed",
-                            error=_client_error_message(exc, fallback="job result serialization failed"),
-                        )
-                    else:
-                        self._finish(job_id, status="completed", result=public_result)
+                    self._finish(job_id, status="completed", result=public_result)
             finally:
                 if gc_was_enabled:
                     gc.enable()

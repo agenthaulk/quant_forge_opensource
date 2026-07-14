@@ -57,6 +57,18 @@ function factorStatusPillHtml(status) {
   return `<span class="status-pill ${tone}">${esc(label)}</span>`;
 }
 
+// Additive honesty pill (never replaces the lifecycle pill above): a
+// precomputed factor's DEFINITION can persist while its VALUES were only
+// ever written to a past run's overlay directory this deployment does not
+// read. Strictly === false renders it — null (not precomputed, or the
+// presence probe itself failed) and true render exactly as before (FP-4:
+// unobservable stays silent, never a guess).
+function valuesUnavailablePillHtml(factor) {
+  return factor.precomputed_values_present === false
+    ? ' <span class="status-pill status-pill--running">值不可用</span>'
+    : '';
+}
+
 function rowFormulaHtml(formula) {
   const text = formula ? String(formula) : '';
   if (text.startsWith(PRECOMPUTED_PREFIX)) {
@@ -71,7 +83,7 @@ function registryRowHtml(factor) {
   const current = factorId && factorId === selectedFactorId ? ' aria-current="true"' : '';
   return `
       <button type="button" class="registry-row" data-factor-id="${esc(factorId)}"${current}>
-        <span class="registry-row-name">${esc(factor.name || factorId)} ${factorStatusPillHtml(factor.status)}</span>
+        <span class="registry-row-name">${esc(factor.name || factorId)} ${factorStatusPillHtml(factor.status)}${valuesUnavailablePillHtml(factor)}</span>
         <span class="meta">${esc(factorId)} · 持有 ${esc(valueOr(factor.horizon_days, 'n/a'))} 天</span>
         ${rowFormulaHtml(factor.formula)}
       </button>`;
@@ -109,7 +121,7 @@ function definitionCardHtml(factor) {
       <div class="panel hero-panel">
         <div>
           <p class="eyebrow">Registry · Factor</p>
-          <h3>${esc(factor.name || factor.factor_id || '')} ${factorStatusPillHtml(factor.status)}</h3>
+          <h3>${esc(factor.name || factor.factor_id || '')} ${factorStatusPillHtml(factor.status)}${valuesUnavailablePillHtml(factor)}</h3>
           ${formulaBlock}
           <p>${esc(factor.description || '')}</p>
           <p class="meta">持有 ${esc(valueOr(factor.horizon_days, 'n/a'))} 天 · source ${esc(factor.source || 'n/a')}</p>

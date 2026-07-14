@@ -466,6 +466,12 @@ def test_validate_idea_route_invokes_patched_evaluate_and_backtest_seams(monkeyp
         factor_values_manifest_root,
     ):
         captured["evaluated_factor_id"] = factor_id
+        # BUG #007: the workflow now records this run, which hashes the file
+        # at artifact_path the same way the real evaluate_factor always
+        # leaves one there - so the fake writes a real (trivial) file too.
+        artifact_path = Path(artifact_root) / "evaluations" / f"{factor_id}.json"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_text("{}", encoding="utf-8")
         return EvaluationResult(
             factor_id=factor_id,
             observations=1,
@@ -474,7 +480,7 @@ def test_validate_idea_route_invokes_patched_evaluate_and_backtest_seams(monkeyp
             rank_ic_std=0.0,
             rank_icir=0.0,
             ic_days=1,
-            artifact_path=Path(artifact_root) / "evaluations" / f"{factor_id}.json",
+            artifact_path=artifact_path,
             simulation_profile=simulation_profile,
         )
 
@@ -495,6 +501,12 @@ def test_validate_idea_route_invokes_patched_evaluate_and_backtest_seams(monkeyp
         include_partial_final_period=False,
     ):
         captured.setdefault("backtest_sample_roles", []).append(sample_role)
+        # BUG #007: same real-file requirement as fake_evaluate_factor above;
+        # both sample-role calls share this path, which is fine (a second
+        # write is an idempotent overwrite of the same trivial content).
+        artifact_path = Path(artifact_root) / "backtests" / f"{factor_id}.json"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_text("{}", encoding="utf-8")
         return BacktestResult(
             factor_id=factor_id,
             periods=1,
@@ -503,7 +515,7 @@ def test_validate_idea_route_invokes_patched_evaluate_and_backtest_seams(monkeyp
             annualized_return=0.01,
             annualized_volatility=0.0,
             max_drawdown=0.0,
-            artifact_path=Path(artifact_root) / "backtests" / f"{factor_id}.json",
+            artifact_path=artifact_path,
             top_quantile=simulation_profile.top_quantile,
             transaction_costs=transaction_costs,
             simulation_profile=simulation_profile,
