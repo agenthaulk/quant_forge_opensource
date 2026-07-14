@@ -339,24 +339,61 @@ def test_touch_targets_meet_the_44px_minimum(web_config) -> None:
 
 
 def test_term_tip_popover_stays_inside_narrow_viewports(web_config) -> None:
-    # FE3 (MAJOR, phase review): `left: 0` anchored the popover to the
-    # term-tip's OWN left edge, so a right-column label (param-grid stays
-    # 2 columns even at 375px — no collapse breakpoint) pushed a 220px-wide
-    # box past the viewport's right edge. Pin the actual fix: centering on
-    # the anchor (`left: 50%` + `translateX(-50%)`, not a one-sided anchor)
-    # plus a narrower, viewport-relative max-width cap. Real geometry for
-    # all 5 tooltips (rectLeft >= 0 and rectRight <= 375 at a true 375px
-    # viewport, focus-visible activated) is recorded in the phase commit
+    # FE3/R1 (MAJOR, phase review, two rounds). Round 1: `left: 0` anchored
+    # the popover to the term-tip's OWN left edge, overflowing the
+    # viewport's RIGHT edge for a right-column label. Round 1's fix
+    # (`left: 50%; transform: translateX(-50%)`) was found to rest on an
+    # implicit, fragile dependency: it only stayed inside the LEFT edge
+    # today because the pre-existing `.param-grid span { display: block; }`
+    # rule (unrelated to this phase) happens to make `.term-tip` stretch to
+    # the full column width. R1 removes that dependency: column-aware
+    # anchoring (the reviewer's own suggestion) — a left-column popover
+    # (`:nth-child(odd)`, param-grid fills row-major so odd = column 1)
+    # anchors at its own LEFT edge and extends rightward (always positive);
+    # a right-column popover (`:nth-child(even)`) anchors at its own RIGHT
+    # edge and extends leftward (always inside the viewport) — neither
+    # depends on the anchor's rendered width. The viewport-relative
+    # max-width stays as a second safety net. Real geometry for all 5
+    # tooltips, BOTH edges (rectLeft >= 0 AND rectRight <= 375 at a true
+    # 375px viewport, via two independently-constructed measurement
+    # techniques that agreed exactly) is recorded in the phase commit
     # message; computed/rendered box geometry is out of a stdlib-only
     # Python test's reach.
     html = web_server._index_html(web_config)
-    start = html.index(".term-tip:hover::after, .term-tip:focus-visible::after {")
-    end = html.index("}", start)
-    block = html[start:end]
-    assert "left: 50%;" in block
-    assert "transform: translateX(-50%);" in block
-    assert "max-width: min(180px, calc(100vw - 40px));" in block
-    assert "left: 0;" not in block
+    base_start = html.index(".term-tip:hover::after, .term-tip:focus-visible::after {")
+    base_end = html.index("}", base_start)
+    base_block = html[base_start:base_end]
+    # The base rule carries no horizontal anchor of its own any more —
+    # positioning is column-aware only, so a stray `left`/`right`/
+    # `transform` re-added here would silently re-couple both columns to
+    # one anchor and reopen exactly this bug.
+    assert "left:" not in base_block
+    assert "right:" not in base_block
+    assert "transform:" not in base_block
+    assert "max-width: min(180px, calc(100vw - 40px));" in base_block
+
+    odd_marker = (
+        ".param-grid label:nth-child(odd) .term-tip:hover::after,\n"
+        "    .param-grid label:nth-child(odd) .term-tip:focus-visible::after {"
+    )
+    even_marker = (
+        ".param-grid label:nth-child(even) .term-tip:hover::after,\n"
+        "    .param-grid label:nth-child(even) .term-tip:focus-visible::after {"
+    )
+    assert odd_marker in html
+    assert even_marker in html
+    odd_start = html.index(odd_marker)
+    odd_end = html.index("}", odd_start)
+    assert "left: 0;" in html[odd_start:odd_end]
+    even_start = html.index(even_marker)
+    even_end = html.index("}", even_start)
+    assert "right: 0;" in html[even_start:even_end]
+    # Column-aware rules must outrank the base rule on SPECIFICITY (no
+    # !important anywhere in the file, confirmed elsewhere), not source
+    # order alone — each compounds an extra class (.param-grid) and
+    # pseudo-class (:nth-child) onto the base selector, so they are
+    # strictly higher regardless of where they sit in the stylesheet.
+    assert "!important" not in html
 
 
 def test_hidden_attribute_override_beats_both_shells_own_display_grid(web_config) -> None:
@@ -384,6 +421,56 @@ def test_hidden_attribute_override_beats_both_shells_own_display_grid(web_config
     assert "!important" not in html
     assert ".app-shell {" in html
     assert ".simple-shell {" in html
+
+
+def test_sticky_elements_offset_below_the_persistent_header(web_config) -> None:
+    # R2 (MINOR, phase review): .mode-header (sticky, top:0, z-index:50)
+    # and .control-rail (ALSO sticky, top:0) both try to pin at the
+    # viewport's y:0 once scrolled — the header wins on z-index, so the
+    # rail's own top content (the QF/Quant Forge brand block) painted
+    # UNDER it. Fix: a single shared --mode-header-height custom property
+    # (defined once in :root, the only common ancestor — .mode-header sits
+    # outside .app-shell entirely, so no closer scope exists) that every
+    # OTHER `position: sticky; top: 0` element offsets by by. The reviewer
+    # additionally asked to audit for the SAME collision elsewhere:
+    # .lab-tabs (sticky inside .workbench) had it too and is fixed the
+    # same way. Real getBoundingClientRect() evidence (rail/tab-strip top
+    # never overlaps the header's bottom edge across several scroll
+    # positions) is recorded in the phase commit message; scroll-driven
+    # sticky geometry is out of a stdlib-only Python test's reach.
+    html = web_server._index_html(web_config)
+    assert "--mode-header-height: 71px;" in html
+    root_start = html.index(":root {")
+    root_end = html.index("}", root_start)
+    assert "--mode-header-height: 71px;" in html[root_start:root_end]
+
+    header_start = html.index(".mode-header {")
+    header_end = html.index("}", header_start)
+    assert "position: sticky;" in html[header_start:header_end]
+    assert "top: 0;" in html[header_start:header_end]
+
+    rail_start = html.index(".control-rail {")
+    rail_end = html.index("}", rail_start)
+    rail_block = html[rail_start:rail_end]
+    assert "position: sticky;" in rail_block
+    assert "top: var(--mode-header-height);" in rail_block
+    assert "height: calc(100vh - var(--mode-header-height));" in rail_block
+    # The old collision values must be gone from THIS rule specifically
+    # (not a global sweep — `top: 0;` / `height: 100vh;` legitimately
+    # appear elsewhere, e.g. on .mode-header itself).
+    assert "top: 0;" not in rail_block
+    assert "height: 100vh;" not in rail_block
+
+    tabs_start = html.index(".lab-tabs {")
+    tabs_end = html.index("}", tabs_start)
+    tabs_block = html[tabs_start:tabs_end]
+    assert "position: sticky;" in tabs_block
+    assert "top: var(--mode-header-height);" in tabs_block
+    assert "top: 0;" not in tabs_block
+
+    # No OTHER `position: sticky` rule was missed by this audit: exactly
+    # these three own that declaration on the served page.
+    assert html.count("position: sticky;") == 3
 
 
 # ---------------------------------------------------------------------------

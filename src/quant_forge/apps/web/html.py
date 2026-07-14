@@ -185,6 +185,20 @@ def _index_html(
       --warn-line: #e3cf9a;
       --bad-wash: #f9ecec;
       --bad-line: #e5bcbc;
+      /* R2 fix (phase review, binding): the ONE shared source for the
+         persistent mode-header's height, so every OTHER sticky-at-the-top
+         element (.control-rail, .lab-tabs) can offset below it instead of
+         colliding at the same pinned y:0 (the collision the reviewer
+         found: header z-index:50 painting over the rail's/tab strip's top
+         content once both are pinned mid-scroll). Not a color
+         token, but :root is where every other shared value already lives,
+         and CSS custom properties inherit from here to both — .mode-header
+         sits outside .app-shell entirely, so no closer common ancestor
+         exists. Value = the header's own real rendered height (44px
+         button min-height + 4px*2 .mode-toggle padding + 2px .mode-toggle
+         border + 8px*2 .mode-header padding + 1px border-bottom = 71px),
+         confirmed against a live getBoundingClientRect() measurement. */
+      --mode-header-height: 71px;
     }}
     * {{ box-sizing: border-box; }}
     html {{ min-width: 320px; }}
@@ -308,20 +322,27 @@ def _index_html(
       border-bottom: 1px dotted var(--line-strong);
       cursor: help;
     }}
-    /* FE3 fix (phase review, binding): `left: 0` anchored the popover to
-       the term-tip's OWN left edge, so a right-column label (param-grid
-       stays 2 columns even at 375px — no collapse breakpoint) pushed a
-       220px-wide box past the viewport's right edge. Centering on the
-       anchor (translateX(-50%)) instead of a one-sided anchor plus a
-       narrower, viewport-relative cap keeps the popover inside a 375px
-       viewport for every label in the grid, in both columns — verified
-       for 融券成本/Top Quantile specifically (the widest labels in the
-       narrower left/right slots) via a real 375px browser check. */
+    /* FE3/R1 fix (phase review, binding). History: `left: 0` anchored the
+       popover to the term-tip's own left edge, overflowing the viewport's
+       RIGHT edge for a right-column label. A first fix centered it
+       (`left: 50%; transform: translateX(-50%)`), which happens to stay
+       inside the viewport TODAY only because `.param-grid span` (above)
+       makes `.term-tip` block-level and column-wide — an implicit,
+       fragile cross-rule dependency a future edit could silently break
+       and reintroduce LEFT-edge overflow for the narrower left column.
+       R1 removes that dependency: column-aware anchoring per the
+       reviewer's own suggestion. param-grid fills row-major (odd
+       `<label>` = column 1, even = column 2 — CP9's existing 2-column
+       grid, no collapse breakpoint even at 375px), so a left-column
+       popover only ever needs to extend RIGHTWARD (anchored at its own
+       left edge, always positive) and a right-column popover only ever
+       needs to extend LEFTWARD (anchored at its own right edge, always
+       inside the viewport) — verified for all 5 tooltips, both edges,
+       at a true 375px viewport (see the phase commit message). The
+       viewport-relative max-width stays as a second safety net. */
     .term-tip:hover::after, .term-tip:focus-visible::after {{
       content: attr(data-tip);
       position: absolute;
-      left: 50%;
-      transform: translateX(-50%);
       bottom: 100%;
       margin-bottom: 6px;
       padding: 6px 8px;
@@ -336,14 +357,31 @@ def _index_html(
       line-height: 1.4;
       z-index: 10;
     }}
+    /* Column-aware anchor: left column (odd label = param-grid column 1)
+       extends rightward from its own left edge; right column (even label
+       = column 2) extends leftward from its own right edge. Strictly
+       higher specificity than the base rule above (an extra class plus
+       an extra pseudo-class), so no forced-priority declaration is
+       needed to win the cascade. */
+    .param-grid label:nth-child(odd) .term-tip:hover::after,
+    .param-grid label:nth-child(odd) .term-tip:focus-visible::after {{
+      left: 0;
+    }}
+    .param-grid label:nth-child(even) .term-tip:hover::after,
+    .param-grid label:nth-child(even) .term-tip:focus-visible::after {{
+      right: 0;
+    }}
     .term-tip:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
     @media (max-width: 480px) {{
       .simple-shell {{ padding: 28px 16px; }}
     }}
     .control-rail {{
+      /* R2 fix (phase review, binding): offset below the persistent
+         .mode-header (shared --mode-header-height) instead of both
+         sticking at top:0 — see the :root definition for why. */
       position: sticky;
-      top: 0;
-      height: 100vh;
+      top: var(--mode-header-height);
+      height: calc(100vh - var(--mode-header-height));
       overflow: auto;
       padding: 22px;
       border-right: 1px solid var(--line);
@@ -692,7 +730,11 @@ def _index_html(
     .lab-stepper .step-link:disabled {{ opacity: 1; cursor: default; }}
     .lab-stepper .step-link:not(:disabled):hover {{ text-decoration: underline; }}
     .lab-stepper .step-link:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
-    .lab-tabs {{ position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 8px;
+    /* R2 audit (phase review, binding): .lab-tabs is ALSO `position:
+       sticky; top: 0` inside .workbench (the app-shell's right column),
+       so it collides with .mode-header exactly like .control-rail did —
+       offset below it via the same shared variable. */
+    .lab-tabs {{ position: sticky; top: var(--mode-header-height); z-index: 5; display: flex; flex-wrap: wrap; gap: 8px;
       margin: 0 -4px 18px; padding: 8px 4px; background: var(--surface-translucent);
       backdrop-filter: blur(6px); border-bottom: 1px solid var(--line); }}
     .lab-tab {{ width: auto; margin: 0; padding: 9px 14px; border: 1px solid var(--line);
