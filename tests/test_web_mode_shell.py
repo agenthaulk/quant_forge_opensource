@@ -5,19 +5,34 @@ and ``docs/design/WORKORDER_frontend_sidecar_p0_p3.md`` §5 P0.
 P0 is pure frontend (zero backend changes, zero new endpoints): a simple-mode
 landing (idea box + example seeds + start button + one-line runtime status)
 sits beside the existing six-tab expert workbench, which is now taggable and
-toggled via the ``hidden`` attribute instead of being the only shell. Three
+toggled via the ``hidden`` attribute instead of being the only shell. A
+persistent header (outside both shells) hosts the mode toggle so switching
+to expert mode never hides the only way back (FE0, phase review). Four
 layers, mirroring the project's existing web-test conventions
-(``docs/frontend_contributing.md``):
+(``docs/frontend_contributing.md``) plus one added for this review round:
 
 - served-page structure pins (``web_server._index_html``) for the new shells,
-  the mode toggle, the advanced-params disclosure, and terminology tooltips;
-- string-contract pins on ``app.js`` for the mode-precedence algorithm
-  (recognized expert deep link > saved preference > default simple) and on
-  ``views/lab.js`` for the read-only hash-recognition predicate it exports;
-- a stdlib Node smoke test that imports the REAL ``views/lab.js`` module and
-  exercises ``isRecognizedExpertHash`` against the full hash vocabulary
-  ``applyHash`` already routes (tabs, modules, workbench anchors, legacy
-  aliases, and the registry/docs/extensions per-item deep links).
+  the persistent toggle header, the advanced-params disclosure, and
+  terminology tooltips;
+- a stdlib ``html.parser`` ancestor-chain check (not a string search) that
+  the toggle buttons are real DOM descendants of the header and NOT of
+  either shell — the structural half of the FE0 regression, which no flat
+  string match or JS-only stub could prove;
+- a stdlib Node DOM-stub harness that imports the REAL ``app.js`` (and its
+  full static import chain) under an auto-vivifying element/window/
+  localStorage stub and DRIVES the real mode-shell lifecycle: default
+  landing, toggle round-trips, the simple-run handoff's non-persistence,
+  deep-link precedence (fresh load and same-document hashchange), and
+  localStorage-throwing resilience. This is the primary behavioral
+  evidence for the mode-precedence and persistence contracts; the stub
+  models state/event wiring faithfully but NOT CSS layout/paint, so it
+  cannot see ancestor-`display:none` cascades (covered by the parser check
+  above) or real viewport geometry (covered by live-browser verification,
+  recorded in the phase commit message, for the FE2/FE3 pixel claims);
+- a handful of string-contract pins for wiring the CSS proxy tests and the
+  lab.js hash-recognition predicate cannot otherwise cover (kept minimal
+  after the phase review's "most pins are string tautologies" finding —
+  see the trimmed set below and the harness above for what replaced them).
 
 No test in this module touches ``apps/web/api.py`` or adds a new endpoint;
 P0's binding scope is ``html.py`` / ``app.js`` / ``views/lab.js`` only.
@@ -28,6 +43,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+from html.parser import HTMLParser
 
 import pytest
 
@@ -37,6 +53,43 @@ from quant_forge.data.local import create_demo_workspace
 
 
 LAB_JS_PATH = web_server.STATIC_ROOT / "views" / "lab.js"
+APP_JS_PATH = web_server.STATIC_ROOT / "app.js"
+
+_VOID_ELEMENTS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr",
+}
+
+
+class _ContainmentParser(HTMLParser):
+    """Stdlib-only ancestor-chain tracker: for every ``id="..."`` attribute
+    encountered, records the set of ids of its OPEN ancestor elements at
+    that point. Used to prove real DOM containment (FE0: the mode-toggle
+    buttons must be descendants of the persistent header and NEVER of
+    either `[hidden]`-toggled shell) without a browser and without a
+    string-position heuristic, which cannot distinguish "before this tag
+    in the source" from "inside this tag"."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._open_ids: list[str] = []
+        self.ancestors_by_id: dict[str, set[str]] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        element_id = dict(attrs).get("id")
+        if element_id:
+            self.ancestors_by_id[element_id] = set(self._open_ids)
+        if tag not in _VOID_ELEMENTS:
+            self._open_ids.append(element_id or "")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        element_id = dict(attrs).get("id")
+        if element_id:
+            self.ancestors_by_id[element_id] = set(self._open_ids)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag not in _VOID_ELEMENTS and self._open_ids:
+            self._open_ids.pop()
 
 
 def _static_module_text(name: str) -> str:
@@ -58,13 +111,14 @@ def web_config(tmp_path):
 def test_index_page_hosts_the_simple_shell_and_mode_toggle(web_config) -> None:
     html = web_server._index_html(web_config)
     for marker in (
-        'id="simple-shell"',
-        'aria-label="简洁模式"',
+        'id="mode-header"',
         'class="mode-toggle" role="group" aria-label="界面模式"',
         'id="mode-simple-btn" class="mode-toggle-btn" aria-pressed="true"',
         'id="mode-expert-btn" class="mode-toggle-btn" aria-pressed="false"',
         '简洁模式',
         '专家模式',
+        'id="simple-shell"',
+        'aria-label="简洁模式"',
         'id="simple-idea"',
         'for="simple-idea" class="sr-only"',
         'class="simple-seeds"',
@@ -86,16 +140,50 @@ def test_index_page_tags_the_existing_workbench_as_the_expert_shell(web_config) 
     assert '<main id="expert-shell" class="app-shell" hidden>' in html
     assert 'class="control-rail"' in html
     assert 'class="lab-tabs" role="tablist"' in html
-    # Document order: simple shell first (default landing), expert shell
-    # second, so the simple experience is what a no-JS-yet paint shows.
+    # Document order: persistent header first (FE0: outside both shells,
+    # never hidden), then simple shell (default landing), then expert
+    # shell, so the simple experience plus a reachable toggle is what a
+    # no-JS-yet paint shows.
+    assert html.index('id="mode-header"') < html.index('id="simple-shell"')
     assert html.index('id="simple-shell"') < html.index('id="expert-shell"')
     assert html.index('id="expert-shell"') < html.index('class="control-rail"')
+    # The header itself is never `[hidden]` — it's the one thing visible in
+    # both modes.
+    header_start = html.index('id="mode-header"')
+    assert "hidden" not in html[header_start : html.index(">", header_start)]
     # Expert shell starts hidden server-side (mirrors the existing
     # non-default lab-panel-* pattern); JS decides the real landing mode.
     expert_start = html.index('id="expert-shell"')
     assert "hidden" in html[expert_start : html.index(">", expert_start)]
     simple_start = html.index('id="simple-shell"')
     assert "hidden" not in html[simple_start : html.index(">", simple_start)]
+
+
+def test_mode_toggle_is_a_descendant_of_the_header_never_of_either_shell(web_config) -> None:
+    # FE0 (BLOCKING, phase review): the toggle used to be a child of
+    # #simple-shell, so applyMode('expert') hid the only way back — a dead
+    # end until reload. A REAL ancestor-chain check (stdlib html.parser,
+    # not a string/index heuristic that can't distinguish "appears earlier
+    # in the source" from "is nested inside") proves the buttons are
+    # structurally outside both `[hidden]`-toggled containers.
+    html = web_server._index_html(web_config)
+    parser = _ContainmentParser()
+    parser.feed(html)
+    for toggle_id in ("mode-simple-btn", "mode-expert-btn"):
+        ancestors = parser.ancestors_by_id.get(toggle_id)
+        assert ancestors is not None, f"{toggle_id} never appeared in the parsed document"
+        assert "simple-shell" not in ancestors, f"{toggle_id} is nested inside #simple-shell"
+        assert "expert-shell" not in ancestors, f"{toggle_id} is nested inside #expert-shell"
+        assert "mode-header" in ancestors, f"{toggle_id} is not nested inside #mode-header"
+    # Sanity check the parser itself against KNOWN-nested ids, so a bug in
+    # the parser (e.g. failing to track nesting at all, which would make
+    # the negative assertions above pass vacuously) is caught here instead.
+    idea_ancestors = parser.ancestors_by_id.get("idea")
+    assert idea_ancestors is not None
+    assert "expert-shell" in idea_ancestors, "parser sanity check failed: #idea should be nested inside #expert-shell"
+    simple_idea_ancestors = parser.ancestors_by_id.get("simple-idea")
+    assert simple_idea_ancestors is not None
+    assert "simple-shell" in simple_idea_ancestors, "parser sanity check failed: #simple-idea should be nested inside #simple-shell"
 
 
 def test_simple_and_expert_idea_fields_share_the_same_seeded_default_text(web_config) -> None:
@@ -105,6 +193,19 @@ def test_simple_and_expert_idea_fields_share_the_same_seeded_default_text(web_co
     default_text = "非ST的小市值股票未来表现更好"
     assert f'<textarea id="simple-idea" aria-describedby="simple-runtime-status">{default_text}</textarea>' in html
     assert f'<textarea id="idea">{default_text}</textarea>' in html
+
+
+def test_simple_shell_subtitle_is_chinese_first(web_config) -> None:
+    # FE4 (MINOR, phase review): the NEW simple-shell subtitle must be
+    # CN-first (D8). Scoped to the element P0 actually introduces — the
+    # pre-existing expert control-rail brand block predates this phase and
+    # is untouched, so its subtitle is deliberately not asserted here.
+    html = web_server._index_html(web_config)
+    simple_start = html.index('id="simple-shell"')
+    expert_start = html.index('id="expert-shell"')
+    simple_shell_html = html[simple_start:expert_start]
+    assert "<p class=\"brand-subtitle\">因子研究控制台</p>" in simple_shell_html
+    assert "Factor research console" not in simple_shell_html
 
 
 def test_advanced_params_details_wraps_the_11_parameter_grid(web_config) -> None:
@@ -191,6 +292,7 @@ def test_mode_shell_css_is_token_only_and_ships_both_themes(web_config) -> None:
     # light :root block and the prefers-color-scheme: dark block cover it.
     assert not re.search(r"#[0-9a-fA-F]{3,6}\b", block)
     for rule in (
+        ".mode-header",
         ".simple-shell",
         ".mode-toggle",
         ".mode-toggle-btn",
@@ -217,6 +319,44 @@ def test_mode_shell_css_stays_overflow_safe_at_narrow_widths(web_config) -> None
     assert "box-sizing: border-box" in block
     assert "flex-wrap: wrap" in block
     assert "@media (max-width: 480px)" in block
+
+
+def test_touch_targets_meet_the_44px_minimum(web_config) -> None:
+    # FE2 (MAJOR, phase review, spec §9): .mode-toggle-btn, .simple-seed-btn,
+    # and .advanced-params summary were all below the 44px minimum touch
+    # target. Pin the min-height rule on each selector's OWN declaration
+    # block specifically (not just "appears somewhere in the file") so a
+    # min-height added to an unrelated rule cannot satisfy this vacuously.
+    # Real pixel confirmation (getBoundingClientRect == 44 for all three,
+    # including the resident #advanced-params summary) is recorded in the
+    # phase commit message; computed layout is out of a stdlib-only Python
+    # test's reach.
+    html = web_server._index_html(web_config)
+    for selector in (".mode-toggle-btn {", ".simple-seed-btn {", ".advanced-params summary {"):
+        start = html.index(selector)
+        end = html.index("}", start)
+        assert "min-height: 44px;" in html[start:end], selector
+
+
+def test_term_tip_popover_stays_inside_narrow_viewports(web_config) -> None:
+    # FE3 (MAJOR, phase review): `left: 0` anchored the popover to the
+    # term-tip's OWN left edge, so a right-column label (param-grid stays
+    # 2 columns even at 375px — no collapse breakpoint) pushed a 220px-wide
+    # box past the viewport's right edge. Pin the actual fix: centering on
+    # the anchor (`left: 50%` + `translateX(-50%)`, not a one-sided anchor)
+    # plus a narrower, viewport-relative max-width cap. Real geometry for
+    # all 5 tooltips (rectLeft >= 0 and rectRight <= 375 at a true 375px
+    # viewport, focus-visible activated) is recorded in the phase commit
+    # message; computed/rendered box geometry is out of a stdlib-only
+    # Python test's reach.
+    html = web_server._index_html(web_config)
+    start = html.index(".term-tip:hover::after, .term-tip:focus-visible::after {")
+    end = html.index("}", start)
+    block = html[start:end]
+    assert "left: 50%;" in block
+    assert "transform: translateX(-50%);" in block
+    assert "max-width: min(180px, calc(100vw - 40px));" in block
+    assert "left: 0;" not in block
 
 
 def test_hidden_attribute_override_beats_both_shells_own_display_grid(web_config) -> None:
@@ -274,85 +414,32 @@ def test_mode_shell_dom_refs_bind_to_the_new_html_elements() -> None:
         assert ref in app_js, ref
 
 
-def test_mode_precedence_deep_link_beats_saved_preference_beats_default() -> None:
-    # Component contract 5.6: "recognized expert deep link > saved mode
-    # preference > default simple. A deep link wins that navigation without
-    # rewriting the saved preference."
+def test_mode_shell_function_shapes_exist_for_the_harness_to_drive() -> None:
+    # Minimal structural sanity (function signatures + the storage-guard
+    # try/catch shape) kept as a cheap first-failure localizer; the BEHAVIOR
+    # these functions implement — precedence, persistence-vs-not,
+    # hashchange re-evaluation, and throwing-storage resilience — is proven
+    # by actually EXECUTING the real module in the Node DOM-stub harness
+    # below (phase review FE5: "most pins are string tautologies" — this
+    # replaces the three former precedence/hashchange/storage-guard tests
+    # that only read text and asserted it existed).
     app_js = _static_module_text("app.js")
-    assert "const MODE_STORAGE_KEY = 'qf_ui_mode';" in app_js
-    assert "function readSavedMode() {" in app_js
-    assert "function writeSavedMode(mode) {" in app_js
-    assert "function applyMode(mode) {" in app_js
-    assert "function setMode(mode) {" in app_js
-    # setMode both applies AND persists; applyMode alone never persists.
-    set_mode_start = app_js.index("function setMode(mode) {")
-    set_mode_end = app_js.index("\n}", set_mode_start)
-    set_mode_body = app_js[set_mode_start:set_mode_end]
-    assert "applyMode(mode);" in set_mode_body
-    assert "writeSavedMode(mode);" in set_mode_body
-    apply_mode_start = app_js.index("function applyMode(mode) {")
-    apply_mode_end = app_js.index("\n}", apply_mode_start)
-    apply_mode_body = app_js[apply_mode_start:apply_mode_end]
-    assert "writeSavedMode" not in apply_mode_body
-    assert "localStorage" not in apply_mode_body
-    # The initial landing decision calls applyMode directly (never setMode)
-    # when the hash is a recognized expert deep link, so that path can never
-    # write the saved preference; readSavedMode only otherwise, defaulting
-    # to 'simple'.
-    assert "const deepLinkIsExpert = isRecognizedExpertHash(window.location.hash);" in app_js
-    assert (
-        "applyMode(deepLinkIsExpert ? 'expert' : (readSavedMode() || 'simple'));" in app_js
-    )
-    initial_landing = app_js.index("const deepLinkIsExpert = isRecognizedExpertHash(window.location.hash);")
-    assert "setMode(" not in app_js[initial_landing : app_js.index(
-        "applyMode(deepLinkIsExpert ? 'expert' : (readSavedMode() || 'simple'));"
-    ) + 1]
-
-
-def test_hashchange_reevaluates_deep_link_precedence_without_a_full_reload() -> None:
-    # Regression pin (found via live browser verification): the initial
-    # applyMode(...) call above runs ONCE at module top-level evaluation.
-    # Editing the URL fragment while the page is already open (or any other
-    # same-document hash navigation) fires 'hashchange' WITHOUT re-running
-    # that top-level code, so a later recognized expert hash would activate
-    # the right TAB inside the expert shell (views/lab.js's own hashchange
-    # listener still runs) while the SHELL itself stayed on whichever mode
-    # was already showing. A second, independent hashchange listener here
-    # re-applies the SAME precedence rule (applyMode only, never setMode,
-    # so it still never rewrites the saved preference) whenever a later
-    # hash change is itself a recognized expert deep link.
-    app_js = _static_module_text("app.js")
-    assert (
-        "window.addEventListener('hashchange', () => {\n"
-        "  if (isRecognizedExpertHash(window.location.hash)) applyMode('expert');\n"
-        "});" in app_js
-    )
-    # Placed after the initial applyMode call, and still never calls
-    # setMode/writeSavedMode.
-    initial_landing = app_js.index("applyMode(deepLinkIsExpert ? 'expert' : (readSavedMode() || 'simple'));")
-    listener_start = app_js.index("window.addEventListener('hashchange', () => {", initial_landing)
-    listener_end = app_js.index("});", listener_start)
-    assert initial_landing < listener_start
-    assert "setMode(" not in app_js[listener_start:listener_end]
-
-
-def test_local_storage_access_is_guarded_against_failure() -> None:
-    # A Storage exception (privacy mode, quota, disabled storage) must
-    # degrade gracefully rather than break the whole module: both the read
-    # and the write path are wrapped in try/catch.
-    app_js = _static_module_text("app.js")
+    for marker in (
+        "const MODE_STORAGE_KEY = 'qf_ui_mode';",
+        "function readSavedMode() {",
+        "function writeSavedMode(mode) {",
+        "function applyMode(mode) {",
+        "function setMode(mode) {",
+        "const deepLinkIsExpert = isRecognizedExpertHash(window.location.hash);",
+        "window.addEventListener('hashchange', () => {",
+    ):
+        assert marker in app_js, marker
     read_start = app_js.index("function readSavedMode() {")
     read_end = app_js.index("function writeSavedMode(mode) {")
-    read_body = app_js[read_start:read_end]
-    assert "try {" in read_body
-    assert "} catch (error) {" in read_body
-    assert "window.localStorage.getItem(MODE_STORAGE_KEY)" in read_body
+    assert "try {" in app_js[read_start:read_end]
     write_start = read_end
     write_end = app_js.index("function applyMode(mode) {")
-    write_body = app_js[write_start:write_end]
-    assert "try {" in write_body
-    assert "} catch (error) {" in write_body
-    assert "window.localStorage.setItem(MODE_STORAGE_KEY, mode);" in write_body
+    assert "try {" in app_js[write_start:write_end]
 
 
 def test_mode_toggle_buttons_and_seed_buttons_are_wired() -> None:
@@ -375,7 +462,14 @@ def test_simple_run_delegates_to_the_existing_run_handler_without_duplicating_it
     body = app_js[simple_run_start:simple_run_end]
     assert "llmProviderOptions.some(option => option.runtimeReady === 'true')" in body
     assert "document.getElementById('parser').value = anyProviderReady ? 'llm' : 'rule';" in body
-    assert "setMode('expert');" in body
+    # FE1 (MAJOR, phase review): this handoff must use applyMode (never
+    # setMode) — running the guided form once must not silently overwrite
+    # the saved mode preference; only an explicit toggle click is a real
+    # preference choice. (The former version of this assertion pinned
+    # `setMode('expert')`, i.e. pinned the bug; the Node harness below now
+    # additionally proves this behaviorally via scenario (c).)
+    assert "applyMode('expert');" in body
+    assert "setMode(" not in body
     assert "button.click();" in body
     # It must NOT reimplement the #run handler's own body inline (no second
     # copy of its activate/submit/render sequence).
@@ -520,6 +614,309 @@ check('empty_string', isRecognizedExpertHash('') === false);
 check('hash_only', isRecognizedExpertHash('#') === false);
 check('unknown', isRecognizedExpertHash('#not-a-real-hash') === false);
 check('undefined_input', isRecognizedExpertHash(undefined) === false);
+
+console.log('SMOKE RESULT: ' + failed + ' failed');
+if (failed) process.exit(1);
+"""
+
+
+# ---------------------------------------------------------------------------
+# app.js: real mode-shell LIFECYCLE, driven by importing the actual module
+# (phase review FE5 — the primary behavioral evidence for FE0/FE1/precedence)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runtime not available")
+def test_node_app_mode_shell_lifecycle_smoke(tmp_path) -> None:
+    """Imports the REAL app.js (and its full static dependency chain —
+    api.js and every static/views/*.js module it wires) under a minimal,
+    auto-vivifying document/window/localStorage stub, with no npm/jsdom,
+    and drives the actual mode-shell lifecycle end to end:
+
+    (a) default simple on first load; (b) the FE0 regression — an expert
+    toggle click, then a return click, then a THIRD switch, proving the
+    toggle buttons keep working rather than trapping the state machine
+    after one switch; (c) the FE1 regression — the simple-run handoff
+    resolves to the expert shell WITHOUT writing the saved preference;
+    (d) a recognized deep link wins navigation without writing storage, for
+    both a fresh load with the hash already set and a same-document
+    hashchange on an already-open page; (e) a throwing localStorage
+    (private-mode style) degrades gracefully — import survives, the
+    default landing still resolves, and the toggle keeps working for that
+    page view.
+
+    Scope note: this stub models DOM state and event wiring faithfully
+    (getElementById is memoized per id, so every call site touching the
+    same id shares one object; `hidden` and `open` behave like the real
+    IDL attributes) but it is NOT a layout/paint engine — it cannot see a
+    `[hidden]` ancestor visually cascading over a nested descendant. That
+    structural half of FE0 is covered by
+    ``test_mode_toggle_is_a_descendant_of_the_header_never_of_either_shell``
+    (a real ancestor-chain parse of the server-rendered HTML) plus the
+    live-browser verification recorded in the phase commit message.
+    """
+    harness = tmp_path / "app_mode_shell_smoke.mjs"
+    harness.write_text(_APP_MODE_SHELL_HARNESS, encoding="utf-8")
+    env = {"QF_APP_URL": APP_JS_PATH.resolve().as_uri()}
+    result = subprocess.run(
+        ["node", str(harness)],
+        capture_output=True,
+        text=True,
+        env={**dict(__import__("os").environ), **env},
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + "\n" + result.stderr
+    assert "SMOKE RESULT: 0 failed" in result.stdout
+    for marker in (
+        "PASS a.default_simple.expert_hidden",
+        "PASS a.default_simple.simple_visible",
+        "PASS a.default_simple.no_write",
+        "PASS b.after_expert_click.expert_visible",
+        "PASS b.after_expert_click.simple_hidden",
+        "PASS b.after_expert_click.persisted",
+        "PASS b.back_to_simple.simple_visible",
+        "PASS b.back_to_simple.expert_hidden",
+        "PASS b.back_to_simple.persisted",
+        "PASS b.third_switch.expert_visible_again",
+        "PASS c.handoff.expert_shell_visible",
+        "PASS c.handoff.no_write",
+        "PASS d.fresh_load_with_hash.expert_visible",
+        "PASS d.fresh_load_with_hash.no_write",
+        "PASS d.same_doc.initial_simple",
+        "PASS d.same_doc.hashchange_reveals_expert",
+        "PASS d.same_doc.hashchange_no_write",
+        "PASS e.import_survived_throwing_storage",
+        "PASS e.default_simple_despite_throwing_storage",
+        "PASS e.toggle_still_works_this_pageview",
+    ):
+        assert marker in result.stdout, result.stdout
+
+
+_APP_MODE_SHELL_HARNESS = r"""
+const APP_URL = process.env.QF_APP_URL;
+
+// Minimal, auto-vivifying DOM/window/localStorage stub: enough for the
+// REAL app.js (and its full static import chain: api.js, every
+// static/views/*.js module it wires, lab.js) to execute top-level module
+// code under plain Node, no npm/jsdom. getElementById returns a generic
+// fake element for ANY id on first request and memoizes it, so every call
+// site touching the SAME id shares one consistent object. This models
+// STATE and EVENT WIRING faithfully; it does NOT model real layout/paint,
+// so it cannot see CSS-driven visibility cascades (an ancestor's
+// `display:none` hiding a structurally-nested descendant) — that aspect of
+// FE0 is covered separately by a real ancestor-chain check over the
+// server-rendered HTML plus live-browser verification, not by this stub.
+function makeElement(id) {
+  const attrs = new Map();
+  const listeners = new Map();
+  const el = {
+    id,
+    value: '',
+    textContent: '',
+    innerHTML: '',
+    disabled: false,
+    open: false,
+    dataset: {},
+    style: {},
+    children: [],
+    classList: {
+      _set: new Set(),
+      add(...names) { names.forEach(n => this._set.add(n)); },
+      remove(...names) { names.forEach(n => this._set.delete(n)); },
+      contains(n) { return this._set.has(n); },
+      toggle(n) { if (this._set.has(n)) { this._set.delete(n); return false; } this._set.add(n); return true; }
+    },
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(fn);
+    },
+    removeEventListener(type, fn) {
+      const fns = listeners.get(type);
+      if (fns) { const i = fns.indexOf(fn); if (i !== -1) fns.splice(i, 1); }
+    },
+    dispatchEvent(evt) {
+      const fns = listeners.get(evt.type) || [];
+      fns.slice().forEach(fn => fn.call(el, evt));
+      return true;
+    },
+    setAttribute(name, value) { attrs.set(name, String(value)); },
+    getAttribute(name) { return attrs.has(name) ? attrs.get(name) : null; },
+    removeAttribute(name) { attrs.delete(name); },
+    hasAttribute(name) { return attrs.has(name); },
+    appendChild(child) { this.children.push(child); return child; },
+    insertBefore(child) { this.children.push(child); return child; },
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    closest() { return null; },
+    focus() {},
+    click() { this.dispatchEvent({ type: 'click', target: el }); },
+    scrollIntoView() {},
+    get hidden() { return attrs.has('hidden'); },
+    set hidden(v) { if (v) attrs.set('hidden', ''); else attrs.delete('hidden'); }
+  };
+  return el;
+}
+
+function makeLocalStorage({ throwing = false, initial = {} } = {}) {
+  const store = new Map(Object.entries(initial));
+  return {
+    getItem(key) {
+      if (throwing) throw new Error('SecurityError: storage disabled');
+      return store.has(key) ? store.get(key) : null;
+    },
+    setItem(key, value) {
+      if (throwing) throw new Error('SecurityError: storage disabled');
+      store.set(key, String(value));
+    },
+    removeItem(key) { store.delete(key); },
+    _dump() { return Object.fromEntries(store); }
+  };
+}
+
+function setupGlobals({ hash = '', localStorageOpts = {} } = {}) {
+  const registry = new Map();
+  const documentStub = {
+    getElementById(id) {
+      if (!registry.has(id)) registry.set(id, makeElement(id));
+      return registry.get(id);
+    },
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    addEventListener() {},
+    removeEventListener() {},
+    createElement() { return makeElement(''); }
+  };
+  const pageConfigEl = documentStub.getElementById('qf-page-config');
+  pageConfigEl.textContent = JSON.stringify({ controlTokenRequired: false, llmProviderOptions: [] });
+
+  let currentHash = hash;
+  const windowListeners = new Map();
+  function fireHashChange() {
+    (windowListeners.get('hashchange') || []).slice().forEach(fn => fn({ type: 'hashchange' }));
+  }
+  const localStorageStub = makeLocalStorage(localStorageOpts);
+  const windowStub = {
+    location: {
+      get hash() { return currentHash; },
+      set hash(v) { currentHash = v.startsWith('#') ? v : '#' + v; fireHashChange(); }
+    },
+    history: { replaceState() {} },
+    sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    localStorage: localStorageStub,
+    addEventListener(type, fn) {
+      if (!windowListeners.has(type)) windowListeners.set(type, []);
+      windowListeners.get(type).push(fn);
+    },
+    removeEventListener() {},
+    confirm: () => false
+  };
+
+  globalThis.document = documentStub;
+  globalThis.window = windowStub;
+  globalThis.MutationObserver = class { observe() {} disconnect() {} };
+  globalThis.fetch = async () => { throw new Error('network disabled in stub'); };
+
+  return { documentStub, windowStub, localStorageStub, setHash: v => { windowStub.location.hash = v; } };
+}
+
+let failed = 0;
+function check(name, cond, detail) {
+  if (cond) console.log('PASS ' + name);
+  else { failed++; console.log('FAIL ' + name + (detail ? ': ' + detail : '')); }
+}
+
+// (a) default simple on first load: no hash, no saved preference.
+{
+  const { documentStub, localStorageStub } = setupGlobals({ hash: '' });
+  await import(APP_URL + '?scenario=a');
+  const expertShell = documentStub.getElementById('expert-shell');
+  const simpleShell = documentStub.getElementById('simple-shell');
+  check('a.default_simple.expert_hidden', expertShell.hidden === true, 'hidden=' + expertShell.hidden);
+  check('a.default_simple.simple_visible', simpleShell.hidden === false, 'hidden=' + simpleShell.hidden);
+  check('a.default_simple.no_write', localStorageStub._dump().qf_ui_mode === undefined, JSON.stringify(localStorageStub._dump()));
+}
+
+// (b) FE0 regression: expert toggle -> toggle stays reachable/functional
+// -> simple toggle returns. (The CSS-cascade half of FE0 — proving the
+// buttons are not a DESCENDANT of a `[hidden]` shell — is proven
+// separately over the real server-rendered HTML; this proves the STATE
+// MACHINE keeps working correctly across repeated mode switches on the
+// SAME button elements, i.e. no listener gets lost or state corrupted.)
+{
+  const { documentStub, localStorageStub } = setupGlobals({ hash: '' });
+  await import(APP_URL + '?scenario=b');
+  const expertBtn = documentStub.getElementById('mode-expert-btn');
+  const simpleBtn = documentStub.getElementById('mode-simple-btn');
+  const expertShell = documentStub.getElementById('expert-shell');
+  const simpleShell = documentStub.getElementById('simple-shell');
+
+  expertBtn.click();
+  check('b.after_expert_click.expert_visible', expertShell.hidden === false, 'hidden=' + expertShell.hidden);
+  check('b.after_expert_click.simple_hidden', simpleShell.hidden === true, 'hidden=' + simpleShell.hidden);
+  check('b.after_expert_click.persisted', localStorageStub._dump().qf_ui_mode === 'expert', JSON.stringify(localStorageStub._dump()));
+  // The critical "not trapped" assertion: the SAME toggle-simple button is
+  // still wired and flips the shells back.
+  simpleBtn.click();
+  check('b.back_to_simple.simple_visible', simpleShell.hidden === false, 'hidden=' + simpleShell.hidden);
+  check('b.back_to_simple.expert_hidden', expertShell.hidden === true, 'hidden=' + expertShell.hidden);
+  check('b.back_to_simple.persisted', localStorageStub._dump().qf_ui_mode === 'simple', JSON.stringify(localStorageStub._dump()));
+  // And it keeps working for a third switch (no one-shot listener bugs).
+  expertBtn.click();
+  check('b.third_switch.expert_visible_again', expertShell.hidden === false, 'hidden=' + expertShell.hidden);
+}
+
+// (c) FE1 regression: the simple-run handoff must NOT write the saved
+// preference — only explicit toggle clicks are a real preference choice.
+{
+  const { documentStub, localStorageStub } = setupGlobals({ hash: '' });
+  await import(APP_URL + '?scenario=c');
+  const simpleRunBtn = documentStub.getElementById('simple-run');
+  const expertShell = documentStub.getElementById('expert-shell');
+  simpleRunBtn.click();
+  check('c.handoff.expert_shell_visible', expertShell.hidden === false, 'hidden=' + expertShell.hidden);
+  check('c.handoff.no_write', localStorageStub._dump().qf_ui_mode === undefined, JSON.stringify(localStorageStub._dump()));
+}
+
+// (d) recognized deep link wins navigation without writing storage — both
+// a fresh load WITH the hash already set, and a same-document hashchange
+// on a page that loaded without one.
+{
+  const { documentStub, localStorageStub } = setupGlobals({ hash: '#lab-tab-registry' });
+  await import(APP_URL + '?scenario=d1');
+  const expertShell = documentStub.getElementById('expert-shell');
+  check('d.fresh_load_with_hash.expert_visible', expertShell.hidden === false, 'hidden=' + expertShell.hidden);
+  check('d.fresh_load_with_hash.no_write', localStorageStub._dump().qf_ui_mode === undefined, JSON.stringify(localStorageStub._dump()));
+}
+{
+  const { documentStub, localStorageStub, setHash } = setupGlobals({ hash: '' });
+  await import(APP_URL + '?scenario=d2');
+  const expertShell = documentStub.getElementById('expert-shell');
+  check('d.same_doc.initial_simple', expertShell.hidden === true);
+  setHash('#lab-tab-registry');
+  check('d.same_doc.hashchange_reveals_expert', expertShell.hidden === false, 'hidden=' + expertShell.hidden);
+  check('d.same_doc.hashchange_no_write', localStorageStub._dump().qf_ui_mode === undefined, JSON.stringify(localStorageStub._dump()));
+}
+
+// (e) localStorage throwing (private-mode style) degrades gracefully: the
+// import itself must not throw, the default landing still resolves, and
+// the toggle still works for THIS page view even though it cannot persist.
+{
+  const { documentStub } = setupGlobals({ hash: '', localStorageOpts: { throwing: true } });
+  let importThrew = false;
+  try {
+    await import(APP_URL + '?scenario=e');
+  } catch (err) {
+    importThrew = true;
+    console.log('e.import_threw detail: ' + (err && err.stack));
+  }
+  check('e.import_survived_throwing_storage', importThrew === false);
+  const expertShell = documentStub.getElementById('expert-shell');
+  const simpleShell = documentStub.getElementById('simple-shell');
+  check('e.default_simple_despite_throwing_storage', expertShell.hidden === true && simpleShell.hidden === false);
+  const expertBtn = documentStub.getElementById('mode-expert-btn');
+  expertBtn.click();
+  check('e.toggle_still_works_this_pageview', expertShell.hidden === false, 'hidden=' + expertShell.hidden);
+}
 
 console.log('SMOKE RESULT: ' + failed + ' failed');
 if (failed) process.exit(1);

@@ -215,6 +215,26 @@ def _index_html(
        override (0-1-1/1-0-1, decisively higher) is required or app.js's
        mode toggle silently has no visual effect. */
     #simple-shell[hidden], #expert-shell[hidden] {{ display: none; }}
+    /* FE0 fix (phase review, binding): the toggle used to live INSIDE
+       #simple-shell, so switching to expert mode hid the only way back —
+       a dead end until reload. It now lives in this persistent header,
+       a sibling of both shells, so it is never a descendant of either
+       `[hidden]` container and stays reachable in both modes. Sticky +
+       a z-index above the control-rail's own sticky aside (which has no
+       explicit z-index, so implicit stacking would otherwise let it paint
+       over this bar once both are pinned at scroll:0) keeps the toggle
+       reachable at any scroll position, not just at the top of the page. */
+    .mode-header {{
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      display: flex;
+      justify-content: center;
+      padding: 8px 16px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-translucent);
+      backdrop-filter: blur(8px);
+    }}
     .simple-shell {{
       box-sizing: border-box;
       max-width: 640px;
@@ -228,7 +248,6 @@ def _index_html(
     .simple-shell .brand {{ border-bottom: 0; padding-bottom: 0; text-align: center; }}
     .simple-shell .brand-mark {{ margin-inline: auto; }}
     .mode-toggle {{
-      justify-self: center;
       display: inline-flex;
       flex-wrap: wrap;
       gap: 4px;
@@ -237,10 +256,17 @@ def _index_html(
       border-radius: 10px;
       background: var(--wash);
     }}
+    /* FE2 fix (phase review, binding): touch targets below the spec's
+       44px minimum (§9). min-height + flex centering instead of relying
+       on padding alone, so shorter label text still gets the full target
+       height. */
     .mode-toggle-btn {{
       width: auto;
+      min-height: 44px;
       margin: 0;
       padding: 8px 16px;
+      display: inline-flex;
+      align-items: center;
       border: 1px solid transparent;
       border-radius: 7px;
       background: transparent;
@@ -257,7 +283,9 @@ def _index_html(
     .simple-seeds {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 10px 0 4px; }}
     .simple-seeds-label {{ color: var(--muted); font-size: 12px; font-weight: 800; }}
     .simple-seed-btn {{
-      width: auto; margin: 0; padding: 6px 10px; border: 1px solid var(--line);
+      width: auto; min-height: 44px; margin: 0; padding: 6px 10px;
+      display: inline-flex; align-items: center;
+      border: 1px solid var(--line);
       border-radius: 999px; background: var(--panel); color: var(--muted);
       font-size: 12px; font-weight: 700; cursor: pointer;
     }}
@@ -267,6 +295,8 @@ def _index_html(
     .simple-runtime-status {{ text-align: center; overflow-wrap: anywhere; }}
     .advanced-params {{ margin: 14px 0; }}
     .advanced-params summary {{
+      min-height: 44px;
+      display: flex; align-items: center;
       cursor: pointer; color: var(--muted); font-size: 12px; font-weight: 800;
       letter-spacing: .02em; padding: 4px 0;
     }}
@@ -278,14 +308,24 @@ def _index_html(
       border-bottom: 1px dotted var(--line-strong);
       cursor: help;
     }}
+    /* FE3 fix (phase review, binding): `left: 0` anchored the popover to
+       the term-tip's OWN left edge, so a right-column label (param-grid
+       stays 2 columns even at 375px — no collapse breakpoint) pushed a
+       220px-wide box past the viewport's right edge. Centering on the
+       anchor (translateX(-50%)) instead of a one-sided anchor plus a
+       narrower, viewport-relative cap keeps the popover inside a 375px
+       viewport for every label in the grid, in both columns — verified
+       for 融券成本/Top Quantile specifically (the widest labels in the
+       narrower left/right slots) via a real 375px browser check. */
     .term-tip:hover::after, .term-tip:focus-visible::after {{
       content: attr(data-tip);
       position: absolute;
-      left: 0;
+      left: 50%;
+      transform: translateX(-50%);
       bottom: 100%;
       margin-bottom: 6px;
       padding: 6px 8px;
-      max-width: 220px;
+      max-width: min(180px, calc(100vw - 40px));
       width: max-content;
       border: 1px solid var(--line-strong);
       border-radius: 6px;
@@ -898,15 +938,17 @@ def _index_html(
   </style>
 </head>
 <body>
+<header id="mode-header" class="mode-header">
+  <div class="mode-toggle" role="group" aria-label="界面模式">
+    <button type="button" id="mode-simple-btn" class="mode-toggle-btn" aria-pressed="true">简洁模式</button>
+    <button type="button" id="mode-expert-btn" class="mode-toggle-btn" aria-pressed="false">专家模式</button>
+  </div>
+</header>
 <section id="simple-shell" class="simple-shell" aria-label="简洁模式">
   <div class="brand">
     <div class="brand-mark">QF</div>
     <h1>Quant Forge</h1>
-    <p class="brand-subtitle">Factor research console</p>
-  </div>
-  <div class="mode-toggle" role="group" aria-label="界面模式">
-    <button type="button" id="mode-simple-btn" class="mode-toggle-btn" aria-pressed="true">简洁模式</button>
-    <button type="button" id="mode-expert-btn" class="mode-toggle-btn" aria-pressed="false">专家模式</button>
+    <p class="brand-subtitle">因子研究控制台</p>
   </div>
   <div class="panel simple-idea-panel">
     <h2>一句话，开始研究</h2>

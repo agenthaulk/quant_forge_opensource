@@ -856,10 +856,15 @@ document.querySelectorAll('.simple-seed-btn').forEach(seedButton => {
 // renderers the delegated run writes into; a no-provider-ready runtime
 // forces the rule parser (no-LLM-key degradation, spec §10) instead of
 // attempting an LLM call the user never chose.
+// FE1 fix (phase review, binding): this handoff uses applyMode, NEVER
+// setMode — running the guided form once must not silently overwrite the
+// saved preference. Only an explicit toggle click is a real preference
+// choice (component contract 5.6); a first-time beginner who runs once
+// and reloads must still land back on the simple default.
 simpleRunButton.addEventListener('click', () => {
   const anyProviderReady = llmProviderOptions.some(option => option.runtimeReady === 'true');
   document.getElementById('parser').value = anyProviderReady ? 'llm' : 'rule';
-  setMode('expert');
+  applyMode('expert');
   button.click();
 });
 // Mirrors the CP10 attribute-observer pattern above (MutationObserver on
