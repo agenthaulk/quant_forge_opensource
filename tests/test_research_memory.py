@@ -1268,6 +1268,90 @@ def test_data_window_and_failure_class_are_redacted(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Outcome ledger (SE-P2 ingress sink; additive ResearchMemoryStore methods).
+# outcome_ingest.ingest_outcome exercises these THROUGH the sink
+# (tests/test_outcome_ingest.py); these tests pin the store's OWN raw
+# contract directly, independent of outcomes.py's ResearchOutcome machinery.
+# ---------------------------------------------------------------------------
+
+
+def _envelope(outcome_id: str) -> dict:
+    return {
+        "record_schema": "qf.research_outcome_record.v1",
+        "outcome_id": outcome_id,
+        "evidence_run_id": f"run-for-{outcome_id}",
+        "evidence_strength": "local_backtest",
+        "signatures": ["sig1"],
+        "outcome": {"factor_id": "FTR_X"},
+    }
+
+
+def test_record_outcome_envelope_appends_and_reports_new(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifact_root")
+
+    recorded = store.record_outcome_envelope(_envelope("oid-1"))
+
+    assert recorded is True
+    rows = _read_jsonl(store.outcomes_ledger_path)
+    assert len(rows) == 1
+    assert rows[0]["outcome_id"] == "oid-1"
+
+
+def test_record_outcome_envelope_exact_replay_drops(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifact_root")
+
+    first = store.record_outcome_envelope(_envelope("oid-1"))
+    second = store.record_outcome_envelope(_envelope("oid-1"))
+
+    assert first is True
+    assert second is False
+    assert len(_read_jsonl(store.outcomes_ledger_path)) == 1
+
+
+def test_record_outcome_envelope_requires_outcome_id(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifact_root")
+
+    with pytest.raises(ValueError, match="outcome_id"):
+        store.record_outcome_envelope({"record_schema": "qf.research_outcome_record.v1"})
+
+
+def test_known_outcome_ids_empty_when_no_ledger_yet(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifact_root")
+
+    assert store.known_outcome_ids() == frozenset()
+    assert not store.outcomes_ledger_path.exists()
+
+
+def test_known_outcome_ids_reflects_every_recorded_id(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifact_root")
+    store.record_outcome_envelope(_envelope("oid-1"))
+    store.record_outcome_envelope(_envelope("oid-2"))
+    store.record_outcome_envelope(_envelope("oid-1"))  # replay: no-op
+
+    assert store.known_outcome_ids() == {"oid-1", "oid-2"}
+
+
+def test_outcomes_revision_counts_ledger_rows_and_is_stable_on_replay(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifact_root")
+
+    assert store.outcomes_revision() == 0
+    store.record_outcome_envelope(_envelope("oid-1"))
+    assert store.outcomes_revision() == 1
+    store.record_outcome_envelope(_envelope("oid-1"))  # replay
+    assert store.outcomes_revision() == 1
+    store.record_outcome_envelope(_envelope("oid-2"))
+    assert store.outcomes_revision() == 2
+
+
+def test_outcomes_ledger_lives_beside_the_other_memory_files(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifact_root")
+    store.record_outcome_envelope(_envelope("oid-1"))
+
+    assert store.outcomes_ledger_path == store.memory_root / "outcomes_ledger.jsonl"
+    assert store.outcomes_ledger_path.parent == store.observations_path.parent
+
+
+# ---------------------------------------------------------------------------
 # End-to-end memory wiring in the research loop (O2)
 # ---------------------------------------------------------------------------
 
@@ -1288,6 +1372,16 @@ def _memory_service(paths: dict[str, Path], **overrides):
 
 
 def test_rd_run_records_observations_and_second_run_promotes_failure(tmp_path: Path) -> None:
+    # v2 (SE-P2): the "run_id" a memory observation carries is now the
+    # LOGICAL EVIDENCE RUN (outcomes.ResearchOutcome.evidence_run_id(),
+    # hash(factor_fingerprint x canonical window x stage)), not the RD
+    # invocation's run_id string. Re-running the SAME seed against the SAME
+    # demo data reuses the SAME evidence run by design (SE-ii's anti-gaming
+    # mechanism: a re-simulation of one candidate must not count as a
+    # second independent confirmation), so "two runs" here uses two
+    # DIFFERENT seed factors that both trip the same strict gate -- two
+    # genuinely independent candidates landing on the same closed-vocabulary
+    # reason is what promotes now, not a raw per-fingerprint replay.
     from quant_forge.research_loop.service import ResearchGate
 
     paths = create_demo_workspace(tmp_path / "demo")
@@ -1298,22 +1392,24 @@ def test_rd_run_records_observations_and_second_run_promotes_failure(tmp_path: P
 
     store = ResearchMemoryStore(paths["artifact_root"])
     observations = _read_jsonl(store.observations_path)
-    blocked = [row for row in observations if row["failure_class"] == "gate_blocked"]
+    blocked = [row for row in observations if row["failure_class"] in ("gate_blocked", "validation_error")]
     assert blocked
-    assert blocked[0]["signature"].startswith("rd_gate_blocked:")
-    assert "gate blocked candidate formula family" in blocked[0]["statement"]
-    assert blocked[0]["run_id"].startswith("rd_FTR_DEMO_SMALL_CAP_")
+    assert SHA256_HEX.match(blocked[0]["signature"])
+    assert blocked[0]["statement"].startswith("[local/gate] blocked: ")
+    assert SHA256_HEX.match(blocked[0]["run_id"])  # evidence_run_id, not the RD run_id string
     assert blocked[0]["data_window"]  # run's evaluation window, start:end
-    # A single run stays trace-only: no knowledge row yet.
+    # A single seed's evidence stays trace-only: no knowledge row yet.
     assert _read_jsonl(store.path_for("failure")) == []
 
-    service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1, gate=strict_gate)
+    # A second, DIFFERENT seed that also trips the strict gate is a second,
+    # independent evidence run and promotes.
+    service.run_once("FTR_DEMO_MOMENTUM", max_candidates=1, gate=strict_gate)
 
     failures = _read_jsonl(store.path_for("failure"))
     assert failures
     assert failures[-1]["status"] == "active"
     assert failures[-1]["observation_count"] >= 2
-    assert "gate blocked candidate formula family" in failures[-1]["statement"]
+    assert failures[-1]["statement"].startswith("[local/gate] blocked: ")
 
 
 def test_rd_run_records_finding_observations_for_accepted_candidates(tmp_path: Path) -> None:
@@ -1328,10 +1424,38 @@ def test_rd_run_records_finding_observations_for_accepted_candidates(tmp_path: P
     assert any(candidate.gate_passed for candidate in result.candidates)
     store = ResearchMemoryStore(paths["artifact_root"])
     observations = _read_jsonl(store.observations_path)
-    accepted = [row for row in observations if row["signature"].startswith("rd_accepted:")]
+    accepted = [row for row in observations if row["failure_class"] == ""]
     assert accepted
-    assert accepted[0]["failure_class"] == ""
-    assert "passed the research gate" in accepted[0]["statement"]
+    assert SHA256_HEX.match(accepted[0]["signature"])
+    assert accepted[0]["statement"] == (
+        "[local/gate] passed: NONE; family=rd_local_candidate; strength=local_backtest; "
+        "scope=asset=equity;universe=local_panel;family=rd_local_candidate;settings=rd_default"
+    )
+
+
+def test_rd_run_two_seeds_accepted_promotes_finding(tmp_path: Path) -> None:
+    # Companion to test_rd_run_records_observations_and_second_run_promotes_
+    # failure's two-seed pattern, for the "passed" verdict (see that test's
+    # comment for why the SAME seed run twice cannot promote under v2).
+    from quant_forge.research_loop.service import ResearchGate
+
+    paths = create_demo_workspace(tmp_path / "demo")
+    service = _memory_service(paths)
+    permissive_gate = ResearchGate(min_ic_days=0, min_coverage=0.0, min_score=-100.0, min_backtest_periods=0)
+
+    r1 = service.run_once("FTR_DEMO_SMALL_CAP", max_candidates=1, gate=permissive_gate)
+    assert any(candidate.gate_passed for candidate in r1.candidates)
+    store = ResearchMemoryStore(paths["artifact_root"])
+    assert _read_jsonl(store.path_for("finding")) == []  # single seed: trace-only, no row yet
+
+    r2 = service.run_once("FTR_DEMO_MOMENTUM", max_candidates=1, gate=permissive_gate)
+    assert any(candidate.gate_passed for candidate in r2.candidates)
+
+    findings = _read_jsonl(store.path_for("finding"))
+    assert findings
+    assert findings[-1]["status"] == "active"
+    assert findings[-1]["observation_count"] >= 2
+    assert findings[-1]["statement"].startswith("[local/gate] passed: NONE")
 
 
 def test_research_memory_disabled_removes_all_memory_writes(tmp_path: Path) -> None:
@@ -1486,8 +1610,21 @@ def test_next_focus_hints_admit_only_feedback_templates(tmp_path: Path) -> None:
 
 
 def test_gate_blocked_memory_statement_reduces_reasons_to_families(tmp_path: Path) -> None:
-    # P2: the durable statement carries only the value-free reason families;
-    # full gate reasons stay in trace/report artifacts.
+    # v2 (SE-P2): the durable statement is a CLOSED TEMPLATE derived only
+    # from origin/stage/verdict/reason_code/family/strength/scope
+    # (outcomes._statement_for) -- it never carries any part of the raw gate
+    # reason string, so provider-channel or repair-exception free text
+    # cannot reach durable memory (a strictly stronger guarantee than the
+    # pre-SE-P2 "reduce to value-free families" text-surgery it replaces).
+    # Each raw gate reason maps, via its family, to one closed reason code
+    # (local_outcomes._reason_code_for_family): "turnover_rate ..." ->
+    # TURNOVER_TOO_HIGH (failure_class "gate_blocked"), "score ..." ->
+    # VALIDATION_ERROR (failure_class "validation_error", since "score" is
+    # ResearchObjectiveWeights' blended composite, not any single closed
+    # metric -- see local_outcomes.py's module docstring). One
+    # ResearchOutcome with two reason codes mints one MemoryObservation per
+    # code (outcomes.outcome_to_observations), so this result yields TWO
+    # observations, not one.
     from quant_forge.core.contracts import BacktestResult, EvaluationResult, FactorDefinition
     from quant_forge.research_loop.service import (
         ResearchCandidateResult,
@@ -1538,16 +1675,38 @@ def test_gate_blocked_memory_statement_reduces_reasons_to_families(tmp_path: Pat
         formula_fingerprint="ab12cd34ef56" + "0" * 52,
     )
 
-    service._record_memory_observations("rd_family_only", [result])  # noqa: SLF001
+    # A hand-built run_id must still carry the embedded UTC timestamp
+    # local_outcomes._observed_at_from_run_id parses (service._research_
+    # run_id's shape): this is the ONLY clock source available to the pure
+    # mapper (no timestamp field exists anywhere on ResearchCandidateResult).
+    run_id = "rd_family_only_20260701T000000000000Z_deadbeef"
+    service._record_memory_observations(run_id, [result])  # noqa: SLF001
 
     observations = _read_jsonl(ResearchMemoryStore(paths["artifact_root"]).observations_path)
-    statement = observations[-1]["statement"]
-    assert statement.startswith("gate blocked candidate formula family ab12cd34ef56")
-    assert "score" in statement
-    assert "turnover_rate" in statement
-    assert "UPSTREAM_MARKER_XYZ" not in statement
-    assert "HTTP 400" not in statement
-    assert "\n" not in statement
+    assert len(observations) == 2
+    by_reason = {row["statement"].split(": ", 1)[1].split(";", 1)[0]: row for row in observations}
+    assert set(by_reason) == {"TURNOVER_TOO_HIGH", "VALIDATION_ERROR"}
+
+    turnover_row = by_reason["TURNOVER_TOO_HIGH"]
+    assert turnover_row["failure_class"] == "gate_blocked"
+    assert turnover_row["statement"] == (
+        "[local/gate] blocked: TURNOVER_TOO_HIGH; family=rd_local_candidate; strength=local_backtest; "
+        "scope=asset=equity;universe=local_panel;family=rd_local_candidate;settings=rd_default"
+    )
+
+    score_row = by_reason["VALIDATION_ERROR"]
+    assert score_row["failure_class"] == "validation_error"
+
+    for row in observations:
+        assert SHA256_HEX.match(row["signature"])
+        assert SHA256_HEX.match(row["run_id"])
+        assert row["observed_at"] == "2026-07-01T00:00:00+00:00"
+        assert "UPSTREAM_MARKER_XYZ" not in row["statement"]
+        assert "HTTP 400" not in row["statement"]
+        assert "score" not in row["statement"]
+        assert "0.0123" not in row["statement"]
+        assert "1.2" not in row["statement"]
+        assert "\n" not in row["statement"]
 
 
 def test_memory_items_for_prompt_rejects_appended_payload() -> None:

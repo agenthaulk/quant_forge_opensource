@@ -121,6 +121,9 @@ _ACTIVE_ROW_STATUSES = frozenset({"active", RULE_CANDIDATE_STATUS})
 _MEMORY_DIR = "research_memory"
 _OBSERVATIONS_FILE = "observations.jsonl"
 _REVIEW_EVENTS_FILE = "activations.jsonl"
+# SE-P2: one append-only ResearchOutcome.to_record() envelope per outcome_id
+# (see the "Outcome ledger" section below).
+_OUTCOMES_LEDGER_FILE = "outcomes_ledger.jsonl"
 _LOCK_FILE = "memory.lock"
 _EVENT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONFLICTED_COPY_MARKER = "conflicted copy"
@@ -355,6 +358,10 @@ class ResearchMemoryStore:
     @property
     def review_events_path(self) -> Path:
         return self.memory_root / _REVIEW_EVENTS_FILE
+
+    @property
+    def outcomes_ledger_path(self) -> Path:
+        return self.memory_root / _OUTCOMES_LEDGER_FILE
 
     @property
     def _lock_path(self) -> Path:
@@ -833,6 +840,71 @@ class ResearchMemoryStore:
                 decided_at=decided_at,
                 supersedes=None,
             )
+
+    # ------------------------------------------------------------------
+    # Outcome ledger (SE-P2 ingress sink; SE-ii/SE-ix/SE-P5): one
+    # append-only JSONL envelope per ``ResearchOutcome.to_record()``, keyed
+    # by ``outcome_id`` for exact replay-drop. Lives beside rules/findings/
+    # failures/observations under THIS store's OWN ``research_memory`` root,
+    # so dual-domain isolation (SE-i) is automatic: a plugin's own
+    # ``ResearchMemoryStore`` instance (a different ``artifact_root``) keeps
+    # its own ledger, and this store never reads or writes another root.
+    # This kernel only appends/reads the envelope; ``outcomes.py``'s frozen
+    # ``ResearchOutcome`` contract already validated its shape before it
+    # reaches here, so this mirrors the plain observations/promotion append
+    # style (reuse ``_read_jsonl``/``_append_jsonl`` as-is) rather than the
+    # heavier review-event schema/tamper-recompute validation: ``outcome_id``
+    # IS already the recomputed content fingerprint the frozen contract
+    # minted, so a second recompute here would just duplicate ``outcomes.
+    # ResearchOutcome.outcome_id()``'s own logic (do not hand-roll a second
+    # reader/writer).
+    # ------------------------------------------------------------------
+
+    def record_outcome_envelope(self, record: Mapping[str, Any]) -> bool:
+        """Append one ``ResearchOutcome.to_record()`` envelope; exact replay-drop.
+
+        ``record["outcome_id"]`` is the content-identity key (SE-ii): a
+        caller resubmitting the EXACT SAME envelope (e.g. retrying a crashed
+        ingest) is dropped -- nothing is appended and this returns False --
+        while any outcome with a NEW id (a genuinely new measurement, even
+        of the same evidence run) is appended and this returns True. The
+        membership check and the append happen inside ONE lock hold so two
+        concurrent ingests of the same ``outcome_id`` cannot both observe
+        "absent" and both append.
+        """
+
+        outcome_id = str(record.get("outcome_id") or "")
+        if not outcome_id:
+            raise ValueError("outcome record is missing outcome_id")
+        with advisory_file_lock(self._lock_path):
+            if outcome_id in self._known_outcome_ids_unlocked():
+                return False
+            _append_jsonl(self.outcomes_ledger_path, record)
+            return True
+
+    def known_outcome_ids(self) -> frozenset[str]:
+        """Every ``outcome_id`` currently on the ledger (locked read)."""
+
+        with advisory_file_lock(self._lock_path):
+            return self._known_outcome_ids_unlocked()
+
+    def outcomes_revision(self) -> int:
+        """Monotonic append index: count of valid ledger rows.
+
+        This is SE-P5's ``as_of`` snapshot-fingerprint input: the ledger only
+        ever grows (append-only; replay-dropped duplicates never append), so
+        two priors snapshots taken at the same revision saw the exact same
+        ledger content, and a genuinely new outcome always strictly
+        increases it.
+        """
+
+        with advisory_file_lock(self._lock_path):
+            return len(_read_jsonl(self.outcomes_ledger_path))
+
+    def _known_outcome_ids_unlocked(self) -> frozenset[str]:
+        return frozenset(
+            str(row["outcome_id"]) for row in _read_jsonl(self.outcomes_ledger_path) if row.get("outcome_id")
+        )
 
     # ------------------------------------------------------------------
     # Unlocked internals: never self-lock (callers hold the lock already).
