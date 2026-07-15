@@ -57,6 +57,24 @@ from quant_forge.apps.web.pipeline import (
     retry_pipeline,
     update_pipeline_parameters,
 )
+from quant_forge.apps.web.narration import (
+    ClarifyBlockedError,
+    SidecarSessionStore,
+    UnresolvedNarrationRefError,
+    active_component_ids_for,
+    assert_chat_not_sole_number_carrier,
+    assert_clarify_unblocked,
+    llm_readiness,
+)
+from quant_forge.apps.web.tools import (
+    ACTION_TOOL_NAMES,
+    SidecarJournal,
+    TOOL_KINDS,
+    ToolAuthorizationError,
+    ToolBudgetError,
+    ToolRegistry,
+)
+from quant_forge.specs.narration import NarrationNode
 from quant_forge.config import QuantForgeConfig
 from quant_forge.mcp.read_models import list_available_fields, list_available_operators
 from quant_forge.research_loop.config import ResearchLoopConfig, load_research_loop_config
@@ -130,6 +148,128 @@ def _pipeline_id_from_action_path(path: str, action: str) -> str:
     return parts[2]
 
 
+def _sidecar_pipeline_id_from_path(path: str, suffix: str) -> str:
+    """``/api/sidecar/pipelines/<id>/<suffix>`` -> ``<id>`` (suffix fixed)."""
+
+    parts = path.strip("/").split("/")
+    if len(parts) != 5 or parts[:3] != ["api", "sidecar", "pipelines"] or parts[4] != suffix or not parts[3]:
+        raise KeyError(f"unknown sidecar path: {path}")
+    return parts[3]
+
+
+def _sidecar_tool_from_path(path: str) -> tuple[str, str]:
+    """``/api/sidecar/pipelines/<id>/tools/<name>`` -> ``(<id>, <name>)``."""
+
+    parts = path.strip("/").split("/")
+    if len(parts) != 6 or parts[:3] != ["api", "sidecar", "pipelines"] or parts[4] != "tools" or not parts[3] or not parts[5]:
+        raise KeyError(f"unknown sidecar tool path: {path}")
+    return parts[3], parts[5]
+
+
+def _sidecar_session_payload(
+    sessions: SidecarSessionStore, journal: SidecarJournal, pipeline_id: str
+) -> dict[str, Any]:
+    """Clarify session + tool journal for a pipeline, for the sidecar drawer +
+    rejoin/replay. An absent session renders an empty (trivially unblocked)
+    interview -- e.g. no-LLM degradation posed nothing (spec §10)."""
+
+    session = sessions.load(pipeline_id)
+    if session is None:
+        clarify = {"pipeline_id": pipeline_id, "questions": [], "answers": [], "blocking_unanswered": [], "executable": True}
+    else:
+        clarify = {
+            **session.to_dict(),
+            "blocking_unanswered": session.blocking_unanswered(),
+            "executable": session.is_executable(),
+        }
+    return {"clarify": clarify, "journal": journal.rows(pipeline_id)}
+
+
+def _sidecar_clarify_answer(
+    sessions: SidecarSessionStore, pipeline_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Record one clarify answer (or a skip = accept default) and persist it.
+
+    A later answer that replaces an earlier one keeps BOTH in provenance
+    (spec §5.2). The session must already exist (the sidecar posed the
+    questions); answering an un-posed pipeline is a 404.
+    """
+
+    session = sessions.load(pipeline_id)
+    if session is None:
+        raise KeyError(f"no clarify session for pipeline: {pipeline_id}")
+    session.answer(
+        str(payload.get("question_key", "")),
+        _optional_str(payload.get("option_id")),
+        skipped=bool(payload.get("skipped", False)),
+    )
+    sessions.save(session)
+    return {
+        "clarify": {
+            **session.to_dict(),
+            "blocking_unanswered": session.blocking_unanswered(),
+            "executable": session.is_executable(),
+        },
+        "provenance": [entry.to_dict() for entry in session.provenance_entries()],
+    }
+
+
+def _sidecar_invoke_tool(
+    registry: ToolRegistry,
+    journal: SidecarJournal,
+    sessions: SidecarSessionStore,
+    *,
+    pipeline_store: PipelineStore,
+    job_manager: Any,
+    config: QuantForgeConfig,
+    pipeline_id: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+    objective: str,
+    nav_target: str | None,
+    supplied_capability: str,
+) -> dict[str, Any]:
+    """Authorize + invoke one allowlisted tool scoped to a pipeline, then
+    journal the action + its narration so a replay reproduces the same cards.
+
+    The per-run grant is created on first touch and reused (so budgets
+    accumulate); an action tool needs the frontend to have called ``authorize``
+    and to present the token as ``X-Sidecar-Capability`` -- otherwise
+    :meth:`ToolRegistry.invoke` raises 401 (even on loopback, spec §5.7).
+    """
+
+    grant = registry.grant_for(pipeline_id) or registry.authorize(pipeline_id)
+    # Blocking clarify questions gate the confirm action server-side too (the
+    # second FE-L4 enforcement point, mirroring the direct /confirm route).
+    if tool_name == "confirm_pipeline":
+        assert_clarify_unblocked(sessions.load(pipeline_id))
+    result = registry.invoke(tool_name, arguments, grant=grant, capability=supplied_capability or None)
+    # One journaled sidecar action. Narration for a tool result is a labelled
+    # STATUS node (no number ever inline -- assert_chat_not_sole_number_carrier
+    # re-checks). Numbers reach the UI only when a later ref node points a
+    # canonical renderer at one of `result.artifact_refs`.
+    narration = [
+        NarrationNode(kind="status", message_key=f"sidecar.tool.{tool_name}", args=[tool_name]).to_dict()
+    ]
+    assert_chat_not_sole_number_carrier(narration)
+    input_refs = {
+        key: arguments[key]
+        for key in ("factor_id", "pipeline_id", "parse_job_id", "run_id")
+        if key in arguments
+    }
+    journal.record(
+        pipeline_id,
+        tool=tool_name,
+        objective=objective,
+        input_refs=input_refs,
+        request_hash=registry.request_hash(tool_name, arguments),
+        artifact_refs=result.artifact_refs,
+        nav_target=nav_target,
+        narration=tuple(narration),
+    )
+    return {"result": result.to_dict(), "narration": narration}
+
+
 def create_local_web_server(
     *, host: str, port: int, config: QuantForgeConfig, rd_config: ResearchLoopConfig | None = None
 ) -> ThreadingHTTPServer:
@@ -158,6 +298,17 @@ def create_local_web_server(
     )
     job_manager = _WebJobManager()
     pipeline_store = PipelineStore(config.paths.artifact_root)
+    # Sidecar surface (agent_sidecar_frontend.md §5.7): the in-process typed
+    # tool adapter, its per-run journal, and clarify-session persistence. The
+    # tool registry mints its OWN per-run capability token for action tools --
+    # independent of `control_token` below, which is empty on a loopback bind
+    # (the network bearer the general routes skip). Action tools stay gated
+    # even then (spec §5.7).
+    tool_registry = ToolRegistry(
+        config=config, store=pipeline_store, job_manager=job_manager, rd_config=research_config
+    )
+    sidecar_journal = SidecarJournal(config.paths.artifact_root)
+    sidecar_sessions = SidecarSessionStore(config.paths.artifact_root)
     control_token = _control_token_for_bind(host, config)
     control_token_required = bool(control_token)
 
@@ -289,6 +440,24 @@ def create_local_web_server(
                         pipeline_store, _pipeline_id_from_path(path), job_manager=job_manager, config=config
                     )
                     self._json(record.to_dict())
+                elif path == "/api/sidecar/readiness":
+                    # LLM readiness tri-state (spec §5.6/§10). The client's
+                    # pre-fetch default is `unknown`; this authenticated read
+                    # returns the real ready/unavailable state.
+                    self._require_control_token()
+                    self._json({"readiness": llm_readiness(config)})
+                elif path == "/api/sidecar/tools":
+                    # Model-facing tool catalog (MCP-shaped). Carries no token
+                    # of any kind (bearer never in model context, spec §5.7).
+                    self._require_control_token()
+                    self._json({"tools": tool_registry.catalog()})
+                elif path.startswith("/api/sidecar/pipelines/") and path.endswith("/session"):
+                    self._require_control_token()
+                    self._json(
+                        _sidecar_session_payload(
+                            sidecar_sessions, sidecar_journal, _sidecar_pipeline_id_from_path(path, "session")
+                        )
+                    )
                 elif path.startswith(STATIC_URL_PREFIX):
                     # Static frontend modules are public like the index page
                     # itself; they contain no runtime values or secrets.
@@ -524,10 +693,17 @@ def create_local_web_server(
                     self._json(record.to_dict(), status=201)
                     return
                 if path.startswith("/api/pipelines/") and path.endswith("/confirm"):
+                    confirm_pipeline_id = _pipeline_id_from_action_path(path, "confirm")
+                    # Blocking clarify questions gate execution (spec §5.2,
+                    # FE-L4). Enforced server-side at BOTH confirm entrypoints
+                    # (this direct route and the confirm_pipeline tool), so the
+                    # UI is never the only gate. A pipeline the sidecar never
+                    # interviewed has no session -> trivially unblocked.
+                    assert_clarify_unblocked(sidecar_sessions.load(confirm_pipeline_id))
                     record = confirm_pipeline(
                         config,
                         pipeline_store,
-                        _pipeline_id_from_action_path(path, "confirm"),
+                        confirm_pipeline_id,
                         nonce=str(payload.get("nonce", "")),
                         version=_int_parameter(payload.get("version", 0), "version"),
                         job_manager=job_manager,
@@ -618,7 +794,55 @@ def create_local_web_server(
                         return
                     self._json({"error": "action must be start or stop"}, status=400)
                     return
+                if path.startswith("/api/sidecar/pipelines/") and path.endswith("/authorize"):
+                    # Mint a per-run tool grant. The capability token crosses to
+                    # the TRUSTED frontend (which holds it and presents it as
+                    # X-Sidecar-Capability on action-tool calls) over the same
+                    # already-authorized channel -- it is never handed to the
+                    # model (spec §5.7: bearer never in model context).
+                    grant = tool_registry.authorize(_sidecar_pipeline_id_from_path(path, "authorize"))
+                    self._json(
+                        {"pipeline_id": grant.pipeline_id, "created_at": grant.created_at, "capability": grant.capability},
+                        status=201,
+                    )
+                    return
+                if path.startswith("/api/sidecar/pipelines/") and path.endswith("/clarify"):
+                    self._json(
+                        _sidecar_clarify_answer(
+                            sidecar_sessions,
+                            _sidecar_pipeline_id_from_path(path, "clarify"),
+                            payload,
+                        )
+                    )
+                    return
+                if path.startswith("/api/sidecar/pipelines/") and "/tools/" in path:
+                    sidecar_pipeline_id, tool_name = _sidecar_tool_from_path(path)
+                    self._json(
+                        _sidecar_invoke_tool(
+                            tool_registry,
+                            sidecar_journal,
+                            sidecar_sessions,
+                            pipeline_store=pipeline_store,
+                            job_manager=job_manager,
+                            config=config,
+                            pipeline_id=sidecar_pipeline_id,
+                            tool_name=tool_name,
+                            arguments=dict(payload.get("arguments") or {}),
+                            objective=str(payload.get("objective", "")),
+                            nav_target=_optional_str(payload.get("nav_target")),
+                            supplied_capability=self.headers.get("X-Sidecar-Capability", ""),
+                        )
+                    )
+                    return
                 self._json({"error": f"unknown endpoint: {path}"}, status=404)
+            except ToolAuthorizationError:
+                self._json({"error": "unauthorized"}, status=401)
+            except ClarifyBlockedError as exc:
+                self._json({"error": str(exc)}, status=409)
+            except ToolBudgetError as exc:
+                self._json({"error": str(exc)}, status=429)
+            except UnresolvedNarrationRefError as exc:
+                self._json({"error": str(exc)}, status=400)
             except KeyError as exc:
                 self._json({"error": str(exc)}, status=404)
             except PermissionError:

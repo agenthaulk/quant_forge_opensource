@@ -352,6 +352,11 @@ let currentDensity = 'beginner';
 let draftOverrides = {};
 let pollToken = 0;
 let onCompletedCallback = null;
+// P2 (agent_sidecar_frontend.md §5.5): the sidecar narration/clarify drawer
+// attaches reactively to whatever pipeline this module owns. pipeline.js stays
+// the single owner of pipeline state (FE-L3); narration.js is a pure consumer
+// notified only on a NEW pipeline or a status change (never on every poll tick).
+let onPipelineCallback = null;
 let lastRenderedHtml = null;
 // phase-review F12: "focus the revealed heading on meaningful transitions,
 // restore focus on dismissal" -- remembers whatever had focus right before
@@ -449,6 +454,7 @@ function setPipeline(pipeline) {
   currentProvenance = pipeline.provenance || [];
   if (isNewPipeline) draftOverrides = {};
   renderCurrent();
+  if ((isNewPipeline || statusChanged) && onPipelineCallback) onPipelineCallback(pipeline);
   if (statusChanged && FOCUS_REVEAL_STATUSES.has(pipeline.status)) {
     focusRevealedHeading();
   } else if (statusChanged && FOCUS_RESTORE_STATUSES.has(pipeline.status)) {
@@ -590,6 +596,10 @@ export function currentPipelineFactorId() {
   return currentPipeline && currentPipeline.factor ? currentPipeline.factor.factor_id : null;
 }
 
+export function currentPipelineId() {
+  return currentPipeline ? currentPipeline.pipeline_id : null;
+}
+
 export function hasActivePipeline() {
   return Boolean(currentPipeline);
 }
@@ -600,6 +610,7 @@ export function resetPipelineCard() {
   currentProvenance = [];
   draftOverrides = {};
   renderCurrent();
+  if (onPipelineCallback) onPipelineCallback(null); // detach the narration drawer
   restoreFocusFromCard(); // F12: an explicit reset is also a "dismissal"
 }
 
@@ -622,6 +633,7 @@ function showPipelineActionError(message) {
 
 export function initPipelineModule(options) {
   onCompletedCallback = (options && options.onCompleted) || null;
+  onPipelineCallback = (options && options.onPipeline) || null;
   if (!mount) return;
   // Explicitly hidden from the very first paint (not just "empty"): a page
   // load with nothing to rejoin never calls renderCurrent() otherwise,

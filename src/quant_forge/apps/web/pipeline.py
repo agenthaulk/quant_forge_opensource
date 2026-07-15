@@ -1369,6 +1369,15 @@ def fork_pipeline_from_failure(
     what "edit and fork" means.
     """
 
+    # P2-F3 (agent sidecar clarify -- documented decision, NOT built here): the
+    # forked child starts with NO clarify session, so a blocking question left
+    # open on the PARENT is not carried onto it. Intentional and safe today: a
+    # fork is only reachable from paused_failure (AFTER a confirm already ran)
+    # and is itself a human re-confirmation that supersedes the parent's
+    # interview; nothing in this build poses clarify questions on a pre-confirm
+    # pipeline anyway (the pose path is the deferred live LLM loop). IF that
+    # pose path later needs a parent's open blocking question to survive an
+    # edit-fork, that carry-over lands in P3 with the live sidecar orchestration.
     with store.lock:
         old = store.load(pipeline_id)
         old = _reconcile(old, store=store, job_manager=job_manager, config=config)
@@ -1467,6 +1476,15 @@ def create_pipeline_as_fallback(
     old failure are simultaneously "live" without the lineage link recorded.
     """
 
+    # P2-F3 (agent sidecar clarify -- documented decision, NOT built here): the
+    # fallback child starts with NO clarify session, so a blocking question left
+    # open on the PARENT is not carried onto it. Intentional and safe today: a
+    # fallback is only reachable from paused_failure (AFTER a confirm already
+    # ran) and is itself a human re-confirmation that supersedes the parent's
+    # interview; nothing in this build poses clarify questions on a pre-confirm
+    # pipeline anyway (the pose path is the deferred live LLM loop). IF that pose
+    # path later needs a parent's open blocking question to survive a fallback,
+    # that carry-over lands in P3 with the live sidecar orchestration.
     # Deferred import mirrors api.py::_parse_idea's own pattern: the server
     # facade imports widely and a module-level import here would risk an
     # apps.web import cycle.

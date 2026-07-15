@@ -40,8 +40,9 @@ JS_CONTENT_TYPE = "text/javascript; charset=utf-8"
 
 # The complete CP6-1 module set (+ CP6-2 Lab chrome + CP6-3 data/registry
 # views + CP6-4 docs/extensions views + CP10 synthesis module + P1 pipeline
-# aggregate views). A new module must be added here so the no-external-
-# resources and single-renderer sweeps keep covering everything.
+# aggregate views + P2 sidecar narration renderer). A new module must be added
+# here so the no-external-resources and single-renderer sweeps keep covering
+# everything.
 EXPECTED_STATIC_MODULES = (
     "api.js",
     "app.js",
@@ -55,6 +56,7 @@ EXPECTED_STATIC_MODULES = (
     "views/factor.js",
     "views/history.js",
     "views/lab.js",
+    "views/narration.js",
     "views/pipeline.js",
     "views/provenance.js",
     "views/registry.js",

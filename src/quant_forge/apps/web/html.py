@@ -871,6 +871,41 @@ def _index_html(
     @media (max-width: 480px) {{
       .pipeline-summary-label {{ min-width: 0; }}
     }}
+    /* P2 sidecar: narration drawer + clarify card (agent_sidecar_frontend.md
+       §5.5/§5.2/§9; static/views/narration.js). Token-only (both themes from
+       the variables above, zero new color literals); every row wraps so a
+       true 375px viewport stays overflow-free. Attaches beside/under the
+       pipeline card -- NOT a standalone chat column (spec §5.5). */
+    .narration-drawer {{ display: grid; gap: 10px; margin: 10px 0 14px; padding: 12px; min-width: 0;
+      border: 1px solid var(--line); border-left: 4px solid var(--accent-2); border-radius: 10px; background: var(--wash); }}
+    .narration-drawer[hidden] {{ display: none; }}
+    .narration-readiness {{ margin: 0; color: var(--muted); font-size: 12px; font-weight: 800; overflow-wrap: anywhere; }}
+    .narration-stream {{ display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }}
+    .narration-node {{ padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px;
+      background: var(--panel); color: var(--ink); font-size: 13px; overflow-wrap: anywhere; }}
+    .narration-ref-link, .narration-action-btn {{ width: auto; min-height: 44px; margin: 0 0 0 4px; padding: 4px 12px;
+      border: 1px solid var(--accent); border-radius: 7px; background: var(--panel); color: var(--accent);
+      font-size: 12px; font-weight: 800; cursor: pointer; }}
+    .narration-ref-link:hover, .narration-action-btn:hover {{ background: var(--ok-wash); }}
+    .narration-ref-link:focus-visible, .narration-action-btn:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .clarify-card {{ display: grid; gap: 10px; }}
+    .clarify-card-title {{ margin: 0; font-size: 14px; }}
+    .clarify-question {{ min-width: 0; margin: 0; padding: 10px; border: 1px solid var(--line);
+      border-radius: 8px; background: var(--panel); display: grid; gap: 6px; }}
+    .clarify-question legend {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+      padding: 0 4px; font-size: 13px; font-weight: 800; color: var(--ink); }}
+    .clarify-tier {{ border-radius: 999px; padding: 1px 8px; font-size: 10px; font-weight: 800; border: 1px solid var(--line); }}
+    .clarify-tier--blocking {{ color: var(--warn); border-color: var(--warn-line); background: var(--warn-wash); }}
+    .clarify-tier--semantic {{ color: var(--muted); border-color: var(--line-strong); }}
+    .clarify-default {{ color: var(--accent-2); font-size: 10px; font-weight: 800; }}
+    .clarify-answered {{ color: var(--accent-2); font-size: 11px; font-weight: 800; }}
+    .clarify-option {{ display: flex; gap: 8px; align-items: baseline; min-height: 44px;
+      font-size: 13px; color: var(--ink); overflow-wrap: anywhere; }}
+    .clarify-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }}
+    .clarify-actions button {{ width: auto; margin: 0; min-height: 44px; flex: 1 1 auto; }}
+    @media (min-width: 921px) {{
+      .narration-drawer {{ max-width: 420px; }}
+    }}
     .registry-layout {{ display: grid; grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
       gap: 14px; align-items: start; }}
     .registry-list {{ display: grid; gap: 8px; align-content: start; }}
@@ -1158,6 +1193,13 @@ def _index_html(
              never on every poll tick. Empty and [hidden] until a pipeline
              exists for this page view. -->
         <div id="pipeline-card-mount" aria-live="polite" aria-atomic="false"></div>
+        <!-- P2 sidecar narration + clarify drawer (agent_sidecar_frontend.md
+             §5.5/§5.2): THE narration renderer (static/views/narration.js)
+             attaches its event stream + clarify Q&A card HERE, beside the
+             pipeline card -- there is no standalone chat column (spec §5.5).
+             Throttled aria-live (spec §9); empty and [hidden] until the
+             sidecar has something to say. -->
+        <div id="narration-drawer" class="narration-drawer" aria-live="polite" aria-atomic="false" aria-label="副驾叙述与澄清" hidden></div>
         <div class="section-title">
           <h2>Factor Tape</h2>
           <p>解析、评价、回测集中展示</p>

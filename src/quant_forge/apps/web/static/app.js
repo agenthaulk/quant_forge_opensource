@@ -42,6 +42,7 @@ import {
   rejoinActivePipelines,
   resetPipelineCard
 } from './views/pipeline.js';
+import { attachToPipeline, initNarrationModule, refreshReadiness } from './views/narration.js';
 
 const pageConfig = JSON.parse(document.getElementById('qf-page-config').textContent || '{}');
 const controlTokenRequired = Boolean(pageConfig.controlTokenRequired);
@@ -280,6 +281,20 @@ function rdPayload() {
     iterations: Number(document.getElementById('rd-iterations').value)
   };
 }
+// WORKORDER P2 §8 deletion item — DEFERRED / ESCALATED (steward to adjudicate).
+// The design calls for this parse/validate orchestration to converge into
+// pipeline.js so app.js returns to "read config + assemble + route". It is NOT
+// done here: the honest, safe extraction (a pipeline.js `parseIntoPipeline`
+// that app.js routes to) is entangled with app.js-owned concerns this security
+// commit should not destabilize -- the shared activeIdeaJobId cancel tracking,
+// the two-family workbench-dot priority, the simple/expert mode handoff, the
+// job-dependent panel invalidation -- and the exact parse->create fetch
+// sequence is pinned by tests/test_web_pipeline_view.py's end-to-end node
+// smoke. Deferring the orthogonal refactor (no P2 pin or acceptance depends on
+// it) keeps the P1 green baseline intact; recommend a focused follow-up (or
+// folding it into P3, where pipeline.js gains the rd_optimize kind and this
+// wiring re-homes naturally). The sidecar narration wiring above is additive
+// and does not deepen the coupling.
 async function submitParse(parserMode) {
   const job = await postJson('/api/jobs/parse-idea', {
       text: document.getElementById('idea').value,
@@ -433,7 +448,17 @@ async function onPipelineCompleted(pipeline) {
     console.warn('pipeline report mirror failed', error);
   }
 }
-initPipelineModule({ onCompleted: onPipelineCompleted });
+// P2 sidecar (agent_sidecar_frontend.md §5.5/§5.6): the narration/clarify
+// drawer attaches to whatever pipeline the pipeline module owns, via its
+// onPipeline hook (pipeline.js stays the single state owner, FE-L3). Readiness
+// is tri-state and refreshed on load + on token arrival; the pre-fetch default
+// stays `unknown` so a token-redacted boot never pre-judges (spec §5.6).
+initNarrationModule();
+initPipelineModule({
+  onCompleted: onPipelineCompleted,
+  onPipeline: pipeline => { attachToPipeline(pipeline && pipeline.pipeline_id).catch(() => {}); }
+});
+refreshReadiness().catch(() => {});
 const multiModulePanel = document.getElementById('lab-module-panel-multi');
 function refreshSynthesisPanelIfDue() {
   if (!multiModulePanel || multiModulePanel.hidden) return;
@@ -512,6 +537,7 @@ async function maybeRejoinActivePipelines() {
 }
 onControlTokenStored(() => {
   refreshRuntimeStatus().catch(() => {});
+  refreshReadiness().catch(() => {});
   historyPanel.refresh();
   benchPanel.refresh();
   dataPanel.refresh();
