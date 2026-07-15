@@ -51,49 +51,46 @@ Exact family -> reason code (checked first, case-insensitive)::
     rebalance_rate             -> TURNOVER_TOO_HIGH    (rebalance_rate above threshold)
     turnover_rate               -> TURNOVER_TOO_HIGH    (turnover_rate above threshold)
     net_return_retention        -> RETURNS_BELOW_GATE   (net/gross retention below threshold)
-    score                       -> VALIDATION_ERROR     (composite objective score; see note below)
-    duplicate                   -> VALIDATION_ERROR     (duplicate result-signature rejection; workflow, not a metric)
-    existing                    -> VALIDATION_ERROR     (pre-existing candidate status conflict; workflow, not a metric)
-    passed                      -> VALIDATION_ERROR     (pass-marker string leaking into gate_reasons on the
-                                                          status-conflict flip path in service.run_once; never a
-                                                          real blocking reason on its own)
+    score                       -> OBJECTIVE_SCORE_BELOW_GATE
+                                    (blended research-objective composite below its configured
+                                     gate; reviewed contract amendment, SE-P2 review 2026-07-14 --
+                                     the pre-review VALIDATION_ERROR label claimed a validation
+                                     failure that never happened)
 
-Substring fallback (checked when no exact family matches; first match
-wins), covering shapes the current local gate does not yet emit but the
-closed vocabulary anticipates (a future correlation/region/weight check),
-plus the ``OOS ...`` / ``{segment} net_annualized_return ...`` shapes whose
-family token IS the segment name, not a fixed word::
+ADMINISTRATIVE families (``duplicate``, ``existing``, ``passed``) are
+workflow bookkeeping, not scientific evidence -- a duplicate-signature
+rejection or a pre-existing-status conflict says nothing about the factor's
+behavior, and the pass-marker string only leaks into ``gate_reasons`` on
+the status-conflict flip path in ``service.run_once``. They map to NO
+reason code: when they co-occur with real blockers they are simply omitted,
+and a result blocked ONLY by administrative families produces NO outcome at
+all (the mapper returns ``None`` and the caller log-skips) rather than a
+fabricated failure lesson (SE-P2 review finding P2-F1).
 
-    sharpe                    -> SHARPE_BELOW_GATE
-    self_correlation           -> SELF_CORRELATION_HIGH
-    redundan(cy)                -> REDUNDANCY_HIGH
-    drawdown                    -> DRAWDOWN_TOO_DEEP
-    weight / concentration       -> WEIGHT_CONCENTRATION_HIGH
-    turnover / rebalance         -> TURNOVER_TOO_HIGH
-    region                       -> REGION_MISMATCH
-    oos                          -> RETURNS_BELOW_GATE  (OOS segment shortfall/decay)
-    return                       -> RETURNS_BELOW_GATE
-    coverage / unavailable        -> DATA_UNAVAILABLE
-    insufficient / sample / evidence -> INSUFFICIENT_SAMPLE
+Anchored variable-family fallback (checked when no exact family matches):
+the ONLY variable family the local gate actually emits is an OOS segment
+name -- ``oos_return_evidence`` and the decay clause admit exclusively
+segments whose name starts with ``OOS`` (case-insensitive), producing
+reasons like ``OOS net_annualized_return below threshold: ...`` /
+``OOS_2024H2 ...`` / ``OOS net return decay exceeds ...`` whose extracted
+family token is the segment name itself::
 
-Anything matching neither table -> ``VALIDATION_ERROR`` (the documented,
-closed-vocabulary fallback; SE-ii forbids inventing a new code). Multiple
+    ^oos([_.-][a-z0-9_.\\-]*)?$  -> RETURNS_BELOW_GATE  (OOS shortfall/decay)
+
+Anything matching neither table FAILS CLOSED: the family maps to no code
+(SE-P2 review finding P2-F2 -- the earlier broad substring fallback let
+unrelated future tokens like ``returning_candidate`` silently classify as
+RETURNS_BELOW_GATE, which is dishonest classification, and SE-ii forbids
+inventing a new code on the fly). As with administrative families, a
+result whose EVERY family fails closed produces no outcome at all. Multiple
 gate reasons collapsing onto the same closed code count once (reason_codes
 is a deduped, sorted tuple, matching ``ResearchOutcome``'s own identity
-contract). ``TURNOVER_TOO_LOW`` and ``EXECUTION_ERROR`` are valid, closed
-codes this table simply never emits today: the local smoke gate has no
-minimum-turnover clause, and a caught evaluation/backtest exception aborts
-the candidate before a ``ResearchCandidateResult`` (and hence this pure
+contract). ``TURNOVER_TOO_LOW``, ``VALIDATION_ERROR`` and
+``EXECUTION_ERROR`` are valid, closed codes this table simply never emits
+today: the local smoke gate has no minimum-turnover clause, no validation
+stage of its own, and a caught evaluation/backtest exception aborts the
+candidate before a ``ResearchCandidateResult`` (and hence this pure
 mapper) is ever reached.
-
-``score`` note: ``result.score`` is ``ResearchObjectiveWeights``'s blended
-composite (``weighted_split_icir`` 0.4 + ``rank_ic_mean`` 0.25 +
-``rank_icir`` 0.2 + ``annualized_return`` 0.1 + ``max_drawdown`` 0.05 by
-default) -- it is neither "sharpe" nor purely "return", and the closed
-vocabulary has no composite-objective code (deliberately: SE-ii excludes
-provider composites, and a research-internal composite is no more honestly
-representable by any single-metric code). ``VALIDATION_ERROR`` is the
-documented fallback, not a claim that anything is broken.
 
 metric_snapshot (closed allowlist; SE-ii)
 -------------------------------------------
@@ -101,7 +98,13 @@ Only ``sharpe``, ``annualized_return``, ``max_drawdown``, ``turnover``
 carry real numbers here -- read off the IN-SAMPLE selection backtest (see
 "sample_role" below), preferring the ``net_*`` (after-cost) field and
 falling back to the explicit ``gross_*`` field, honestly labeled either way
-via ``MetricReading.basis``. ``subwindow_sharpe``, ``self_correlation``,
+via ``MetricReading.basis``. ``max_drawdown`` is converted to ``abs()`` of
+the selected reading: the local backtester reports drawdown in its
+negative-return convention, while the frozen contract (``outcomes.
+METRIC_SPECS["max_drawdown"]``) defines a NON-NEGATIVE magnitude -- the
+sign is a reporting convention, not information, so taking the magnitude is
+a lossless unit conversion, never a rewrite of a measurement (SE-P2 review
+finding P2-F3). ``None`` stays ``None``. ``subwindow_sharpe``, ``self_correlation``,
 ``max_weight`` are allowlisted in the target vocabulary but this local
 smoke-gate pipeline has no numeric source for any of the three (sub-window
 Sharpe and self/redundancy correlation live only in the BRAIN-facing
@@ -188,32 +191,38 @@ to make. This is safe to leave unknown -- see the ``factor_family``/
 ``settings_profile`` paragraph below for why those two specifically cannot
 follow the same path.
 
-``factor_family``/``settings_profile`` are FIXED LITERALS
-(``_FACTOR_FAMILY = "rd_local_candidate"``, ``_SETTINGS_PROFILE =
-"rd_default"``), NOT ``""``, even though the local candidate shape carries
-no real per-strategy-type taxonomy or named tuning-profile axis
-(``FactorDefinition`` has no family field; ``experiment_result_to_outcome``
-is not even given the ``ResearchGate`` that produced ``result``, so no
-settings signal is available beyond "the local smoke gate's own defaults").
-This is deliberate, not a shortcut: ``outcomes.OutcomeScope.
-signature_payloads()`` disambiguates EVERY signature by its own
-``evidence_run_id()`` whenever EITHER dimension is empty (R-F4), and
-``evidence_run_id()`` is itself deterministic per ``(factor_fingerprint,
-window, stage)`` -- so an empty family/settings would make two DIFFERENT
-evidence runs (e.g. two distinct candidate factors independently blocked
-for the same reason) permanently unable to share a signature, and
-promotion (``>=2`` distinct ``run_id``s per signature) could never fire for
-ANY local outcome, no matter how many independent candidates recur with the
-same verdict/reason/scope. That would silently break the "two runs still
-promote a finding/failure" behavior this migration must preserve. Fixed
-literals name the ONE family/profile this V1 pipeline honestly has today
-(mirrors the SE-P3 producer's own fixed ``asset_class="us_eq"``/
-``universe="top3000"``: "there is no other value this adapter could
-honestly report" -- here, no more GRANULAR value); every locally-produced
-outcome unifying under one coarse family/profile bucket is the INTENDED
-SE-ii generalization (promote by reason-code family and scope, not by raw
-per-factor fingerprint), not an accident. A real per-strategy-type
-taxonomy replacing this fixed pair is future work, not a regression.
+``factor_family`` is the FIXED LITERAL ``_FACTOR_FAMILY =
+"rd_local_candidate"``, NOT ``""``, even though the local candidate shape
+carries no real per-strategy-type taxonomy (``FactorDefinition`` has no
+family field). This is deliberate, not a shortcut: ``outcomes.
+OutcomeScope.signature_payloads()`` disambiguates EVERY signature by its
+own ``evidence_run_id()`` whenever EITHER family or settings is empty
+(R-F4), and ``evidence_run_id()`` is itself deterministic per
+``(factor_fingerprint, window, stage)`` -- so an empty dimension would make
+two DIFFERENT evidence runs (e.g. two distinct candidate factors
+independently blocked for the same reason) permanently unable to share a
+signature, and promotion (``>=2`` distinct ``run_id``s per signature) could
+never fire for ANY local outcome. The fixed literal names the ONE coarse
+cohort this V1 pipeline honestly has today (upheld by the SE-P2 review as
+an explicitly-coarse-but-real cohort); a real per-strategy-type taxonomy
+replacing it is future work, not a regression.
+
+``settings_profile`` is DERIVED, never a fixed label: ``_settings_profile_
+token(gate)`` = ``"rd_" + sha256(canonical JSON of the effective
+ResearchGate's fields)[:10]``. The pre-review fixed ``"rd_default"``
+literal merged evidence produced under materially different gate settings
+(``run_once`` accepts arbitrary per-run ``ResearchGate`` overrides --
+e.g. a turnover failure under ``max_turnover_rate=0.2`` and another under
+``1.5`` shared a signature and could promote together despite different
+standards; SE-P2 review finding P2-F4). The token is bounded (13 chars),
+deterministic (sorted-key JSON over ``dataclasses.fields``, no floats
+reformatted), matches the scope-dimension grammar, and is intentionally
+OPAQUE rather than named: equal effective gates -- and only equal
+effective gates -- unify, including the constructor-default gate (no
+special "default" name that could silently become a lie if the defaults
+ever change). Adding a field to ``ResearchGate`` shifts every token, which
+is the conservative direction: evidence produced under a gate whose
+semantics changed does not silently unify with old evidence.
 
 observed_at (no clock; run_id-derived)
 ----------------------------------------
@@ -253,6 +262,9 @@ gate.py``, which is exactly the boundary this module must not cross.
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
+import json
 import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -269,7 +281,7 @@ from quant_forge.research_loop.outcomes import (
 from quant_forge.workbench.service import evaluation_data_window
 
 if TYPE_CHECKING:
-    from quant_forge.research_loop.service import ResearchCandidateResult
+    from quant_forge.research_loop.service import ResearchCandidateResult, ResearchGate
 
 __all__ = ["experiment_result_to_outcome"]
 
@@ -286,12 +298,14 @@ _RESERVED_SCOPE_SENTINELS = frozenset({"unknown", "global"})
 # not given).
 _RUN_ID_TIMESTAMP_RE = re.compile(r"(\d{8}T\d{12}Z)_[0-9a-f]{8}\Z")
 
-# Fixed scope literals (see module docstring "scope" section): required
+# Fixed family literal (see module docstring "scope" section): required
 # non-empty so outcomes.OutcomeScope.signature_payloads() does not
 # per-evidence-run disambiguate every local signature, which would make
-# promotion structurally unreachable (R-F4 interaction).
+# promotion structurally unreachable (R-F4 interaction). settings_profile is
+# DERIVED per effective gate -- see _settings_profile_token.
 _FACTOR_FAMILY = "rd_local_candidate"
-_SETTINGS_PROFILE = "rd_default"
+_SETTINGS_TOKEN_PREFIX = "rd_"
+_SETTINGS_TOKEN_HEX_LEN = 10
 
 # --- reason_codes mapping table (see module docstring for the full table) ---
 
@@ -304,40 +318,43 @@ _EXACT_FAMILY_REASON_CODES: dict[str, str] = {
     "rebalance_rate": "TURNOVER_TOO_HIGH",
     "turnover_rate": "TURNOVER_TOO_HIGH",
     "net_return_retention": "RETURNS_BELOW_GATE",
-    "score": "VALIDATION_ERROR",
-    "duplicate": "VALIDATION_ERROR",
-    "existing": "VALIDATION_ERROR",
-    "passed": "VALIDATION_ERROR",
+    # Reviewed contract amendment (SE-P2 review 2026-07-14, P2-F1): the
+    # blended objective composite is a real scientific blocker; the closed
+    # vocabulary gained OBJECTIVE_SCORE_BELOW_GATE for exactly this shape.
+    "score": "OBJECTIVE_SCORE_BELOW_GATE",
 }
 
-_SUBSTRING_FAMILY_REASON_CODES: tuple[tuple[str, str], ...] = (
-    ("sharpe", "SHARPE_BELOW_GATE"),
-    ("self_correlation", "SELF_CORRELATION_HIGH"),
-    ("redundan", "REDUNDANCY_HIGH"),
-    ("drawdown", "DRAWDOWN_TOO_DEEP"),
-    ("weight", "WEIGHT_CONCENTRATION_HIGH"),
-    ("concentration", "WEIGHT_CONCENTRATION_HIGH"),
-    ("turnover", "TURNOVER_TOO_HIGH"),
-    ("rebalance", "TURNOVER_TOO_HIGH"),
-    ("region", "REGION_MISMATCH"),
-    ("oos", "RETURNS_BELOW_GATE"),
-    ("return", "RETURNS_BELOW_GATE"),
-    ("coverage", "DATA_UNAVAILABLE"),
-    ("unavailable", "DATA_UNAVAILABLE"),
-    ("insufficient", "INSUFFICIENT_SAMPLE"),
-    ("sample", "INSUFFICIENT_SAMPLE"),
-    ("evidence", "INSUFFICIENT_SAMPLE"),
+# Workflow bookkeeping, not scientific evidence (P2-F1): mapping these to any
+# reason code would fabricate a failure lesson. They are omitted alongside
+# real blockers; a result blocked ONLY by these produces no outcome at all.
+_ADMINISTRATIVE_FAMILIES = frozenset({"duplicate", "existing", "passed"})
+
+# The ONLY variable family the local gate emits is an OOS segment name
+# (oos_return_evidence / the decay clause admit exclusively names starting
+# with "OOS", case-insensitive). Anchored, not substring (P2-F2):
+# "returning_candidate" or "no_return_path" must NOT classify as a returns
+# shortfall. Families matching nothing FAIL CLOSED (no code, no invention).
+_VARIABLE_FAMILY_REASON_CODES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^oos(?:[_.\-][a-z0-9_.\-]*)?$"), "RETURNS_BELOW_GATE"),
 )
 
-_DEFAULT_REASON_CODE = "VALIDATION_ERROR"
 
-
-def experiment_result_to_outcome(result: "ResearchCandidateResult", *, run_id: str) -> ResearchOutcome | None:
+def experiment_result_to_outcome(
+    result: "ResearchCandidateResult", *, run_id: str, gate: "ResearchGate"
+) -> ResearchOutcome | None:
     """Map one local candidate result to a ``ResearchOutcome`` (SE-P2 producer).
 
-    Returns ``None`` only when ``result.factor.factor_id`` has no
-    representable identity in the neutral vocabulary (see module docstring
-    "factor_id" section); the caller (``service._record_memory_
+    ``gate`` is the effective ``ResearchGate`` that judged ``result`` (the
+    same object ``service.run_once`` resolved); it feeds ONLY the derived
+    ``settings_profile`` scope token (P2-F4) -- this mapper re-evaluates
+    nothing.
+
+    Returns ``None`` when the result has no representable outcome in the
+    neutral vocabulary: either ``result.factor.factor_id`` fails the frozen
+    identity charset (see module docstring "factor_id" section), or a
+    blocked result's EVERY gate-reason family is administrative or unmapped
+    (fail-closed; see the reason-table section -- emitting a fabricated
+    reason code would be dishonest). The caller (``service._record_memory_
     observations``) is responsible for logging the skip -- this pure mapper
     performs no I/O of its own.
     """
@@ -366,6 +383,8 @@ def experiment_result_to_outcome(result: "ResearchCandidateResult", *, run_id: s
     else:
         verdict = "blocked"
         reason_codes = _blocked_reason_codes(result.gate_reasons)
+        if not reason_codes:
+            return None
 
     metric_backtest, sample_role = _sample_role_and_backtest(result)
 
@@ -379,20 +398,25 @@ def experiment_result_to_outcome(result: "ResearchCandidateResult", *, run_id: s
         reason_codes=reason_codes,
         sample_role=sample_role,
         window=_outcome_window(result.evaluation),
-        scope=_outcome_scope(result),
+        scope=_outcome_scope(result, gate),
         metric_snapshot=_metric_snapshot(metric_backtest),
     )
 
 
 def _blocked_reason_codes(gate_reasons: tuple[str, ...]) -> tuple[str, ...]:
-    codes = {_reason_code_for_family(family) for family in _reason_families(gate_reasons)}
-    if not codes:
-        # Unreachable for a real apply_gate() result (a blocked verdict
-        # always carries >=1 raw reason -- see module docstring "verdict"
-        # section), kept as an honest closed-vocabulary fallback rather than
-        # an assertion so a future/hand-built caller shape cannot crash this
-        # mapper.
-        codes = {_DEFAULT_REASON_CODE}
+    """Deduped, sorted closed codes for the representable families only.
+
+    Empty when every family is administrative or fails closed -- the caller
+    then skips the whole outcome rather than minting a fabricated reason
+    (P2-F1/P2-F2). The pre-review behavior (collapse anything unmapped onto
+    VALIDATION_ERROR) is exactly what the review rejected.
+    """
+
+    codes = {
+        code
+        for code in (_reason_code_for_family(family) for family in _reason_families(gate_reasons))
+        if code is not None
+    }
     return tuple(sorted(codes))
 
 
@@ -418,15 +442,25 @@ def _reason_families(reasons: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(sorted(dict.fromkeys(family for family in families if family)))
 
 
-def _reason_code_for_family(family: str) -> str:
+def _reason_code_for_family(family: str) -> str | None:
+    """Closed code for one family, or ``None`` (administrative / fail-closed).
+
+    ``None`` is NOT an error state: administrative families are deliberately
+    unrepresentable, and an unrecognized family must not be guessed into a
+    metric code (P2-F2 -- token-anchored matching only, no substring
+    containment).
+    """
+
     key = family.strip().lower()
     exact = _EXACT_FAMILY_REASON_CODES.get(key)
     if exact is not None:
         return exact
-    for needle, code in _SUBSTRING_FAMILY_REASON_CODES:
-        if needle in key:
+    if key in _ADMINISTRATIVE_FAMILIES:
+        return None
+    for pattern, code in _VARIABLE_FAMILY_REASON_CODES:
+        if pattern.fullmatch(key):
             return code
-    return _DEFAULT_REASON_CODE
+    return None
 
 
 def _observed_at_from_run_id(run_id: str) -> str:
@@ -469,14 +503,33 @@ def _outcome_window(evaluation: EvaluationResult) -> OutcomeWindow:
         return OutcomeWindow()
 
 
-def _outcome_scope(result: "ResearchCandidateResult") -> OutcomeScope:
+def _outcome_scope(result: "ResearchCandidateResult", gate: "ResearchGate") -> OutcomeScope:
     profile = result.evaluation.simulation_profile
     return OutcomeScope(
         asset_class=_clean_scope_dim(profile.instrument_type),
         universe=_clean_scope_dim(profile.universe),
         factor_family=_FACTOR_FAMILY,
-        settings_profile=_SETTINGS_PROFILE,
+        settings_profile=_settings_profile_token(gate),
     )
+
+
+def _settings_profile_token(gate: "ResearchGate") -> str:
+    """Bounded deterministic settings token for the EFFECTIVE gate (P2-F4).
+
+    ``"rd_" + sha256(sorted-key JSON of the gate's dataclass fields)[:10]``:
+    equal effective gates -- and only equal effective gates -- share a
+    token, so evidence produced under materially different thresholds can
+    never unify into one signature. Uses ``dataclasses.fields`` reflection
+    (duck-typed) rather than importing ``ResearchGate``, which would
+    recreate the service.py<->local_outcomes.py cycle the module docstring
+    describes. Output is 13 chars of ``[a-z0-9_]`` -- always a valid,
+    non-reserved scope-dimension token.
+    """
+
+    payload = {field.name: getattr(gate, field.name) for field in dataclasses.fields(gate)}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"{_SETTINGS_TOKEN_PREFIX}{digest[:_SETTINGS_TOKEN_HEX_LEN]}"
 
 
 def _clean_scope_dim(value: str) -> str:
@@ -494,11 +547,25 @@ def _net_or_gross(net: float | None, gross: float | None) -> MetricReading:
     return MetricReading()
 
 
+def _magnitude(reading: MetricReading) -> MetricReading:
+    """``abs()`` of a reading's value, basis preserved, ``None`` preserved.
+
+    The frozen contract defines ``max_drawdown`` as a NON-NEGATIVE magnitude
+    (``outcomes.METRIC_SPECS``); the local backtester reports it in a
+    negative-return convention. The sign is convention, not information --
+    dropping it is a unit conversion, not a measurement rewrite (P2-F3).
+    """
+
+    if reading.value is None:
+        return reading
+    return MetricReading(value=abs(reading.value), basis=reading.basis)
+
+
 def _metric_snapshot(backtest: BacktestResult) -> dict[str, MetricReading]:
     return {
         "sharpe": _net_or_gross(backtest.net_long_short_sharpe, backtest.gross_long_short_sharpe),
         "annualized_return": _net_or_gross(backtest.net_annualized_return, backtest.gross_annualized_return),
-        "max_drawdown": _net_or_gross(backtest.net_max_drawdown, backtest.gross_max_drawdown),
+        "max_drawdown": _magnitude(_net_or_gross(backtest.net_max_drawdown, backtest.gross_max_drawdown)),
         "turnover": MetricReading(value=backtest.turnover_rate),
         "subwindow_sharpe": MetricReading(),
         "self_correlation": MetricReading(),

@@ -2,12 +2,15 @@
 
 Covers ``src/quant_forge/research_loop/local_outcomes.py`` against the
 binding contract for DECISIONS.md "2026-07-13 -- Self-evolution engine
-CP0", rulings SE-i/SE-ii/SE-vii, and the task's explicit checklist: pass ->
-passed/NONE; block -> blocked with mapped closed reasons (incl.
-unmappable -> VALIDATION_ERROR); no provider composite ever in
-metric_snapshot; None-for-absent metrics; typed window; valid fingerprint;
-conservative sample_role; producer neutrality (no integrations/ import, no
-clock).
+CP0", rulings SE-i/SE-ii/SE-vii, plus the SE-P2 review rework (2026-07-14,
+P2-F1..F4): pass -> passed/NONE; block -> blocked with mapped closed
+reasons; administrative and unmapped families FAIL CLOSED (a block carried
+only by them maps to NO outcome, never a fabricated code); score maps to
+the amended OBJECTIVE_SCORE_BELOW_GATE; max_drawdown is a non-negative
+magnitude; settings_profile is a deterministic token of the effective
+gate; no provider composite ever in metric_snapshot; None-for-absent
+metrics; typed window; valid fingerprint; conservative sample_role;
+producer neutrality (no integrations/ import, no clock).
 """
 
 from __future__ import annotations
@@ -36,12 +39,16 @@ from quant_forge.research_loop.outcomes import (
 )
 from quant_forge.research_loop.service import (
     ResearchCandidateResult,
+    ResearchGate,
     ResearchHypothesis,
     ResearchSelfReview,
 )
 
 FP_HEX_UPPER = "AB12CD34EF560000"
 REAL_RUN_ID = "rd_FTR_SEED_20260701T120000123456Z_deadbeef"
+# The effective gate is now a REQUIRED mapper input (P2-F4): it feeds the
+# derived settings_profile token and nothing else.
+_GATE = ResearchGate()
 
 _ALLOWED_METRIC_KEYS = frozenset(
     {"sharpe", "annualized_return", "max_drawdown", "turnover", "subwindow_sharpe", "self_correlation", "max_weight"}
@@ -140,7 +147,7 @@ def _result(
 
 
 def test_gate_passed_maps_to_passed_none() -> None:
-    outcome = experiment_result_to_outcome(_result(gate_passed=True), run_id=REAL_RUN_ID)
+    outcome = experiment_result_to_outcome(_result(gate_passed=True), run_id=REAL_RUN_ID, gate=_GATE)
     assert outcome is not None
     assert outcome.origin == "local"
     assert outcome.stage == "gate"
@@ -160,34 +167,81 @@ def test_gate_passed_maps_to_passed_none() -> None:
         ("rebalance_rate above threshold: 0.9", "TURNOVER_TOO_HIGH"),
         ("turnover_rate above threshold: 1.2", "TURNOVER_TOO_HIGH"),
         ("net_return_retention below threshold: 0.1", "RETURNS_BELOW_GATE"),
-        ("score 0.010000 < 0.500000", "VALIDATION_ERROR"),
-        ("duplicate result signature matches FTR_OTHER", "VALIDATION_ERROR"),
-        ("existing active status requires explicit user decision", "VALIDATION_ERROR"),
-        ("passed smoke research gate", "VALIDATION_ERROR"),
+        # Reviewed contract amendment (P2-F1): the blended objective
+        # composite has its own honest closed code now.
+        ("score 0.010000 < 0.500000", "OBJECTIVE_SCORE_BELOW_GATE"),
+        # The OOS segment name is the ONLY variable family the local gate
+        # emits (segment shortfall + decay shapes), anchored-matched:
         ("OOS net return decay exceeds 0.3", "RETURNS_BELOW_GATE"),
         ("OOS net_annualized_return below threshold: 0.01", "RETURNS_BELOW_GATE"),
-        # unmappable / future-proofing substring rules never yet emitted by
-        # the local gate today, but the closed table must still resolve them:
-        ("something totally unrecognized happened", "VALIDATION_ERROR"),
-        ("max_single_name_weight above threshold: 0.4", "WEIGHT_CONCENTRATION_HIGH"),
-        ("self_correlation too high: 0.9", "SELF_CORRELATION_HIGH"),
-        ("redundancy too high: 0.9", "REDUNDANCY_HIGH"),
-        ("max_drawdown_floor breached: -0.5", "DRAWDOWN_TOO_DEEP"),
-        ("region mismatch detected", "REGION_MISMATCH"),
+        ("OOS_2024H2 net_annualized_return below threshold: 0.01", "RETURNS_BELOW_GATE"),
+        ("oos_2 net_annualized_return below threshold: 0.01", "RETURNS_BELOW_GATE"),
     ],
 )
 def test_blocked_reason_family_maps_to_closed_code(reason: str, expected_code: str) -> None:
-    outcome = experiment_result_to_outcome(_result(gate_passed=False, gate_reasons=(reason,)), run_id=REAL_RUN_ID)
+    outcome = experiment_result_to_outcome(_result(gate_passed=False, gate_reasons=(reason,)), run_id=REAL_RUN_ID, gate=_GATE)
     assert outcome is not None
     assert outcome.verdict == "blocked"
     assert outcome.reason_codes == (expected_code,)
     assert expected_code in REASON_CODES
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        # Administrative families: workflow bookkeeping, not scientific
+        # evidence (P2-F1) -- alone they must produce NO outcome at all.
+        "duplicate result signature matches FTR_OTHER",
+        "existing active status requires explicit user decision",
+        "passed smoke research gate",
+        # Unknown families FAIL CLOSED (P2-F2): the pre-review behavior
+        # collapsed these onto VALIDATION_ERROR, fabricating a validation
+        # failure that never happened.
+        "something totally unrecognized happened",
+        "max_single_name_weight above threshold: 0.4",
+        "self_correlation too high: 0.9",
+        "redundancy too high: 0.9",
+        "max_drawdown_floor breached: -0.5",
+        "region mismatch detected",
+        # Token-boundary adversarial probes (P2-F2): the retired substring
+        # fallback dishonestly classified every one of these.
+        "returning_candidate rejected",
+        "no_return_path found",
+        "return_code_error 137",
+        "sharpening_failed for kernel",
+        "lightweight_error in adapter",
+        "regionalization pending",
+        "oosmalformed_no_separator value",
+    ],
+)
+def test_unrepresentable_families_fail_closed_to_no_outcome(reason: str) -> None:
+    outcome = experiment_result_to_outcome(
+        _result(gate_passed=False, gate_reasons=(reason,)), run_id=REAL_RUN_ID, gate=_GATE
+    )
+    assert outcome is None
+
+
+def test_administrative_families_are_omitted_when_real_blockers_coexist() -> None:
+    outcome = experiment_result_to_outcome(
+        _result(
+            gate_passed=False,
+            gate_reasons=(
+                "duplicate result signature matches FTR_OTHER",
+                "turnover_rate above threshold: 1.2",
+                "something totally unrecognized happened",
+            ),
+        ),
+        run_id=REAL_RUN_ID,
+        gate=_GATE,
+    )
+    assert outcome is not None
+    assert outcome.reason_codes == ("TURNOVER_TOO_HIGH",)
+
+
 def test_blocked_reason_codes_are_sorted_and_deduped_closed_set() -> None:
     outcome = experiment_result_to_outcome(
         _result(gate_passed=False, gate_reasons=("turnover_rate above threshold: 1.2", "rebalance_rate above threshold: 0.9")),
-        run_id=REAL_RUN_ID,
+        run_id=REAL_RUN_ID, gate=_GATE,
     )
     assert outcome is not None
     # Both reasons map to the SAME closed code: deduped to one entry.
@@ -196,7 +250,7 @@ def test_blocked_reason_codes_are_sorted_and_deduped_closed_set() -> None:
 
 def test_blocked_reason_codes_never_contain_none() -> None:
     outcome = experiment_result_to_outcome(
-        _result(gate_passed=False, gate_reasons=("score 0.1 < 0.5",)), run_id=REAL_RUN_ID
+        _result(gate_passed=False, gate_reasons=("score 0.1 < 0.5",)), run_id=REAL_RUN_ID, gate=_GATE
     )
     assert outcome is not None
     assert REASON_NONE not in outcome.reason_codes
@@ -204,10 +258,13 @@ def test_blocked_reason_codes_never_contain_none() -> None:
 
 def test_reason_code_table_targets_are_all_in_closed_vocabulary() -> None:
     targets = set(local_outcomes._EXACT_FAMILY_REASON_CODES.values())
-    targets.update(code for _, code in local_outcomes._SUBSTRING_FAMILY_REASON_CODES)
-    targets.add(local_outcomes._DEFAULT_REASON_CODE)
+    targets.update(code for _, code in local_outcomes._VARIABLE_FAMILY_REASON_CODES)
     assert targets <= REASON_CODES
     assert REASON_NONE not in targets  # a blocked outcome never carries NONE
+    # The rejected pre-review fallback must stay gone: no mapping target is
+    # VALIDATION_ERROR, and administrative families map to no code at all.
+    assert "VALIDATION_ERROR" not in targets
+    assert not (set(local_outcomes._EXACT_FAMILY_REASON_CODES) & local_outcomes._ADMINISTRATIVE_FAMILIES)
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +307,7 @@ def test_reason_family_extraction(reasons: tuple[str, ...], expected: tuple[str,
 
 
 def test_metric_snapshot_only_allowlisted_keys_ever_populated() -> None:
-    outcome = experiment_result_to_outcome(_result(gate_passed=True), run_id=REAL_RUN_ID)
+    outcome = experiment_result_to_outcome(_result(gate_passed=True), run_id=REAL_RUN_ID, gate=_GATE)
     assert outcome is not None
     assert set(outcome.metric_snapshot) <= _ALLOWED_METRIC_KEYS
     for key in outcome.metric_snapshot:
@@ -264,7 +321,7 @@ def test_metric_snapshot_only_allowlisted_keys_ever_populated() -> None:
 
 
 def test_metric_snapshot_unavailable_metrics_are_none_not_zero() -> None:
-    outcome = experiment_result_to_outcome(_result(gate_passed=True), run_id=REAL_RUN_ID)
+    outcome = experiment_result_to_outcome(_result(gate_passed=True), run_id=REAL_RUN_ID, gate=_GATE)
     assert outcome is not None
     for key in ("subwindow_sharpe", "self_correlation", "max_weight"):
         reading = outcome.metric_snapshot[key]
@@ -284,17 +341,40 @@ def test_metric_snapshot_prefers_net_falls_back_to_gross_labeled_honestly() -> N
         turnover_rate=0.4,
     )
     outcome = experiment_result_to_outcome(
-        _result(gate_passed=True, selection_backtest=selection), run_id=REAL_RUN_ID
+        _result(gate_passed=True, selection_backtest=selection), run_id=REAL_RUN_ID, gate=_GATE
     )
     assert outcome is not None
     assert outcome.metric_snapshot["sharpe"].value == 0.7
     assert outcome.metric_snapshot["sharpe"].basis == "gross"
     assert outcome.metric_snapshot["annualized_return"].value == 0.2
     assert outcome.metric_snapshot["annualized_return"].basis == "net"
-    assert outcome.metric_snapshot["max_drawdown"].value == -0.3
+    # abs() of the backtester's -0.3 (P2-F3): the frozen contract defines
+    # max_drawdown as a non-negative magnitude; basis still says gross.
+    assert outcome.metric_snapshot["max_drawdown"].value == 0.3
     assert outcome.metric_snapshot["max_drawdown"].basis == "gross"
     assert outcome.metric_snapshot["turnover"].value == 0.4
     assert outcome.metric_snapshot["turnover"].basis == ""
+
+
+def test_metric_snapshot_max_drawdown_is_nonnegative_magnitude() -> None:
+    # P2-F3: the local backtester reports drawdown in a negative-return
+    # convention; the frozen METRIC_SPECS entry demands a non-negative
+    # magnitude. Sign flips to magnitude; None stays None; basis preserved.
+    selection = _backtest(sample_role=IN_SAMPLE_ROLE, net_max_drawdown=-0.42)
+    outcome = experiment_result_to_outcome(
+        _result(gate_passed=True, selection_backtest=selection), run_id=REAL_RUN_ID, gate=_GATE
+    )
+    assert outcome is not None
+    assert outcome.metric_snapshot["max_drawdown"].value == 0.42
+    assert outcome.metric_snapshot["max_drawdown"].basis == "net"
+
+    absent = _backtest(sample_role=IN_SAMPLE_ROLE, net_max_drawdown=None, gross_max_drawdown=None)
+    outcome_absent = experiment_result_to_outcome(
+        _result(gate_passed=True, selection_backtest=absent), run_id=REAL_RUN_ID, gate=_GATE
+    )
+    assert outcome_absent is not None
+    assert outcome_absent.metric_snapshot["max_drawdown"].value is None
+    assert outcome_absent.metric_snapshot["max_drawdown"].basis == ""
 
 
 def test_metric_snapshot_absent_both_sides_is_none() -> None:
@@ -305,7 +385,7 @@ def test_metric_snapshot_absent_both_sides_is_none() -> None:
         turnover_rate=None,
     )
     outcome = experiment_result_to_outcome(
-        _result(gate_passed=True, selection_backtest=selection), run_id=REAL_RUN_ID
+        _result(gate_passed=True, selection_backtest=selection), run_id=REAL_RUN_ID, gate=_GATE
     )
     assert outcome is not None
     assert outcome.metric_snapshot["sharpe"].value is None
@@ -321,7 +401,7 @@ def test_metric_snapshot_uses_selection_backtest_not_the_oos_field() -> None:
     oos_only = _backtest(sample_role=EXTERNAL_OOS_ROLE, net_long_short_sharpe=99.0)
     selection = _backtest(sample_role=IN_SAMPLE_ROLE, net_long_short_sharpe=1.5)
     outcome = experiment_result_to_outcome(
-        _result(gate_passed=True, backtest=oos_only, selection_backtest=selection), run_id=REAL_RUN_ID
+        _result(gate_passed=True, backtest=oos_only, selection_backtest=selection), run_id=REAL_RUN_ID, gate=_GATE
     )
     assert outcome is not None
     assert outcome.metric_snapshot["sharpe"].value == 1.5
@@ -333,14 +413,14 @@ def test_metric_snapshot_uses_selection_backtest_not_the_oos_field() -> None:
 
 
 def test_sample_role_in_sample_when_selection_backtest_self_reports_it() -> None:
-    outcome = experiment_result_to_outcome(_result(gate_passed=True), run_id=REAL_RUN_ID)
+    outcome = experiment_result_to_outcome(_result(gate_passed=True), run_id=REAL_RUN_ID, gate=_GATE)
     assert outcome is not None
     assert outcome.sample_role == "in_sample"
 
 
 def test_sample_role_unspecified_when_selection_backtest_missing() -> None:
     outcome = experiment_result_to_outcome(
-        _result(gate_passed=True, selection_backtest=None), run_id=REAL_RUN_ID
+        _result(gate_passed=True, selection_backtest=None), run_id=REAL_RUN_ID, gate=_GATE
     )
     assert outcome is not None
     assert outcome.sample_role == "unspecified"
@@ -353,7 +433,7 @@ def test_sample_role_never_guesses_out_of_sample() -> None:
     # "in_sample"; everything else is "unspecified", never "out_of_sample".
     mislabeled_selection = _backtest(sample_role=EXTERNAL_OOS_ROLE)  # not IN_SAMPLE_ROLE
     outcome = experiment_result_to_outcome(
-        _result(gate_passed=True, selection_backtest=mislabeled_selection), run_id=REAL_RUN_ID
+        _result(gate_passed=True, selection_backtest=mislabeled_selection), run_id=REAL_RUN_ID, gate=_GATE
     )
     assert outcome is not None
     assert outcome.sample_role == "unspecified"
@@ -370,13 +450,13 @@ def test_factor_id_with_disallowed_equals_character_returns_none() -> None:
     # frozen outcomes.py identity contract does not. No representable
     # identity -> None (log-skip at the caller), never rewritten.
     factor = _factor(factor_id="FTR_A=1")
-    outcome = experiment_result_to_outcome(_result(gate_passed=True, factor=factor), run_id=REAL_RUN_ID)
+    outcome = experiment_result_to_outcome(_result(gate_passed=True, factor=factor), run_id=REAL_RUN_ID, gate=_GATE)
     assert outcome is None
 
 
 def test_factor_fingerprint_is_lowercased_and_hex_valid() -> None:
     outcome = experiment_result_to_outcome(
-        _result(gate_passed=True, formula_fingerprint="AB12CD34EF560000"), run_id=REAL_RUN_ID
+        _result(gate_passed=True, formula_fingerprint="AB12CD34EF560000"), run_id=REAL_RUN_ID, gate=_GATE
     )
     assert outcome is not None
     assert outcome.factor_fingerprint == "ab12cd34ef560000"
@@ -384,7 +464,7 @@ def test_factor_fingerprint_is_lowercased_and_hex_valid() -> None:
 
 
 def test_factor_fingerprint_falls_back_to_factor_formula_fingerprint_when_blank() -> None:
-    outcome = experiment_result_to_outcome(_result(gate_passed=True, formula_fingerprint=""), run_id=REAL_RUN_ID)
+    outcome = experiment_result_to_outcome(_result(gate_passed=True, formula_fingerprint=""), run_id=REAL_RUN_ID, gate=_GATE)
     assert outcome is not None
     assert re.fullmatch(r"[0-9a-f]{16,64}", outcome.factor_fingerprint)
 
@@ -408,7 +488,7 @@ def test_window_available_from_split_metrics() -> None:
         ic_days=100,
     )
     outcome = experiment_result_to_outcome(
-        _result(gate_passed=True, evaluation=_evaluation(split_metrics=(split,))), run_id=REAL_RUN_ID
+        _result(gate_passed=True, evaluation=_evaluation(split_metrics=(split,))), run_id=REAL_RUN_ID, gate=_GATE
     )
     assert outcome is not None
     assert outcome.window.status == "available"
@@ -417,7 +497,7 @@ def test_window_available_from_split_metrics() -> None:
 
 
 def test_window_unavailable_when_no_split_metrics() -> None:
-    outcome = experiment_result_to_outcome(_result(gate_passed=True), run_id=REAL_RUN_ID)
+    outcome = experiment_result_to_outcome(_result(gate_passed=True), run_id=REAL_RUN_ID, gate=_GATE)
     assert outcome is not None
     assert outcome.window.status == "unavailable"
     assert outcome.window.canonical() == ""
@@ -431,28 +511,59 @@ def test_window_unavailable_when_no_split_metrics() -> None:
 def test_scope_asset_and_universe_from_simulation_profile() -> None:
     profile = SimulationProfile(instrument_type="equity", universe="local_panel")
     outcome = experiment_result_to_outcome(
-        _result(gate_passed=True, evaluation=_evaluation(simulation_profile=profile)), run_id=REAL_RUN_ID
+        _result(gate_passed=True, evaluation=_evaluation(simulation_profile=profile)), run_id=REAL_RUN_ID, gate=_GATE
     )
     assert outcome is not None
     assert outcome.scope.asset_class == "equity"
     assert outcome.scope.universe == "local_panel"
 
 
-def test_scope_family_and_settings_are_fixed_nonempty_literals() -> None:
+def test_scope_family_literal_and_settings_token_are_nonempty_valid_dims() -> None:
     # Required non-empty: outcomes.OutcomeScope.signature_payloads()
     # disambiguates every signature by evidence_run_id whenever EITHER is
     # empty (R-F4), which would make promotion structurally unreachable for
     # every local outcome (see module docstring "scope" section).
-    outcome = experiment_result_to_outcome(_result(gate_passed=True), run_id=REAL_RUN_ID)
+    outcome = experiment_result_to_outcome(_result(gate_passed=True), run_id=REAL_RUN_ID, gate=_GATE)
     assert outcome is not None
-    assert outcome.scope.factor_family
-    assert outcome.scope.settings_profile
+    assert outcome.scope.factor_family == "rd_local_candidate"
+    assert re.fullmatch(r"rd_[0-9a-f]{10}", outcome.scope.settings_profile)
     assert outcome.scope.factor_family not in ("unknown", "global")
     assert outcome.scope.settings_profile not in ("unknown", "global")
 
 
+def test_settings_token_is_deterministic_per_gate_and_distinct_across_gates() -> None:
+    # P2-F4: evidence produced under materially different gate settings must
+    # never share a signature. Equal gates -> equal token (promotion within
+    # one configuration still works); different thresholds -> different
+    # token; the constructor-default gate gets no special name.
+    strict = ResearchGate(max_turnover_rate=0.2)
+    loose = ResearchGate(max_turnover_rate=1.5)
+    reason = ("turnover_rate above threshold: 0.9",)
+
+    strict_a = experiment_result_to_outcome(
+        _result(gate_passed=False, gate_reasons=reason), run_id=REAL_RUN_ID, gate=strict
+    )
+    strict_b = experiment_result_to_outcome(
+        _result(gate_passed=False, gate_reasons=reason), run_id=REAL_RUN_ID, gate=ResearchGate(max_turnover_rate=0.2)
+    )
+    loose_outcome = experiment_result_to_outcome(
+        _result(gate_passed=False, gate_reasons=reason), run_id=REAL_RUN_ID, gate=loose
+    )
+    default_outcome = experiment_result_to_outcome(
+        _result(gate_passed=False, gate_reasons=reason), run_id=REAL_RUN_ID, gate=_GATE
+    )
+    assert strict_a is not None and strict_b is not None and loose_outcome is not None and default_outcome is not None
+    assert strict_a.scope.settings_profile == strict_b.scope.settings_profile
+    assert strict_a.scope.settings_profile != loose_outcome.scope.settings_profile
+    assert strict_a.scope.settings_profile != default_outcome.scope.settings_profile
+    assert loose_outcome.scope.settings_profile != default_outcome.scope.settings_profile
+    # Distinct settings tokens flow into distinct signatures: the merged
+    # cross-gate promotion path P2-F4 attacked is structurally closed.
+    assert strict_a.signature_payloads() != loose_outcome.signature_payloads()
+
+
 def test_scope_horizon_bucket_stays_unknown() -> None:
-    outcome = experiment_result_to_outcome(_result(gate_passed=True), run_id=REAL_RUN_ID)
+    outcome = experiment_result_to_outcome(_result(gate_passed=True), run_id=REAL_RUN_ID, gate=_GATE)
     assert outcome is not None
     assert outcome.scope.horizon_bucket == ""
 
@@ -460,7 +571,7 @@ def test_scope_horizon_bucket_stays_unknown() -> None:
 def test_scope_dimension_outside_grammar_degrades_to_empty_not_a_raise() -> None:
     profile = SimulationProfile(instrument_type="US Equity", universe="local_panel")
     outcome = experiment_result_to_outcome(
-        _result(gate_passed=True, evaluation=_evaluation(simulation_profile=profile)), run_id=REAL_RUN_ID
+        _result(gate_passed=True, evaluation=_evaluation(simulation_profile=profile)), run_id=REAL_RUN_ID, gate=_GATE
     )
     assert outcome is not None
     assert outcome.scope.asset_class == ""  # "US Equity" has a space + uppercase: not a valid dim token
@@ -474,7 +585,7 @@ def test_scope_dimension_outside_grammar_degrades_to_empty_not_a_raise() -> None
 
 def test_observed_at_parsed_from_run_id_embedded_timestamp() -> None:
     outcome = experiment_result_to_outcome(
-        _result(gate_passed=True), run_id="rd_FTR_SEED_20260701T120000123456Z_deadbeef"
+        _result(gate_passed=True), run_id="rd_FTR_SEED_20260701T120000123456Z_deadbeef", gate=_GATE
     )
     assert outcome is not None
     assert outcome.observed_at == "2026-07-01T12:00:00.123456+00:00"
@@ -482,7 +593,7 @@ def test_observed_at_parsed_from_run_id_embedded_timestamp() -> None:
 
 def test_observed_at_raises_when_run_id_carries_no_timestamp() -> None:
     with pytest.raises(ValueError, match="cannot derive observed_at"):
-        experiment_result_to_outcome(_result(gate_passed=True), run_id="not-a-real-run-id")
+        experiment_result_to_outcome(_result(gate_passed=True), run_id="not-a-real-run-id", gate=_GATE)
 
 
 # ---------------------------------------------------------------------------

@@ -533,31 +533,48 @@ _SCOPE_RESERVED_VALUES = frozenset({"unknown", "global"})
 _SCOPE_MAX_LENGTH = 160
 
 
-def _parse_scope_grammar(scope: str) -> bool:
+def _scope_dimensions(scope: str) -> dict[str, str] | None:
     """Structural validation of a scope string (item 4a/6): ``"global"``, or
     a ``;``-joined sequence of ``key=value`` segments with keys drawn from
     the closed 5-dimension set (each appearing at most once, in canonical
     order), values matching the outcomes dimension-token grammar, and
     neither ``"unknown"`` nor ``"global"`` accepted as a value.
+
+    Returns the parsed ``{key: value}`` mapping (empty for ``"global"``) so
+    callers can cross-check embedded statement fields against the scope's
+    own dimensions (P2-F6), or ``None`` when the string is not a shape
+    ``outcomes.OutcomeScope.scope_key()`` ever mints.
     """
 
     if len(scope) > _SCOPE_MAX_LENGTH:
-        return False
+        return None
     if scope == "global":
-        return True
+        return {}
     seen_keys: list[str] = []
+    dimensions: dict[str, str] = {}
     for segment in scope.split(";"):
         key, separator, value = segment.partition("=")
         if not separator or key not in _SCOPE_DIMENSION_KEYS or key in seen_keys:
-            return False
+            return None
         if value in _SCOPE_RESERVED_VALUES or not _SCOPE_TOKEN_RE.fullmatch(value):
-            return False
+            return None
         seen_keys.append(key)
+        dimensions[key] = value
     if not seen_keys:
-        return False  # e.g. an empty string: neither "global" nor any real segment
+        return None  # e.g. an empty string: neither "global" nor any real segment
     order_index = {key: index for index, key in enumerate(_SCOPE_DIMENSION_KEYS)}
     positions = [order_index[key] for key in seen_keys]
-    return positions == sorted(positions)
+    if positions != sorted(positions):
+        return None
+    return dimensions
+
+
+def _parse_scope_grammar(scope: str) -> bool:
+    """Boolean face of :func:`_scope_dimensions` for callers that validate a
+    STANDALONE scope value (no embedded statement fields to cross-check).
+    """
+
+    return _scope_dimensions(scope) is not None
 
 
 def _family_token_valid(family: str) -> bool:
@@ -632,7 +649,24 @@ def _authenticate_outcome_statement(statement: str) -> str | None:
     # be genuinely minted by outcome_to_observations().
     if strength != STAGE_EVIDENCE_STRENGTH[stage]:
         return None
-    if not _parse_scope_grammar(scope):
+    dimensions = _scope_dimensions(scope)
+    if dimensions is None:
+        return None
+    # Family/scope coherence (SE-P2 review finding P2-F6): _statement_for
+    # derives the top-level family field AND the scope string from the SAME
+    # OutcomeScope -- family is scope.factor_family when set (and then
+    # scope_key() carries the identical value in its "family" dimension) or
+    # the literal "unknown" when factor_family is empty (and then
+    # scope_key() omits the dimension entirely). A statement whose two
+    # copies disagree is not a shape the engine can mint; before this check
+    # it authenticated anyway, so a same-host writer could smuggle a
+    # divergent family/scope pair through BOTH the active and passive
+    # channels.
+    scope_family = dimensions.get("family")
+    if family == "unknown":
+        if scope_family is not None:
+            return None
+    elif scope_family != family:
         return None
     return scope
 

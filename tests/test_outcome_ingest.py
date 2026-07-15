@@ -3,9 +3,13 @@
 Covers ``src/quant_forge/research_loop/outcome_ingest.py`` (and, through it,
 the ADDITIVE outcome-ledger methods on ``ResearchMemoryStore``) against
 DECISIONS.md "2026-07-13 -- Self-evolution engine CP0", rulings
-SE-i/SE-ii/SE-ix: envelope written with exact replay-drop by ``outcome_id``;
-observations recorded and promotion runs; ``as_of`` monotonic across
-distinct outcomes and stable across an exact replay.
+SE-i/SE-ii/SE-ix, plus the SE-P2 review rework (P2-F5): a replay whose
+``outcome_id`` is already on the ledger appends NOTHING (no envelope, no
+observations -- ``observations.jsonl`` cannot grow on administrative
+resends) but still runs promotion; for a new outcome the envelope lands
+LAST as the completion marker, so a crash between observations and
+envelope self-heals on retry; ``as_of`` monotonic across distinct outcomes
+and stable across an exact replay.
 """
 
 from __future__ import annotations
@@ -203,17 +207,17 @@ def test_ingest_replay_does_not_double_count_toward_promotion(tmp_path: Path) ->
 
 
 # ---------------------------------------------------------------------------
-# crash-safety: unconditional observation recording
+# crash-safety: replay short-circuit + envelope-last completion marker (P2-F5)
 # ---------------------------------------------------------------------------
 
 
-def test_ingest_records_observations_even_when_envelope_was_already_present(tmp_path: Path) -> None:
-    # Simulates a prior crashed ingest that recorded the ledger envelope but
-    # died before recording observations: record_outcome_envelope directly
-    # (bypassing ingest_outcome) pre-populates the ledger, so a later
-    # ingest_outcome call for the SAME outcome sees recorded=False, but MUST
-    # still record its observations (module docstring "Unconditional
-    # recording (crash-safety)").
+def test_ingest_ledger_known_id_appends_nothing(tmp_path: Path) -> None:
+    # The envelope is the sink's COMPLETION MARKER (written last). An id
+    # already on the ledger means a fully completed prior ingest, so a
+    # replay appends nothing at all -- the pre-review behavior (re-append
+    # every observation on every replay) let administrative resends grow
+    # observations.jsonl without bound and let an earlier-observed_at resend
+    # shift the pre-threshold representative row (P2-F5).
     store = _store(tmp_path)
     outcome = _outcome(verdict="blocked", reason_codes=("SHARPE_BELOW_GATE",))
     store.record_outcome_envelope(outcome.to_record())
@@ -222,8 +226,68 @@ def test_ingest_records_observations_even_when_envelope_was_already_present(tmp_
     receipt = ingest_outcome(store, outcome)
 
     assert receipt.recorded is False
-    assert receipt.observation_count == 1
-    assert len(_read_jsonl(store.observations_path)) == 1
+    assert receipt.observation_count == 0
+    assert _read_jsonl(store.observations_path) == []
+
+
+def test_ingest_replay_never_grows_observations_jsonl(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    outcome = _outcome(verdict="blocked", reason_codes=("SHARPE_BELOW_GATE", "TURNOVER_TOO_HIGH"))
+    first = ingest_outcome(store, outcome)
+    assert first.observation_count == 2
+    assert len(_read_jsonl(store.observations_path)) == 2
+
+    for _ in range(3):
+        replay = ingest_outcome(store, outcome)
+        assert replay.recorded is False
+        assert replay.observation_count == 0
+    assert len(_read_jsonl(store.observations_path)) == 2  # physically unchanged
+
+
+def test_ingest_crash_between_observations_and_envelope_self_heals_on_retry(tmp_path: Path) -> None:
+    # Envelope-last ordering: simulate a crash AFTER the observation rows
+    # landed but BEFORE the completion-marker envelope, by recording the
+    # observations directly (what a torn first attempt leaves behind). The
+    # retry sees an unknown id, re-appends its observations (duplicates are
+    # bounded to real crash windows and stay scientifically inert -- the
+    # promote cap counts <=1 per (signature, run_id)), and completes the
+    # envelope; a further replay then appends nothing.
+    from quant_forge.research_loop.outcomes import outcome_to_observations
+
+    store = _store(tmp_path)
+    outcome = _outcome(verdict="blocked", reason_codes=("SHARPE_BELOW_GATE",))
+    for observation in outcome_to_observations(outcome):
+        store.record_observation(
+            signature=observation.signature,
+            statement=observation.statement,
+            run_id=observation.run_id,
+            data_window=observation.data_window,
+            failure_class=observation.failure_class,
+            evidence_ref=observation.evidence_ref,
+            observed_at=observation.observed_at,
+            scope=observation.scope,
+        )
+    assert store.known_outcome_ids() == frozenset()  # marker never landed
+
+    retry = ingest_outcome(store, outcome)
+    assert retry.recorded is True
+    assert retry.observation_count == 1
+    assert len(_read_jsonl(store.observations_path)) == 2  # torn attempt + retry
+    assert store.known_outcome_ids() == {outcome.outcome_id()}
+
+    replay = ingest_outcome(store, outcome)
+    assert replay.recorded is False
+    assert replay.observation_count == 0
+    assert len(_read_jsonl(store.observations_path)) == 2  # replay adds nothing
+
+    # The duplicate rows are one evidence unit: no self-promotion from a
+    # crash retry, and a second DISTINCT evidence run still promotes.
+    assert _read_jsonl(store.path_for("failure")) == []
+    ingest_outcome(
+        store,
+        _outcome(factor_id="FTR_B", factor_fingerprint=FP_B, verdict="blocked", reason_codes=("SHARPE_BELOW_GATE",)),
+    )
+    assert _read_jsonl(store.path_for("failure"))
 
 
 # ---------------------------------------------------------------------------

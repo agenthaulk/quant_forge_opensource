@@ -70,6 +70,14 @@ REASON_CODES = frozenset(
         "REGION_MISMATCH",
         "INSUFFICIENT_SAMPLE",
         "DATA_UNAVAILABLE",
+        # Reviewed contract amendment (SE-P2 review, 2026-07-14): a blended
+        # research-objective composite falling below its configured gate is a
+        # real, recurring scientific blocker with no honest single-metric
+        # code; mislabeling it VALIDATION_ERROR was rejected as dishonest.
+        # This code stays neutral (no provider composite enters the metric
+        # vocabulary -- the READING stays unrepresentable; only the blocking
+        # REASON is named).
+        "OBJECTIVE_SCORE_BELOW_GATE",
         "VALIDATION_ERROR",
         "EXECUTION_ERROR",
     }

@@ -1038,12 +1038,14 @@ class ResearchLoopService:
             seed_assessment=seed_assessment,
             config_snapshot=config_snapshot,
         )
-        self._record_memory_observations(run_id, results)
+        self._record_memory_observations(run_id, results, candidate_gate)
         self._created_factor_ids.clear()
         self._promoted_factor_snapshots.clear()
         return result
 
-    def _record_memory_observations(self, run_id: str, results: list[ResearchCandidateResult]) -> None:
+    def _record_memory_observations(
+        self, run_id: str, results: list[ResearchCandidateResult], gate: ResearchGate
+    ) -> None:
         """Record this run's candidate outcomes as durable memory (SE-P2).
 
         Each candidate is mapped to one neutral ``ResearchOutcome``
@@ -1067,19 +1069,27 @@ class ResearchLoopService:
         per-outcome call keeps this loop a thin pass-through over the shared
         sink instead of re-implementing its steps here.
 
-        A candidate result with no representable factor identity in the
-        neutral vocabulary (``experiment_result_to_outcome`` returns None) is
-        skipped and logged here, at the caller, rather than inside the pure
-        mapper.
+        ``gate`` is the effective ``ResearchGate`` this run's candidates were
+        judged under; the producer folds it into the derived
+        ``settings_profile`` scope token so evidence produced under
+        materially different thresholds can never share a signature
+        (SE-P2 review finding P2-F4).
+
+        A candidate result with no representable outcome in the neutral
+        vocabulary (``experiment_result_to_outcome`` returns None: an
+        unrepresentable factor identity, or a block carried ONLY by
+        administrative/unmapped reason families) is skipped and logged here,
+        at the caller, rather than inside the pure mapper.
         """
 
         if self.memory_store is None:
             return
         for result in results:
-            outcome = experiment_result_to_outcome(result, run_id=run_id)
+            outcome = experiment_result_to_outcome(result, run_id=run_id, gate=gate)
             if outcome is None:
                 logger.info(
-                    "skipping memory observation for run %s candidate %s: no usable factor identity",
+                    "skipping memory observation for run %s candidate %s: no representable outcome "
+                    "(factor identity or reason families outside the neutral vocabulary)",
                     run_id,
                     result.factor.factor_id if result.factor is not None else "<unknown>",
                 )

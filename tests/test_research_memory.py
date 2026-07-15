@@ -980,6 +980,47 @@ def test_stage_strength_coherence_drops_mismatched_pairing_with_counter() -> Non
             )
 
 
+def test_family_scope_coherence_rejects_non_mintable_mismatch_on_both_channels() -> None:
+    # SE-P2 review finding P2-F6: outcomes._statement_for derives the
+    # top-level family field AND the scope string from the SAME OutcomeScope,
+    # so a statement whose two copies disagree can never be genuinely
+    # minted. Before the fix, the shared authenticator validated each
+    # independently and a same-host writer could smuggle
+    # "family=foo; ... scope=family=bar;..." through BOTH the active-rules
+    # channel and the passive recall union.
+    import quant_forge.research_loop.llm as rd_llm
+
+    prefix = "[local/gate] blocked: TURNOVER_TOO_HIGH"
+    strength = "strength=local_backtest"
+    mismatched_scope = "family=bar;settings=rd_default"
+    mismatched = f"{prefix}; family=foo; {strength}; scope={mismatched_scope}"
+    known_family_global_scope = f"{prefix}; family=foo; {strength}; scope=global"
+    unknown_family_with_scope_family = f"{prefix}; family=unknown; {strength}; scope=family=bar;settings=rd_default"
+    coherent = f"{prefix}; family=foo; {strength}; scope=family=foo;settings=rd_default"
+    coherent_unknown = f"{prefix}; family=unknown; {strength}; scope=settings=rd_default"
+
+    # Active channel: statement + standalone scope both authenticated.
+    assert not rd_llm.authenticate_active_rule_item(mismatched, mismatched_scope)
+    assert not rd_llm.authenticate_active_rule_item(known_family_global_scope, "global")
+    assert not rd_llm.authenticate_active_rule_item(
+        unknown_family_with_scope_family, "family=bar;settings=rd_default"
+    )
+    assert rd_llm.authenticate_active_rule_item(coherent, "family=foo;settings=rd_default")
+    assert rd_llm.authenticate_active_rule_item(coherent_unknown, "settings=rd_default")
+
+    # Passive channel: same authenticator underneath the recall union.
+    items = rd_llm._memory_items_for_prompt(  # noqa: SLF001
+        [
+            {"source": "research_memory", "statement": mismatched, "observation_count": 3},
+            {"source": "research_memory", "statement": known_family_global_scope, "observation_count": 3},
+            {"source": "research_memory", "statement": unknown_family_with_scope_family, "observation_count": 3},
+            {"source": "research_memory", "statement": coherent, "observation_count": 3},
+        ]
+    )
+    statements = [item["statement"] for item in items]
+    assert statements == [coherent]
+
+
 def test_active_rules_carry_event_id_and_reviewed_entry_id_for_traceability(tmp_path: Path) -> None:
     # R2 rework item R2-6 (Fable ruling, auditability not security): every
     # active_rules item forwarded to the LLM prompt carries its event_id and
@@ -1427,9 +1468,14 @@ def test_rd_run_records_finding_observations_for_accepted_candidates(tmp_path: P
     accepted = [row for row in observations if row["failure_class"] == ""]
     assert accepted
     assert SHA256_HEX.match(accepted[0]["signature"])
+    # settings is the deterministic token of the EFFECTIVE gate (P2-F4),
+    # computed through the same helper the producer uses -- never hand-typed.
+    from quant_forge.research_loop.local_outcomes import _settings_profile_token
+
+    settings_token = _settings_profile_token(permissive_gate)
     assert accepted[0]["statement"] == (
         "[local/gate] passed: NONE; family=rd_local_candidate; strength=local_backtest; "
-        "scope=asset=equity;universe=local_panel;family=rd_local_candidate;settings=rd_default"
+        f"scope=asset=equity;universe=local_panel;family=rd_local_candidate;settings={settings_token}"
     )
 
 
@@ -1662,13 +1708,12 @@ def test_gate_blocked_memory_statement_reduces_reasons_to_families(tmp_path: Pat
     # pre-SE-P2 "reduce to value-free families" text-surgery it replaces).
     # Each raw gate reason maps, via its family, to one closed reason code
     # (local_outcomes._reason_code_for_family): "turnover_rate ..." ->
-    # TURNOVER_TOO_HIGH (failure_class "gate_blocked"), "score ..." ->
-    # VALIDATION_ERROR (failure_class "validation_error", since "score" is
-    # ResearchObjectiveWeights' blended composite, not any single closed
-    # metric -- see local_outcomes.py's module docstring). One
-    # ResearchOutcome with two reason codes mints one MemoryObservation per
-    # code (outcomes.outcome_to_observations), so this result yields TWO
-    # observations, not one.
+    # TURNOVER_TOO_HIGH, "score ..." -> OBJECTIVE_SCORE_BELOW_GATE (the
+    # reviewed SE-P2 amendment; both are real gate blocks, failure_class
+    # "gate_blocked" -- the pre-review VALIDATION_ERROR label fabricated a
+    # validation failure). One ResearchOutcome with two reason codes mints
+    # one MemoryObservation per code (outcomes.outcome_to_observations), so
+    # this result yields TWO observations, not one.
     from quant_forge.core.contracts import BacktestResult, EvaluationResult, FactorDefinition
     from quant_forge.research_loop.service import (
         ResearchCandidateResult,
@@ -1724,22 +1769,27 @@ def test_gate_blocked_memory_statement_reduces_reasons_to_families(tmp_path: Pat
     # run_id's shape): this is the ONLY clock source available to the pure
     # mapper (no timestamp field exists anywhere on ResearchCandidateResult).
     run_id = "rd_family_only_20260701T000000000000Z_deadbeef"
-    service._record_memory_observations(run_id, [result])  # noqa: SLF001
+    from quant_forge.research_loop.local_outcomes import _settings_profile_token
+    from quant_forge.research_loop.service import ResearchGate
+
+    recording_gate = ResearchGate()
+    service._record_memory_observations(run_id, [result], recording_gate)  # noqa: SLF001
 
     observations = _read_jsonl(ResearchMemoryStore(paths["artifact_root"]).observations_path)
     assert len(observations) == 2
     by_reason = {row["statement"].split(": ", 1)[1].split(";", 1)[0]: row for row in observations}
-    assert set(by_reason) == {"TURNOVER_TOO_HIGH", "VALIDATION_ERROR"}
+    assert set(by_reason) == {"OBJECTIVE_SCORE_BELOW_GATE", "TURNOVER_TOO_HIGH"}
 
+    settings_token = _settings_profile_token(recording_gate)
     turnover_row = by_reason["TURNOVER_TOO_HIGH"]
     assert turnover_row["failure_class"] == "gate_blocked"
     assert turnover_row["statement"] == (
         "[local/gate] blocked: TURNOVER_TOO_HIGH; family=rd_local_candidate; strength=local_backtest; "
-        "scope=asset=equity;universe=local_panel;family=rd_local_candidate;settings=rd_default"
+        f"scope=asset=equity;universe=local_panel;family=rd_local_candidate;settings={settings_token}"
     )
 
-    score_row = by_reason["VALIDATION_ERROR"]
-    assert score_row["failure_class"] == "validation_error"
+    score_row = by_reason["OBJECTIVE_SCORE_BELOW_GATE"]
+    assert score_row["failure_class"] == "gate_blocked"  # a real gate block, not a validation failure
 
     for row in observations:
         assert SHA256_HEX.match(row["signature"])

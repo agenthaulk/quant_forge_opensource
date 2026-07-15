@@ -22,18 +22,24 @@ module, and this module never imports it). This sink has no opinion on
 outcome PRODUCTION either: it accepts an already-built ``ResearchOutcome``
 and does not import ``local_outcomes`` or any producer.
 
-Unconditional recording (crash-safety): steps 2 and 3 in
-:func:`ingest_outcome` run REGARDLESS of whether step 1 recorded a new
-ledger envelope or dropped an exact replay. This is deliberate, not
-redundant: ``outcome_id`` excludes ``observed_at`` (an administrative resend
-of the exact same measurement keeps the same id), so a process that crashed
-between step 1 and step 2 on a PRIOR attempt would otherwise lose that
-outcome's observations forever on retry if this sink skipped them whenever
-``recorded`` came back False. Double-recording is harmless:
-``memory.promote``'s own evidence-unit cap (<=1 observation per
-``(signature, run_id)`` reaches the promotion thresholds, where ``run_id``
-here is the outcome's ``evidence_run_id()``) absorbs the duplicate, so a
-replay never inflates a promotion count.
+Replay short-circuit + envelope-last ordering (crash-safety; SE-P2 review
+finding P2-F5): an ``outcome_id`` already on the ledger appends NOTHING --
+no envelope, no observations -- so administrative replays can never grow
+``observations.jsonl`` or shift the pre-threshold representative row toward
+a resend's payload. For a NEW outcome the observations are appended FIRST
+and the envelope LAST, as the completion marker (the same
+transactional-marker-last discipline the SE-P3 plugin ingest uses):
+
+* crash after some observations, before the envelope -> the retry sees an
+  unknown id and re-appends everything; the duplicated observation rows are
+  bounded to real crash windows (not every replay) and stay scientifically
+  inert -- ``memory.promote``'s evidence-unit cap (<=1 observation per
+  ``(signature, run_id)``, where ``run_id`` is ``evidence_run_id()``) means
+  a duplicate never inflates a promotion count;
+* crash after the envelope, before promotion -> the retry short-circuits
+  the appends but STILL runs ``promote_pending()`` (promotion is a pure,
+  deterministic function of the full observation set, so this is the
+  self-healing step, never a source of drift).
 """
 
 from __future__ import annotations
@@ -57,22 +63,31 @@ class IngestReceipt:
 
 
 def ingest_outcome(store: ResearchMemoryStore, outcome: ResearchOutcome) -> IngestReceipt:
-    """Ingest one outcome into ``store``: envelope, observations, promotion.
+    """Ingest one outcome into ``store``: observations, envelope, promotion.
 
     ``recorded`` is False exactly when ``outcome.outcome_id()`` was already
-    present on the ledger (an exact administrative replay); ``observation_
-    count`` is the number of :class:`~quant_forge.research_loop.memory.
-    MemoryObservation` rows this call submitted (0 for an ``unknown``/
-    ``not_applicable`` verdict outcome, which mints none by design -- see
-    ``outcomes.outcome_to_observations``), independent of ``recorded``.
-    ``as_of`` is the store's outcomes-ledger revision AFTER this call (SE-P5's
-    snapshot input): stable across a replay, strictly higher after a
-    genuinely new outcome. See the module docstring for why both the
-    observation recording and the promotion step run unconditionally.
+    present on the ledger (an exact administrative replay); a replay appends
+    NOTHING, so ``observation_count`` -- the number of :class:`~quant_forge.
+    research_loop.memory.MemoryObservation` rows THIS call submitted -- is 0
+    for a replay (P2-F5), and 0 for an ``unknown``/``not_applicable``
+    verdict outcome, which mints none by design (see ``outcomes.
+    outcome_to_observations``). ``promote_pending()`` runs on every call,
+    replay included -- see the module docstring's crash-window walk-through.
+    ``as_of`` is the store's outcomes-ledger revision AFTER this call
+    (SE-P5's snapshot input): stable across a replay, strictly higher after
+    a genuinely new outcome.
     """
 
     record = outcome.to_record()
-    recorded = store.record_outcome_envelope(record)
+    outcome_id = str(record["outcome_id"])
+    if outcome_id in store.known_outcome_ids():
+        store.promote_pending()
+        return IngestReceipt(
+            outcome_id=outcome_id,
+            recorded=False,
+            observation_count=0,
+            as_of=store.outcomes_revision(),
+        )
     observations = outcome_to_observations(outcome)
     for observation in observations:
         store.record_observation(
@@ -85,9 +100,10 @@ def ingest_outcome(store: ResearchMemoryStore, outcome: ResearchOutcome) -> Inge
             observed_at=observation.observed_at,
             scope=observation.scope,
         )
+    recorded = store.record_outcome_envelope(record)
     store.promote_pending()
     return IngestReceipt(
-        outcome_id=str(record["outcome_id"]),
+        outcome_id=outcome_id,
         recorded=recorded,
         observation_count=len(observations),
         as_of=store.outcomes_revision(),
