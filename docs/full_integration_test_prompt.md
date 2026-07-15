@@ -289,6 +289,25 @@ seed）、`last_accepted_factor_id`、`last_explored_factor_id`、
   设置布局视口与 `prefers-color-scheme: dark`。**不要用旧式 `--window-size`**——它不设置
   布局视口（layout viewport），验不出真正的响应式断点。
 
+### 4.6 记忆治理页 / research-memory review tab
+
+「记忆治理」（`#lab-tab-memory` → `#lab-panel-memory`）是研究记忆的人工复核面：
+
+- **激活方式：** 点击 tab 或深链 hash 激活；面板内容渲染进 `#memory-result`。
+  已知缺口（登记在案）：方向键 roving-tabindex 循环暂不包含该 tab，用原生
+  Tab/Shift+Tab 或点击可达——按已知问题记录，不作为新发现。
+- **读面：** 应展示晋升的 findings / failures 列表、retired 状态与规则
+  （rule）状态，数据来自 `GET /api/memory/review` 的单次锁内快照；尚无记忆
+  数据时应显示空态而不是报错。
+- **治理动作：** activate / deactivate / retire 等动作必须要求 actor
+  （`#mem-actor` 输入框），空 actor 应被拒绝；提交后事件只追加、可在列表中
+  看到状态变化。非字符串字段（null/数字）应得到 400，不得把 `"None"` 落成
+  reviewer 身份。
+- **诚实展示：** 计数与比率区分 `passed`/`blocked`（进分母）与
+  `unknown`/`not_applicable`（只计数）；schema 校验失败的行以
+  `invalid_rows` 显式呈现，不得静默按 0 处理（后端口径见
+  `qf memory priors --json`）。
+
 ---
 
 ## 5. 后端 / API 交叉核对 / Backend cross-check（supporting, NOT acceptance）
