@@ -25,10 +25,12 @@ STRENGTH["gate"]``), never inflated by this module (owner ruling R5-3).
 verdict
 -------
 ``result.gate_passed`` -> ``"passed"`` with reason_codes exactly
-``(REASON_NONE,)``; ``False`` -> ``"blocked"`` with >=1 real reason code
-(never empty -- ``apply_gate``'s own invariant guarantees ``gate_reasons``
-is non-empty whenever ``gate_passed`` is False, and the mapper falls back to
-``VALIDATION_ERROR`` in the unreachable case it somehow were not).
+``(REASON_NONE,)``; ``False`` -> ``"blocked"`` with >=1 real reason code.
+When NO gate-reason family maps to a closed code (administrative-only or
+entirely unrecognized families), the mapper returns ``None`` -- no outcome,
+no ledger row, no observation (the fail-closed contract; the pre-review
+VALIDATION_ERROR fallback was rejected as fabricating a validation failure
+-- SE-P2 review P2-F1/P2-F2, doc fix RV2-F5).
 
 reason_codes mapping table (closed ``outcomes.REASON_CODES`` set; SE-ii)
 -------------------------------------------------------------------------
@@ -72,10 +74,11 @@ the ONLY variable family the local gate actually emits is an OOS segment
 name -- ``oos_return_evidence`` and the decay clause admit exclusively
 segments whose name starts with ``OOS`` (case-insensitive), producing
 reasons like ``OOS net_annualized_return below threshold: ...`` /
-``OOS_2024H2 ...`` / ``OOS net return decay exceeds ...`` whose extracted
-family token is the segment name itself::
+``OOS1 ...`` / ``OOS2 ...`` (the shipped ``DEFAULT_SAMPLE_SPLITS`` names)
+/ ``OOS_2024H2 ...`` / ``OOS net return decay exceeds ...`` whose
+extracted family token is the segment name itself::
 
-    ^oos([_.-][a-z0-9_.\\-]*)?$  -> RETURNS_BELOW_GATE  (OOS shortfall/decay)
+    ^oos[0-9]*([_.-][a-z0-9_.\\-]*)?$  -> RETURNS_BELOW_GATE  (OOS shortfall/decay)
 
 Anything matching neither table FAILS CLOSED: the family maps to no code
 (SE-P2 review finding P2-F2 -- the earlier broad substring fallback let
@@ -333,9 +336,15 @@ _ADMINISTRATIVE_FAMILIES = frozenset({"duplicate", "existing", "passed"})
 # (oos_return_evidence / the decay clause admit exclusively names starting
 # with "OOS", case-insensitive). Anchored, not substring (P2-F2):
 # "returning_candidate" or "no_return_path" must NOT classify as a returns
-# shortfall. Families matching nothing FAIL CLOSED (no code, no invention).
+# shortfall. The optional digit run right after "oos" covers the SHIPPED
+# default split names OOS1/OOS2 (evaluation.service.DEFAULT_SAMPLE_SPLITS --
+# re-verify RV2-F1: the first anchored pattern required a separator and
+# silently dropped exactly the segments the default configuration emits);
+# a letter directly after "oos"/"oos<digits>" (e.g. "oosmalformed") still
+# fails closed. Families matching nothing FAIL CLOSED (no code, no
+# invention).
 _VARIABLE_FAMILY_REASON_CODES: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"^oos(?:[_.\-][a-z0-9_.\-]*)?$"), "RETURNS_BELOW_GATE"),
+    (re.compile(r"^oos[0-9]*(?:[_.\-][a-z0-9_.\-]*)?$"), "RETURNS_BELOW_GATE"),
 )
 
 
@@ -526,10 +535,31 @@ def _settings_profile_token(gate: "ResearchGate") -> str:
     non-reserved scope-dimension token.
     """
 
-    payload = {field.name: getattr(gate, field.name) for field in dataclasses.fields(gate)}
+    payload = {
+        field.name: _canonical_settings_value(getattr(gate, field.name)) for field in dataclasses.fields(gate)
+    }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return f"{_SETTINGS_TOKEN_PREFIX}{digest[:_SETTINGS_TOKEN_HEX_LEN]}"
+
+
+def _canonical_settings_value(value: object) -> object:
+    """Numeric canonicalization so EQUAL gates hash equal (RV2-F2).
+
+    Raw JSON spelling splits values Python compares equal: ``0`` vs ``0.0``
+    serialize differently, and ``-0.0 == 0.0`` while ``json.dumps`` spells
+    them apart -- so ``ResearchGate(min_score=0.0)`` and
+    ``ResearchGate(min_score=-0.0)`` (equal dataclasses) minted different
+    tokens and could never promote together. Every non-bool number
+    canonicalizes to a float with signed zero collapsed; bools/str/None
+    pass through. Non-finite values never reach here --
+    ``ResearchGate.__post_init__`` rejects them (RV2-F4).
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    number = float(value)
+    return 0.0 if number == 0.0 else number
 
 
 def _clean_scope_dim(value: str) -> str:

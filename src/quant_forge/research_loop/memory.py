@@ -91,7 +91,7 @@ import json
 import logging
 from pathlib import Path
 import re
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 # ``advisory_file_lock`` is a public export of lineage.store (promoted from a
 # private name in the P4a rework, item 12) but this reuses the SAME lock
@@ -423,7 +423,40 @@ class ResearchMemoryStore:
     ) -> MemoryObservation:
         """Append one observation to the trace tier (never a knowledge row)."""
 
-        observation = MemoryObservation(
+        observation = self._normalized_observation(
+            signature=signature,
+            statement=statement,
+            run_id=run_id,
+            data_window=data_window,
+            failure_class=failure_class,
+            evidence_ref=evidence_ref,
+            observed_at=observed_at,
+            scope=scope,
+        )
+        # Critical section (S2-F10): serialize this append against a
+        # concurrent promote_pending() read of the same file under the SAME
+        # store-wide lock, so a reader can never observe a torn write.
+        with advisory_file_lock(self._lock_path):
+            self._append_observation_unlocked(observation)
+        return observation
+
+    def _normalized_observation(
+        self,
+        *,
+        signature: str,
+        statement: str,
+        run_id: str,
+        data_window: str = "",
+        failure_class: str = "",
+        evidence_ref: str = "",
+        observed_at: str | None = None,
+        scope: str = "global",
+    ) -> MemoryObservation:
+        """The ONE normalization applied to every recorded observation --
+        shared by :meth:`record_observation` and :meth:`ingest_outcome_rows`
+        so the two write paths can never drift apart."""
+
+        return MemoryObservation(
             signature=redact_free_text(signature),
             statement=redact_free_text(statement),
             run_id=run_id,
@@ -433,15 +466,12 @@ class ResearchMemoryStore:
             evidence_ref=evidence_ref,
             scope=redact_free_text(scope),
         )
-        # Critical section (S2-F10): serialize this append against a
-        # concurrent promote_pending() read of the same file under the SAME
-        # store-wide lock, so a reader can never observe a torn write.
-        with advisory_file_lock(self._lock_path):
-            _append_jsonl(
-                self.observations_path,
-                {"schema_version": RESEARCH_MEMORY_SCHEMA_VERSION, "record": "observation", **observation.to_dict()},
-            )
-        return observation
+
+    def _append_observation_unlocked(self, observation: MemoryObservation) -> None:
+        _append_jsonl(
+            self.observations_path,
+            {"schema_version": RESEARCH_MEMORY_SCHEMA_VERSION, "record": "observation", **observation.to_dict()},
+        )
 
     def promote_pending(self) -> tuple[dict[str, Any], ...]:
         """Run :func:`promote` over all recorded observations; append new rows.
@@ -887,6 +917,55 @@ class ResearchMemoryStore:
 
         with advisory_file_lock(self._lock_path):
             return self._known_outcome_ids_unlocked()
+
+    def ingest_outcome_rows(
+        self, record: Mapping[str, Any], observations: Sequence[MemoryObservation]
+    ) -> tuple[bool, int]:
+        """One critical section for the whole SE-P2 sink write (RV2-F3).
+
+        The known-``outcome_id`` replay check, every derived observation
+        append, and the envelope append (LAST -- the completion marker)
+        happen under ONE store-lock hold, so two concurrent ingests of the
+        same outcome can never both observe "absent" and double-append the
+        observations the way the sink's earlier check-then-write sequence
+        (three separate lock acquisitions) could. Returns
+        ``(recorded, appended_observation_count)``: ``(False, 0)`` for a
+        replay, which appends NOTHING. Promotion stays OUTSIDE this method
+        (its own lock hold; a pure, deterministic function of the full
+        observation set) -- holding one lock across append+promote would
+        add latency for no correctness gain and re-nest the advisory lock
+        :meth:`promote_pending` already takes.
+
+        Note the crash-window contract is unchanged from the sink's
+        docstring: a crash between the observation appends and the envelope
+        append is impossible WITHIN this method's single hold only for
+        concurrency, not for process death -- a killed process mid-method
+        still leaves observations without the envelope marker, and the
+        retry re-appends both (duplicates stay scientifically inert under
+        promote's ``(signature, run_id)`` cap).
+        """
+
+        outcome_id = str(record.get("outcome_id") or "")
+        if not outcome_id:
+            raise ValueError("outcome record is missing outcome_id")
+        with advisory_file_lock(self._lock_path):
+            if outcome_id in self._known_outcome_ids_unlocked():
+                return False, 0
+            for observation in observations:
+                self._append_observation_unlocked(
+                    self._normalized_observation(
+                        signature=observation.signature,
+                        statement=observation.statement,
+                        run_id=observation.run_id,
+                        data_window=observation.data_window,
+                        failure_class=observation.failure_class,
+                        evidence_ref=observation.evidence_ref,
+                        observed_at=observation.observed_at,
+                        scope=observation.scope,
+                    )
+                )
+            _append_jsonl(self.outcomes_ledger_path, record)
+            return True, len(observations)
 
     def outcomes_revision(self) -> int:
         """Monotonic append index: count of valid ledger rows.

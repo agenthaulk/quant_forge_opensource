@@ -80,31 +80,15 @@ def ingest_outcome(store: ResearchMemoryStore, outcome: ResearchOutcome) -> Inge
 
     record = outcome.to_record()
     outcome_id = str(record["outcome_id"])
-    if outcome_id in store.known_outcome_ids():
-        store.promote_pending()
-        return IngestReceipt(
-            outcome_id=outcome_id,
-            recorded=False,
-            observation_count=0,
-            as_of=store.outcomes_revision(),
-        )
-    observations = outcome_to_observations(outcome)
-    for observation in observations:
-        store.record_observation(
-            signature=observation.signature,
-            statement=observation.statement,
-            run_id=observation.run_id,
-            data_window=observation.data_window,
-            failure_class=observation.failure_class,
-            evidence_ref=observation.evidence_ref,
-            observed_at=observation.observed_at,
-            scope=observation.scope,
-        )
-    recorded = store.record_outcome_envelope(record)
+    # ONE store-level critical section (RV2-F3): the replay check, the
+    # observation appends, and the envelope completion marker are a single
+    # lock hold inside the store, so two concurrent ingests of the same
+    # outcome cannot both pass the check and double-append.
+    recorded, observation_count = store.ingest_outcome_rows(record, outcome_to_observations(outcome))
     store.promote_pending()
     return IngestReceipt(
         outcome_id=outcome_id,
         recorded=recorded,
-        observation_count=len(observations),
+        observation_count=observation_count,
         as_of=store.outcomes_revision(),
     )

@@ -131,6 +131,25 @@ class ResearchGate:
         # is constructed directly instead of via the strict YAML loader.
         if not isinstance(self.missing_oos_evidence_blocks, bool):
             raise ValueError("missing_oos_evidence_blocks must be a boolean")
+        # SE-P2 re-verify RV2-F4: NaN slips through every `< 0` comparison
+        # below and +/-inf passes the minimum checks, then blows up LATE in
+        # the settings-token serialization after research artifacts were
+        # already written. A non-finite threshold is never meaningful; fail
+        # at construction.
+        for numeric_field in (
+            "min_ic_days",
+            "min_coverage",
+            "min_score",
+            "min_backtest_periods",
+            "min_oos_net_annualized_return",
+            "max_rebalance_rate",
+            "max_turnover_rate",
+            "min_net_return_retention",
+            "max_oos_net_return_decay",
+        ):
+            value = getattr(self, numeric_field)
+            if value is not None and not isfinite(value):
+                raise ValueError(f"{numeric_field} must be finite")
         if self.min_ic_days < 0:
             raise ValueError("min_ic_days must be non-negative")
         if not 0 <= self.min_coverage <= 1:

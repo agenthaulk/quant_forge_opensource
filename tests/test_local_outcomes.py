@@ -174,6 +174,11 @@ def test_gate_passed_maps_to_passed_none() -> None:
         # emits (segment shortfall + decay shapes), anchored-matched:
         ("OOS net return decay exceeds 0.3", "RETURNS_BELOW_GATE"),
         ("OOS net_annualized_return below threshold: 0.01", "RETURNS_BELOW_GATE"),
+        # The SHIPPED default split names (evaluation.service.DEFAULT_SAMPLE_
+        # SPLITS) carry no separator -- re-verify RV2-F1 caught the first
+        # anchored pattern silently dropping exactly these.
+        ("OOS1 net_annualized_return below threshold: 0.01", "RETURNS_BELOW_GATE"),
+        ("OOS2 net_annualized_return below threshold: 0.01", "RETURNS_BELOW_GATE"),
         ("OOS_2024H2 net_annualized_return below threshold: 0.01", "RETURNS_BELOW_GATE"),
         ("oos_2 net_annualized_return below threshold: 0.01", "RETURNS_BELOW_GATE"),
     ],
@@ -212,6 +217,7 @@ def test_blocked_reason_family_maps_to_closed_code(reason: str, expected_code: s
         "lightweight_error in adapter",
         "regionalization pending",
         "oosmalformed_no_separator value",
+        "oos1malformed value",
     ],
 )
 def test_unrepresentable_families_fail_closed_to_no_outcome(reason: str) -> None:
@@ -560,6 +566,35 @@ def test_settings_token_is_deterministic_per_gate_and_distinct_across_gates() ->
     # Distinct settings tokens flow into distinct signatures: the merged
     # cross-gate promotion path P2-F4 attacked is structurally closed.
     assert strict_a.signature_payloads() != loose_outcome.signature_payloads()
+
+
+def test_settings_token_canonicalizes_numeric_spelling(  # RV2-F2
+) -> None:
+    # Gates that compare EQUAL must hash equal: -0.0 == 0.0 and 5 == 5.0 in
+    # Python, but raw JSON spells them apart -- the first token derivation
+    # split equal gates and blocked otherwise-valid promotion.
+    from quant_forge.research_loop.local_outcomes import _settings_profile_token
+
+    assert ResearchGate(min_score=0.0) == ResearchGate(min_score=-0.0)
+    assert _settings_profile_token(ResearchGate(min_score=0.0)) == _settings_profile_token(
+        ResearchGate(min_score=-0.0)
+    )
+    assert ResearchGate(min_ic_days=5) == ResearchGate(min_ic_days=5.0)  # type: ignore[arg-type]
+    assert _settings_profile_token(ResearchGate(min_ic_days=5)) == _settings_profile_token(
+        ResearchGate(min_ic_days=5.0)  # type: ignore[arg-type]
+    )
+    # And genuinely different numbers still split.
+    assert _settings_profile_token(ResearchGate(min_score=0.0)) != _settings_profile_token(
+        ResearchGate(min_score=0.5)
+    )
+
+
+def test_research_gate_rejects_non_finite_thresholds() -> None:  # RV2-F4
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="finite"):
+            ResearchGate(min_score=bad)
+        with pytest.raises(ValueError, match="finite"):
+            ResearchGate(max_turnover_rate=abs(bad))
 
 
 def test_scope_horizon_bucket_stays_unknown() -> None:

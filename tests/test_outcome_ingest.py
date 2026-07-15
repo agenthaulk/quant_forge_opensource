@@ -230,6 +230,39 @@ def test_ingest_ledger_known_id_appends_nothing(tmp_path: Path) -> None:
     assert _read_jsonl(store.observations_path) == []
 
 
+def test_concurrent_same_outcome_ingests_append_exactly_once(tmp_path: Path) -> None:
+    # RV2-F3: the replay check + observation appends + envelope marker are
+    # ONE store-level critical section (ResearchMemoryStore.ingest_outcome_
+    # rows), so racing ingests of the same outcome cannot both observe
+    # "absent" and double-append. Exactly one thread records; the rest are
+    # replays appending nothing.
+    import threading
+
+    store = _store(tmp_path)
+    outcome = _outcome(verdict="blocked", reason_codes=("SHARPE_BELOW_GATE", "TURNOVER_TOO_HIGH"))
+    receipts: list[Any] = []
+    receipts_lock = threading.Lock()
+    barrier = threading.Barrier(4)
+
+    def _ingest() -> None:
+        barrier.wait()
+        receipt = ingest_outcome(store, outcome)
+        with receipts_lock:
+            receipts.append(receipt)
+
+    threads = [threading.Thread(target=_ingest) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(receipt.recorded for receipt in receipts) == [False, False, False, True]
+    assert sorted(receipt.observation_count for receipt in receipts) == [0, 0, 0, 2]
+    assert len(_read_jsonl(store.observations_path)) == 2  # appended exactly once
+    assert len(_read_jsonl(store.outcomes_ledger_path)) == 1  # one envelope
+    assert all(receipt.as_of == 1 for receipt in receipts)
+
+
 def test_ingest_replay_never_grows_observations_jsonl(tmp_path: Path) -> None:
     store = _store(tmp_path)
     outcome = _outcome(verdict="blocked", reason_codes=("SHARPE_BELOW_GATE", "TURNOVER_TOO_HIGH"))
