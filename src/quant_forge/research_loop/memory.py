@@ -918,6 +918,21 @@ class ResearchMemoryStore:
         with advisory_file_lock(self._lock_path):
             return self._known_outcome_ids_unlocked()
 
+    def outcome_records(self) -> tuple[dict[str, Any], ...]:
+        """Every valid outcome envelope, in ledger (append) order -- ONE
+        locked read (SE-P5 priors basis).
+
+        The returned tuple's length IS the ledger revision
+        (:meth:`outcomes_revision` counts the same valid rows), so a caller
+        deriving ``as_of = len(outcome_records())`` from a single call can
+        never stamp a revision that disagrees with the rows it actually
+        saw -- the TOCTOU a separate ``outcomes_revision()`` call after an
+        unlocked read would reintroduce.
+        """
+
+        with advisory_file_lock(self._lock_path):
+            return tuple(_read_jsonl(self.outcomes_ledger_path))
+
     def ingest_outcome_rows(
         self, record: Mapping[str, Any], observations: Sequence[MemoryObservation]
     ) -> tuple[bool, int]:

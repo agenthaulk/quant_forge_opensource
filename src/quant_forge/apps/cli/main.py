@@ -393,6 +393,22 @@ def build_parser() -> argparse.ArgumentParser:
     memory_rules_deactivate.add_argument("--artifact-root", type=Path)
     memory_rules_deactivate.set_defaults(handler=_cmd_memory_rules_deactivate)
 
+    # SE-P5 (ruling SE-v): computed, never-persisted priors read surface.
+    memory_priors = memory_subcommands.add_parser(
+        "priors", help="quantitative priors view over the outcomes ledger (computed, read-only)"
+    )
+    memory_priors.add_argument(
+        "--dimension",
+        action="append",
+        dest="dimensions",
+        choices=("factor_family", "settings_profile", "asset_class", "universe"),
+        help="restrict to specific dimensions (repeatable; default: all)",
+    )
+    memory_priors.add_argument("--json", action="store_true", help="emit the full view as JSON")
+    _add_config_options(memory_priors)
+    memory_priors.add_argument("--artifact-root", type=Path)
+    memory_priors.set_defaults(handler=_cmd_memory_priors)
+
     memory_rules_retire = memory_rules_subcommands.add_parser(
         "retire", help="retire a finding or failure signature (or unambiguous prefix)"
     )
@@ -1355,6 +1371,39 @@ def _cmd_memory_rules_list(args: argparse.Namespace) -> int:
         return 0
     entries.sort(key=lambda pair: str(pair[0].get("last_seen") or ""), reverse=True)
     _print_memory_rules_table(entries)
+    return 0
+
+
+def _cmd_memory_priors(args: argparse.Namespace) -> int:
+    from quant_forge.research_loop.priors import PRIOR_DIMENSIONS, PriorsQuery, compute_priors
+
+    store = ResearchMemoryStore(_runtime_paths(args).artifact_root)
+    dimensions = tuple(args.dimensions) if args.dimensions else PRIOR_DIMENSIONS
+    view = compute_priors(store, PriorsQuery(dimensions=dimensions))
+    if args.json:
+        print(json.dumps(view.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    print(
+        f"priors as_of={view.as_of} envelopes={view.total_envelopes} "
+        f"evidence_runs={view.total_evidence_runs} oos_excluded={view.oos_excluded}"
+    )
+    for table in view.tables:
+        print(f"\n[{table.dimension}] (unbucketed: {table.unbucketed})")
+        if not table.cells:
+            print("  no cells")
+            continue
+        for cell in table.cells:
+            rate = "n/a" if cell.pass_rate is None else f"{cell.pass_rate:.2f}"
+            weighted = "n/a" if cell.weighted_pass_rate is None else f"{cell.weighted_pass_rate:.2f}"
+            counts = cell.verdict_counts
+            reasons = ", ".join(f"{code}x{count}" for code, count in cell.top_blocked_reasons) or "-"
+            print(
+                f"  {cell.bucket}: runs={cell.evidence_runs} passed={counts.get('passed', 0)} "
+                f"blocked={counts.get('blocked', 0)} unknown={counts.get('unknown', 0)} "
+                f"rate={rate} weighted={weighted}"
+                + (" (insufficient_sample)" if cell.insufficient_sample else "")
+                + f" | blocked_reasons: {reasons}"
+            )
     return 0
 
 
