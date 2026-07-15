@@ -615,3 +615,39 @@ surfacing deferred to SE-P5 planning_influences by design.
 
 Gates at close: 1494 passed / CLI OK / diff clean / release scan 245
 files. Governance battery: 111 review-event + memory tests.
+
+## 2026-07-14 — Workflow B / SE-P2: local outcome ingress (CLOSED)
+
+Trunk chain `69ea900` (producer local_outcomes.experiment_result_to_outcome
++ shared sink outcome_ingest.ingest_outcome + service.py recorder seam
+migration off the ad-hoc rd_accepted:/rd_gate_blocked: signatures) →
+`146a0b0` (passive recall admits the v2 outcome grammar via the SAME
+authenticator the active channel uses — newly promoted lessons steer
+prompts again) → `dbf0899` (strict-review rework: reviewed contract
+amendment adds OBJECTIVE_SCORE_BELOW_GATE — the score→VALIDATION_ERROR
+label fabricated a validation failure; administrative families
+(duplicate/existing/passed) map to NO code and admin-only blocks produce
+no outcome; the substring fallback became one anchored OOS-segment
+pattern with everything else failing closed; max_drawdown persists as the
+frozen non-negative magnitude; settings_profile is a deterministic token
+of the EFFECTIVE ResearchGate threaded from run_once, so evidence under
+different thresholds can never share a signature; ingest short-circuits
+ledger-known ids and writes the envelope last; the statement
+authenticator enforces family/scope coherence on both channels) →
+`b016f61` (re-verify residuals: OOS1/OOS2 shipped split names admitted;
+numeric canonicalization for token equality; ResearchMemoryStore.ingest_
+outcome_rows makes the whole sink write ONE advisory-lock critical
+section with a 4-thread race regression; ResearchGate rejects non-finite
+thresholds; stale docstring fallback claim removed) → `8928822` (integers
+kept exact above 2**53 in the canonical settings form).
+
+Review trail (all model pins rollout-verified): sol-high sharded review
+REWORK 6 findings → rework → sol re-verify 3 residual + 5 sub-findings →
+fixes → sol final spot-check 1 residual → fix with regression →
+adjudicated CLOSED (convergence 6→5→1→0). The one contract amendment
+(REASON_CODES + OBJECTIVE_SCORE_BELOW_GATE) is additive-only; sig.v2.1
+golden vectors unchanged throughout.
+
+Gates at close: 1589 passed / CLI OK / diff clean / release scan 249
+files. SE-P5 priors + planning_influence_snapshot freeze is now unblocked
+(P2 folded).
