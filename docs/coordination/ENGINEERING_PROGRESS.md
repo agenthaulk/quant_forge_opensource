@@ -837,3 +837,52 @@ files / api.py byte-identical to the FE base across all three commits.
 THE FE SIDECAR TRACK (P0–P3) IS COMPLETE on feature/agent-sidecar-frontend; the
 remaining cross-track work is the endgame (CP-INT union + the SE-ix real
 capture wiring + neutral renames + the two PRs).
+
+## 2026-07-15 — CP-INT: dual-track union verified end-to-end (local branch cp-int-union)
+
+Union mechanics: merging the engine trunk and the sidecar branch produced
+exactly two content conflicts — routing.py (import/helper/POST-dispatch
+blocks, resolved as the pure union of the memory-review and
+sidecar/pipeline route families over the shared ValueError→400 mapping)
+and test_web_static_frontend.py (EXPECTED_STATIC_MODULES = union) — and
+the first united suite passed 1971/1971 with api.py identical to the
+sidecar branch's D12-shrunk state (the engine side never touched it).
+
+Cross-track wiring (union-only, follow-up-PR bound): the planning-
+influence capture went live at BOTH confirm sites — module-level import,
+snapshot persisted on the record as an additive spec field, hash filling
+the reserved input_hash slot on the factor-study and rd paths; the frozen
+contract module and its golden vector are byte-untouched; a
+fresh-workspace capture yields empty active_rules with a non-empty hash
+instead of a crash. The two-run determinism fixture proves the SE-ix
+promise end to end with real stores: identical inputs reproduce identical
+snapshot hashes and input_hash; a rule activation/deactivation changes
+the hash with a strictly greater review_events_revision; the priors view
+is invariant under governance events. The memory tab joined the single
+roving-tabindex cycle (lab.js owns the cycle; memory.js keeps content
+rendering plus a lazy-load hook) with a Node render harness and
+absence/presence string pins. Union tip suite: 1975 passed.
+
+Acceptance: the full integration test (real desktop Chrome, computeruse
+mode; Docker daemon unavailable → the prompt's local fresh-venv
+provision, exercised on py3.13 + pandas 3.0.3) returned ACCEPT with zero
+blocking or major findings. All seven new surfaces passed: pipeline A
+including paused_failure/retry/fork; sidecar narration and tools with
+action-token 401 even on loopback; pipeline B with the audit-only
+external-OOS label, truthful post-execution dedup disposition, and
+synchronous 400s for out-of-range parameters; the editable-formula card
+with review-packet refusal and immutable edited runs; the
+memory-governance tab with arrow-key roving and typed actor rejections;
+real planning-influence snapshots (deterministic across identical
+confirms); and the cross-cutting deep-link / zero-console-error /
+dark-375px sweep. Honest-research invariants held everywhere; payload
+hygiene clean. Findings: five minor/doc items — the IA seven-tab count
+fixed on this branch, the planning-influence and composite-prefix prose
+fixed on the union, and three registered in BUG_LIST (U-1 llm-smoke
+traceback, U-2 the "AI 推断" label under rule mode, U-3 the
+constraints.txt py3.12 baseline note).
+
+Branch gates at this closure: engine trunk 1670 passed / sidecar branch
+1553 passed, each with CLI smoke, a clean diff check, and a passing
+release scan. Both tracks are COMPLETE and jointly verified; what remains
+is the neutral-named pushes, the two PRs, and the follow-up wiring PR.

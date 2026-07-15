@@ -214,3 +214,28 @@ contributes no tracked diff). Phase discipline inside each track is unchanged:
 per-phase dev → adversarial review → fixes, sequential within a track. The
 SE-x temp-integration-branch CP-INT runs over the union of both PR heads
 before either merges; owner approval gates both merges.
+
+**Amendment (2026-07-15): CP-INT executed and closed on the local union
+branch.** The SE-x temp-integration-branch requirement is SATISFIED:
+`cp-int-union` = merge of the two PR heads; exactly two content conflicts
+(routing.py route families; EXPECTED_STATIC_MODULES), both resolved as
+pure unions; first united suite 1971 passed, 1975 at union tip. The SE-ix
+real capture is wired ON THE UNION ONLY: both confirm sites persist the
+snapshot and fold its hash into `input_hash`; the frozen contract and
+golden vector are byte-untouched; the two-run determinism fixture proves
+identical inputs → identical hashes, governance events → different hashes
+with strictly increasing `review_events_revision`, and priors invariance
+under events. Full integration test per the canonical prompt: verdict
+ACCEPT (real desktop Chrome, zero blocking/major findings; residuals
+registered as BUG_LIST U-1..U-3 plus two doc fixes landed in place).
+Runtime-artifact canary and tracked-tree sweeps clean. Register
+adjudications: the §8 app.js→pipeline.js convergence row is ruled
+SATISFIED in aggregate (the resident validate control routes through the
+pipeline aggregate; the parse job is the pipeline's designed entry; the
+remaining app.js state is a deliberate ownership decision); the
+publish-CAS residual window and the plugin-domain read-only pane remain
+deferred with their recorded boundaries; the RD kernel scoring
+legacy-alias consumption is queued as an owner question. Landing shape:
+the two PRs stay independent; the union-only wiring + roving-cycle
+commits land as a small follow-up PR after both merge; `cp-int-union`
+itself is not pushed.

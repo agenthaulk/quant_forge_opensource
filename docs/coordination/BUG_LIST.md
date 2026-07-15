@@ -89,3 +89,13 @@
 ---
 
 *首次建立 2026-07-10（CP-INT PR#16/#17 联调）。缺陷复现证据见联调报告与本会话记录。*
+
+## 2026-07-15 — CP-INT（双轨联合）联调登记
+
+| # | 位置 | 症状 | 状态 |
+| --- | --- | --- | --- |
+| U-1 | `apps/cli/main.py` `llm-smoke` | 缺 key 时 RuntimeError 未捕获、裸 traceback（同条件 `doctor` 是结构化 check；无 key 泄漏） | OPEN（合并后修） |
+| U-2 | `static/views/provenance.js:28` | 规则解析降级下仍显示「AI 推断」徽标（底层 `agent_inferred` 源值本身诚实；建议改模式中立的「系统推断」） | OPEN（合并后修） |
+| U-3 | `constraints.txt` + README | py3.13/3.14 环境按 constraints 安装失败（numpy 1.26.4 / pyarrow 16.1.0 不可构建）；floor-only 安装后全套 1975 通过（pandas 3.0.3） | OPEN（README 注明 py3.12 基线 + floor-only 备选） |
+
+观察（非缺陷）：LLM 无 key 降级前的确认用原生 `window.confirm`——符合 §4.1 契约（先询问、命名 provider/env、不泄 key），体验上可换页内确认框，不列 OPEN。
