@@ -8,9 +8,13 @@
  * onActivate/lazyPanelsByTab wiring, both of which are FE-track-owned files
  * outside this module's scope. So this module additively layers its OWN
  * tablist participation (click delegation on the existing .lab-tabs
- * container, hashchange handling for #lab-tab-memory) beside the existing
- * controller instead of inside it -- lab.js and app.js are read, never
- * written, by this file. One known, accepted gap from that split: lab.js's
+ * container; a hashchange listener that activates OR deactivates this tab
+ * depending on the target; a MutationObserver on the tablist that
+ * deactivates this tab the moment any other tab's aria-selected becomes
+ * "true", catching programmatic activation that never touches the URL at
+ * all) beside the existing controller instead of inside it -- lab.js and
+ * app.js are read, never written, by this file. One known, accepted gap
+ * from that split: lab.js's
  * ArrowRight/ArrowLeft/Home/End roving-tabindex handler does not know about
  * lab-tab-memory, so arrow-key cycling skips this tab; native Tab/Shift+Tab
  * and Enter/Space activation both still work (plain <button> semantics).
@@ -382,7 +386,50 @@ if (tablist) {
     else deactivateMemoryTab();
   });
 }
+
+// P4B-F3: two independent, complementary mechanisms close "leaves both
+// tabs selected" -- neither alone covers every path the existing
+// controller (views/lab.js, read but never written by this module) uses to
+// switch tabs:
+//
+// 1. hashchange: covers user-driven navigation (address bar, back/forward,
+//    an <a href="#..."> link). The ORIGINAL bug was here -- this listener
+//    only ever handled "the new hash IS lab-tab-memory" and did nothing on
+//    every other target, so switching to any other tab via the hash left
+//    this tab's aria-selected/hidden state untouched. Now it deactivates
+//    on ANY target that is not lab-tab-memory, unconditionally -- a
+//    recognized TAB_IDS entry, a workbench anchor (#report-*), an unknown
+//    hash, all of it.
+// 2. MutationObserver on the tablist: covers PROGRAMMATIC activation that
+//    never touches the URL hash at all -- e.g. app.js's Parse/Validate/RD
+//    button handlers call activateTab('lab-tab-factor') directly, and
+//    activateTab's default updateHash path writes the URL via
+//    history.replaceState, which fires NEITHER 'hashchange' NOR
+//    'popstate'. Watching the other six tabs' aria-selected attribute is
+//    the only reliable, controller-agnostic signal that "some other tab
+//    just became the active one" -- it fires even when nothing else would.
+//
+// Both call deactivateMemoryTab(), which is idempotent (a no-op if this
+// tab is already inactive), so the two mechanisms overlapping on the same
+// real navigation (as they do for a plain hash-driven tab switch) is
+// harmless, not a double-fire bug.
 window.addEventListener('hashchange', () => {
-  if ((window.location.hash || '').replace(/^#/, '') === TAB_ID) activateMemoryTab();
+  const target = (window.location.hash || '').replace(/^#/, '');
+  if (target === TAB_ID) activateMemoryTab();
+  else deactivateMemoryTab();
 });
+
+if (tablist) {
+  new MutationObserver(mutations => {
+    for (const mutation of mutations) {
+      const target = mutation.target;
+      if (!target || target.id === TAB_ID) continue;
+      if (OTHER_TAB_IDS.includes(target.id) && target.getAttribute('aria-selected') === 'true') {
+        deactivateMemoryTab();
+        return;
+      }
+    }
+  }).observe(tablist, { attributes: true, attributeFilter: ['aria-selected'], subtree: true });
+}
+
 if ((window.location.hash || '').replace(/^#/, '') === TAB_ID) activateMemoryTab();

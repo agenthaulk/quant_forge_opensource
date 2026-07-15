@@ -105,6 +105,31 @@ def _static_asset(url_path: str) -> tuple[bytes, str]:
     return body, content_type
 
 
+def _memory_review_str_field(payload: dict[str, Any], name: str) -> str:
+    """One field from a ``POST /api/memory/review/*`` body, type-checked at
+    the JSON boundary (review finding P4B-F1).
+
+    A JSON value that is not a string -- ``null``, a number, an object, an
+    array, a bool -- must never reach :func:`review_rule`/
+    :func:`review_promoted` through a blind ``str()`` coercion:
+    ``str(None) == "None"``, ``str(42) == "42"``, ``str({}) == "{}"`` are
+    all non-empty after ``.strip()``, so they would silently pass the
+    "actor is required" check downstream and fabricate a persisted actor
+    identity ("None" as a reviewer!), or corrupt a signature-prefix lookup.
+    An absent key reads as ``""`` (unchanged prior behavior for every
+    optional field on this surface); a present key must be a string
+    (``""`` included) or this raises ``ValueError``, which ``do_POST``'s
+    existing handler maps to a clean 400 -- the action is never called.
+    """
+
+    if name not in payload:
+        return ""
+    value = payload[name]
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string, got {type(value).__name__}")
+    return value
+
+
 def create_local_web_server(
     *, host: str, port: int, config: QuantForgeConfig, rd_config: ResearchLoopConfig | None = None
 ) -> ThreadingHTTPServer:
@@ -483,15 +508,20 @@ def create_local_web_server(
                     # unknown action, ambiguous/absent signature prefix)
                     # falls through to the generic ValueError -> 400 mapping
                     # below. No plugin_store passed in V1, matching the GET
-                    # route above.
+                    # route above. P4B-F1: every field is extracted through
+                    # _memory_review_str_field, which rejects a non-string
+                    # JSON value (null/number/object/array/bool) with a 400
+                    # BEFORE review_rule is ever called -- a blind str()
+                    # here would let {"actor": null} persist "None" as the
+                    # reviewer identity.
                     memory_store = ResearchMemoryStore(config.paths.artifact_root)
                     self._json(
                         review_rule(
                             memory_store,
-                            signature_prefix=str(payload.get("signature_prefix", "")),
-                            action=str(payload.get("action", "")),
-                            actor=str(payload.get("actor", "")),
-                            rationale=str(payload.get("rationale", "")),
+                            signature_prefix=_memory_review_str_field(payload, "signature_prefix"),
+                            action=_memory_review_str_field(payload, "action"),
+                            actor=_memory_review_str_field(payload, "actor"),
+                            rationale=_memory_review_str_field(payload, "rationale"),
                         )
                     )
                     return
@@ -500,11 +530,11 @@ def create_local_web_server(
                     self._json(
                         review_promoted(
                             memory_store,
-                            kind=str(payload.get("kind", "")),
-                            signature_prefix=str(payload.get("signature_prefix", "")),
-                            action=str(payload.get("action", "")),
-                            actor=str(payload.get("actor", "")),
-                            rationale=str(payload.get("rationale", "")),
+                            kind=_memory_review_str_field(payload, "kind"),
+                            signature_prefix=_memory_review_str_field(payload, "signature_prefix"),
+                            action=_memory_review_str_field(payload, "action"),
+                            actor=_memory_review_str_field(payload, "actor"),
+                            rationale=_memory_review_str_field(payload, "rationale"),
                         )
                     )
                     return

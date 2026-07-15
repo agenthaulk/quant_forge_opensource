@@ -104,25 +104,86 @@ def _rules_payload(store: ResearchMemoryStore, *, include_actions: bool) -> list
     return rows
 
 
+_PROMOTED_STABLE_READ_ATTEMPTS = 3
+
+
+def _entry_id_mapping(rows: tuple[dict[str, Any], ...]) -> dict[str, str]:
+    return {str(row.get("signature") or ""): str(row.get("entry_id") or "") for row in rows}
+
+
+def _stable_promoted_rows_and_retired(
+    store: ResearchMemoryStore, kind: str
+) -> tuple[tuple[dict[str, Any], ...], frozenset[str]]:
+    """(rows, retired_signatures) for ``kind``, read as one consistent
+    snapshot -- without a single atomic store method to do it in one read
+    (review finding P4B-F2).
+
+    :meth:`ResearchMemoryStore.list_promoted` and :meth:`ResearchMemoryStore.
+    retired_signatures` are each independently locked (the store takes and
+    releases its advisory lock once per call), so calling them back to back
+    is two separate snapshots of the store, not one: a ``promote_pending()``
+    landing between them can supersede a row (new ``entry_id``) exactly when
+    that signature's retire event was bound to the OLD ``entry_id`` -- the
+    frozen contract (``_latest_events_by_signature_unlocked``) then makes
+    that event lapse, so the signature is no longer retired, but a
+    ``retired_signatures()`` read from BEFORE the supersession would still
+    say it is. Pairing that stale flag with the NEW (post-supersession) row
+    falsely labels fresh, never-reviewed content as retired.
+
+    Unlike rules (:meth:`ResearchMemoryStore.rule_review_snapshot` already
+    reads rows and events in ONE lock hold), there is no equivalent single
+    public method for finding/failure retirement -- adding one would touch
+    the frozen store contract, which is out of scope here. Instead this
+    reads the SAME two public methods repeatedly and only trusts a pairing
+    once it has evidence nothing moved underneath it: two consecutive
+    ``list_promoted`` reads whose ``(signature -> entry_id)`` mapping is
+    IDENTICAL bracket the ``retired_signatures`` read in between them, so
+    nothing could have superseded a row inside that bracket without ALSO
+    changing the second rows read -- the retired set read inside a stable
+    bracket safely corresponds to the rows on either side of it. Bounded to
+    :data:`_PROMOTED_STABLE_READ_ATTEMPTS` attempts; on persistent churn (a
+    pathological continuously-promoting workload that never lets two
+    consecutive reads agree) this returns the LATEST pair rather than
+    blocking forever -- append-only, single-host-writer files (the store's
+    own operating assumption) make convergence the overwhelmingly common
+    case in practice, and an unbounded retry loop would be a new liveness
+    risk this read-only surface should not own.
+    """
+
+    rows: tuple[dict[str, Any], ...] = ()
+    retired: frozenset[str] = frozenset()
+    previous_mapping: dict[str, str] | None = None
+    for _ in range(_PROMOTED_STABLE_READ_ATTEMPTS):
+        rows = store.list_promoted(kind)
+        retired = store.retired_signatures(kind)
+        mapping = _entry_id_mapping(rows)
+        if previous_mapping is not None and mapping == previous_mapping:
+            break
+        previous_mapping = mapping
+    return rows, retired
+
+
 def _promoted_payload(store: ResearchMemoryStore, kind: str, *, include_actions: bool) -> list[dict[str, Any]]:
     """Every live ``kind`` row from :meth:`ResearchMemoryStore.list_promoted`
     (already newest-last_seen-first), with retirement joined in from
     :meth:`ResearchMemoryStore.retired_signatures` -- retirement is an event
     overlay, never a row mutation (SE-iii), so it is never present on the row
-    itself and must be computed here.
+    itself and must be computed here. Rows and retirement are read together
+    via :func:`_stable_promoted_rows_and_retired` (P4B-F2), never as two
+    independently-racy calls.
     """
 
-    retired = store.retired_signatures(kind)
-    rows: list[dict[str, Any]] = []
-    for row in store.list_promoted(kind):
+    rows, retired = _stable_promoted_rows_and_retired(store, kind)
+    entries: list[dict[str, Any]] = []
+    for row in rows:
         signature = str(row.get("signature") or "")
         is_retired = signature in retired
         entry: dict[str, Any] = {**row, "review_state": "retired" if is_retired else "active"}
         if include_actions:
             entry["can_retire"] = not is_retired
             entry["can_unretire"] = is_retired
-        rows.append(entry)
-    return rows
+        entries.append(entry)
+    return entries
 
 
 def _domain_payload(store: ResearchMemoryStore, *, include_actions: bool) -> dict[str, Any]:
@@ -145,8 +206,9 @@ def memory_review_payload(
     pane (R5) carrying the SAME shape with NO eligibility flags anywhere --
     the plugin domain is pure display, never an action target from this
     surface. ``plugin_store is None`` omits the ``"plugin"`` pane entirely
-    (V1: no config hook resolves a plugin artifact root yet -- see routing
-    wiring / the implementation report).
+    (V1: no config/env hook anywhere in this repo resolves a plugin
+    artifact root yet, so ``apps/web/routing.py`` never constructs one --
+    see its ``GET /api/memory/review`` handler).
     """
 
     payload: dict[str, Any] = {

@@ -15,6 +15,8 @@ disclosure).
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import threading
 import urllib.error
 import urllib.request
@@ -22,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+import quant_forge.apps.web.routing as web_routing
 import quant_forge.apps.web.server as web_server
 from quant_forge.apps.web.memory_review import (
     MEMORY_REVIEW_PAYLOAD_SCHEMA_VERSION,
@@ -220,6 +223,102 @@ def test_failure_payload_shape_and_retire(tmp_path: Path) -> None:
     payload = review_promoted(store, kind="failure", signature_prefix="sig_failure", action="retire", actor="carol")
     entry = payload["failures"][0]
     assert entry["review_state"] == "retired"
+
+
+# ---------------------------------------------------------------------------
+# P4B-F2: promoted-row retirement survives a read-read race
+# ---------------------------------------------------------------------------
+
+
+def test_promoted_retirement_survives_a_supersession_race_between_reads(tmp_path: Path, monkeypatch) -> None:
+    # list_promoted() and retired_signatures() are each independently
+    # locked; a promote_pending() landing between them can supersede a row
+    # exactly when its retire event's reviewed_entry_id no longer matches
+    # the live row -- the frozen contract then makes that event lapse
+    # (truthfully NOT retired relative to the new row). Simulate the
+    # interleaving: list_promoted's FIRST call returns the STALE
+    # pre-supersession row; every later call returns the real (post-
+    # supersession) row. retired_signatures is left untouched -- it always
+    # answers with the CURRENT truth. A naive "call both once" read would
+    # zip the stale rows-read together with retired_signatures and could
+    # only get lucky or unlucky depending on call order; the fix must
+    # detect the mismatch and retry until the (signature -> entry_id)
+    # mapping stabilizes.
+    store = _store(tmp_path)
+    old_row = _promote_finding_or_failure(store, signature="sig_race")
+    review_promoted(store, kind="finding", signature_prefix="sig_race", action="retire", actor="alice")
+
+    store.record_observation(
+        signature="sig_race", statement="statement for sig_race", run_id="sig_race-3", observed_at=T3
+    )
+    store.promote_pending()
+    new_row = store.resolve_signature_prefix("finding", "sig_race")
+    assert new_row["entry_id"] != old_row["entry_id"]
+    # The frozen contract's own truth: the retire event lapsed, since it is
+    # bound to old_row's entry_id, not the new live row's.
+    assert "sig_race" not in store.retired_signatures("finding")
+
+    real_list_promoted = store.list_promoted
+    calls = {"count": 0}
+
+    def flaky_list_promoted(kind: str):
+        # memory_review_payload() also reads kind="failure" (empty, always
+        # stable in one extra pair) -- scope the staleness simulation and
+        # the call count to "finding" only, so the count assertion below
+        # is a precise, meaningful pin on THIS kind's retry behavior rather
+        # than incidentally counting an unrelated kind's own reads too.
+        if kind != "finding":
+            return real_list_promoted(kind)
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return (old_row,)
+        return real_list_promoted(kind)
+
+    monkeypatch.setattr(store, "list_promoted", flaky_list_promoted)
+
+    payload = memory_review_payload(store)
+    entry = next(item for item in payload["findings"] if item["signature"] == "sig_race")
+    # Converges on the NEW row with its correctly-lapsed (not retired)
+    # status -- never the new row mislabeled retired from the stale first
+    # read, and never stuck serving the stale old row either.
+    assert entry["entry_id"] == new_row["entry_id"]
+    assert entry["review_state"] == "active"
+    assert calls["count"] == 3  # 1 stale + 1 mismatch-detected + 1 confirming match
+
+
+def test_promoted_stable_read_is_bounded_and_uses_latest_pair_on_persistent_churn(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Pathological case: the (signature -> entry_id) mapping never
+    # stabilizes across the bounded attempt budget. The read must still
+    # terminate (never hang/retry forever) and must return a
+    # SELF-CONSISTENT pairing from its own last attempt, not some
+    # undefined mix of two different attempts.
+    store = _store(tmp_path)
+    _promote_finding_or_failure(store, signature="sig_churn")
+
+    real_list_promoted = store.list_promoted
+    calls = {"count": 0}
+
+    def churning_list_promoted(kind: str):
+        # Scope to "finding" only -- see the identical note in
+        # test_promoted_retirement_survives_a_supersession_race_between_reads;
+        # the empty "failure" kind is also read by memory_review_payload()
+        # and would otherwise pollute this count.
+        if kind != "finding":
+            return real_list_promoted(kind)
+        calls["count"] += 1
+        rows = real_list_promoted(kind)
+        # A fabricated, ever-changing entry_id: the mapping is different on
+        # every single call, so consecutive reads can never agree.
+        return tuple({**row, "entry_id": f"{row['entry_id']}-{calls['count']}"} for row in rows)
+
+    monkeypatch.setattr(store, "list_promoted", churning_list_promoted)
+
+    payload = memory_review_payload(store)  # must not hang, must not raise
+    assert calls["count"] == 3  # bounded: exactly _PROMOTED_STABLE_READ_ATTEMPTS, never unbounded
+    entry = next(item for item in payload["findings"] if item["signature"] == "sig_churn")
+    assert entry["entry_id"].endswith("-3")  # the LATEST attempt's pair, not the first or a mix
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +596,99 @@ def test_post_memory_review_rule_unknown_action_is_a_clean_400(web_app, web_conf
     assert "rule review action must be one of" in json.loads(body.decode("utf-8"))["error"]
 
 
+# ---------------------------------------------------------------------------
+# P4B-F1: the JSON-string boundary check on every POST field
+# ---------------------------------------------------------------------------
+
+
+def test_memory_review_str_field_accepts_strings_and_treats_absent_keys_as_empty() -> None:
+    assert web_routing._memory_review_str_field({"a": "hello"}, "a") == "hello"
+    assert web_routing._memory_review_str_field({"a": ""}, "a") == ""
+    assert web_routing._memory_review_str_field({}, "a") == ""
+
+
+@pytest.mark.parametrize("bad_value", [None, 42, 3.14, {}, [], True])
+def test_memory_review_str_field_rejects_every_non_string_json_type(bad_value) -> None:
+    with pytest.raises(ValueError, match="must be a string"):
+        web_routing._memory_review_str_field({"a": bad_value}, "a")
+
+
+@pytest.mark.parametrize("bad_actor", [None, 42, {}], ids=["null", "number", "object"])
+def test_post_memory_review_rule_non_string_actor_is_400_with_no_event_appended(
+    web_app, web_config, bad_actor
+) -> None:
+    store = ResearchMemoryStore(web_config.paths.artifact_root)
+    _promote_rule(store, signature="sig_http_bad_actor_type")
+    events_path = store.review_events_path
+    before = events_path.read_text(encoding="utf-8") if events_path.exists() else ""
+
+    status, content_type, body = _post(
+        web_app,
+        "/api/memory/review/rule",
+        {"signature_prefix": "sig_http_bad_actor_type", "action": "activate", "actor": bad_actor},
+    )
+    assert status == 400
+    assert content_type == JSON_CONTENT_TYPE
+    assert "actor must be a string" in json.loads(body.decode("utf-8"))["error"]
+
+    after = events_path.read_text(encoding="utf-8") if events_path.exists() else ""
+    assert after == before  # the action was never called: zero bytes appended
+
+
+@pytest.mark.parametrize("bad_actor", [None, 42, {}], ids=["null", "number", "object"])
+def test_post_memory_review_promoted_non_string_actor_is_400_with_no_event_appended(
+    web_app, web_config, bad_actor
+) -> None:
+    store = ResearchMemoryStore(web_config.paths.artifact_root)
+    _promote_finding_or_failure(store, signature="sig_http_bad_actor_promoted")
+    events_path = store.review_events_path
+    before = events_path.read_text(encoding="utf-8") if events_path.exists() else ""
+
+    status, content_type, body = _post(
+        web_app,
+        "/api/memory/review/promoted",
+        {"kind": "finding", "signature_prefix": "sig_http_bad_actor_promoted", "action": "retire", "actor": bad_actor},
+    )
+    assert status == 400
+    assert content_type == JSON_CONTENT_TYPE
+    assert "actor must be a string" in json.loads(body.decode("utf-8"))["error"]
+
+    after = events_path.read_text(encoding="utf-8") if events_path.exists() else ""
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "field,bad_value",
+    [
+        ("action", None),
+        ("action", 7),
+        ("kind", None),
+        ("kind", []),
+        ("signature_prefix", None),
+        ("signature_prefix", 5),
+        ("rationale", 5),
+        ("rationale", {}),
+    ],
+)
+def test_post_memory_review_promoted_rejects_every_non_string_field_with_no_event_appended(
+    web_app, web_config, field, bad_value
+) -> None:
+    store = ResearchMemoryStore(web_config.paths.artifact_root)
+    _promote_finding_or_failure(store, signature="sig_http_bad_field")
+    events_path = store.review_events_path
+    before = events_path.read_text(encoding="utf-8") if events_path.exists() else ""
+
+    body = {"kind": "finding", "signature_prefix": "sig_http_bad_field", "action": "retire", "actor": "alice"}
+    body[field] = bad_value
+    status, content_type, response_body = _post(web_app, "/api/memory/review/promoted", body)
+    assert status == 400
+    assert content_type == JSON_CONTENT_TYPE
+    assert f"{field} must be a string" in json.loads(response_body.decode("utf-8"))["error"]
+
+    after = events_path.read_text(encoding="utf-8") if events_path.exists() else ""
+    assert after == before
+
+
 def test_memory_review_paths_do_not_leak_into_unrelated_routes(web_app) -> None:
     status, content_type, body = _get(web_app, "/api/memory/reviewX")
     assert status == 404
@@ -521,3 +713,243 @@ def test_index_page_hosts_the_memory_tab_panel_and_script_entry(web_config) -> N
     assert html.index('id="lab-tab-extensions"') < html.index('id="lab-tab-memory"')
     assert html.index('id="lab-panel-extensions"') < html.index('id="lab-panel-memory"')
     assert html.index('src="/static/app.js"') < html.index('src="/static/views/memory.js"')
+
+
+# ---------------------------------------------------------------------------
+# P4B-F3: DOM regression -- the memory tab must deactivate when another tab
+# becomes active, via EITHER path the real controller uses (hashchange, or
+# a programmatic activateTab() that only mutates the DOM). A stdlib-only
+# Node harness (the pattern tests/test_web_synthesis_view.py uses for its
+# pure-renderer fixtures), extended here with a small stateful DOM/window
+# shim because this bug is specifically about DOM/event interaction, not a
+# pure function.
+# ---------------------------------------------------------------------------
+
+MEMORY_JS_PATH = web_server.STATIC_ROOT / "views" / "memory.js"
+
+_MEMORY_TAB_HARNESS = r"""
+// Minimal, stateful DOM/window shim -- NOT jsdom, NOT a browser -- just
+// enough to exercise memory.js's tab-activation logic under plain Node.
+// A synchronous MutationObserver replica invokes its callback the instant
+// an observed attribute changes; real MutationObserver batches into a
+// microtask, but that only changes WHEN the callback runs, never WHETHER
+// the mutation is captured, which is all this harness needs to prove.
+
+class FakeElement {
+  constructor(id) {
+    this.id = id;
+    this._attrs = {};
+    this.hidden = false;
+    this.tabIndex = 0;
+    this._listeners = {};
+    this._innerHTML = '';
+  }
+  setAttribute(name, value) {
+    this._attrs[name] = String(value);
+    for (const observer of ACTIVE_OBSERVERS) observer._notify(this, name);
+  }
+  getAttribute(name) {
+    return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name] : null;
+  }
+  removeAttribute(name) { delete this._attrs[name]; }
+  addEventListener(type, handler) { (this._listeners[type] = this._listeners[type] || []).push(handler); }
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(value) {
+    // Poor-man's HTML parse: memory.js's ensureShell()/renderPayload()
+    // assign a full HTML string, then getElementById() its mount points
+    // (#mem-tables-mount, #mem-actor, ...) later -- a plain string
+    // property write (no parsing) would leave every one of those ids
+    // unresolvable. Registering a placeholder element for every id="..."
+    // this markup introduces is sufficient for what this harness checks
+    // (id resolvability, never deeper structure/text content).
+    this._innerHTML = value;
+    const idPattern = /id="([^"]+)"/g;
+    let match;
+    while ((match = idPattern.exec(value))) {
+      if (!ELEMENTS.has(match[1])) makeElement(match[1], this);
+    }
+  }
+}
+
+const ACTIVE_OBSERVERS = [];
+class FakeMutationObserver {
+  constructor(callback) { this._callback = callback; this._watching = []; }
+  observe(target, options) { this._watching.push({ target, options }); ACTIVE_OBSERVERS.push(this); }
+  _notify(element, attrName) {
+    for (const { target, options } of this._watching) {
+      if (options.attributeFilter && !options.attributeFilter.includes(attrName)) continue;
+      const isSelf = element === target;
+      const isTrackedChild = options.subtree && CHILD_PARENT.get(element) === target;
+      if (isSelf || isTrackedChild) this._callback([{ target: element, attributeName: attrName }]);
+    }
+  }
+}
+globalThis.MutationObserver = FakeMutationObserver;
+
+const ELEMENTS = new Map();
+const CHILD_PARENT = new Map();
+function makeElement(id, parent) {
+  const el = new FakeElement(id);
+  ELEMENTS.set(id, el);
+  if (parent) CHILD_PARENT.set(el, parent);
+  return el;
+}
+
+const tablist = makeElement('__tablist__', null);
+// The seven real top-level tab ids (six pre-existing + SE-P4b's memory tab)
+// laid out exactly like the real .lab-tabs container: every tab button is
+// a direct child, so subtree observation needs only one level.
+const ALL_TAB_IDS = [
+  'lab-tab-factor', 'lab-tab-history', 'lab-tab-data',
+  'lab-tab-registry', 'lab-tab-docs', 'lab-tab-extensions', 'lab-tab-memory'
+];
+ALL_TAB_IDS.forEach(id => makeElement(id, tablist));
+ALL_TAB_IDS.forEach(id => makeElement(id.replace('lab-tab-', 'lab-panel-'), null));
+makeElement('memory-result', null);
+
+globalThis.document = {
+  getElementById: id => ELEMENTS.get(id) || null,
+  querySelector: selector => (selector === '.lab-tabs' ? tablist : null),
+  createElement: () => new FakeElement(''),
+  head: { appendChild: () => {} }
+};
+
+const windowListeners = {};
+globalThis.window = {
+  location: { hash: '' },
+  history: { replaceState: () => {} },
+  sessionStorage: { getItem: () => null, setItem: () => {} },
+  addEventListener: (type, handler) => { (windowListeners[type] = windowListeners[type] || []).push(handler); },
+  prompt: () => null
+};
+function fireHashChange() { (windowListeners['hashchange'] || []).forEach(handler => handler({})); }
+
+globalThis.fetch = async () => ({
+  ok: true,
+  json: async () => ({
+    schema_version: 'qf.web.memory_review.v1', rules: [], findings: [], failures: [],
+    priors: {
+      schema_version: 'qf.research_priors.v1', query: {}, query_fingerprint: '', as_of: 0,
+      total_envelopes: 0, total_evidence_runs: 0, oos_excluded: 0, invalid_rows: 0, tables: []
+    },
+    plugin: null
+  })
+});
+
+// Plays views/lab.js's part by hand (memory.js only READS lab.js, never
+// imports it -- see the module docstring): exactly what activateTab(tabId)
+// does to the DOM -- every one of lab.js's OWN six tab ids gets its
+// aria-selected/tabIndex set and its panel's hidden toggled, target true,
+// all others false. lab-tab-memory is deliberately OUTSIDE this loop,
+// exactly like the real lab.js TAB_IDS array (that omission is the root
+// cause this whole finding is about).
+const LAB_JS_TAB_IDS = ['lab-tab-factor', 'lab-tab-history', 'lab-tab-data', 'lab-tab-registry', 'lab-tab-docs', 'lab-tab-extensions'];
+function simulateLabJsActivateTab(tabId) {
+  LAB_JS_TAB_IDS.forEach(id => {
+    const tab = ELEMENTS.get(id);
+    const panel = ELEMENTS.get(id.replace('lab-tab-', 'lab-panel-'));
+    const selected = id === tabId;
+    tab.setAttribute('aria-selected', selected ? 'true' : 'false');
+    tab.tabIndex = selected ? 0 : -1;
+    panel.hidden = !selected;
+  });
+}
+
+function selectedTabIds() {
+  return ALL_TAB_IDS.filter(id => ELEMENTS.get(id).getAttribute('aria-selected') === 'true');
+}
+function visiblePanelIds() {
+  return ALL_TAB_IDS.map(id => id.replace('lab-tab-', 'lab-panel-')).filter(id => ELEMENTS.get(id).hidden === false);
+}
+
+let failed = 0;
+function check(name, cond, detail) {
+  if (cond) { console.log('PASS ' + name); }
+  else { failed++; console.log('FAIL ' + name + (detail ? ': ' + detail : '')); }
+}
+
+// --- import the REAL served module under the shim -------------------------
+window.location.hash = '#lab-tab-memory';
+await import(process.env.QF_MEMORY_URL);
+
+check('setup.memory_self_activates_on_matching_hash',
+  ELEMENTS.get('lab-tab-memory').getAttribute('aria-selected') === 'true'
+  && ELEMENTS.get('lab-panel-memory').hidden === false);
+
+// --- Scenario A: reviewer's literal reproduction -- hash to memory
+// (above), then hash to data. Exercises BOTH fix mechanisms together, as a
+// real browser would (lab.js's activateTab mutates the DOM, which routes
+// through the MutationObserver; the hashchange dispatch independently
+// reaches memory.js's own listener too -- both converge on the same
+// correct end state, proving the overlap is harmless).
+window.location.hash = '#lab-tab-data';
+simulateLabJsActivateTab('lab-tab-data');
+fireHashChange();
+check('scenario_a.exactly_one_selected', selectedTabIds().length === 1, JSON.stringify(selectedTabIds()));
+check('scenario_a.selected_is_data', selectedTabIds()[0] === 'lab-tab-data');
+check('scenario_a.exactly_one_visible_panel', visiblePanelIds().length === 1, JSON.stringify(visiblePanelIds()));
+check('scenario_a.visible_is_data_panel', visiblePanelIds()[0] === 'lab-panel-data');
+
+// --- Scenario B: isolate the MutationObserver mechanism -- a purely
+// PROGRAMMATIC activation with NO hashchange at all (mirrors app.js's
+// Parse/Validate/RD button handlers, which call activateTab() through
+// history.replaceState -- fires neither 'hashchange' nor 'popstate'). If
+// only the hashchange fix existed, this scenario would fail.
+window.location.hash = '#lab-tab-memory';
+fireHashChange();
+check('scenario_b.setup_memory_reselected', selectedTabIds()[0] === 'lab-tab-memory');
+simulateLabJsActivateTab('lab-tab-registry');  // DOM mutation only, no hash touched, no event fired
+check('scenario_b.exactly_one_selected_with_no_hashchange_event', selectedTabIds().length === 1, JSON.stringify(selectedTabIds()));
+check('scenario_b.selected_is_registry', selectedTabIds()[0] === 'lab-tab-registry');
+check('scenario_b.memory_panel_hidden', ELEMENTS.get('lab-panel-memory').hidden === true);
+check('scenario_b.memory_tab_deselected', ELEMENTS.get('lab-tab-memory').getAttribute('aria-selected') === 'false');
+
+// --- Scenario C: isolate the hashchange mechanism -- the hash changes to
+// something UNRECOGNIZED and lab.js's own applyHash does NOTHING (its
+// documented behavior: "Unknown hashes are ignored; the server-rendered
+// default tab stays") -- no other tab's DOM ever changes, so the
+// MutationObserver never fires. If only the MutationObserver fix existed,
+// this scenario would fail: memory would stay visually selected forever.
+window.location.hash = '#lab-tab-memory';
+fireHashChange();
+check('scenario_c.setup_memory_reselected', selectedTabIds()[0] === 'lab-tab-memory');
+window.location.hash = '#totally-unrecognized-garbage';
+fireHashChange();  // no simulateLabJsActivateTab call on purpose
+check('scenario_c.memory_deactivated_with_no_other_tab_ever_selected',
+  ELEMENTS.get('lab-tab-memory').getAttribute('aria-selected') === 'false'
+  && ELEMENTS.get('lab-panel-memory').hidden === true);
+check('scenario_c.no_tab_left_selected', selectedTabIds().length === 0);
+
+console.log('FIXTURE RESULT: ' + failed + ' failed');
+if (failed) process.exit(1);
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runtime not available")
+def test_node_dom_harness_memory_tab_deactivates_on_every_switch_path(tmp_path: Path) -> None:
+    harness = tmp_path / "memory_tab_harness.mjs"
+    harness.write_text(_MEMORY_TAB_HARNESS, encoding="utf-8")
+    env = {"QF_MEMORY_URL": MEMORY_JS_PATH.resolve().as_uri()}
+    result = subprocess.run(
+        ["node", str(harness)],
+        capture_output=True,
+        text=True,
+        env={**dict(__import__("os").environ), **env},
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + "\n" + result.stderr
+    assert "FIXTURE RESULT: 0 failed" in result.stdout
+    for marker in (
+        "PASS setup.memory_self_activates_on_matching_hash",
+        "PASS scenario_a.exactly_one_selected",
+        "PASS scenario_a.selected_is_data",
+        "PASS scenario_a.exactly_one_visible_panel",
+        "PASS scenario_a.visible_is_data_panel",
+        "PASS scenario_b.exactly_one_selected_with_no_hashchange_event",
+        "PASS scenario_b.selected_is_registry",
+        "PASS scenario_b.memory_panel_hidden",
+        "PASS scenario_b.memory_tab_deselected",
+        "PASS scenario_c.memory_deactivated_with_no_other_tab_ever_selected",
+        "PASS scenario_c.no_tab_left_selected",
+    ):
+        assert marker in result.stdout, result.stdout
