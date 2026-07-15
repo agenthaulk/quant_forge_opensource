@@ -279,6 +279,71 @@ def test_pipeline_cancel_and_unknown_id_over_http(web_app) -> None:
     assert "error" in json.loads(error_body)
 
 
+# ---------------------------------------------------------------------------
+# P3 route surface: pre-validation + pipeline B (rd_optimize) over HTTP
+# ---------------------------------------------------------------------------
+
+
+def test_pre_validate_route_is_read_only_over_http(web_app) -> None:
+    # Known operator -> ready + fingerprint; unknown operator -> review packet.
+    # Neither executes or persists (spec §5.3, WORKORDER pin).
+    status, ready = _post(web_app, "/api/pipelines/pre-validate", {"formula": "-rank(market_cap)"})
+    assert status == 200, ready
+    assert ready["status"] == "ready"
+    assert ready["fingerprint"]
+    assert ready["executed"] is False and ready["persisted"] is False
+
+    status, review = _post(web_app, "/api/pipelines/pre-validate", {"formula": "ts_made_up_operator(close, 5)"})
+    assert status == 200, review
+    assert review["status"] == "review_required"
+    assert review["review_packet"]["channel"] == "operator_drafts"
+    assert review["review_packet"]["hot_executed"] is False
+    assert review["executed"] is False
+
+
+def test_rd_pipeline_create_confirm_and_leaderboard_over_http(web_app) -> None:
+    # Pipeline B end to end over the real routing.py wiring: create with an
+    # explicit seed (no A->B auto-bridge), confirm launches ONE research job,
+    # and the pipeline reaches the terminal leaderboard stage.
+    status, pipeline = _post(
+        web_app,
+        "/api/pipelines",
+        {"kind": "rd_optimize", "seed_factor_id": "FTR_DEMO_MOMENTUM", "rounds": 1, "candidates_per_round": 1},
+    )
+    assert status == 201, pipeline
+    assert pipeline["kind"] == "rd_optimize"
+    assert pipeline["status"] == "awaiting_confirm"
+    assert [stage["stage_id"] for stage in pipeline["stages"]] == ["confirm", "run", "leaderboard"]
+    assert pipeline["planning_influence_hash"] == ""
+
+    status, confirmed = _post(
+        web_app,
+        f"/api/pipelines/{pipeline['pipeline_id']}/confirm",
+        {"nonce": pipeline["confirm"]["nonce"], "version": pipeline["confirm"]["version"]},
+    )
+    assert status == 200, confirmed
+    assert confirmed["status"] == "running"
+    run_job_id = confirmed["stages"][1]["child_job_id"]  # "run" stage
+    assert run_job_id
+    _wait_job_http(web_app, run_job_id, timeout=90.0)
+
+    status, _, final = _get(web_app, f"/api/pipelines/{pipeline['pipeline_id']}")
+    assert status == 200
+    final_body = json.loads(final)
+    assert final_body["status"] == "completed"
+    assert final_body["stages"][2]["status"] == "completed"  # leaderboard terminal
+
+
+def test_rd_pipeline_rejects_out_of_range_rounds_over_http(web_app) -> None:
+    status, error = _post(
+        web_app,
+        "/api/pipelines",
+        {"kind": "rd_optimize", "seed_factor_id": "FTR_DEMO_MOMENTUM", "rounds": 99},
+    )
+    assert status == 400, error
+    assert "rounds must be" in error["error"]
+
+
 @pytest.mark.parametrize(
     "probe",
     ["/api/pipelines/../html.py", "/api/pipelines/not-a-real-id", "/api/pipelines/PL_short"],

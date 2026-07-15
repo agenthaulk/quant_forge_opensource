@@ -36,6 +36,7 @@ import { initSynthesisModule, refreshSynthesisPanel } from './views/synthesis.js
 import {
   confirmCurrentPipeline,
   createPipelineFromParseJob,
+  createRdPipeline,
   currentPipelineParameters,
   hasActivePipeline,
   initPipelineModule,
@@ -43,6 +44,7 @@ import {
   resetPipelineCard
 } from './views/pipeline.js';
 import { attachToPipeline, initNarrationModule, refreshReadiness } from './views/narration.js';
+import { initFormulaModule, openFormulaCard } from './views/formula.js';
 
 const pageConfig = JSON.parse(document.getElementById('qf-page-config').textContent || '{}');
 const controlTokenRequired = Boolean(pageConfig.controlTokenRequired);
@@ -60,10 +62,20 @@ const llmApiKeyInput = document.getElementById('llm-api-key');
 const llmApiKeyStatus = document.getElementById('llm-api-key-status');
 let llmProviderOptions = pageConfig.llmProviderOptions || [];
 const rdRun = document.getElementById('rd-run');
-const rdStart = document.getElementById('rd-start');
-const rdStop = document.getElementById('rd-stop');
+// R3.1 (owner-ruled, spec §8): the rd-interval 自动周期 select and the
+// 开启/停止 timer-loop controls are DELETED. RD inherits the factor evaluation
+// interval/sample contract (no independent RD interval parameter); an explicit
+// pipeline B (rd_optimize), started from the report follow-up #rd-entry below,
+// replaces implicit timed RD. CLI `research run-once` and its scheduler stay.
 const rdCancel = document.getElementById('rd-cancel');
 const rdStatusEl = document.getElementById('rd-status');
+// P3 (spec §2.1 / §8): the post-report follow-up bar. #report-followups is
+// hidden until pipeline A produces a report; #rd-entry starts pipeline B
+// seeded from THIS report's factor (the ONLY A→B path — no automatic bridge);
+// #formula-edit opens the expert editable-formula card (pre-validation).
+const reportFollowups = document.getElementById('report-followups');
+const rdEntryButton = document.getElementById('rd-entry');
+const formulaEditButton = document.getElementById('formula-edit');
 let activeIdeaJobId = null;
 let activeRdJobId = null;
 let parsedIdea = null;
@@ -426,6 +438,12 @@ initSynthesisModule({ onJobComplete: invalidateJobDependentPanels });
 // same one submitValidation()'s own success path uses) still owns turning
 // that job's result into pixels (FE-L2); this callback only fetches the
 // already-completed job and hands it over.
+// P3: the report follow-up bar (pipeline B entry + expert formula edit +
+// staggered check) is hidden until pipeline A yields a factor to seed from.
+function revealReportFollowups(hasFactor) {
+  if (!reportFollowups) return;
+  reportFollowups.hidden = !hasFactor;
+}
 async function onPipelineCompleted(pipeline) {
   try {
     // Restart-proof (re-verify RV-F4): the /report endpoint serves the live
@@ -435,11 +453,27 @@ async function onPipelineCompleted(pipeline) {
     const report = await getPipelineReport(pipeline.pipeline_id);
     const result = report && report.result;
     if (!result) return;
+    if (pipeline.kind === 'rd_optimize') {
+      // Pipeline B terminal (spec §2.1/§5.4): the candidate leaderboard
+      // renders through the canonical research.js renderer (FE-L2) — external
+      // OOS labelled audit-only, dedup disposition executed/reused/skipped —
+      // into the existing RD result area, never a bespoke second renderer. The
+      // pipeline card itself already shows the terminal leaderboard status, so
+      // this path does not also drive the workbench RD dot (pipeline B started
+      // via #rd-entry never set it 'running', so a bare 'done' would be a
+      // running-less writer — the legacy 运行一次 lane stays its sole owner).
+      renderResearch(result);
+      invalidateJobDependentPanels();
+      const rdSection = document.getElementById('workbench-rd');
+      if (rdSection && rdSection.scrollIntoView) rdSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      return;
+    }
     render(result);
     parsedIdea = { parser: result.parser, factor: result.factor, parameters: result.parameters };
     validatedFactorId = result.factor && result.factor.factor_id;
     document.getElementById('rd-seed').value = validatedFactorId || document.getElementById('rd-seed').value;
     setStaggeredEnabled(Boolean(validatedFactorId));
+    revealReportFollowups(Boolean(validatedFactorId));
     invalidateJobDependentPanels();
   } catch (error) {
     // Best-effort mirror of the legacy Factor Tape: the pipeline card itself
@@ -454,6 +488,7 @@ async function onPipelineCompleted(pipeline) {
 // is tri-state and refreshed on load + on token arrival; the pre-fetch default
 // stays `unknown` so a token-redacted boot never pre-judges (spec §5.6).
 initNarrationModule();
+initFormulaModule();
 initPipelineModule({
   onCompleted: onPipelineCompleted,
   onPipeline: pipeline => { attachToPipeline(pipeline && pipeline.pipeline_id).catch(() => {}); }
@@ -574,6 +609,7 @@ button.addEventListener('click', async () => {
   parsedIdea = null;
   validatedFactorId = null;
   setStaggeredEnabled(false);
+  revealReportFollowups(false);
   resetStaggeredResult();
   const parserMode = document.getElementById('parser').value;
   try {
@@ -648,6 +684,7 @@ validateButton.addEventListener('click', async () => {
     validatedFactorId = payload.factor.factor_id;
     document.getElementById('rd-seed').value = payload.factor.factor_id;
     setStaggeredEnabled(true);
+    revealReportFollowups(true);
     setWorkbenchDot('idea', 'done');
     invalidateJobDependentPanels();
     statusEl.innerHTML = '<span class="ok">验证完成</span>';
@@ -777,40 +814,40 @@ rdCancel.addEventListener('click', async () => {
     rdCancel.disabled = false;
   }
 });
-rdStart.addEventListener('click', async () => {
-  rdStart.disabled = true;
-  activateTab('lab-tab-factor');
-  activateModule('lab-module-single');
-  clearGlobalError();
-  resetRdResult('调度启动中', '调度开启后，最近一次 RD 结果会在这里刷新。');
-  rdStatusEl.textContent = '调度启动中...';
-  try {
-    const payload = rdPayload();
-    payload.action = 'start';
-    payload.interval_days = Number(document.getElementById('rd-interval').value);
-    const status = await postJson('/api/research/schedule', payload);
-    rdStatusEl.innerHTML = '<span class="ok">调度已开启</span>';
-    if (status.last_result) {
-      renderResearch(status.last_result);
+// P3 (spec §2.1): the ONLY A→B path. Clicking #rd-entry creates pipeline B
+// (rd_optimize) seeded from THIS report's factor and hands it to the pipeline
+// card, which opens on the RD confirm gate. There is NO automatic bridge —
+// nothing here fires unless the user clicks this report follow-up button.
+if (rdEntryButton) {
+  rdEntryButton.addEventListener('click', async () => {
+    const seed = validatedFactorId || (parsedIdea && parsedIdea.factor && parsedIdea.factor.factor_id);
+    if (!seed) return;
+    rdEntryButton.disabled = true;
+    activateTab('lab-tab-factor');
+    activateModule('lab-module-single');
+    clearGlobalError();
+    try {
+      await createRdPipeline(seed);
+      const mount = document.getElementById('pipeline-card-mount');
+      if (mount && mount.scrollIntoView) mount.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (error) {
+      errorEl.textContent = jobFailureReason(error);
+    } finally {
+      rdEntryButton.disabled = false;
     }
-  } catch (error) {
-    rdStatusEl.textContent = error.message;
-  } finally {
-    rdStart.disabled = false;
-  }
-});
-rdStop.addEventListener('click', async () => {
-  rdStop.disabled = true;
-  clearGlobalError();
-  try {
-    const status = await postJson('/api/research/schedule', {action: 'stop'});
-    rdStatusEl.textContent = status.run_count ? `调度已停止，累计运行 ${status.run_count} 次` : '调度已停止';
-  } catch (error) {
-    rdStatusEl.textContent = error.message;
-  } finally {
-    rdStop.disabled = false;
-  }
-});
+  });
+}
+// P3 (spec §5.3): open the expert editable-formula card seeded with the
+// current factor's formula. The card runs read-only pre-validation
+// (/api/pipelines/pre-validate: no persist / eval / backtest).
+if (formulaEditButton) {
+  formulaEditButton.addEventListener('click', () => {
+    const formula = (parsedIdea && parsedIdea.factor && parsedIdea.factor.formula) || '';
+    openFormulaCard(formula);
+    const mount = document.getElementById('formula-card-mount');
+    if (mount && mount.scrollIntoView) mount.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+}
 modeSimpleBtn.addEventListener('click', () => setMode('simple'));
 modeExpertBtn.addEventListener('click', () => setMode('expert'));
 document.querySelectorAll('.simple-seed-btn').forEach(seedButton => {

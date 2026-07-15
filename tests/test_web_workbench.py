@@ -1078,7 +1078,12 @@ allowed_interval_days: [5]
     assert "/api/jobs/staggered-entry" in bundle
     assert "/api/research/campaign" not in html
     assert "/api/research/campaign" not in bundle
-    assert "/api/research/schedule" in bundle
+    # R3.1 (owner-ruled, spec §8): the rd-interval auto-cycle 开启/停止 controls
+    # are DELETED, so the FRONTEND no longer drives the scheduler endpoint.
+    # /api/research/schedule stays a backend/CLI concern (routing.py keeps it),
+    # but no served module calls it any more; an explicit pipeline B replaces
+    # implicit timed RD. Absence is also pinned in tests/test_web_mode_shell.py.
+    assert "/api/research/schedule" not in bundle
     assert "解析因子" in html
     assert "验证并评测" in html
     assert "首月逐日建仓稳健性回测" in html
@@ -1131,11 +1136,15 @@ allowed_interval_days: [5]
     assert "RD Campaign" not in html
     assert "rd-campaign" not in bundle
     assert "RD Campaign" not in bundle
-    assert 'value="5"' in html
+    # R3.1 (owner-ruled, spec §8): the rd-interval 自动周期 select is DELETED,
+    # so its default option (value="5" from default_interval_days) no longer
+    # renders. The RD config's default_max_candidates (value="2") still fills
+    # the #rd-max input.
     assert 'value="2"' in html
     assert '<option value="rank_icir" selected>ICIR</option>' in html
     assert '<option value="balanced" selected>' not in html
-    assert '<option value="5" selected>5天</option>' in html
+    # R3.1: the rd-interval 自动周期 select (and its "5天" option) is DELETED.
+    assert '<option value="5" selected>5天</option>' not in html
     assert "LLM parser: deepseek / fake-deepseek" in html
     assert "RD optimizer: research local deterministic" in html
     assert '<option value="deepseek" selected>deepseek / fake-deepseek · env QF_TEST_DEEPSEEK_KEY</option>' in html

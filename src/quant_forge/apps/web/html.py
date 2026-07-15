@@ -113,10 +113,10 @@ def _index_html(
     factor_values_root = escape(paths["factor_values_root"])
     factor_values_overlay_root = escape(paths["factor_values_overlay_root"])
     artifact_root = escape(paths["artifact_root"])
-    interval_options = "\n".join(
-        f'      <option value="{day}"{_selected_attr(day == research_config.default_interval_days)}>{day}天</option>'
-        for day in research_config.allowed_interval_days
-    )
+    # R3.1 (owner-ruled, spec §8): the rd-interval 自动周期 select is DELETED, so
+    # its <option> generation from research_config.allowed_interval_days is gone
+    # too. RD inherits the factor evaluation interval; explicit pipeline B
+    # replaces implicit timed RD. The CLI research scheduler is untouched.
     objective_options = "\n".join(
         f'      <option value="{value}"{_selected_attr(value == research_config.objective)}>{label}</option>'
         for value, label in (
@@ -906,6 +906,41 @@ def _index_html(
     @media (min-width: 921px) {{
       .narration-drawer {{ max-width: 420px; }}
     }}
+    /* P3 editable-formula card + pipeline B (rd_optimize) confirm card + report
+       follow-up bar (agent_sidecar_frontend.md §5.3/§2.1/§8;
+       static/views/formula.js + static/views/pipeline.js). Token-only (both
+       themes from the variables above, zero new color literals); every row
+       wraps so a true 375px viewport stays overflow-free; the editable
+       controls are 44px touch targets. */
+    .report-followups {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }}
+    .report-followups[hidden] {{ display: none; }}
+    .report-followups button {{ width: auto; margin: 0; min-height: 44px; flex: 1 1 auto; }}
+    .formula-card {{ border-top: 4px solid var(--accent-2); margin-top: 12px; }}
+    .formula-card[hidden] {{ display: none; }}
+    .formula-card-header {{ display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center;
+      justify-content: space-between; margin-bottom: 8px; }}
+    .formula-card-title {{ margin: 0; font-size: 15px; }}
+    .formula-card-header button {{ width: auto; margin: 0; min-height: 44px; }}
+    .formula-editor {{ position: relative; margin: 8px 0; min-width: 0; }}
+    .formula-overlay, .formula-input {{ margin: 0; padding: 10px; border: 1px solid var(--line);
+      border-radius: 8px; font-family: var(--mono); font-size: 13px; line-height: 1.5;
+      white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; box-sizing: border-box; }}
+    .formula-overlay {{ position: absolute; inset: 0; pointer-events: none; color: var(--ink);
+      background: var(--panel); overflow: auto; border-color: transparent; }}
+    .formula-input {{ position: relative; display: block; width: 100%; min-height: 96px; resize: vertical;
+      background: transparent; color: transparent; caret-color: var(--ink); }}
+    .formula-input:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .formula-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }}
+    .formula-actions button {{ width: auto; margin: 0; min-height: 44px; flex: 1 1 auto; }}
+    .formula-prevalidate-result {{ margin-top: 10px; min-width: 0; }}
+    .formula-prevalidate-status {{ display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }}
+    .formula-review-packet {{ margin-top: 8px; padding: 8px 10px; border: 1px solid var(--warn-line);
+      border-radius: 8px; background: var(--warn-wash); overflow-wrap: anywhere; }}
+    .pipeline-rd-disclosure {{ display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; margin-bottom: 10px; }}
+    .pipeline-rd-grid {{ display: grid; gap: 10px; margin-bottom: 10px; }}
+    .pipeline-rd-grid label {{ display: grid; gap: 4px; min-width: 0; }}
+    .pipeline-rd-grid input, .pipeline-rd-grid select {{ min-width: 0; min-height: 44px; }}
+    .pipeline-rd-cost {{ overflow-wrap: anywhere; }}
     .registry-layout {{ display: grid; grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
       gap: 14px; align-items: start; }}
     .registry-list {{ display: grid; gap: 8px; align-content: start; }}
@@ -1135,7 +1170,10 @@ def _index_html(
            markup, so this deletion costs no styling. -->
       <button id="run">解析因子</button>
       <button id="validate-run" class="secondary" disabled>验证并评测</button>
-      <button id="staggered-run" class="secondary" disabled>首月逐日建仓稳健性回测</button>
+      <!-- R3.1 / spec §8: #staggered-run is MIGRATED out of this control rail
+           into the post-report follow-up bar (#report-followups, below), next
+           to the explicit pipeline B (RD) entry -- it is a report follow-up
+           action, not a resident control. -->
       <button id="cancel-run" class="secondary danger" disabled>中断本次运行</button>
       <p id="status" class="meta"></p>
     </div>
@@ -1154,14 +1192,14 @@ def _index_html(
       <input id="rd-max" type="number" min="1" max="10" value="{research_config.default_max_candidates}">
       <label for="rd-iterations">RD迭代次数</label>
       <input id="rd-iterations" type="number" min="1" max="{MAX_RD_ITERATIONS}" step="1" value="1">
-      <label for="rd-interval">自动周期</label>
-      <select id="rd-interval">
-{interval_options}
-      </select>
+      <!-- R3.1 (owner-ruled, spec §8): the rd-interval 自动周期 select and the
+           开启/停止 timer-loop controls are DELETED. RD inherits the factor
+           evaluation interval/sample contract -- there is no independent RD
+           interval parameter -- and an explicit pipeline B (rd_optimize),
+           started from the report follow-up entry below, replaces implicit
+           timed RD. CLI `research run-once` and its scheduler are kept. -->
       <div class="button-row">
         <button id="rd-run">运行一次</button>
-        <button id="rd-start" class="secondary">开启</button>
-        <button id="rd-stop" class="secondary">停止</button>
       </div>
       <button id="rd-cancel" class="secondary danger" disabled>中断本次RD</button>
       <p id="rd-status" class="meta"></p>
@@ -1193,6 +1231,13 @@ def _index_html(
              never on every poll tick. Empty and [hidden] until a pipeline
              exists for this page view. -->
         <div id="pipeline-card-mount" aria-live="polite" aria-atomic="false"></div>
+        <!-- P3 editable-formula card mount (agent_sidecar_frontend.md §5.3):
+             THE expert formula editor -- a <textarea> single source of truth
+             with an aria-hidden canonical-highlight overlay (views/dsl.js) and
+             a fast pre-validation call (/api/pipelines/pre-validate: no persist
+             / eval / backtest). Its own module static/views/formula.js (one
+             face, one module). Empty and [hidden] until the expert opens it. -->
+        <div id="formula-card-mount" hidden></div>
         <!-- P2 sidecar narration + clarify drawer (agent_sidecar_frontend.md
              §5.5/§5.2): THE narration renderer (static/views/narration.js)
              attaches its event stream + clarify Q&A card HERE, beside the
@@ -1209,6 +1254,18 @@ def _index_html(
             <h3>等待输入</h3>
             <p class="meta">输入因子观点后运行，公式、IC、回测收益、缓存路径会在这里展开。</p>
           </div>
+        </div>
+        <!-- P3 (spec §2.1 / §8): post-report follow-up actions. The report is
+             the TERMINAL stage of pipeline A. From here the user MAY explicitly
+             start pipeline B (rd_optimize) seeded from THIS report's factor --
+             there is NO automatic A->B bridge, only this entry button -- and
+             re-run the first-month staggered-entry robustness check (migrated
+             here from the former 01 Parse control rail). Hidden until a report
+             exists. -->
+        <div id="report-followups" class="report-followups" hidden>
+          <button id="rd-entry" class="secondary">开始 RD 优化（管线 B）</button>
+          <button id="formula-edit" class="secondary">编辑并预验证公式</button>
+          <button id="staggered-run" class="secondary" disabled>首月逐日建仓稳健性回测</button>
         </div>
         <div id="staggered-result"></div>
         <section class="report-section" id="report-comparison">

@@ -71,8 +71,12 @@ __all__ = [
     "FACTOR_LEVEL_FIELDS",
     "PARAMETER_FIELDS",
     "CONFIRM_CARD_FIELDS",
+    "RD_CONFIRM_CARD_FIELDS",
+    "confirm_card_fields_for_kind",
     "derive_baseline_provenance",
     "derive_current_provenance",
+    "derive_rd_baseline_provenance",
+    "derive_rd_current_provenance",
     "provenance_by_field",
     "assert_full_coverage",
     "assert_provenance_matches_current_values",
@@ -112,6 +116,22 @@ PARAMETER_FIELDS: tuple[str, ...] = (
     "short_borrow_bps_annual",
 )
 CONFIRM_CARD_FIELDS: tuple[str, ...] = FACTOR_LEVEL_FIELDS + PARAMETER_FIELDS
+
+# rd_optimize (pipeline B, spec §2.1/G2) has its OWN confirm card: rounds,
+# candidates-per-round, and objective. It has none of factor_study's 11
+# simulation/backtest parameters -- R3.1 pins that the evaluation
+# interval/sample contract is INHERITED (a fixed_policy disclosure rendered
+# on the card), never re-parameterized here -- so its per-value badge
+# coverage is over these three fields, checked independently of
+# CONFIRM_CARD_FIELDS. `confirm_card_fields_for_kind` is the single place the
+# load-time assertion and both derivations agree on which set applies.
+RD_CONFIRM_CARD_FIELDS: tuple[str, ...] = ("rounds", "candidates_per_round", "objective")
+
+
+def confirm_card_fields_for_kind(kind: str) -> tuple[str, ...]:
+    if kind == "rd_optimize":
+        return RD_CONFIRM_CARD_FIELDS
+    return CONFIRM_CARD_FIELDS
 
 # Recognizable non-ST-exclusion phrasing, mirroring the ONE existing
 # predicate in factor_library/repository.py::parse_idea_to_definition
@@ -365,13 +385,98 @@ def provenance_by_field(entries: tuple[ProvenanceEntry, ...]) -> dict[str, Prove
     return {entry.field: entry for entry in entries}
 
 
-def assert_full_coverage(entries: list[ProvenanceEntry] | tuple[ProvenanceEntry, ...]) -> None:
-    """Fail loud if any CONFIRM_CARD_FIELDS field has no badge (WORKORDER P1 pin)."""
+def assert_full_coverage(
+    entries: list[ProvenanceEntry] | tuple[ProvenanceEntry, ...],
+    *,
+    fields: tuple[str, ...] = CONFIRM_CARD_FIELDS,
+) -> None:
+    """Fail loud if any confirm-card field has no badge (WORKORDER P1 pin).
+
+    ``fields`` defaults to factor_study's ``CONFIRM_CARD_FIELDS`` so every
+    existing caller is unchanged; the rd_optimize derivations pass
+    ``RD_CONFIRM_CARD_FIELDS``.
+    """
 
     covered = {entry.field for entry in entries}
-    missing = [field_name for field_name in CONFIRM_CARD_FIELDS if field_name not in covered]
+    missing = [field_name for field_name in fields if field_name not in covered]
     if missing:
         raise MissingProvenanceError(f"missing provenance badge for confirm-card field(s): {missing}")
+
+
+# ---------------------------------------------------------------------------
+# rd_optimize (pipeline B) provenance. Same 7-value vocabulary, same
+# immutable-baseline + fingerprint-comparison discipline as factor_study, but
+# over RD_CONFIRM_CARD_FIELDS (rounds / candidates_per_round / objective).
+# ---------------------------------------------------------------------------
+
+
+def derive_rd_baseline_provenance(
+    *,
+    rounds: Any,
+    candidates_per_round: Any,
+    objective: Any,
+    user_explicit_fields: frozenset[str] = frozenset(),
+) -> tuple[ProvenanceEntry, ...]:
+    """The IMMUTABLE per-field origin artifact for a pipeline B confirm card.
+
+    A field the user set explicitly on the create request is ``user_explicit``;
+    one that fell back to the RD config default is ``profile_default``. The
+    period/sample contract itself is NOT a field here -- it is a fixed_policy
+    disclosure the card renders statically (R3.1: RD inherits the evaluation
+    interval, never re-parameterized), so it needs no per-value badge.
+    """
+
+    values = {"rounds": rounds, "candidates_per_round": candidates_per_round, "objective": objective}
+    entries = [
+        ProvenanceEntry(
+            field=field_name,
+            value=values[field_name],
+            source="user_explicit" if field_name in user_explicit_fields else "profile_default",
+        )
+        for field_name in RD_CONFIRM_CARD_FIELDS
+    ]
+    assert_full_coverage(entries, fields=RD_CONFIRM_CARD_FIELDS)
+    return tuple(entries)
+
+
+def derive_rd_current_provenance(
+    *,
+    baseline: tuple[dict[str, Any], ...],
+    current_parameters: dict[str, Any],
+) -> tuple[ProvenanceEntry, ...]:
+    """Current pipeline B badges as a PURE function of (baseline, current values).
+
+    A field whose current value's fingerprint matches its baseline keeps the
+    baseline origin; a differing fingerprint is ``human_override`` with
+    ``parent_value`` set. Mirrors ``derive_current_provenance`` for the three
+    rd fields.
+    """
+
+    baseline_by_field = {str(entry.get("field", "")): entry for entry in baseline}
+    entries: list[ProvenanceEntry] = []
+    for field_name in RD_CONFIRM_CARD_FIELDS:
+        baseline_entry = baseline_by_field.get(field_name)
+        if baseline_entry is None:
+            raise MissingProvenanceError(
+                f"declared rd confirm-card field {field_name!r} is missing from the baseline provenance artifact"
+            )
+        current_value = _require_field(current_parameters, field_name, artifact="current rd parameters")
+        baseline_value = baseline_entry.get("value")
+        if _fingerprint(current_value) != _fingerprint(baseline_value):
+            entries.append(
+                ProvenanceEntry(field=field_name, value=current_value, source="human_override", parent_value=baseline_value)
+            )
+        else:
+            entries.append(
+                ProvenanceEntry(
+                    field=field_name,
+                    value=current_value,
+                    source=str(baseline_entry.get("source", "")),
+                    parent_value=baseline_entry.get("parent_value"),
+                )
+            )
+    assert_full_coverage(entries, fields=RD_CONFIRM_CARD_FIELDS)
+    return tuple(entries)
 
 
 def assert_provenance_matches_current_values(
@@ -379,6 +484,7 @@ def assert_provenance_matches_current_values(
     *,
     factor: dict[str, Any],
     parameters: dict[str, Any],
+    kind: str = "factor_study",
 ) -> None:
     """Load-time guard (phase-review F5): a persisted provenance array must
     genuinely describe the record it is attached to.
@@ -388,15 +494,20 @@ def assert_provenance_matches_current_values(
     entry's stored ``value`` still equals the CURRENT value of the field it
     names. Called from ``apps/web/pipeline.py::PipelineStore.load`` -- a GET
     must never serve a confirm card whose badges have silently gone stale
-    relative to the values they are attached to.
+    relative to the values they are attached to. ``kind`` selects the
+    expected field set (factor_study's 16 confirm-card fields, or
+    rd_optimize's three) so a pipeline B record loads against its OWN
+    confirm-card contract; it defaults to factor_study for every existing
+    caller.
     """
 
+    expected_fields = confirm_card_fields_for_kind(kind)
     fields = [str(entry.get("field", "")) for entry in entries]
     if len(fields) != len(set(fields)):
         duplicates = sorted({name for name in fields if fields.count(name) > 1})
         raise InvalidProvenanceError(f"duplicate provenance field(s): {duplicates}")
     covered = set(fields)
-    expected = set(CONFIRM_CARD_FIELDS)
+    expected = set(expected_fields)
     missing = expected - covered
     if missing:
         raise InvalidProvenanceError(f"missing provenance badge for confirm-card field(s): {sorted(missing)}")
@@ -404,8 +515,11 @@ def assert_provenance_matches_current_values(
     if unknown:
         raise InvalidProvenanceError(f"provenance entry for unknown field(s): {sorted(unknown)}")
 
-    current_by_field: dict[str, Any] = {name: factor.get(name) for name in FACTOR_LEVEL_FIELDS}
-    current_by_field.update({name: parameters.get(name) for name in PARAMETER_FIELDS})
+    if kind == "rd_optimize":
+        current_by_field = {name: parameters.get(name) for name in RD_CONFIRM_CARD_FIELDS}
+    else:
+        current_by_field = {name: factor.get(name) for name in FACTOR_LEVEL_FIELDS}
+        current_by_field.update({name: parameters.get(name) for name in PARAMETER_FIELDS})
 
     for entry in entries:
         field_name = str(entry.get("field", ""))

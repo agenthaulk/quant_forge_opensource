@@ -40,9 +40,9 @@ JS_CONTENT_TYPE = "text/javascript; charset=utf-8"
 
 # The complete CP6-1 module set (+ CP6-2 Lab chrome + CP6-3 data/registry
 # views + CP6-4 docs/extensions views + CP10 synthesis module + P1 pipeline
-# aggregate views + P2 sidecar narration renderer). A new module must be added
-# here so the no-external-resources and single-renderer sweeps keep covering
-# everything.
+# aggregate views + P2 sidecar narration renderer + P3 editable-formula card).
+# A new module must be added here so the no-external-resources and
+# single-renderer sweeps keep covering everything.
 EXPECTED_STATIC_MODULES = (
     "api.js",
     "app.js",
@@ -54,6 +54,7 @@ EXPECTED_STATIC_MODULES = (
     "views/dsl.js",
     "views/extensions.js",
     "views/factor.js",
+    "views/formula.js",
     "views/history.js",
     "views/lab.js",
     "views/narration.js",
@@ -235,10 +236,11 @@ def test_index_page_keeps_all_panel_sections_and_controls(web_app) -> None:
         'id="rd-objective"',
         'id="rd-max"',
         'id="rd-iterations"',
-        'id="rd-interval"',
+        # R3.1 (owner-ruled, spec §8): #rd-interval / #rd-start / #rd-stop
+        # (the auto-cycle select + 开启/停止 timer-loop controls) are DELETED;
+        # their absence is pinned in tests/test_web_mode_shell.py alongside the
+        # other R3.1 deletions. #rd-run stays (single 运行一次).
         'id="rd-run"',
-        'id="rd-start"',
-        'id="rd-stop"',
         'id="rd-cancel"',
         'id="rd-status"',
         'id="runtime-llm"',

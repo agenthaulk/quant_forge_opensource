@@ -18,7 +18,7 @@
 
 import { esc } from '../metric.js';
 import { formulaHtml } from './dsl.js';
-import { provenanceBadgeRowHtml, provenanceEntryByField } from './provenance.js';
+import { provenanceBadgeHtml, provenanceBadgeRowHtml, provenanceEntryByField } from './provenance.js';
 
 // The 11 simulation/backtest fields absorbed from the deleted
 // apps/web/html.py#validation-controls grid (WORKORDER P1 减法).
@@ -56,6 +56,26 @@ const SUMMARY_GROUPS = [
 ];
 
 const FACTOR_STUDY_STAGE_LABELS = { parse: '解析', confirm: '假设确认', compute: '计算', report: '报告' };
+// Pipeline B (rd_optimize, spec §2.1): RD 确认 → RD 运行 → 排行榜. Three
+// truth-mapped stages (the N rounds run inside ONE job, D11), never one light
+// per round.
+const RD_OPTIMIZE_STAGE_LABELS = { confirm: 'RD 确认', run: 'RD 运行', leaderboard: '排行榜' };
+const STAGE_LABELS_BY_KIND = { factor_study: FACTOR_STUDY_STAGE_LABELS, rd_optimize: RD_OPTIMIZE_STAGE_LABELS };
+
+// Objective options for the pipeline B confirm card, mirroring the resident
+// #rd-objective select in apps/web/html.py (kept in lockstep by
+// tests/test_web_pipeline_view.py).
+const RD_OBJECTIVE_OPTIONS = [
+  ['balanced', 'IC / ICIR 优先'],
+  ['rank_ic', 'Rank IC'],
+  ['rank_icir', 'ICIR'],
+  ['annualized_return', '回测收益']
+];
+// Server-enforced rounds ceiling (apps/web/api.py::MAX_RD_ITERATIONS). This is
+// only a UI hint: create_rd_pipeline AND _confirm_rd_pipeline both re-validate
+// rounds server-side, so an edited-past-the-max value is rejected there, never
+// merely here (WORKORDER pin: out-of-range rounds rejected server-side).
+const RD_MAX_ITERATIONS = 5;
 
 const STATUS_META = {
   draft: { pill: 'status-pill--neutral', text: '草稿' },
@@ -125,9 +145,10 @@ export function renderNegativeEvidence(pipeline) {
     items.push(`<div class="notice warn"><span class="status-pill status-pill--running">警告</span> ${esc(warning)}</div>`);
   });
   if (pipeline.failure) {
+    const labels = STAGE_LABELS_BY_KIND[pipeline.kind] || FACTOR_STUDY_STAGE_LABELS;
     items.push(
       `<div class="notice err"><span class="status-pill status-pill--fail">失败</span> ` +
-      `${esc(FACTOR_STUDY_STAGE_LABELS[pipeline.failure.stage_id] || pipeline.failure.stage_id)} · ${esc(pipeline.failure.reason_code)}</div>`
+      `${esc(labels[pipeline.failure.stage_id] || pipeline.failure.stage_id)} · ${esc(pipeline.failure.reason_code)}</div>`
     );
   }
   if (!items.length) return '';
@@ -197,8 +218,9 @@ function renderDensityBody(pipeline, density, provenanceByField, draftOverrides,
 }
 
 export function renderStageStrip(pipeline) {
+  const labels = STAGE_LABELS_BY_KIND[pipeline.kind] || FACTOR_STUDY_STAGE_LABELS;
   const items = (pipeline.stages || []).map(stage => {
-    const label = FACTOR_STUDY_STAGE_LABELS[stage.stage_id] || stage.stage_id;
+    const label = labels[stage.stage_id] || stage.stage_id;
     const current = stage.status === 'active' ? ' aria-current="step"' : '';
     return `<li class="pipeline-stage pipeline-stage--${esc(stage.status)}"${current}>${esc(label)}</li>`;
   }).join('');
@@ -237,6 +259,96 @@ export function renderConfirmCard(pipeline, density, provenance, draftOverrides)
         <button type="button" id="pipeline-confirm-btn" data-pipeline-action="confirm">确认并计算</button>
         <button type="button" class="secondary danger" data-pipeline-action="cancel">放弃本次研究</button>
       </div>
+    </div>`;
+}
+
+// -----------------------------------------------------------------------
+// Pipeline B (rd_optimize) cards. Its confirm card is its OWN three-field
+// gate (rounds / candidates-per-round / objective) — NOT the factor_study
+// 11-parameter density grid — plus the R3.1 fixed_policy disclosure (the
+// evaluation interval/sample contract is INHERITED, never re-parameterized)
+// and a cost preview. The leaderboard is TERMINAL; the candidate ranking
+// itself renders below via the canonical research.js renderer (FE-L2).
+// -----------------------------------------------------------------------
+
+function rdCostText(rounds, candidates) {
+  const total = Number(rounds) * Number(candidates);
+  const totalText = Number.isFinite(total) ? total : 'n/a';
+  return `成本预告：约 ${esc(rounds)} 轮 × ${esc(candidates)} 候选 = ${esc(totalText)} 次候选评测（研究口径；真实 LLM + 全量数据耗时可能很长）。`;
+}
+
+export function renderRdConfirmCard(pipeline, provenance) {
+  const provenanceByField = provenanceEntryByField(provenance || []);
+  const params = pipeline.parameters || {};
+  const rounds = params.rounds === undefined || params.rounds === null ? 1 : params.rounds;
+  const candidates = params.candidates_per_round === undefined || params.candidates_per_round === null ? 1 : params.candidates_per_round;
+  const objective = params.objective || 'balanced';
+  const seedFactorId = (pipeline.factor && pipeline.factor.factor_id) || '';
+  const objectiveOptions = RD_OBJECTIVE_OPTIONS.map(([value, label]) =>
+    `<option value="${esc(value)}"${value === objective ? ' selected' : ''}>${esc(label)}</option>`
+  ).join('');
+  return `
+    <div class="panel pipeline-card" id="pipeline-card">
+      ${statusRowHtml(pipeline, '确认 RD 优化（管线 B）')}
+      ${renderStageStrip(pipeline)}
+      ${renderNegativeEvidence(pipeline)}
+      <p class="meta">从因子 <code>${esc(seedFactorId)}</code> 出发做 RD 优化。RD 是一条由你显式发起的独立管线——报告不会自动进入 RD（无 A→B 自动桥）。</p>
+      <div class="pipeline-rd-disclosure">
+        ${provenanceBadgeHtml({ source: 'fixed_policy' })}
+        <span class="meta">周期与样本区间继承因子评测设置，不在此重新配置（R3.1：RD 无独立 interval 参数）。</span>
+      </div>
+      <div class="pipeline-rd-grid">
+        <label><span>迭代轮数</span>
+          <input type="number" min="1" max="${RD_MAX_ITERATIONS}" step="1" data-pipeline-rd-field="rounds" value="${esc(rounds)}">
+          ${provenanceBadgeRowHtml(provenanceByField['rounds'])}</label>
+        <label><span>每轮候选数</span>
+          <input type="number" min="1" step="1" data-pipeline-rd-field="candidates_per_round" value="${esc(candidates)}">
+          ${provenanceBadgeRowHtml(provenanceByField['candidates_per_round'])}</label>
+        <label><span>目标优先级</span>
+          <select data-pipeline-rd-field="objective">${objectiveOptions}</select>
+          ${provenanceBadgeRowHtml(provenanceByField['objective'])}</label>
+      </div>
+      <p class="meta pipeline-rd-cost" id="pipeline-rd-cost">${rdCostText(rounds, candidates)}</p>
+      <div class="pipeline-actions">
+        <button type="button" id="pipeline-rd-confirm-btn" data-pipeline-action="confirm">确认并运行 RD</button>
+        <button type="button" class="secondary danger" data-pipeline-action="cancel">放弃本次 RD</button>
+      </div>
+    </div>`;
+}
+
+export function renderRdRunningCard(pipeline) {
+  return `
+    <div class="panel pipeline-card" id="pipeline-card">
+      ${statusRowHtml(pipeline, '正在运行 RD 优化')}
+      ${renderStageStrip(pipeline)}
+      ${renderNegativeEvidence(pipeline)}
+      <p class="meta">RD 的 N 轮在同一个后台任务内运行（不拆分每轮灯）；完成后候选排行榜会在下方 RD 循环区展开。</p>
+      <div class="pipeline-actions">
+        <button type="button" class="secondary danger" data-pipeline-action="cancel">中断本次 RD</button>
+      </div>
+    </div>`;
+}
+
+export function renderRdPausedFailureCard(pipeline) {
+  return `
+    <div class="panel pipeline-card" id="pipeline-card">
+      ${statusRowHtml(pipeline, 'RD 尝试失败')}
+      ${renderStageStrip(pipeline)}
+      ${renderNegativeEvidence(pipeline)}
+      <p class="meta">seed 与 RD 参数已冻结保留。可沿用原参数重试，或放弃本次 RD。</p>
+      <div class="pipeline-actions">
+        <button type="button" data-pipeline-action="retry">重试（沿用原参数）</button>
+        <button type="button" class="secondary danger" data-pipeline-action="cancel">放弃本次 RD</button>
+      </div>
+    </div>`;
+}
+
+export function renderRdLeaderboardCard(pipeline) {
+  return `
+    <div class="panel pipeline-card" id="pipeline-card">
+      ${statusRowHtml(pipeline, '排行榜已生成')}
+      ${renderStageStrip(pipeline)}
+      <p class="meta">RD 优化完成，候选排行榜在下方 RD 循环区展开：external OOS 列仅供审计（不参与 winner 选择），并按 executed / reused / skipped 披露去重处置。</p>
     </div>`;
 }
 
@@ -318,6 +430,27 @@ export function renderPipelineCard(pipeline, options) {
   const density = opts.density === 'expert' ? 'expert' : 'beginner';
   const provenance = opts.provenance || [];
   const draftOverrides = opts.draftOverrides || {};
+  if (pipeline.kind === 'rd_optimize') {
+    // Pipeline B has its own three-field confirm gate and a terminal
+    // leaderboard; it shares only the shared status machine, not the
+    // factor_study density body (spec §2.1 / §5.4).
+    switch (pipeline.status) {
+      case 'draft':
+      case 'awaiting_confirm':
+        return renderRdConfirmCard(pipeline, provenance);
+      case 'running':
+        return renderRdRunningCard(pipeline);
+      case 'paused_failure':
+        return renderRdPausedFailureCard(pipeline);
+      case 'completed':
+        return renderRdLeaderboardCard(pipeline);
+      case 'aborted':
+      case 'expired':
+        return renderTerminalCard(pipeline);
+      default:
+        return '';
+    }
+  }
   switch (pipeline.status) {
     case 'draft':
     case 'awaiting_confirm':
@@ -496,9 +629,31 @@ export async function createPipelineFromParseJob(parseJobId) {
   return record;
 }
 
+/* Reads the pipeline B confirm card's own three fields (rounds /
+ * candidates_per_round / objective) straight from the DOM at confirm time.
+ * The server re-validates rounds against 1..MAX_RD_ITERATIONS regardless, so
+ * a hand-edited out-of-range value is rejected server-side, never merely by
+ * the input's own max attribute (WORKORDER pin). */
+function parametersFromRdConfirm() {
+  if (!mount) return {};
+  const values = {};
+  mount.querySelectorAll('[data-pipeline-rd-field]').forEach(input => {
+    const field = input.dataset.pipelineRdField;
+    if (!field) return;
+    if (field === 'objective') {
+      values[field] = input.value;
+    } else {
+      values[field] = input.value === '' ? null : Number(input.value);
+    }
+  });
+  return values;
+}
+
 export async function confirmCurrentPipeline() {
   if (!currentPipeline) throw new Error('没有待确认的管线');
-  const overrides = currentDensity === 'expert' ? parametersFromExpertGrid() : draftOverrides;
+  const overrides = currentPipeline.kind === 'rd_optimize'
+    ? parametersFromRdConfirm()
+    : (currentDensity === 'expert' ? parametersFromExpertGrid() : draftOverrides);
   const body = {
     nonce: currentPipeline.confirm.nonce,
     version: currentPipeline.confirm.version,
@@ -506,6 +661,23 @@ export async function confirmCurrentPipeline() {
   };
   const record = await postJson(`/api/pipelines/${encodeURIComponent(currentPipeline.pipeline_id)}/confirm`, body);
   draftOverrides = {};
+  setPipeline(record);
+  return record;
+}
+
+/* Pipeline B (rd_optimize) creation, seeded from an EXPLICIT factor id (spec
+ * §2.1): a completed report's factor or a registry factor. There is NO
+ * automatic A->B bridge — only an explicit user action ever reaches here, and
+ * nothing in the aggregate calls it on A's completion. Replaces whatever
+ * terminal pipeline the card was showing with the fresh RD confirm gate. */
+export async function createRdPipeline(seedFactorId, options) {
+  const opts = options || {};
+  const body = { kind: 'rd_optimize', seed_factor_id: seedFactorId };
+  if (opts.rounds !== undefined) body.rounds = opts.rounds;
+  if (opts.candidates_per_round !== undefined) body.candidates_per_round = opts.candidates_per_round;
+  if (opts.objective !== undefined) body.objective = opts.objective;
+  const record = await postJson('/api/pipelines', body);
+  currentDensity = 'beginner';
   setPipeline(record);
   return record;
 }
@@ -670,6 +842,20 @@ export function initPipelineModule(options) {
     })();
   });
   mount.addEventListener('input', event => {
+    // Pipeline B confirm card: refresh the cost preview live as rounds /
+    // candidates change (the confirmed values are still read fresh from the
+    // DOM at confirm time by parametersFromRdConfirm).
+    const rdInput = event.target.closest('[data-pipeline-rd-field]');
+    if (rdInput) {
+      const costEl = mount.querySelector('#pipeline-rd-cost');
+      if (costEl) {
+        const values = parametersFromRdConfirm();
+        const rounds = values.rounds === undefined || values.rounds === null ? 1 : values.rounds;
+        const candidates = values.candidates_per_round === undefined || values.candidates_per_round === null ? 1 : values.candidates_per_round;
+        costEl.innerHTML = rdCostText(rounds, candidates);
+      }
+      return;
+    }
     const input = event.target.closest('[data-pipeline-param-field]');
     if (!input) return;
     const field = input.dataset.pipelineParamField;

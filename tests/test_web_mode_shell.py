@@ -238,6 +238,57 @@ def test_advanced_params_grid_is_no_longer_server_rendered(web_config) -> None:
 
 
 # ---------------------------------------------------------------------------
+# R3.1 (owner-ruled, spec §8): rd-interval auto-cycle + 开启/停止 loop deleted;
+# #staggered-run migrated to the post-report follow-up bar
+# ---------------------------------------------------------------------------
+
+
+def test_r31_deletes_rd_autocycle_controls_and_migrates_staggered(web_config) -> None:
+    # The rd-interval 自动周期 select and the 开启/停止 timer-loop controls are
+    # DELETED: RD inherits the factor evaluation interval/sample contract (no
+    # independent RD interval parameter), and an explicit pipeline B replaces
+    # implicit timed RD. #staggered-run is MIGRATED (not deleted) out of the
+    # 01 Parse control rail into the report follow-up bar.
+    html = web_server._index_html(web_config)
+    for gone in ('id="rd-interval"', 'id="rd-start"', 'id="rd-stop"'):
+        assert gone not in html, gone
+    # #rd-run (single 运行一次) survives; the report follow-up bar carries the
+    # ONLY A→B entry (spec §2.1: no auto bridge) plus the expert formula editor.
+    assert 'id="rd-run"' in html
+    assert 'id="report-followups"' in html
+    assert 'id="rd-entry"' in html
+    assert 'id="formula-edit"' in html
+    # #staggered-run still exists, now INSIDE #report-followups and no longer in
+    # the 01 Parse control rail (between #run and #cancel-run).
+    assert 'id="staggered-run"' in html
+    assert html.index('id="report-followups"') < html.index('id="staggered-run"')
+    control_rail = html[html.index('id="run"') : html.index('id="cancel-run"')]
+    assert 'id="staggered-run"' not in control_rail
+
+
+def test_app_module_drops_rd_autocycle_scheduler_wiring() -> None:
+    # R3.1: app.js no longer READS #rd-interval or drives the 开启/停止
+    # scheduler (/api/research/schedule), and binds no rdStart/rdStop refs; the
+    # explicit pipeline B entry (createRdPipeline via #rd-entry) replaced them.
+    # Checked against live-wiring patterns (DOM reads / fetch / ref names) so an
+    # explanatory R3.1 comment that merely names the deleted control does not
+    # trip the pin.
+    app_js = _static_module_text("app.js")
+    for gone in (
+        "getElementById('rd-interval')",
+        "getElementById('rd-start')",
+        "getElementById('rd-stop')",
+        "/api/research/schedule",
+        "rdStart",
+        "rdStop",
+    ):
+        assert gone not in app_js, gone
+    assert "createRdPipeline(" in app_js
+    assert "getElementById('rd-entry')" in app_js
+    assert "getElementById('formula-edit')" in app_js
+
+
+# ---------------------------------------------------------------------------
 # No duplicate DOM ids anywhere on the served page (general regression pin)
 # ---------------------------------------------------------------------------
 

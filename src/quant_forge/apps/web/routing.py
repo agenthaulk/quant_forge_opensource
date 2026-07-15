@@ -51,9 +51,11 @@ from quant_forge.apps.web.pipeline import (
     confirm_pipeline,
     create_pipeline,
     create_pipeline_as_fallback,
+    create_rd_pipeline,
     fork_pipeline_from_failure,
     get_pipeline,
     list_active_pipelines,
+    pre_validate_formula,
     retry_pipeline,
     update_pipeline_parameters,
 )
@@ -268,6 +270,20 @@ def _sidecar_invoke_tool(
         narration=tuple(narration),
     )
     return {"result": result.to_dict(), "narration": narration}
+
+
+def _optional_universe_filters(value: Any) -> tuple[str, ...]:
+    """Shape a request ``universe_filters`` list into a tuple of strings.
+
+    Pre-validation is read-only: this only normalizes the input shape; the
+    ValidationGate remains the single authority on which filter FORMS are
+    accepted (``specs/validation_gate.py``)."""
+
+    if value in (None, ""):
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("universe_filters must be a JSON array of strings")
+    return tuple(str(item) for item in value)
 
 
 def create_local_web_server(
@@ -678,18 +694,53 @@ def create_local_web_server(
                 if path.startswith("/api/jobs/") and path.endswith("/cancel"):
                     self._json(job_manager.cancel(_job_id_from_cancel_path(path)))
                     return
-                if path == "/api/pipelines":
-                    # create_pipeline takes a job id, never a client-supplied
-                    # parser/factor payload (FE-L3): the parser/factor this
-                    # pipeline stores comes from job_manager's OWN stored
-                    # result for parse_job_id, not from this request body.
-                    record = create_pipeline(
-                        pipeline_store,
-                        job_manager=job_manager,
-                        parse_job_id=str(payload.get("parse_job_id", "")),
-                        rd_config=research_config,
-                        kind=str(payload.get("kind", "factor_study")),
+                if path == "/api/pipelines/pre-validate":
+                    # Editable-formula pre-validation (spec §5.3): canonicalize +
+                    # ValidationGate, NO persist / eval / backtest. An unknown
+                    # operator returns an operator_drafts review-packet ref and
+                    # NEVER hot-executes. Distinct from /api/validate-idea, which
+                    # runs the whole evaluation chain.
+                    self._json(
+                        pre_validate_formula(
+                            str(payload.get("formula", "")),
+                            name=str(payload.get("name", "")),
+                            horizon_days=payload.get("horizon_days", 5),
+                            universe_filters=_optional_universe_filters(payload.get("universe_filters")),
+                        )
                     )
+                    return
+                if path == "/api/pipelines":
+                    kind = str(payload.get("kind", "factor_study"))
+                    if kind == "rd_optimize":
+                        # Pipeline B (spec §2.1): user-initiated, seeded from an
+                        # explicit factor id (a completed report's factor or a
+                        # registry factor). There is NO automatic A->B bridge --
+                        # nothing here is reached by A completing. Rounds are
+                        # validated server-side inside create_rd_pipeline.
+                        record = create_rd_pipeline(
+                            pipeline_store,
+                            job_manager=job_manager,
+                            config=config,
+                            seed_factor_id=str(payload.get("seed_factor_id", "")),
+                            rd_config=research_config,
+                            rounds=_optional_int(payload.get("rounds"), "rounds"),
+                            candidates_per_round=_optional_int(
+                                payload.get("candidates_per_round"), "candidates_per_round"
+                            ),
+                            objective=_optional_str(payload.get("objective")),
+                        )
+                    else:
+                        # create_pipeline takes a job id, never a client-supplied
+                        # parser/factor payload (FE-L3): the parser/factor this
+                        # pipeline stores comes from job_manager's OWN stored
+                        # result for parse_job_id, not from this request body.
+                        record = create_pipeline(
+                            pipeline_store,
+                            job_manager=job_manager,
+                            parse_job_id=str(payload.get("parse_job_id", "")),
+                            rd_config=research_config,
+                            kind=kind,
+                        )
                     self._json(record.to_dict(), status=201)
                     return
                 if path.startswith("/api/pipelines/") and path.endswith("/confirm"):

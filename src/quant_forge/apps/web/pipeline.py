@@ -117,6 +117,7 @@ unscoped registry side effects.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 from datetime import UTC, datetime, timedelta
 import json
@@ -128,19 +129,28 @@ import threading
 from typing import Any
 from uuid import uuid4
 
-from quant_forge.apps.web.api import _factor_from_request, run_idea_validation_workflow
+from quant_forge.apps.web.api import (
+    MAX_RD_ITERATIONS,
+    _factor_from_request,
+    run_idea_validation_workflow,
+    run_research_once_workflow,
+)
 from quant_forge.apps.web.jobs import _WebJobManager, _utc_now
 from quant_forge.apps.web.provenance import (
     PARAMETER_FIELDS,
+    RD_CONFIRM_CARD_FIELDS,
     assert_provenance_matches_current_values,
     derive_baseline_provenance,
     derive_current_provenance,
+    derive_rd_baseline_provenance,
+    derive_rd_current_provenance,
 )
 from quant_forge.config import QuantForgeConfig
 from quant_forge.core.contracts import FactorDefinition
 from quant_forge.factor_engine.value_store import remove_stored_values_for_factor_id
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.research_loop.config import ResearchLoopConfig
+from quant_forge.specs.factor_spec import FactorSpec
 from quant_forge.specs.pipeline import (
     ArtifactRef,
     AttemptState,
@@ -153,6 +163,7 @@ from quant_forge.specs.pipeline import (
     initial_stages_for,
 )
 from quant_forge.specs.run_manifest import canonical_fingerprint
+from quant_forge.specs.validation_gate import validate_factor_spec
 
 LOGGER = logging.getLogger("quant_forge.apps.web.pipeline")
 
@@ -161,6 +172,7 @@ __all__ = [
     "PipelineConflictError",
     "PipelineStore",
     "create_pipeline",
+    "create_rd_pipeline",
     "get_pipeline",
     "pipeline_report",
     "list_active_pipelines",
@@ -170,6 +182,8 @@ __all__ = [
     "update_pipeline_parameters",
     "fork_pipeline_from_failure",
     "create_pipeline_as_fallback",
+    "pre_validate_formula",
+    "capture_planning_influence",
 ]
 
 _PIPELINE_DIR_NAME = "pipelines"
@@ -181,6 +195,67 @@ _PIPELINE_ID_RE = re.compile(r"^PL_[0-9a-f]{32}$")
 # reconciliation when its job finishes (or JOB_NOT_FOUND on rejoin if it
 # didn't survive a restart and no matching completion artifact exists).
 DEFAULT_DRAFT_TTL_SECONDS = 24 * 3600
+
+
+# ---------------------------------------------------------------------------
+# SE-ix seam (cross-track amendment, binding). THIN FE-SIDE INTERFACE ONLY.
+# ---------------------------------------------------------------------------
+#
+# ESCALATION (FE-P3, recorded per the FE-P1 Cluster C honest-escalation
+# precedent): the real capture lives at
+# `quant_forge.research_loop.planning_influence.capture_planning_influence`,
+# which — together with its whole dependency chain (priors.py,
+# memory.planning_influence_inputs, llm.authenticate_active_rule_item) — is on
+# the SE trunk ONLY, NOT on this FE base branch. Importing it here would fail
+# at import time. So this is a THIN seam and nothing more: the confirm path
+# CALLS it (below, in every confirm), which freezes the wiring and the
+# input_hash contract NOW; but with the SE module absent the default returns
+# "" and the reserved `PipelineRecord.planning_influence_hash` slot stays
+# empty, so input_hash is stable. The real `capture_planning_influence(store)`
+# call wires up at CP-INT when the FE and SE branches unite — by reassigning
+# THIS module attribute, with no change to any call site and no schema
+# migration. Do NOT import, vendor, or reimplement the SE module here; the
+# golden-vector-pinned frozen hash contract must not be forked.
+def _default_capture_planning_influence(*, store: "PipelineStore", record: PipelineRecord) -> str:
+    return ""
+
+
+# Injectable indirection so CP-INT (or a test) can substitute the real capture
+# without editing every call site. Never reassigned on this FE branch.
+capture_planning_influence = _default_capture_planning_influence
+
+
+# ---------------------------------------------------------------------------
+# Kind config. Both pipeline kinds share the aggregate (record, journal,
+# idempotent confirm, rejoin, expiry, attempt lineage, freeze); they differ
+# ONLY in their compute/terminal stage ids and their compute-stage side
+# effects. `_KindPlan` is the single place that divergence is declared, so the
+# shared machinery (_reconcile / _complete_from_reconciliation) stays one code
+# path with small, explicit branches rather than a forked duplicate.
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class _KindPlan:
+    run_stage_id: str  # the stage a child job runs under ("compute" | "run")
+    terminal_stage_id: str  # the TERMINAL display stage ("report" | "leaderboard")
+    publishes: bool  # factor_study publishes a canonical factor on success; rd does not
+    run_job_ref_kind: str  # artifact_ref.kind counting durable launches for attempt numbering
+
+
+_KIND_PLANS: dict[str, _KindPlan] = {
+    "factor_study": _KindPlan(
+        run_stage_id="compute", terminal_stage_id="report", publishes=True, run_job_ref_kind="compute_job"
+    ),
+    "rd_optimize": _KindPlan(
+        run_stage_id="run", terminal_stage_id="leaderboard", publishes=False, run_job_ref_kind="run_job"
+    ),
+}
+
+
+def _kind_plan(kind: str) -> _KindPlan:
+    plan = _KIND_PLANS.get(kind)
+    if plan is None:
+        raise ValueError(f"no kind plan for pipeline kind: {kind!r}")
+    return plan
 
 
 class PipelineNotFoundError(KeyError):
@@ -324,7 +399,9 @@ class PipelineStore:
         # phase-review F5: a GET must never serve a confirm card whose
         # badges are missing, malformed, or stale relative to the values
         # they describe.
-        assert_provenance_matches_current_values(record.provenance, factor=record.factor, parameters=record.parameters)
+        assert_provenance_matches_current_values(
+            record.provenance, factor=record.factor, parameters=record.parameters, kind=record.kind
+        )
         return record
 
     def list_ids(self) -> list[str]:
@@ -702,7 +779,7 @@ def _completion_matches_record(payload: dict[str, Any] | None, record: PipelineR
 
     if payload is None:
         return False
-    compute = record.stage("compute")
+    compute = record.stage(_kind_plan(record.kind).run_stage_id)
     attempt = payload.get("attempt")
     # Strict type, not int() coercion (re-verify RV3-F2): True, 1.9 and "1"
     # all coerce to a matching attempt number, and forged near-miss types
@@ -875,6 +952,149 @@ def create_pipeline(
     return record
 
 
+# ---------------------------------------------------------------------------
+# Pipeline B (rd_optimize) creation + server-side rounds validation.
+# ---------------------------------------------------------------------------
+
+
+def _validate_rd_rounds(value: Any) -> int:
+    """Server-authoritative rounds bound (WORKORDER pin: out-of-range rounds
+    rejected SERVER-SIDE, never client-only). Mirrors api.py's
+    ``_rd_iterations_parameter`` (1..MAX_RD_ITERATIONS) so the pipeline-B
+    confirm gate and the legacy RD endpoint agree on the same closed range."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"rounds must be an integer between 1 and {MAX_RD_ITERATIONS}")
+    if value < 1 or value > MAX_RD_ITERATIONS:
+        raise ValueError(f"rounds must be between 1 and {MAX_RD_ITERATIONS}")
+    return value
+
+
+def _validate_rd_candidates(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("candidates_per_round must be a positive integer")
+    return value
+
+
+def _rd_parameters_only(parameters: dict[str, Any]) -> dict[str, Any]:
+    """Keep only the three pipeline-B confirm-card fields (RD inherits the
+    evaluation interval/sample contract; R3.1 adds no other RD parameter)."""
+
+    return {name: parameters.get(name) for name in RD_CONFIRM_CARD_FIELDS}
+
+
+def _rd_input_hash(
+    *,
+    seed_factor_id: str,
+    rd_parameters: dict[str, Any],
+    rd_config: ResearchLoopConfig,
+    planning_influence_hash: str,
+) -> str:
+    """seed + (rounds, candidates_per_round, objective) + config, plus the
+    reserved SE-ix slot -- same shape discipline as ``_compute_input_hash``."""
+
+    payload = {
+        "seed": {"factor_id": seed_factor_id},
+        "rd": {name: rd_parameters.get(name) for name in RD_CONFIRM_CARD_FIELDS},
+        "config": {"objective": rd_config.objective},
+        "planning_influence_hash": planning_influence_hash,
+    }
+    return canonical_fingerprint(payload)
+
+
+def create_rd_pipeline(
+    store: PipelineStore,
+    *,
+    job_manager: _WebJobManager,
+    config: QuantForgeConfig,
+    seed_factor_id: str,
+    rd_config: ResearchLoopConfig,
+    rounds: Any = None,
+    candidates_per_round: Any = None,
+    objective: Any = None,
+    parent_run_id: str | None = None,
+) -> PipelineRecord:
+    """Create a pipeline B (rd_optimize) aggregate, seeded from a factor id.
+
+    Pipeline B is ALWAYS user-initiated with an explicit seed (a completed
+    report's factor, or a registry factor): there is NO automatic A->B bridge
+    (spec §2.1) -- nothing in the aggregate ever calls this on A's completion.
+    Rounds are validated server-side here AND again at confirm, so an
+    out-of-range value can never launch even if a client skips its own check.
+    """
+
+    if not seed_factor_id.strip():
+        raise ValueError("seed_factor_id is required to create an rd_optimize pipeline")
+    user_explicit: set[str] = set()
+    if rounds is None:
+        rounds_value = 1
+    else:
+        rounds_value = _validate_rd_rounds(rounds)
+        user_explicit.add("rounds")
+    if candidates_per_round is None:
+        candidates_value = int(rd_config.default_max_candidates)
+    else:
+        candidates_value = _validate_rd_candidates(candidates_per_round)
+        user_explicit.add("candidates_per_round")
+    if objective is None or (isinstance(objective, str) and not objective.strip()):
+        objective_value = str(rd_config.objective)
+    else:
+        objective_value = str(objective)
+        user_explicit.add("objective")
+
+    rd_parameters = {
+        "rounds": rounds_value,
+        "candidates_per_round": candidates_value,
+        "objective": objective_value,
+    }
+    now = _utc_now()
+    planning_influence_hash = ""  # SE-ix reserved slot; empty until CP-INT (see module header).
+    input_hash = _rd_input_hash(
+        seed_factor_id=seed_factor_id,
+        rd_parameters=rd_parameters,
+        rd_config=rd_config,
+        planning_influence_hash=planning_influence_hash,
+    )
+    baseline_provenance = tuple(
+        entry.to_dict()
+        for entry in derive_rd_baseline_provenance(
+            rounds=rounds_value,
+            candidates_per_round=candidates_value,
+            objective=objective_value,
+            user_explicit_fields=frozenset(user_explicit),
+        )
+    )
+    provenance = derive_rd_current_provenance(baseline=baseline_provenance, current_parameters=rd_parameters)
+    pipeline_id = _new_pipeline_id()
+    record = PipelineRecord(
+        pipeline_id=pipeline_id,
+        kind="rd_optimize",
+        created_at=now,
+        expires_at=_expires_at(now, DEFAULT_DRAFT_TTL_SECONDS),
+        status="draft",
+        stages=initial_stages_for("rd_optimize"),
+        input_hash=input_hash,
+        planning_influence_hash=planning_influence_hash,
+        confirm=ConfirmState(nonce=_new_nonce(), version=1),
+        # `factor` carries only the seed id (pipeline B does not parse or
+        # publish a factor); the leaderboard renders the RD job's own payload.
+        factor={"factor_id": seed_factor_id},
+        parameters=rd_parameters,
+        original_parameters=rd_parameters,
+        provenance=tuple(entry.to_dict() for entry in provenance),
+        baseline_provenance=baseline_provenance,
+        attempt=AttemptState(number=1, parent_run_id=parent_run_id),
+        # No working factor row: RD seeds from an already-registered factor and
+        # never overwrites it (promotion is G3, outside the sidecar).
+        working_factor_id="",
+    )
+    with store.lock:
+        record = _transition(record, "awaiting_confirm")
+        record = _advance_stage(record, "confirm", status="active", started_at=now)
+        record = store.save(record, event="created")
+    return record
+
+
 def _reconcile(
     record: PipelineRecord, *, store: PipelineStore, job_manager: _WebJobManager, config: QuantForgeConfig
 ) -> PipelineRecord:
@@ -906,11 +1126,15 @@ def _reconcile(
         return store.save(record, event="expired")
     if record.status != "running":
         return record
-    compute = record.stage("compute")
-    if compute.child_job_id is None:
+    # Kind-aware run stage: factor_study runs its compute job under "compute",
+    # rd_optimize runs its research job under "run" -- the SAME reconciliation
+    # logic folds the child job's status into whichever stage holds it.
+    plan = _kind_plan(record.kind)
+    run_stage = record.stage(plan.run_stage_id)
+    if run_stage.child_job_id is None:
         return record
     try:
-        job = job_manager.get(compute.child_job_id)
+        job = job_manager.get(run_stage.child_job_id)
     except KeyError:
         # Re-verify RV-F4: do not assume failure just because the in-memory
         # job manager has forgotten this job -- but ONLY the attempt-scoped
@@ -921,24 +1145,28 @@ def _reconcile(
         if _completion_matches_record(_read_completion_artifact(store, record.pipeline_id), record):
             return _complete_from_reconciliation(record, store=store, config=config, now=now)
         record = _with_cleanup(record, config)
-        record = _advance_stage(record, "compute", status="failed", ended_at=now)
-        record = _transition(record, "paused_failure", failure=FailureState(stage_id="compute", reason_code="JOB_NOT_FOUND"))
+        record = _advance_stage(record, plan.run_stage_id, status="failed", ended_at=now)
+        record = _transition(
+            record, "paused_failure", failure=FailureState(stage_id=plan.run_stage_id, reason_code="JOB_NOT_FOUND")
+        )
         return store.save(record, event="job_not_found_on_reconcile")
     job_status = job.get("status")
     if job_status in {"running", "cancel_requested"}:
         return record
     if job_status == "completed":
-        return _complete_from_reconciliation(record, store=store, config=config, now=now, compute_job_id=compute.child_job_id)
+        return _complete_from_reconciliation(
+            record, store=store, config=config, now=now, compute_job_id=run_stage.child_job_id
+        )
     if job_status == "cancelled":
         record = _with_cleanup(record, config)
-        record = _advance_stage(record, "compute", status="failed", ended_at=now)
+        record = _advance_stage(record, plan.run_stage_id, status="failed", ended_at=now)
         record = _transition(record, "aborted")
         return store.save(record, event="compute_cancelled")
     # failed
     record = _with_cleanup(record, config)
     reason = str(job.get("error") or "").strip()[:200] or "COMPUTE_FAILED"
-    record = _advance_stage(record, "compute", status="failed", ended_at=now)
-    record = _transition(record, "paused_failure", failure=FailureState(stage_id="compute", reason_code=reason))
+    record = _advance_stage(record, plan.run_stage_id, status="failed", ended_at=now)
+    record = _transition(record, "paused_failure", failure=FailureState(stage_id=plan.run_stage_id, reason_code=reason))
     return store.save(record, event="compute_failed")
 
 
@@ -950,20 +1178,28 @@ def _complete_from_reconciliation(
     now: str,
     compute_job_id: str | None = None,
 ) -> PipelineRecord:
-    published, publish_state = _publish_canonical_factor(config, record)
+    plan = _kind_plan(record.kind)
+    # factor_study publishes ONE canonical factor on success (CAS-guarded);
+    # rd_optimize produces a candidate leaderboard, not a single publishable
+    # factor -- promotion to active is G3, outside the sidecar (spec §3) --
+    # so it never publishes and has no working row to clean.
+    if plan.publishes:
+        published, publish_state = _publish_canonical_factor(config, record)
+    else:
+        published, publish_state = None, ""
     record = _with_cleanup(record, config)
     # The report ref names BOTH the job id and the durable completion
     # artifact path (re-verify RV-F4): the report endpoint serves from the
     # live job when it still exists and falls back to the artifact when a
     # restart has wiped the in-memory manager, so a legitimately recovered
-    # pipeline still renders a report.
+    # pipeline still renders its report/leaderboard.
     report_ref = ArtifactRef(
         kind="report",
-        job_id=compute_job_id or record.stage("compute").child_job_id,
+        job_id=compute_job_id or record.stage(plan.run_stage_id).child_job_id,
         artifact_path=str(_completion_artifact_path(store, record.pipeline_id)),
     )
-    record = _advance_stage(record, "compute", status="completed", ended_at=now)
-    record = _advance_stage(record, "report", status="completed", started_at=now, ended_at=now)
+    record = _advance_stage(record, plan.run_stage_id, status="completed", ended_at=now)
+    record = _advance_stage(record, plan.terminal_stage_id, status="completed", started_at=now, ended_at=now)
     record = record.with_updates(
         artifact_refs=record.artifact_refs + (report_ref,),
         published_factor_id=published,
@@ -999,7 +1235,9 @@ def pipeline_report(
         if record.status != "completed":
             raise PipelineConflictError(f"pipeline {pipeline_id} has no report (status={record.status})")
         report_ref = next((ref for ref in record.artifact_refs if ref.kind == "report"), None)
-        job_id = (report_ref.job_id if report_ref is not None else None) or record.stage("compute").child_job_id
+        job_id = (report_ref.job_id if report_ref is not None else None) or record.stage(
+            _kind_plan(record.kind).run_stage_id
+        ).child_job_id
         if job_id:
             try:
                 job = job_manager.get(job_id)
@@ -1098,6 +1336,23 @@ def confirm_pipeline(
     with store.lock:
         record = store.load(pipeline_id)
         record = _reconcile(record, store=store, job_manager=job_manager, config=config)
+        if record.kind == "rd_optimize":
+            # Pipeline B has a distinct launch (a research job; no canonical
+            # publish, no working-factor row, no CAS). It shares the SAME
+            # idempotent-confirm token, exactly-once launch, attempt lineage,
+            # and rejoin machinery, so it dispatches to its own confirm body
+            # with this already-loaded+reconciled record, under the same
+            # (reentrant) store lock.
+            return _confirm_rd_pipeline(
+                config,
+                store,
+                record,
+                nonce=nonce,
+                version=version,
+                job_manager=job_manager,
+                rd_config=rd_config,
+                parameters=parameters,
+            )
         if record.confirm.nonce == nonce and record.confirm.version == version and record.confirm.confirmed_at is not None:
             replay_effective = _flat_parameters_only({**dict(record.parameters), **(parameters or {})})
             if replay_effective == (record.confirmed_parameters or {}):
@@ -1132,6 +1387,10 @@ def confirm_pipeline(
             factor=record.factor,
             current_parameters=effective_parameters,
         )
+        # SE-ix seam (see module header): CALLED here so the wiring and hash
+        # contract are frozen now; the default returns "" with the SE module
+        # absent, so the reserved slot stays empty and input_hash is stable.
+        planning_influence_hash = capture_planning_influence(store=store, record=record)
         # Recompute input_hash from the EFFECTIVE (post-override) parameters:
         # it must fingerprint what is actually about to run, not the
         # pre-edit draft default.
@@ -1141,9 +1400,9 @@ def confirm_pipeline(
             parse_job_id=next((ref.job_id for ref in record.artifact_refs if ref.kind == "parse"), ""),
             parser_source=str(record.parser.get("source", "")),
             rd_config=rd_config,
-            planning_influence_hash=record.planning_influence_hash,
+            planning_influence_hash=planning_influence_hash,
         )
-        record = record.with_updates(input_hash=input_hash)
+        record = record.with_updates(input_hash=input_hash, planning_influence_hash=planning_influence_hash)
         factor = _working_factor(record)
 
         # Exactly-once launch: reserve -> durably save "running" -> start.
@@ -1235,13 +1494,146 @@ def confirm_pipeline(
         return running_record
 
 
+def _confirm_rd_pipeline(
+    config: QuantForgeConfig,
+    store: PipelineStore,
+    record: PipelineRecord,
+    *,
+    nonce: str,
+    version: int,
+    job_manager: _WebJobManager,
+    rd_config: ResearchLoopConfig,
+    parameters: dict[str, Any] | None = None,
+) -> PipelineRecord:
+    """Confirm gate + exactly-once launch for pipeline B (rd_optimize).
+
+    Called under ``store.lock`` (reentrant) with an already-loaded+reconciled
+    ``record`` (see :func:`confirm_pipeline`). Reuses the SAME idempotent-token
+    contract, exactly-once launch ordering, and attempt lineage as
+    factor_study, but launches the research job (``run_research_once_workflow``)
+    instead of the validate chain, and has NO canonical publish, NO working
+    factor row, and NO CAS baseline -- pipeline B ranks candidates; it never
+    overwrites a registry factor (promotion is G3, outside the sidecar).
+
+    Rounds are re-validated SERVER-SIDE here from the EFFECTIVE (post-override)
+    parameters, so an out-of-range value can never launch even if the client
+    skipped its own check and even if the create-time value was later edited.
+    """
+
+    pipeline_id = record.pipeline_id
+    if record.confirm.nonce == nonce and record.confirm.version == version and record.confirm.confirmed_at is not None:
+        replay_effective = _rd_parameters_only({**dict(record.parameters), **(parameters or {})})
+        if replay_effective == (record.confirmed_parameters or {}):
+            return record
+        raise PipelineConflictError(
+            "confirm token already consumed with a different parameter payload; "
+            "reload the pipeline to see what actually launched"
+        )
+    if record.status not in {"draft", "awaiting_confirm"}:
+        raise PipelineConflictError(f"pipeline {pipeline_id} is not awaiting confirmation (status={record.status})")
+    if record.confirm.nonce != nonce or record.confirm.version != version:
+        raise PipelineConflictError("stale confirm token; reload the pipeline and try again")
+
+    effective_parameters = _rd_parameters_only({**dict(record.parameters), **(parameters or {})})
+    # Server-authoritative revalidation of the EFFECTIVE values (WORKORDER pin).
+    effective_parameters["rounds"] = _validate_rd_rounds(effective_parameters.get("rounds"))
+    effective_parameters["candidates_per_round"] = _validate_rd_candidates(
+        effective_parameters.get("candidates_per_round")
+    )
+    if not str(effective_parameters.get("objective") or "").strip():
+        effective_parameters["objective"] = str(rd_config.objective)
+
+    provenance = derive_rd_current_provenance(
+        baseline=record.baseline_provenance, current_parameters=effective_parameters
+    )
+    # SE-ix seam (see module header): CALLED so the wiring/hash contract are
+    # frozen now; default returns "" with the SE module absent, so the
+    # reserved slot stays empty and input_hash is stable.
+    planning_influence_hash = capture_planning_influence(store=store, record=record)
+    input_hash = _rd_input_hash(
+        seed_factor_id=str(record.factor.get("factor_id", "")),
+        rd_parameters=effective_parameters,
+        rd_config=rd_config,
+        planning_influence_hash=planning_influence_hash,
+    )
+    record = record.with_updates(input_hash=input_hash, planning_influence_hash=planning_influence_hash)
+
+    # Exactly-once launch: reserve -> durably save "running" -> start. attempt
+    # counts prior durable launches of THIS pipeline's run job (never a bare
+    # retry click), the SAME contract as factor_study's compute_job counting.
+    prior_launches = sum(1 for ref in record.artifact_refs if ref.kind == "run_job")
+    child_job_id = job_manager.reserve_id()
+    now = _utc_now()
+    attempt_number = prior_launches + 1
+    seed_factor_id = str(record.factor.get("factor_id", ""))
+    objective = str(effective_parameters["objective"])
+    max_candidates = int(effective_parameters["candidates_per_round"])
+    rounds = int(effective_parameters["rounds"])
+    running_record = record.with_updates(
+        parameters=effective_parameters,
+        confirmed_parameters=effective_parameters,
+        confirm=ConfirmState(nonce=record.confirm.nonce, version=record.confirm.version, confirmed_at=now),
+        provenance=tuple(entry.to_dict() for entry in provenance),
+        attempt=AttemptState(number=attempt_number, parent_run_id=record.attempt.parent_run_id),
+        artifact_refs=record.artifact_refs + (ArtifactRef(kind="run_job", job_id=child_job_id),),
+    )
+    running_record = _advance_stage(running_record, "confirm", status="completed", ended_at=now)
+    running_record = _advance_stage(running_record, "run", status="active", started_at=now, child_job_id=child_job_id)
+    running_record = _transition(running_record, "running")
+    running_record = store.save(
+        running_record,
+        event="confirmed",
+        detail={"nonce": nonce, "version": version, "child_job_id": child_job_id, "rounds": rounds},
+    )
+    frozen_input_hash = running_record.input_hash
+
+    def _run_and_mark(cancel_event: Any) -> dict[str, Any]:
+        result = run_research_once_workflow(
+            config,
+            seed_factor_id,
+            objective=objective,
+            max_candidates=max_candidates,
+            iterations=rounds,
+            rd_config=rd_config,
+            cancel_event=cancel_event,
+        )
+        from quant_forge.apps.web import server as _server
+
+        public_result = _server._web_public_json(result)
+        # Attempt-scoped durable completion proof (re-verify RV-F4): written
+        # AFTER the workflow succeeds and BEFORE the job flips to completed, so
+        # a restart that wipes the job manager can still recognize and serve
+        # this leaderboard. A write failure propagates -> the pipeline pauses
+        # honestly instead of claiming a completion it cannot prove.
+        _write_completion_artifact(
+            store,
+            pipeline_id=pipeline_id,
+            child_job_id=child_job_id,
+            attempt=attempt_number,
+            input_hash=frozen_input_hash,
+            result=public_result,
+        )
+        return result
+
+    try:
+        job_manager.start("research_run_once", _run_and_mark, job_id=child_job_id)
+    except Exception as exc:
+        LOGGER.warning("rd job launch failed for pipeline %s after durable save", pipeline_id, exc_info=True)
+        failed_record = _advance_stage(running_record, "run", status="failed", ended_at=_utc_now())
+        failed_record = _transition(
+            failed_record, "paused_failure", failure=FailureState(stage_id="run", reason_code=f"LAUNCH_FAILED: {exc}"[:200])
+        )
+        return store.save(failed_record, event="launch_failed")
+    return running_record
+
+
 def cancel_pipeline(store: PipelineStore, pipeline_id: str, *, job_manager: _WebJobManager, config: QuantForgeConfig) -> PipelineRecord:
     with store.lock:
         record = store.load(pipeline_id)
         record = _reconcile(record, store=store, job_manager=job_manager, config=config)
         if record.status in TERMINAL_PIPELINE_STATUSES:
             return record  # cancel is idempotent, not an error, once terminal
-        compute = record.stage("compute")
+        compute = record.stage(_kind_plan(record.kind).run_stage_id)
         if compute.child_job_id is not None:
             try:
                 job_manager.cancel(compute.child_job_id)
@@ -1289,7 +1681,7 @@ def retry_pipeline(store: PipelineStore, pipeline_id: str, *, job_manager: _WebJ
                     f"pipeline {pipeline_id} has unfinished working-artifact cleanup; retry once it clears"
                 )
         now = _utc_now()
-        record = _reset_stage(record, "compute")
+        record = _reset_stage(record, _kind_plan(record.kind).run_stage_id)
         record = _transition(record, "awaiting_confirm")
         record = record.with_updates(
             confirm=ConfirmState(nonce=_new_nonce(), version=record.confirm.version + 1),
@@ -1563,3 +1955,94 @@ def create_pipeline_as_fallback(
         old = _transition(old, "aborted")
         store.save(old, event="aborted_by_rule_fallback", detail={"forked_to": new_record.pipeline_id})
         return new_record
+
+
+# ---------------------------------------------------------------------------
+# Editable-formula pre-validation endpoint (spec §5.3). Net-new: today's
+# revalidate path runs the whole evaluation chain (apps/web/api.py); this one
+# does NOT.
+# ---------------------------------------------------------------------------
+
+
+def pre_validate_formula(
+    formula: str,
+    *,
+    name: str = "",
+    horizon_days: Any = 5,
+    universe_filters: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Canonicalize + ValidationGate a formula WITHOUT persisting, evaluating,
+    or backtesting (spec §5.3).
+
+    Returns a canonical fingerprint of the (formula, universe_filters) spec and
+    the gate status. An unknown operator returns an ``operator_drafts``
+    review-packet REF and NEVER hot-executes: ``ValidationGate`` only RESOLVES
+    the formula against the read-only registry -- it never runs it -- and this
+    endpoint never touches the evaluation/backtest chain or writes anything.
+    The existing operator_drafts review path (Codex/developer audit) is where
+    such an operator is actually promoted; pre-validation stays no-persist.
+    """
+
+    formula = str(formula or "")
+    if not formula.strip():
+        raise ValueError("formula is required")
+    filters = tuple(str(item) for item in universe_filters)
+    # Canonical fingerprint of the pre-validated spec (stable across
+    # key-order/type-shape via the project's one hash helper).
+    fingerprint = canonical_fingerprint({"formula": formula, "universe_filters": list(filters)})
+    try:
+        horizon = int(horizon_days) if horizon_days not in (None, "") else 5
+    except (TypeError, ValueError):
+        horizon = 5
+    base_payload: dict[str, Any] = {
+        "fingerprint": fingerprint,
+        "formula": formula,
+        # Guarantees to the caller/renderer: pre-validation never runs the
+        # formula and never persists (spec §5.3 / WORKORDER pin).
+        "executed": False,
+        "persisted": False,
+    }
+    try:
+        spec = FactorSpec(
+            factor_id="PREVALIDATE",
+            name=name or "pre-validation",
+            formula_dsl=formula,
+            horizon_days=horizon,
+            universe_filters=filters,
+        )
+        result = validate_factor_spec(spec)
+    except Exception:
+        # A malformed formula (parse error) is an honest "blocked", never a
+        # 500 and never an execution. The message is generic and leak-free
+        # (it describes the formula surface, carries no path/secret).
+        LOGGER.debug("pre-validation rejected a malformed formula", exc_info=True)
+        return {
+            **base_payload,
+            "status": "blocked",
+            "unresolved_operators": [],
+            "unresolved_fields": [],
+            "blocking_reasons": ["formula is not parseable under the canonical operator registry"],
+            "warnings": [],
+            "unchecked": [],
+        }
+    payload = {
+        **base_payload,
+        "status": result.status,
+        "unresolved_operators": list(result.unresolved_operators),
+        "unresolved_fields": list(result.unresolved_fields),
+        "blocking_reasons": list(result.blocking_reasons),
+        "warnings": list(result.warnings),
+        "unchecked": list(result.unchecked),
+    }
+    if result.unresolved_operators:
+        payload["status"] = "review_required"
+        payload["review_packet"] = {
+            "channel": "operator_drafts",
+            "unresolved_operators": list(result.unresolved_operators),
+            "hot_executed": False,
+            "note": (
+                "unknown operator requires operator-draft review (Codex/developer audit); "
+                "never hot-executed and not persisted by pre-validation"
+            ),
+        }
+    return payload

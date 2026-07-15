@@ -37,9 +37,11 @@ from quant_forge.apps.web.pipeline import (
     confirm_pipeline,
     create_pipeline,
     create_pipeline_as_fallback,
+    create_rd_pipeline,
     fork_pipeline_from_failure,
     get_pipeline,
     list_active_pipelines,
+    pre_validate_formula,
     retry_pipeline,
     update_pipeline_parameters,
 )
@@ -54,6 +56,7 @@ from quant_forge.specs.pipeline import (
     FACTOR_STUDY_STAGE_IDS,
     LEGAL_TRANSITIONS,
     PIPELINE_KINDS,
+    RD_OPTIMIZE_STAGE_IDS,
     ConfirmState,
     PipelineRecord,
     can_transition,
@@ -136,43 +139,64 @@ def test_legal_transitions_cover_every_status_and_terminal_statuses_are_closed()
 
 
 # ---------------------------------------------------------------------------
-# F14: closed kind vocabulary at the schema layer, not just an API-level check
+# F14 -> P3: rd_optimize is now a first-class kind at the schema layer (the P1
+# note promised this as a reviewed schema addition, not a today-inert value).
 # ---------------------------------------------------------------------------
 
 
-def test_rd_optimize_is_not_in_the_p1_kind_vocabulary_at_all() -> None:
-    assert PIPELINE_KINDS == frozenset({"factor_study"})
+def test_rd_optimize_is_now_a_first_class_kind_with_three_stages() -> None:
+    assert PIPELINE_KINDS == frozenset({"factor_study", "rd_optimize"})
+    assert RD_OPTIMIZE_STAGE_IDS == ("confirm", "run", "leaderboard")
+    stages = initial_stages_for("rd_optimize")
+    assert tuple(stage.stage_id for stage in stages) == RD_OPTIMIZE_STAGE_IDS
+    # An unknown kind is STILL a hard error -- the vocabulary is closed to the
+    # two real kinds, not opened wide.
     with pytest.raises(ValueError, match="unknown pipeline kind"):
-        initial_stages_for("rd_optimize")
+        initial_stages_for("totally_made_up_kind")
 
 
-def test_pipeline_record_construction_rejects_rd_optimize_kind() -> None:
-    with pytest.raises(ValueError, match="invalid pipeline kind"):
+def test_pipeline_record_accepts_rd_optimize_with_its_stages_and_rejects_wrong_ones() -> None:
+    record = PipelineRecord(
+        pipeline_id="PL_" + "a" * 32,
+        kind="rd_optimize",
+        created_at="2026-01-01T00:00:00Z",
+        expires_at="2026-01-02T00:00:00Z",
+        status="draft",
+        stages=initial_stages_for("rd_optimize"),
+        input_hash="deadbeef",
+        confirm=ConfirmState(nonce="n"),
+    )
+    assert record.kind == "rd_optimize"
+    # Stage ids must still map 1:1 onto rd_optimize's execution units --
+    # handing it factor_study's stages is rejected.
+    with pytest.raises(ValueError, match="stages must map 1:1"):
         PipelineRecord(
-            pipeline_id="PL_" + "a" * 32,
+            pipeline_id="PL_" + "b" * 32,
             kind="rd_optimize",
             created_at="2026-01-01T00:00:00Z",
             expires_at="2026-01-02T00:00:00Z",
             status="draft",
-            stages=(),
+            stages=initial_stages_for("factor_study"),
             input_hash="deadbeef",
             confirm=ConfirmState(nonce="n"),
         )
 
 
-def test_pipeline_record_from_dict_rejects_rd_optimize_kind() -> None:
+def test_pipeline_record_from_dict_round_trips_rd_optimize() -> None:
     payload = {
         "pipeline_id": "PL_" + "a" * 32,
         "kind": "rd_optimize",
         "created_at": "2026-01-01T00:00:00Z",
         "expires_at": "2026-01-02T00:00:00Z",
         "status": "draft",
-        "stages": [],
+        "stages": [{"stage_id": stage_id, "status": "pending"} for stage_id in RD_OPTIMIZE_STAGE_IDS],
         "input_hash": "deadbeef",
         "confirm": {"nonce": "n", "version": 1},
     }
-    with pytest.raises(ValueError, match="invalid pipeline kind"):
-        PipelineRecord.from_dict(payload)
+    record = PipelineRecord.from_dict(payload)
+    assert record.kind == "rd_optimize"
+    assert record.to_dict()["kind"] == "rd_optimize"
+    assert record.planning_influence_hash == ""
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +236,10 @@ def test_create_pipeline_from_a_completed_rule_parse_job_lands_in_awaiting_confi
     assert pipeline.revision >= 1
 
 
-def test_create_pipeline_rejects_rd_optimize_in_p1(tmp_path) -> None:
+def test_create_pipeline_still_routes_rd_optimize_to_create_rd_pipeline(tmp_path) -> None:
+    # create_pipeline is the factor_study (parse-seeded) constructor; pipeline
+    # B is created via create_rd_pipeline (seed-id-seeded), so create_pipeline
+    # keeps refusing an rd_optimize kind rather than silently mis-seeding it.
     config, store, job_manager = _new_env(tmp_path)
     parse_job = _parsed_job(config, job_manager)
 
@@ -220,6 +247,219 @@ def test_create_pipeline_rejects_rd_optimize_in_p1(tmp_path) -> None:
         create_pipeline(
             store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config(), kind="rd_optimize"
         )
+
+
+# ---------------------------------------------------------------------------
+# Pipeline B (rd_optimize): create, server-side rounds, confirm/launch,
+# attempt lineage, SE-ix hash stability, no A->B auto-bridge, pre-validation.
+# ---------------------------------------------------------------------------
+
+
+def _seed_factor_id(config, job_manager) -> str:
+    # A factor actually registered in the demo factor_root, so the research
+    # run can resolve the seed (a parse-generated id is never persisted).
+    return "FTR_DEMO_MOMENTUM"
+
+
+def test_create_rd_pipeline_seeds_from_a_factor_and_opens_on_the_confirm_gate(tmp_path) -> None:
+    config, store, job_manager = _new_env(tmp_path)
+    seed = _seed_factor_id(config, job_manager)
+
+    pipeline = create_rd_pipeline(
+        store,
+        job_manager=job_manager,
+        config=config,
+        seed_factor_id=seed,
+        rd_config=_rd_config(),
+        rounds=3,
+        candidates_per_round=4,
+        objective="balanced",
+    )
+
+    assert pipeline.kind == "rd_optimize"
+    assert pipeline.status == "awaiting_confirm"
+    assert tuple(stage.stage_id for stage in pipeline.stages) == RD_OPTIMIZE_STAGE_IDS
+    assert pipeline.stage("confirm").status == "active"
+    assert pipeline.stage("run").status == "pending"
+    assert pipeline.stage("leaderboard").status == "pending"
+    assert pipeline.factor["factor_id"] == seed
+    assert pipeline.parameters == {"rounds": 3, "candidates_per_round": 4, "objective": "balanced"}
+    # No working factor row: RD never overwrites the seed (promotion is G3).
+    assert pipeline.working_factor_id == ""
+    # SE-ix reserved slot present, empty, folded into the hash.
+    assert pipeline.planning_influence_hash == ""
+    assert pipeline.input_hash
+    # Every confirm-card value carries a server-derived badge (spec §5.1); the
+    # record round-trips through load() (which asserts rd coverage).
+    reloaded = store.load(pipeline.pipeline_id)
+    by_field = {entry["field"]: entry for entry in reloaded.provenance}
+    assert set(by_field) == {"rounds", "candidates_per_round", "objective"}
+    assert by_field["rounds"]["source"] == "user_explicit"
+
+
+def test_create_rd_pipeline_requires_a_seed(tmp_path) -> None:
+    config, store, job_manager = _new_env(tmp_path)
+    with pytest.raises(ValueError, match="seed_factor_id is required"):
+        create_rd_pipeline(store, job_manager=job_manager, config=config, seed_factor_id="  ", rd_config=_rd_config())
+
+
+@pytest.mark.parametrize("bad_rounds", [0, -1, 6, 99])
+def test_create_rd_pipeline_rejects_out_of_range_rounds_server_side(tmp_path, bad_rounds) -> None:
+    config, store, job_manager = _new_env(tmp_path)
+    seed = _seed_factor_id(config, job_manager)
+    with pytest.raises(ValueError, match="rounds must be"):
+        create_rd_pipeline(
+            store, job_manager=job_manager, config=config, seed_factor_id=seed, rd_config=_rd_config(), rounds=bad_rounds
+        )
+
+
+def test_confirm_rd_pipeline_launches_the_research_run_and_reaches_the_leaderboard(tmp_path) -> None:
+    config, store, job_manager = _new_env(tmp_path)
+    seed = _seed_factor_id(config, job_manager)
+    pipeline = create_rd_pipeline(
+        store, job_manager=job_manager, config=config, seed_factor_id=seed, rd_config=_rd_config(), rounds=1, candidates_per_round=1
+    )
+
+    confirmed = confirm_pipeline(
+        config,
+        store,
+        pipeline.pipeline_id,
+        nonce=pipeline.confirm.nonce,
+        version=pipeline.confirm.version,
+        job_manager=job_manager,
+        rd_config=_rd_config(),
+    )
+    assert confirmed.status == "running"
+    assert confirmed.attempt.number == 1
+    run_job_id = confirmed.stage("run").child_job_id
+    assert run_job_id
+    # It launched a REAL research job under the "run" stage (not a compute job).
+    assert any(ref.kind == "run_job" and ref.job_id == run_job_id for ref in confirmed.artifact_refs)
+    _wait_job(job_manager, run_job_id, timeout=60.0)
+    reconciled = get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert reconciled.status == "completed"
+    assert reconciled.stage("run").status == "completed"
+    assert reconciled.stage("leaderboard").status == "completed"
+    # RD never publishes a canonical factor (promotion is G3, outside sidecar).
+    assert reconciled.published_factor_id is None
+    assert reconciled.publish_state == ""
+
+
+def test_confirm_rd_pipeline_rejects_out_of_range_rounds_even_if_create_was_bypassed(tmp_path) -> None:
+    # Server-authoritative revalidation at confirm: a client that hand-edits
+    # rounds to an out-of-range value after create still cannot launch.
+    config, store, job_manager = _new_env(tmp_path)
+    seed = _seed_factor_id(config, job_manager)
+    pipeline = create_rd_pipeline(
+        store, job_manager=job_manager, config=config, seed_factor_id=seed, rd_config=_rd_config(), rounds=1
+    )
+    with pytest.raises(ValueError, match="rounds must be"):
+        confirm_pipeline(
+            config,
+            store,
+            pipeline.pipeline_id,
+            nonce=pipeline.confirm.nonce,
+            version=pipeline.confirm.version,
+            job_manager=job_manager,
+            rd_config=_rd_config(),
+            parameters={"rounds": 99},
+        )
+
+
+def test_rd_planning_influence_slot_stays_empty_and_input_hash_is_stable(tmp_path) -> None:
+    # WORKORDER pin: with the SE module absent (default seam returns ""), the
+    # reserved slot stays "" and confirm does not move input_hash.
+    config, store, job_manager = _new_env(tmp_path)
+    seed = _seed_factor_id(config, job_manager)
+    pipeline = create_rd_pipeline(
+        store, job_manager=job_manager, config=config, seed_factor_id=seed, rd_config=_rd_config(), rounds=1, candidates_per_round=1
+    )
+    hash_at_create = pipeline.input_hash
+    confirmed = confirm_pipeline(
+        config,
+        store,
+        pipeline.pipeline_id,
+        nonce=pipeline.confirm.nonce,
+        version=pipeline.confirm.version,
+        job_manager=job_manager,
+        rd_config=_rd_config(),
+    )
+    assert confirmed.planning_influence_hash == ""
+    assert confirmed.input_hash == hash_at_create
+    _wait_job(job_manager, confirmed.stage("run").child_job_id, timeout=60.0)
+
+
+def test_rd_planning_influence_slot_participates_in_the_hash_when_the_seam_returns_a_value(tmp_path, monkeypatch) -> None:
+    # Proves the slot is genuinely folded into input_hash: swapping the SE-ix
+    # seam for one that returns a non-empty value changes the confirm hash,
+    # while the DEFAULT keeps it "" (previous test). No SE module is imported.
+    import quant_forge.apps.web.pipeline as pl
+
+    config, store, job_manager = _new_env(tmp_path)
+    seed = _seed_factor_id(config, job_manager)
+    pipeline = create_rd_pipeline(
+        store, job_manager=job_manager, config=config, seed_factor_id=seed, rd_config=_rd_config(), rounds=1, candidates_per_round=1
+    )
+    monkeypatch.setattr(pl, "capture_planning_influence", lambda *, store, record: "SE_HASH_XYZ")
+    confirmed = confirm_pipeline(
+        config,
+        store,
+        pipeline.pipeline_id,
+        nonce=pipeline.confirm.nonce,
+        version=pipeline.confirm.version,
+        job_manager=job_manager,
+        rd_config=_rd_config(),
+    )
+    assert confirmed.planning_influence_hash == "SE_HASH_XYZ"
+    assert confirmed.input_hash != pipeline.input_hash
+    _wait_job(job_manager, confirmed.stage("run").child_job_id, timeout=60.0)
+
+
+def test_completing_a_factor_study_pipeline_never_auto_creates_an_rd_pipeline(tmp_path) -> None:
+    # WORKORDER pin: no automatic A->B bridge. Running factor_study end to end
+    # leaves ZERO rd_optimize pipelines on disk; B only exists when a user
+    # explicitly creates it with a seed.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    confirmed = confirm_pipeline(
+        config,
+        store,
+        pipeline.pipeline_id,
+        nonce=pipeline.confirm.nonce,
+        version=pipeline.confirm.version,
+        job_manager=job_manager,
+        rd_config=_rd_config(),
+    )
+    _wait_job(job_manager, confirmed.stage("compute").child_job_id, timeout=60.0)
+    completed = get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert completed.status == "completed"
+    # Not one rd_optimize record was spawned by A's completion.
+    kinds = [store.load(pid).kind for pid in store.list_ids()]
+    assert "rd_optimize" not in kinds
+
+
+def test_pre_validate_formula_is_read_only_and_never_executes(tmp_path) -> None:
+    # A resolvable formula is "ready" with a canonical fingerprint; a malformed
+    # one is honest "blocked"; neither ever runs or persists.
+    ready = pre_validate_formula("-rank(market_cap)")
+    assert ready["status"] == "ready"
+    assert ready["fingerprint"]
+    assert ready["executed"] is False and ready["persisted"] is False
+    blocked = pre_validate_formula("this is (( not a formula")
+    assert blocked["status"] == "blocked"
+    assert blocked["executed"] is False
+
+
+def test_pre_validate_unknown_operator_returns_a_review_packet_and_never_executes(tmp_path) -> None:
+    # WORKORDER pin: unknown operator -> operator_drafts review-packet ref,
+    # NEVER hot-executed and NEVER persisted.
+    result = pre_validate_formula("ts_made_up_operator(close, 5)")
+    assert result["status"] == "review_required"
+    assert result["unresolved_operators"] == ["ts_made_up_operator"]
+    assert result["review_packet"]["channel"] == "operator_drafts"
+    assert result["review_packet"]["hot_executed"] is False
+    assert result["executed"] is False and result["persisted"] is False
 
 
 def test_create_pipeline_never_trusts_a_client_supplied_parser_claim(tmp_path) -> None:

@@ -75,12 +75,43 @@ export function renderComparisonTable(payload) {
             <th>公式</th>
             <th>Selection</th>
             <th>样本内回测</th>
-            <th>External OOS</th>
+            <th>External OOS<br><span class="meta">审计</span></th>
             <th>Gate</th>
           </tr>
         </thead>
         <tbody>${body || '<tr><td colspan="8">暂无比较行</td></tr>'}</tbody>
       </table>
+    </div>`;
+}
+
+/* Dedup disposition (agent_sidecar_frontend.md §5.4): every candidate the RD
+ * run considered is disposed as executed | reused | skipped, and all three
+ * counts are SERVER-AUTHORITATIVE — they are read straight off the run
+ * payload, never inferred client-side. `executed` = candidates that actually
+ * ran evaluation/backtest (payload.candidates); `reused` = result-signature
+ * duplicates the server collapsed instead of re-running
+ * (deduplication.result_duplicates); `skipped` = plans the dedup gate dropped
+ * before execution (formula fingerprint + candidate diversity). These are the
+ * multiple-comparison honesty counts the leaderboard must disclose. */
+export function dedupDisposition(payload) {
+  const dedup = payload.deduplication || {};
+  const executed = (payload.candidates || []).length;
+  const reused = Number(dedup.result_duplicates || 0);
+  const skipped = Number(dedup.formula_skipped || 0) + Number(dedup.diversity_skipped || 0);
+  return { executed, reused, skipped };
+}
+
+export function renderDedupDisposition(payload) {
+  const { executed, reused, skipped } = dedupDisposition(payload);
+  return `
+    <div class="panel report-section" id="rd-dedup-disposition">
+      <h3>候选去重处置</h3>
+      <p class="meta">服务端权威计数：executed 为真正评测/回测的候选，reused 为结果指纹重复而复用的候选，skipped 为去重门在执行前丢弃的方案。</p>
+      <p>
+        <span class="pill">executed ${esc(executed)}</span>
+        <span class="pill">reused ${esc(reused)}</span>
+        <span class="pill">skipped ${esc(skipped)}</span>
+      </p>
     </div>`;
 }
 
@@ -187,6 +218,7 @@ export function renderResearch(payload) {
   const candidates = payload.candidates || [];
   const cards = candidates.map(renderCandidateCard).join('');
   rdResultEl.innerHTML = renderRdSummary(payload)
+    + renderDedupDisposition(payload)
     + (cards || '<div class="panel"><h3>无候选</h3></div>')
     + renderComparisonTable(payload);
 }

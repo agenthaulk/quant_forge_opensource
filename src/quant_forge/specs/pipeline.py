@@ -8,13 +8,20 @@ statuses and starts its worker immediately) with a real, persisted status
 that can sit `awaiting_confirm` indefinitely with NO worker thread parked on
 a human.
 
-Only ``factor_study`` (pipeline A: 解析→假设确认→计算→报告, report TERMINAL) is
-constructible or deserializable in this P1 build (phase-review finding F14):
-``PIPELINE_KINDS`` is closed to that one value, so a payload claiming
-``kind="rd_optimize"`` fails ``PipelineRecord.__post_init__``/``from_dict``
-outright rather than silently round-tripping. Pipeline B's kind, stage ids,
-and legal transitions land as a real schema addition in P3, not as a
-today-inert placeholder value that could be constructed by accident.
+Two kinds are constructible (P3 schema addition, landing exactly as the P1
+F14 note below promised — a reviewed schema change, not a today-inert
+placeholder that could be built by accident):
+
+* ``factor_study`` (pipeline A: 解析→假设确认→计算→报告, report TERMINAL);
+* ``rd_optimize`` (pipeline B: RD 确认→RD 运行→排行榜, leaderboard TERMINAL),
+  seeded from a completed report or a registry factor, never auto-bridged
+  from A (spec §2.1). Its N rounds run inside ONE job (spec §2.2), so it is
+  three truth-mapped stages, not one-per-round.
+
+Both kinds share the SAME status graph (``LEGAL_TRANSITIONS`` is keyed by
+status, not kind) and the SAME idempotent-confirm / rejoin / expiry
+machinery in :mod:`quant_forge.apps.web.pipeline`; only their stage ids and
+their compute-stage side effects differ.
 
 Every function here is pure (dataclasses + validation + serialization only);
 no filesystem or clock access. Persistence, locking, and journaling live in
@@ -37,6 +44,7 @@ __all__ = [
     "STAGE_STATUSES",
     "TERMINAL_PIPELINE_STATUSES",
     "FACTOR_STUDY_STAGE_IDS",
+    "RD_OPTIMIZE_STAGE_IDS",
     "STAGE_IDS_BY_KIND",
     "LEGAL_TRANSITIONS",
     "PipelineKind",
@@ -54,12 +62,15 @@ __all__ = [
 
 PIPELINE_SCHEMA_VERSION = "qf.pipeline.v1"
 
-# F14 (phase review, binding): closed to factor_study only. P3 adds
-# "rd_optimize" here, plus its own stage ids and legal-transition edges, as a
-# deliberate schema change reviewed at that time -- not a value that exists
-# in the type system today but is merely unused.
-PipelineKind = Literal["factor_study"]
-PIPELINE_KINDS: frozenset[str] = frozenset({"factor_study"})
+# F14 (phase review) was: closed to factor_study only, with "rd_optimize" to
+# land in P3 as a deliberate, reviewed schema change (never a today-inert
+# placeholder). P3 is here: "rd_optimize" is now a first-class kind with its
+# own stage ids (below). No NEW legal-transition edges were needed -- both
+# kinds share the status graph in LEGAL_TRANSITIONS; only stage ids and the
+# compute-stage side effects (publish vs. no-publish) differ, and those live
+# in apps/web/pipeline.py, not in this pure type layer.
+PipelineKind = Literal["factor_study", "rd_optimize"]
+PIPELINE_KINDS: frozenset[str] = frozenset({"factor_study", "rd_optimize"})
 
 PipelineStatus = Literal[
     "draft",
@@ -91,8 +102,19 @@ STAGE_STATUSES: tuple[str, ...] = ("pending", "active", "completed", "failed", "
 # stage/round events (spec §12 open question #1).
 FACTOR_STUDY_STAGE_IDS: tuple[str, ...] = ("parse", "confirm", "compute", "report")
 
+# rd_optimize = RD 确认 → RD 运行 → 排行榜 (spec §2.1/§2.2). Three stages, NOT
+# one-per-round: the whole N-round chain runs inside ONE research job (the
+# existing `research_run_once` workflow), so honest stage granularity (D11)
+# maps the run to a single stage and never fakes per-round lights. There is
+# no "parse" stage: pipeline B is seeded from an already-resolved factor
+# (a completed report or a registry factor), so it opens directly on the RD
+# confirm gate. `leaderboard` is TERMINAL (the candidate ranking display),
+# mirroring `report` for factor_study.
+RD_OPTIMIZE_STAGE_IDS: tuple[str, ...] = ("confirm", "run", "leaderboard")
+
 STAGE_IDS_BY_KIND: dict[str, tuple[str, ...]] = {
     "factor_study": FACTOR_STUDY_STAGE_IDS,
+    "rd_optimize": RD_OPTIMIZE_STAGE_IDS,
 }
 
 # Legal transitions (spec §2.3). Keyed by FROM status; value is the set of
