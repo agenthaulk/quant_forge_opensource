@@ -1385,7 +1385,8 @@ def _cmd_memory_priors(args: argparse.Namespace) -> int:
         return 0
     print(
         f"priors as_of={view.as_of} envelopes={view.total_envelopes} "
-        f"evidence_runs={view.total_evidence_runs} oos_excluded={view.oos_excluded}"
+        f"evidence_runs={view.total_evidence_runs} oos_excluded={view.oos_excluded} "
+        f"invalid_rows={view.invalid_rows}"
     )
     for table in view.tables:
         print(f"\n[{table.dimension}] (unbucketed: {table.unbucketed})")
@@ -1400,6 +1401,7 @@ def _cmd_memory_priors(args: argparse.Namespace) -> int:
             print(
                 f"  {cell.bucket}: runs={cell.evidence_runs} passed={counts.get('passed', 0)} "
                 f"blocked={counts.get('blocked', 0)} unknown={counts.get('unknown', 0)} "
+                f"not_applicable={counts.get('not_applicable', 0)} "
                 f"rate={rate} weighted={weighted}"
                 + (" (insufficient_sample)" if cell.insufficient_sample else "")
                 + f" | blocked_reasons: {reasons}"

@@ -624,20 +624,7 @@ class ResearchMemoryStore:
 
         with advisory_file_lock(self._lock_path):
             snapshot = self._rule_snapshot_unlocked()
-        results: list[dict[str, Any]] = []
-        for info in snapshot.values():
-            if info["state"] != "active":
-                continue
-            results.append(
-                {
-                    **info["row"],
-                    "event_id": info["event_id"],
-                    "reviewed_entry_id": info["reviewed_entry_id"],
-                    "activation_seq": info["activation_seq"],
-                    "decided_at": info["decided_at"],
-                }
-            )
-        return tuple(results)
+        return self._effective_rules_from_snapshot(snapshot)
 
     def rule_review_snapshot(self) -> dict[str, dict[str, Any]]:
         """Atomic, full state classification of every LIVE rule row (R2-7):
@@ -928,10 +915,60 @@ class ResearchMemoryStore:
         never stamp a revision that disagrees with the rows it actually
         saw -- the TOCTOU a separate ``outcomes_revision()`` call after an
         unlocked read would reintroduce.
+
+        Read-path honesty (SE-P5 review P5-F7): an ABSENT ledger returns
+        empty WITHOUT touching the lock sidecar (a pure read command must
+        not create state under an empty artifact root), and a lock that
+        cannot be opened at all (read-only filesystem) degrades to a
+        lockless read -- safe exactly there, because a filesystem that
+        refuses the lock write refuses every concurrent writer too.
+        """
+
+        if not self.outcomes_ledger_path.exists():
+            return ()
+        try:
+            with advisory_file_lock(self._lock_path):
+                return tuple(_read_jsonl(self.outcomes_ledger_path))
+        except OSError:
+            logger.debug("lock unavailable for %s; lockless read on read-only store", self.outcomes_ledger_path)
+            return tuple(_read_jsonl(self.outcomes_ledger_path))
+
+    def planning_influence_inputs(self) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], int]:
+        """(outcome envelopes, effective active rules, review-events
+        revision) captured under ONE lock hold (SE-P5 review P5-F5).
+
+        The planning-influence snapshot must describe ONE durable instant:
+        reading the ledger and the rule state under separate lock
+        acquisitions let a write land in between and pair outcomes revision
+        N with a rule set that only existed after N. The third element is
+        the count of VALID review events -- the append-only activation
+        log's own monotone revision (P5-F4: the previous
+        max-activation_seq-of-active-rows regressed on deactivation and
+        could not pin which events existed).
         """
 
         with advisory_file_lock(self._lock_path):
-            return tuple(_read_jsonl(self.outcomes_ledger_path))
+            records = tuple(_read_jsonl(self.outcomes_ledger_path))
+            snapshot = self._rule_snapshot_unlocked()
+            events_revision = len(self._read_review_events_unlocked())
+        return records, self._effective_rules_from_snapshot(snapshot), events_revision
+
+    @staticmethod
+    def _effective_rules_from_snapshot(snapshot: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+        results: list[dict[str, Any]] = []
+        for info in snapshot.values():
+            if info["state"] != "active":
+                continue
+            results.append(
+                {
+                    **info["row"],
+                    "event_id": info["event_id"],
+                    "reviewed_entry_id": info["reviewed_entry_id"],
+                    "activation_seq": info["activation_seq"],
+                    "decided_at": info["decided_at"],
+                }
+            )
+        return tuple(results)
 
     def ingest_outcome_rows(
         self, record: Mapping[str, Any], observations: Sequence[MemoryObservation]

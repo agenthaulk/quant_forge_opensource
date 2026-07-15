@@ -12,21 +12,29 @@ view exists for the human read surface and for the SE-ix
 
 Evidence discipline (each rule carries its own reason):
 
-* **Unit = evidence run, not row.** Within one bucket, all envelopes
-  sharing an ``evidence_run_id`` collapse to the LATEST one in ledger
-  order: a re-measured outcome (same factor x window x stage, new
-  ``outcome_id``) supersedes its predecessor's verdict instead of voting
-  beside it, mirroring ``memory.promote``'s own anti-gaming cap (<=1
-  observation per (signature, run_id)).
+* **Rows are re-validated on read.** The write path's frozen contract
+  cannot bind a foreign or corrupt writer under the artifact root, so
+  every envelope is schema/closed-vocabulary checked before it can count
+  (verdict, strength, sample_role, reason codes, scope grammar with
+  reserved sentinels rejected); invalid rows are EXCLUDED and surfaced in
+  ``invalid_rows``, never silently zero-weighted or bucketed (review
+  round P5-F6/OP5-F1/OP5-F2).
+* **Unit = evidence run, not row.** ALL valid envelopes sharing an
+  ``evidence_run_id`` collapse to the LATEST one in ledger order FIRST: a
+  re-measured outcome (same factor x window x stage, new ``outcome_id``)
+  supersedes its predecessor's verdict instead of voting beside it,
+  mirroring ``memory.promote``'s own anti-gaming cap (<=1 observation per
+  (signature, run_id)).
 * **Four verdicts counted separately** (SE-v). Only ``passed``/``blocked``
   are scientific answers, so ONLY they enter a rate denominator;
   ``unknown``/``not_applicable`` are reported as counts and nothing else
   (a pending submission is not evidence for either side -- FP-4).
-* **OOS-role rows never steer** (FP-G / owner ruling R5-3's sample-role
-  axis): an envelope whose ``sample_role`` is ``out_of_sample`` is
-  excluded from every count and rate and tallied in ``oos_excluded`` --
-  confirmatory holdout results must not become priors that steer the
-  search that will later be judged on them.
+* **OOS-role runs never steer** (FP-G / owner ruling R5-3's sample-role
+  axis), judged on the SURVIVING envelope AFTER supersession: a run whose
+  latest measurement is ``out_of_sample`` contributes nothing anywhere
+  and is tallied in ``oos_excluded``. Ordering matters (review round
+  P5-F2): excluding OOS rows before supersession let a stale in-sample
+  verdict outlive the OOS re-measurement that superseded it.
 * **Unknown dimension values do not unify** (R-F4's spirit): a row whose
   bucket dimension is ``""`` cannot honestly generalize along that
   dimension; it is tallied in that table's ``unbucketed`` counter, never
@@ -55,9 +63,24 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping
 
+import re
+
 from quant_forge.lineage.store import canonical_fingerprint
 from quant_forge.research_loop.memory import ResearchMemoryStore
-from quant_forge.research_loop.outcomes import EVIDENCE_STRENGTHS, VERDICTS
+from quant_forge.research_loop.outcomes import (
+    EVIDENCE_STRENGTHS,
+    REASON_CODES,
+    RESEARCH_OUTCOME_RECORD_SCHEMA_VERSION,
+    SAMPLE_ROLES,
+    VERDICTS,
+)
+
+# Mirrors outcomes.OutcomeScope's own dimension grammar + reserved sentinels
+# (module-private there; reproduced with a pointer comment, same as llm.py's
+# scope parser does): the priors view reads RAW DISK DICTS, so the write-time
+# invariants must be re-checked on read (review round: P5-F6/OP5-F1).
+_SCOPE_DIM_RE = re.compile(r"^[a-z0-9_.\-]{0,32}$")
+_RESERVED_SCOPE_SENTINELS = frozenset({"unknown", "global"})
 
 __all__ = [
     "PRIORS_SCHEMA_VERSION",
@@ -179,6 +202,7 @@ class PriorsView:
     total_envelopes: int
     total_evidence_runs: int
     oos_excluded: int
+    invalid_rows: int
     tables: tuple[PriorsTable, ...] = field(default_factory=tuple)
     schema_version: str = PRIORS_SCHEMA_VERSION
 
@@ -191,8 +215,49 @@ class PriorsView:
             "total_envelopes": self.total_envelopes,
             "total_evidence_runs": self.total_evidence_runs,
             "oos_excluded": self.oos_excluded,
+            "invalid_rows": self.invalid_rows,
             "tables": [table.to_dict() for table in self.tables],
         }
+
+
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _record_is_valid(record: dict[str, Any]) -> bool:
+    """Read-path re-validation of one ledger envelope (P5-F6/OP5-F1/OP5-F2).
+
+    The write path already enforces all of this through the frozen
+    ``ResearchOutcome`` contract; the view reads RAW DISK DICTS, so a
+    foreign or corrupt writer under the artifact root could otherwise push
+    reserved sentinels, invented reason strings, or unknown strengths into
+    cells and terminal output. Invalid rows are EXCLUDED and counted --
+    never silently zero-weighted, never a bucket.
+    """
+
+    if str(record.get("record_schema", "")) != RESEARCH_OUTCOME_RECORD_SCHEMA_VERSION:
+        return False
+    if not _HEX64_RE.fullmatch(str(record.get("evidence_run_id", ""))):
+        return False
+    if str(record.get("evidence_strength", "")) not in EVIDENCE_STRENGTHS:
+        return False
+    outcome = record.get("outcome")
+    if not isinstance(outcome, dict):
+        return False
+    if str(outcome.get("verdict", "")) not in VERDICTS:
+        return False
+    if str(outcome.get("sample_role", "")) not in SAMPLE_ROLES:
+        return False
+    reasons = outcome.get("reason_codes")
+    if not isinstance(reasons, list) or not all(str(code) in REASON_CODES for code in reasons):
+        return False
+    scope = outcome.get("scope")
+    if not isinstance(scope, dict):
+        return False
+    for dimension in PRIOR_DIMENSIONS:
+        value = str(scope.get(dimension, "") or "")
+        if value in _RESERVED_SCOPE_SENTINELS or not _SCOPE_DIM_RE.fullmatch(value):
+            return False
+    return True
 
 
 def compute_priors(store: ResearchMemoryStore, query: PriorsQuery | None = None) -> PriorsView:
@@ -200,27 +265,38 @@ def compute_priors(store: ResearchMemoryStore, query: PriorsQuery | None = None)
 
     Pure function of (ledger content, query): the single locked ledger read
     supplies both the rows and ``as_of`` (the valid-row count IS the
-    revision), so the stamp cannot race the data.
+    revision), so the stamp cannot race the data. Row pipeline, in order
+    (each step's reason in the module docstring):
+
+    1. schema/closed-vocabulary validation -- invalid rows excluded +
+       counted (``invalid_rows``);
+    2. supersession -- LATEST envelope per evidence run wins;
+    3. OOS-role exclusion -- applied to the SURVIVING envelope (review
+       round P5-F2: excluding OOS rows BEFORE supersession let a stale
+       in-sample verdict outlive the OOS re-measurement that superseded
+       it).
     """
 
     query = query or PriorsQuery()
     records = store.outcome_records()
     as_of = len(records)
 
-    eligible: list[dict[str, Any]] = []
-    oos_excluded = 0
-    # Latest envelope per evidence run wins (ledger order == append order).
+    invalid_rows = 0
     latest_by_run: dict[str, dict[str, Any]] = {}
     for record in records:
+        if not _record_is_valid(record):
+            invalid_rows += 1
+            continue
+        latest_by_run[str(record["evidence_run_id"])] = record
+
+    eligible: list[dict[str, Any]] = []
+    oos_excluded = 0
+    for record in latest_by_run.values():
         outcome = record.get("outcome") or {}
         if str(outcome.get("sample_role", "")) == "out_of_sample":
             oos_excluded += 1
             continue
-        run_id = str(record.get("evidence_run_id", ""))
-        if not run_id:
-            continue
-        latest_by_run[run_id] = record
-    eligible = list(latest_by_run.values())
+        eligible.append(record)
 
     tables = tuple(_dimension_table(dimension, eligible, query) for dimension in query.dimensions)
     return PriorsView(
@@ -229,6 +305,7 @@ def compute_priors(store: ResearchMemoryStore, query: PriorsQuery | None = None)
         total_envelopes=len(records),
         total_evidence_runs=len(latest_by_run),
         oos_excluded=oos_excluded,
+        invalid_rows=invalid_rows,
         tables=tables,
     )
 
