@@ -449,11 +449,19 @@ def _memory_items_for_prompt(items: tuple[dict[str, Any], ...] | list[dict[str, 
     the same tuples keep their existing prompt channels), and only the
     already-redacted statement plus observation_count are forwarded. Disk is
     not trusted at read time: after collapsing the statement to a single line it
-    must FULLY match one of the two service statement templates
-    (``_MEMORY_STATEMENT_PATTERNS``). A conforming prefix followed by an
-    appended payload does not match and is dropped, so free text written by any
-    other same-host writer cannot steer prompts. ``_MEMORY_STATEMENT_MAX_CHARS``
-    is a secondary defense-in-depth length bound, not the primary gate.
+    must FULLY match one of the accepted engine-minted shapes -- either a legacy
+    service statement template (``_MEMORY_STATEMENT_PATTERNS``) OR the
+    ResearchOutcome-derived grammar (``_authenticate_outcome_statement``, SE-i/
+    SE-ii). This is the SAME union the active_rules channel authenticates
+    (SE-iv): once SE-P2 migrated the local candidate-gate recorder to emit
+    ResearchOutcome statements, promoted findings/failures carry the outcome
+    grammar, so the passive recall gate must recognize it too or newly-promoted
+    lessons silently stop steering hypothesis generation. A conforming prefix
+    followed by an appended payload matches neither and is dropped, so free text
+    written by any other same-host writer cannot steer prompts. Passive recall
+    forwards only the statement text (no ``scope`` field), so there is no
+    scope-spoofing surface here. ``_MEMORY_STATEMENT_MAX_CHARS`` is a secondary
+    defense-in-depth length bound, not the primary gate.
     """
 
     bounded: list[dict[str, Any]] = []
@@ -463,7 +471,10 @@ def _memory_items_for_prompt(items: tuple[dict[str, Any], ...] | list[dict[str, 
         statement = " ".join(str(item.get("statement") or "").split())
         if len(statement) > _MEMORY_STATEMENT_MAX_CHARS:
             continue
-        if not any(pattern.match(statement) for pattern in _MEMORY_STATEMENT_PATTERNS):
+        if not (
+            any(pattern.match(statement) for pattern in _MEMORY_STATEMENT_PATTERNS)
+            or _authenticate_outcome_statement(statement) is not None
+        ):
             continue
         bounded.append(
             {
