@@ -202,6 +202,15 @@ class PlanningInfluenceSnapshot:
             missing = sorted(expected - keys)
             extra = sorted(keys - expected)
             raise ValueError(f"planning_influence payload key mismatch (missing={missing}, extra={extra})")
+        # Exact-type integers (final-round RV3-F2): dict equality treats
+        # True == 1, so the canonical-form check alone cannot catch a bool
+        # smuggled into an int field. `type(...) is int` excludes bool.
+        for int_field in ("as_of", "review_events_revision"):
+            if type(payload[int_field]) is not int:
+                raise ValueError(f"planning_influence {int_field} must be a plain integer")
+        for rule in payload.get("active_rules") or ():
+            if isinstance(rule, dict) and type(rule.get("activation_seq")) is not int:
+                raise ValueError("planning_influence active_rules activation_seq must be a plain integer")
         recorded_hash = str(payload["snapshot_hash"])
         if not _HEX64_RE.fullmatch(recorded_hash):
             raise ValueError("planning_influence snapshot_hash must be 64-hex")

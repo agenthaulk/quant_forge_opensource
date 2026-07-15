@@ -537,5 +537,47 @@ def test_from_dict_rejects_non_canonical_field_types(tmp_path: Path) -> None:
     snapshot = capture_planning_influence(store)
     payload = json.loads(json.dumps(snapshot.to_dict()))
     payload["as_of"] = str(payload["as_of"])
-    with pytest.raises(ValueError, match="canonical serialized form"):
+    # The exact-int type gate (RV3-F2) fires first for this field; both
+    # layers reject non-canonical typing either way.
+    with pytest.raises(ValueError, match="plain integer|canonical serialized form"):
+        PlanningInfluenceSnapshot.from_dict(payload)
+
+
+def test_lifecycle_stage_coherence_is_bidirectional(tmp_path: Path) -> None:
+    # RV3-F1 (final round): submit REQUIRES a lifecycle; every other stage
+    # FORBIDS one -- both directions are unmintable otherwise.
+    store = _store(tmp_path)
+    ingest_outcome(store, _outcome(_fp(1), verdict="blocked"))
+    ledger = store.outcomes_ledger_path
+    genuine = json.loads(ledger.read_text(encoding="utf-8").splitlines()[0])
+
+    submit_without_lifecycle = json.loads(json.dumps(genuine))
+    submit_without_lifecycle["evidence_run_id"] = "6" * 64
+    submit_without_lifecycle["outcome"]["stage"] = "submit"
+    submit_without_lifecycle["evidence_strength"] = "submitted_live"
+    submit_without_lifecycle["outcome"]["lifecycle_status"] = ""
+
+    gate_with_lifecycle = json.loads(json.dumps(genuine))
+    gate_with_lifecycle["evidence_run_id"] = "7" * 64
+    gate_with_lifecycle["outcome"]["lifecycle_status"] = "accepted"
+
+    with ledger.open("a", encoding="utf-8") as handle:
+        for row in (submit_without_lifecycle, gate_with_lifecycle):
+            handle.write(json.dumps(row) + "\n")
+
+    view = compute_priors(store)
+    assert view.invalid_rows == 2
+    assert view.total_evidence_runs == 1
+
+
+def test_from_dict_rejects_bool_smuggled_into_int_fields(tmp_path: Path) -> None:
+    # RV3-F2 (final round): True == 1 defeats plain dict equality; exact
+    # type checks must reject it.
+    store = _store(tmp_path)
+    ingest_outcome(store, _outcome(_fp(1)))
+    snapshot = capture_planning_influence(store)
+    payload = json.loads(json.dumps(snapshot.to_dict()))
+    assert payload["as_of"] == 1
+    payload["as_of"] = True
+    with pytest.raises(ValueError, match="plain integer"):
         PlanningInfluenceSnapshot.from_dict(payload)

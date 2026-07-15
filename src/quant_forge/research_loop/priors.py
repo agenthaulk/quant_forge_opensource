@@ -275,8 +275,18 @@ def _record_is_valid(record: Any) -> bool:
         return False
     if verdict == "blocked" and (REASON_NONE in reason_set):
         return False
+    # Bidirectional stage<->lifecycle coherence (final-round RV3-F1): the
+    # frozen contract makes lifecycle representable ONLY on submit, and
+    # every submit row carries one -- a submit row WITHOUT lifecycle could
+    # otherwise claim submitted_live weight with no lifecycle proof, and a
+    # gate row WITH one is equally unmintable.
     lifecycle = str(outcome.get("lifecycle_status", "") or "")
-    if lifecycle and SUBMIT_LIFECYCLE_VERDICTS.get(lifecycle) != verdict:
+    if stage == "submit":
+        if lifecycle not in SUBMIT_LIFECYCLE_VERDICTS:
+            return False
+        if SUBMIT_LIFECYCLE_VERDICTS[lifecycle] != verdict:
+            return False
+    elif lifecycle:
         return False
     scope = outcome.get("scope")
     if not isinstance(scope, dict):
