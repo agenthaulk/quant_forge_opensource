@@ -705,10 +705,13 @@ def test_get_pipeline_reconciles_a_completed_job_into_the_report_stage(tmp_path)
 # ---------------------------------------------------------------------------
 
 
-def test_rejoin_after_restart_recognizes_a_genuinely_completed_job_via_run_index(tmp_path) -> None:
-    # phase-review F9: a completed-but-pruned job, or any job after a server
-    # restart, must NOT be rewritten as a JOB_NOT_FOUND failure -- the
-    # durable RunIndex lineage is independent proof the compute finished.
+def test_rejoin_after_restart_recognizes_a_genuinely_completed_job_via_completion_artifact(tmp_path) -> None:
+    # phase-review F9 + re-verify RV-F4: a completed-but-pruned job, or any
+    # job after a server restart, must NOT be rewritten as a JOB_NOT_FOUND
+    # failure -- the ATTEMPT-SCOPED completion artifact the compute job
+    # itself wrote at the moment of success is the independent proof (the
+    # earlier unscoped RunIndex row-count probe could credit a prior
+    # attempt's rows to the current attempt).
     config, store, job_manager = _new_env(tmp_path)
     parse_job = _parsed_job_with_request(config, job_manager)
     pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
@@ -1076,15 +1079,13 @@ def test_fallback_to_rule_parse_creates_a_new_pipeline_with_parent_lineage_and_a
     failed = get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
     assert failed.status == "paused_failure"
 
-    # Caller already ran a fresh rule-mode parse against the same text --
-    # exactly what the frontend does via the existing /api/jobs/parse-idea
-    # endpoint (unchanged).
-    new_parse_job = _parsed_job_with_request(config, job_manager)
-
+    # Re-verify RV-F10: the rule parse now runs SERVER-SIDE inside
+    # create_pipeline_as_fallback, against the failed pipeline's own
+    # persisted source_text -- no client-supplied parse job id exists in the
+    # contract at all anymore.
     fallback = create_pipeline_as_fallback(
         store,
         job_manager=job_manager,
-        parse_job_id=new_parse_job["job_id"],
         rd_config=_rd_config(),
         parent_pipeline_id=pipeline.pipeline_id,
         config=config,
@@ -1093,6 +1094,14 @@ def test_fallback_to_rule_parse_creates_a_new_pipeline_with_parent_lineage_and_a
     assert fallback.status == "awaiting_confirm"
     assert fallback.attempt.parent_run_id == pipeline.pipeline_id
     assert fallback.attempt.number == 1
+    # The fallback's parse artifact is genuinely the RULE parser's output,
+    # derived from the parent's persisted idea text.
+    assert fallback.parser.get("source") == "rule"
+    assert fallback.source_text == pipeline.source_text
+    # Server-side synchronous parse: the parse ref carries no job id.
+    parse_refs = [ref for ref in fallback.artifact_refs if ref.kind == "parse"]
+    assert len(parse_refs) == 1
+    assert parse_refs[0].job_id is None
 
     old_after_fallback = get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
     assert old_after_fallback.status == "aborted"
@@ -1102,13 +1111,11 @@ def test_fallback_to_rule_parse_rejects_a_non_paused_parent(tmp_path) -> None:
     config, store, job_manager = _new_env(tmp_path)
     parse_job = _parsed_job_with_request(config, job_manager)
     pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
-    other_parse_job = _parsed_job_with_request(config, job_manager)
 
     with pytest.raises(PipelineConflictError, match="not paused"):
         create_pipeline_as_fallback(
             store,
             job_manager=job_manager,
-            parse_job_id=other_parse_job["job_id"],
             rd_config=_rd_config(),
             parent_pipeline_id=pipeline.pipeline_id,
             config=config,
@@ -1218,3 +1225,286 @@ def test_store_load_prefers_the_journal_when_it_is_ahead_of_the_snapshot(tmp_pat
     recovered = store.load(pipeline.pipeline_id)
     assert recovered.revision == edited.revision
     assert recovered.parameters["holding_days"] == 42
+
+
+# ---------------------------------------------------------------------------
+# Re-verify round 2 (RV-F1..RV-F6, RV-F9 + Cluster A payload semantics)
+# ---------------------------------------------------------------------------
+
+import json
+
+import quant_forge.apps.web.pipeline as pipeline_module
+from quant_forge.core.contracts import FactorDefinition as _FactorDefinition
+
+
+def _confirm(config, store, pipeline, job_manager):
+    return confirm_pipeline(
+        config, store, pipeline.pipeline_id,
+        nonce=pipeline.confirm.nonce, version=pipeline.confirm.version,
+        job_manager=job_manager, rd_config=_rd_config(),
+    )
+
+
+def test_confirm_token_reuse_with_a_different_payload_is_a_conflict(tmp_path) -> None:
+    # Cluster A (re-verify): the token is single-use PER PAYLOAD. Two tabs
+    # holding the same (nonce, version): the first confirms with edits, the
+    # second submits DIFFERENT edits with the now-consumed token -- the old
+    # behavior silently treated it as an idempotent replay of the first.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+
+    first = confirm_pipeline(
+        config, store, pipeline.pipeline_id,
+        nonce=pipeline.confirm.nonce, version=pipeline.confirm.version,
+        job_manager=job_manager, rd_config=_rd_config(),
+        parameters={"holding_days": 7},
+    )
+    assert first.status == "running"
+    assert first.confirmed_parameters["holding_days"] == 7
+
+    # Same spent token, same payload: idempotent replay returns the run.
+    replay = confirm_pipeline(
+        config, store, pipeline.pipeline_id,
+        nonce=pipeline.confirm.nonce, version=pipeline.confirm.version,
+        job_manager=job_manager, rd_config=_rd_config(),
+        parameters={"holding_days": 7},
+    )
+    assert replay.pipeline_id == first.pipeline_id
+    assert replay.attempt.number == first.attempt.number
+
+    # Same spent token, DIFFERENT payload: conflict, never a silent discard.
+    with pytest.raises(PipelineConflictError, match="different parameter payload"):
+        confirm_pipeline(
+            config, store, pipeline.pipeline_id,
+            nonce=pipeline.confirm.nonce, version=pipeline.confirm.version,
+            job_manager=job_manager, rd_config=_rd_config(),
+            parameters={"holding_days": 9},
+        )
+    _wait_job(job_manager, first.stage("compute").child_job_id)
+
+
+def test_expiry_rotates_the_confirm_token(tmp_path) -> None:
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    expired_at = pipeline.with_updates(expires_at="2000-01-01T00:00:00Z")
+    store.save(expired_at, event="test_forced_expiry_setup")
+
+    reconciled = get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert reconciled.status == "expired"
+    assert reconciled.confirm.nonce != pipeline.confirm.nonce
+    assert reconciled.confirm.version > pipeline.confirm.version
+
+
+def test_publish_cas_declines_when_canonical_row_changed_mid_run(tmp_path) -> None:
+    # RV-F1: a canonical draft edited BETWEEN confirm and completion must be
+    # preserved -- the completed pipeline reports publish_state="conflict"
+    # instead of clobbering the newer content with its snapshot of the past.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    _wait_job(job_manager, confirmed.stage("compute").child_job_id)
+
+    # Concurrent actor edits (creates) the canonical row while compute ran.
+    repo = FactorRepository(config.paths.factor_root)
+    canonical_id = str(pipeline.factor["factor_id"])
+    repo.save(
+        _FactorDefinition(
+            factor_id=canonical_id, name="edited_mid_run", formula="rank(volume)", status="draft",
+            description="a concurrent human edit that must survive",
+        )
+    )
+
+    done = get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert done.status == "completed"
+    assert done.publish_state == "conflict"
+    assert done.published_factor_id is None
+    survived = repo.get(canonical_id)
+    assert survived.name == "edited_mid_run"
+    assert survived.formula == "rank(volume)"
+
+
+def test_publish_cas_succeeds_when_canonical_row_unchanged(tmp_path) -> None:
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    _wait_job(job_manager, confirmed.stage("compute").child_job_id)
+
+    done = get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert done.status == "completed"
+    assert done.publish_state == "published"
+    assert done.published_factor_id == pipeline.factor["factor_id"]
+
+
+def test_terminal_cleanup_removes_cached_working_values_from_both_roots(tmp_path) -> None:
+    # RV-F2: cancel/fail/abort must remove the working id's cached value
+    # directories, not just the registry row.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+
+    # The demo env leaves both value roots unset; configure them the way a
+    # real deployment does so the cleanup path has something to sweep.
+    from dataclasses import replace as _dc_replace
+
+    values_root = config.paths.artifact_root / "test_factor_values"
+    overlay_root = config.paths.artifact_root / "test_overlay_values"
+    config = _dc_replace(
+        config,
+        paths=_dc_replace(config.paths, factor_values_root=values_root, factor_values_overlay_root=overlay_root),
+    )
+    from quant_forge.factor_library.classification import FACTOR_CATEGORY_DIRS
+
+    category_dir = next(iter(FACTOR_CATEGORY_DIRS.values()))
+    orphan_dir = values_root / category_dir / f"factor_id={pipeline.working_factor_id.upper()}"
+    orphan_dir.mkdir(parents=True, exist_ok=True)
+    (orphan_dir / "2024.parquet").write_bytes(b"stub")
+    # And the raw-id spelling under the overlay root itself.
+    raw_dir = overlay_root / pipeline.working_factor_id
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    (raw_dir / "2024.parquet").write_bytes(b"stub")
+
+    cancelled = cancel_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert cancelled.status == "aborted"
+    assert cancelled.cleanup_pending is False
+    assert not orphan_dir.exists()
+    assert not raw_dir.exists()
+
+
+def test_failed_cleanup_persists_cleanup_pending_and_reconcile_retries_it(tmp_path, monkeypatch) -> None:
+    # RV-F3: a cleanup failure must not be swallowed once and forgotten --
+    # the record carries cleanup_pending and the next load retries it.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+
+    original_delete = pipeline_module.FactorRepository.delete
+
+    def _boom(self, factor_id):
+        raise RuntimeError("simulated registry outage")
+
+    monkeypatch.setattr(pipeline_module.FactorRepository, "delete", _boom)
+    cancelled = cancel_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert cancelled.status == "aborted"
+    assert cancelled.cleanup_pending is True
+
+    monkeypatch.setattr(pipeline_module.FactorRepository, "delete", original_delete)
+    retried = get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert retried.cleanup_pending is False
+
+
+def test_stale_completion_artifact_from_another_attempt_does_not_complete(tmp_path) -> None:
+    # RV-F4 (attack side): an artifact keyed to a DIFFERENT child job /
+    # attempt / input hash is not completion evidence for this record.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    _wait_job(job_manager, confirmed.stage("compute").child_job_id)
+
+    # Forge a stale artifact naming a different attempt + job id.
+    pipeline_module._write_completion_artifact(
+        store,
+        pipeline_id=pipeline.pipeline_id,
+        child_job_id="JOB_someone_else",
+        attempt=99,
+        input_hash="not-this-input",
+        result={"forged": True},
+    )
+    fresh_job_manager = _WebJobManager()
+    fresh_store = PipelineStore(config.paths.artifact_root)
+    rejoined = get_pipeline(fresh_store, pipeline.pipeline_id, job_manager=fresh_job_manager, config=config)
+    # The record was still "running" on disk; the mismatched artifact must
+    # NOT complete it -- honest paused_failure with the three exits instead.
+    assert rejoined.status == "paused_failure"
+    assert rejoined.failure.reason_code == "JOB_NOT_FOUND"
+
+
+def test_pipeline_report_serves_from_artifact_after_restart(tmp_path) -> None:
+    # RV-F4 (recovery side): a completed pipeline still renders a report
+    # after the in-memory job manager is wiped.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    _wait_job(job_manager, confirmed.stage("compute").child_job_id)
+    done = get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert done.status == "completed"
+
+    live = pipeline_module.pipeline_report(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert live["source"] == "job"
+    assert live["result"]
+
+    fresh_job_manager = _WebJobManager()
+    recovered = pipeline_module.pipeline_report(
+        store, pipeline.pipeline_id, job_manager=fresh_job_manager, config=config
+    )
+    assert recovered["source"] == "artifact"
+    assert recovered["result"]
+    assert recovered["result"].keys() == live["result"].keys()
+
+
+def test_journal_tolerates_a_torn_multibyte_utf8_tail(tmp_path) -> None:
+    # RV-F5: a crash can truncate the tail mid-way through a multi-byte
+    # codepoint; the reader must keep every complete earlier record.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    journal_path = store._journal_path(pipeline.pipeline_id)
+
+    torn = json.dumps({"event": "torn", "detail": "管线中文字段"}, ensure_ascii=False).encode("utf-8")
+    with journal_path.open("ab") as handle:
+        handle.write(torn[: len(torn) - 4])  # cut inside the multi-byte run
+
+    loaded = store.load(pipeline.pipeline_id)
+    assert loaded.pipeline_id == pipeline.pipeline_id
+    assert loaded.revision == pipeline.revision
+
+
+def test_journal_only_pipeline_is_discoverable_by_list_ids(tmp_path) -> None:
+    # RV-F6: crash after the first journal fsync but before the first
+    # snapshot replace leaves a journal-only pipeline; rejoin must find it.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    snapshot_path = store._snapshot_path(pipeline.pipeline_id)
+    snapshot_path.unlink()
+
+    assert pipeline.pipeline_id in store.list_ids()
+    records = list_active_pipelines(store, job_manager=job_manager, config=config)
+    assert any(record.pipeline_id == pipeline.pipeline_id for record in records)
+
+
+def test_fork_carries_pending_parameter_edits_as_human_override(tmp_path, monkeypatch) -> None:
+    # RV-F9: the paused card's visible pending edits travel with the fork
+    # and badge as human_override against the FROZEN inputs of the failed
+    # attempt.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    monkeypatch.setattr(
+        pipeline_module,
+        "run_idea_validation_workflow",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    _wait_job(job_manager, confirmed.stage("compute").child_job_id)
+    monkeypatch.undo()
+    failed = get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert failed.status == "paused_failure"
+
+    forked = fork_pipeline_from_failure(
+        store, pipeline.pipeline_id,
+        job_manager=job_manager, config=config, rd_config=_rd_config(),
+        parameters={"holding_days": 13},
+    )
+    assert forked.parameters["holding_days"] == 13
+    assert forked.original_parameters["holding_days"] == failed.confirmed_parameters["holding_days"]
+    badge = provenance_by_field(
+        tuple(ProvenanceEntry(**entry) for entry in forked.provenance)
+    )["holding_days"]
+    assert badge.source == "human_override"
+    assert badge.parent_value == failed.confirmed_parameters["holding_days"]

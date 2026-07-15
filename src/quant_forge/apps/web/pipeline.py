@@ -62,13 +62,14 @@ Design notes worth reading before touching this file:
   thread polling job status. :func:`get_pipeline` / :func:`list_active_pipelines`
   / :func:`confirm_pipeline` / :func:`cancel_pipeline` all call
   :func:`_reconcile` first, which folds a live job's current status into the
-  record. Phase-review F9: when the job manager has no memory of a child job
-  (pruned, or wiped by a restart), reconciliation does not assume failure --
-  it independently checks the durable ``RunIndex`` lineage for this
-  pipeline's ``working_factor_id`` before concluding ``JOB_NOT_FOUND``, so a
-  job that actually finished (the compute chain's own ``record_run`` calls
-  already landed on disk) is recognized as completed instead of being
-  rewritten as a failure.
+  record. Phase-review F9 + re-verify RV-F4: when the job manager has no
+  memory of a child job (pruned, or wiped by a restart), reconciliation does
+  not assume failure -- it checks the durable, ATTEMPT-SCOPED completion
+  artifact the compute job itself wrote at the moment of success (keyed by
+  pipeline, child job id, attempt, and input hash) before concluding
+  ``JOB_NOT_FOUND``, so a job that actually finished is recognized as
+  completed instead of being rewritten as a failure, and a PRIOR attempt's
+  side effects can never be credited to the current one.
 
 KNOWN LIMITATION (phase-review F6, escalated, not silently dropped):
 the phase review asked that a pipeline's working factor be "EXCLUDED from
@@ -95,8 +96,23 @@ consolidates to one canonical id per formula; no dangling failed rows --
 proactive delete plus the RunIndex-backed reconciliation catches the crash
 case too; no concurrent-edit collision -- pipeline_id scoping is strictly
 tighter than the input-hash scoping it replaces) and leaves the
-picker-visibility-during-compute window open, reported here for Fable's
+picker-visibility-during-compute window open, reported for steward
 adjudication rather than worked around with a second store.
+
+ADJUDICATED (re-verify round 2): the visibility window is ACCEPTED as the
+documented V1 boundary -- closing it requires either kernel signature
+changes or a filter in the frozen api.py, both out of this phase's
+authority -- on three conditions, all implemented here: the working row is
+self-describing (its description names the owning pipeline, so a human
+browsing the registry sees the truth -- ``_working_factor``); every
+terminal path cleans BOTH the registry row and its cached value files,
+with a persisted ``cleanup_pending`` retry when cleanup fails
+(``_cleanup_working_artifacts`` / RV-F2/RV-F3); and the completion-time
+publish is CAS-guarded against concurrent canonical edits
+(``_publish_canonical_factor`` / RV-F1). Completion itself is proven by an
+attempt-scoped durable artifact written by the compute job at the moment
+of success (``_write_completion_artifact`` / RV-F4), never inferred from
+unscoped registry side effects.
 """
 
 from __future__ import annotations
@@ -117,12 +133,13 @@ from quant_forge.apps.web.jobs import _WebJobManager, _utc_now
 from quant_forge.apps.web.provenance import (
     PARAMETER_FIELDS,
     assert_provenance_matches_current_values,
-    derive_confirm_provenance,
+    derive_baseline_provenance,
+    derive_current_provenance,
 )
 from quant_forge.config import QuantForgeConfig
 from quant_forge.core.contracts import FactorDefinition
+from quant_forge.factor_engine.value_store import remove_stored_values_for_factor_id
 from quant_forge.factor_library.repository import FactorRepository
-from quant_forge.lineage.store import RunIndex
 from quant_forge.research_loop.config import ResearchLoopConfig
 from quant_forge.specs.pipeline import (
     ArtifactRef,
@@ -145,6 +162,7 @@ __all__ = [
     "PipelineStore",
     "create_pipeline",
     "get_pipeline",
+    "pipeline_report",
     "list_active_pipelines",
     "confirm_pipeline",
     "cancel_pipeline",
@@ -161,7 +179,7 @@ _PIPELINE_ID_RE = re.compile(r"^PL_[0-9a-f]{32}$")
 # deliberately exempt -- a live compute must never be silently expired out
 # from under itself; it resolves to completed/paused_failure through
 # reconciliation when its job finishes (or JOB_NOT_FOUND on rejoin if it
-# didn't survive a restart and the RunIndex has no record of it either).
+# didn't survive a restart and no matching completion artifact exists).
 DEFAULT_DRAFT_TTL_SECONDS = 24 * 3600
 
 
@@ -202,33 +220,38 @@ def _is_expired(expires_at: str, *, now: str) -> bool:
 
 
 def _read_journal_tolerant(path: Path) -> list[dict[str, Any]]:
-    """Torn-tail-tolerant JSONL reader.
+    """Torn-tail-tolerant JSONL reader (byte-level -- re-verify RV-F5).
 
     Append-only writers can only ever leave the LAST line partially written
     (a crash mid-``write``/``flush`` truncates the tail; every earlier line
-    was already fully flushed by a prior, completed append). So: a malformed
-    FINAL line is treated as an expected torn tail and dropped; a malformed
-    line anywhere else is NOT explicable by that failure mode and means real
+    was already fully flushed by a prior, completed append). The file is
+    read as BYTES and each newline-delimited record is decoded
+    independently: a crash can truncate the tail mid-way through a
+    multi-byte UTF-8 codepoint (e.g. a Chinese journal field), and a
+    whole-file ``read_text`` would raise ``UnicodeDecodeError`` before any
+    JSON tolerance could apply. A malformed FINAL line -- undecodable OR
+    unparsable -- is the expected torn tail and is dropped; a malformed line
+    anywhere else is NOT explicable by that failure mode and means real
     corruption, which raises rather than silently losing history (mirrors,
     and is deliberately stricter than, ``lineage/store.py::_read_jsonl``'s
-    "skip any bad line" tolerance -- interior corruption there would also be
-    swallowed silently, which this module treats as a bug worth surfacing
-    rather than a routine crash artifact).
+    "skip any bad line" tolerance).
     """
 
     if not path.exists():
         return []
-    lines = path.read_text(encoding="utf-8").splitlines()
+    raw_lines = path.read_bytes().split(b"\n")
+    # A cleanly-terminated file ends with a newline, so the split yields a
+    # trailing empty chunk: the REAL torn-tail candidate is the last
+    # non-empty chunk.
+    tail_index = max((index for index, chunk in enumerate(raw_lines) if chunk.strip()), default=-1)
     rows: list[dict[str, Any]] = []
-    last_index = len(lines) - 1
-    for index, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped:
+    for index, raw_line in enumerate(raw_lines):
+        if not raw_line.strip():
             continue
         try:
-            rows.append(json.loads(stripped))
-        except json.JSONDecodeError:
-            if index == last_index:
+            rows.append(json.loads(raw_line.decode("utf-8").strip()))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            if index == tail_index:
                 LOGGER.warning("ignoring torn tail line in %s (line %d)", path, index + 1)
                 continue
             raise ValueError(f"corrupt pipeline journal at {path} (interior line {index + 1})") from None
@@ -305,9 +328,16 @@ class PipelineStore:
         return record
 
     def list_ids(self) -> list[str]:
+        """Union of snapshot AND journal ids (re-verify RV-F6): a crash after
+        the very first journal fsync but before the first snapshot replace
+        leaves a journal-only pipeline, which must still be discoverable so
+        rejoin can reconcile it instead of silently orphaning it."""
+
         if not self._root.is_dir():
             return []
-        return sorted(path.stem for path in self._root.glob("PL_*.json"))
+        snapshot_ids = {path.stem for path in self._root.glob("PL_*.json") if not path.stem.endswith(".completion")}
+        journal_ids = {path.name.removesuffix(".journal.jsonl") for path in self._root.glob("PL_*.journal.jsonl")}
+        return sorted(pipeline_id for pipeline_id in snapshot_ids | journal_ids if _PIPELINE_ID_RE.match(pipeline_id))
 
     def save(self, record: PipelineRecord, *, event: str, detail: dict[str, Any] | None = None) -> PipelineRecord:
         with self.lock:
@@ -390,30 +420,18 @@ def _reset_stage(record: PipelineRecord, stage_id: str) -> PipelineRecord:
     return record.with_updates(stages=new_stages)
 
 
-def _source_text_for(record: PipelineRecord, *, job_manager: _WebJobManager) -> str:
-    """Re-derive the raw idea text a pipeline's parse job originally saw.
+def _source_text_for(record: PipelineRecord) -> str:
+    """The raw idea text the parse stage consumed (re-verify RV-F8/RV-F10).
 
-    ``PipelineRecord`` does not persist the text itself -- it is already
-    captured, once, inside the ``parse`` job's own stored ``request``
-    (``apps/web/jobs.py::_WebJob.request``, plumbed through by
-    ``apps/web/routing.py``'s ``/api/jobs/parse-idea`` handler) -- so
-    re-reading it via the SAME parse job id every pipeline already carries
-    in ``artifact_refs`` is a single source of truth instead of a second,
-    potentially-drifting copy. Falls back to ``""`` if the parse job has
-    since been pruned from the job manager's bounded retention (a benign
-    degradation: universe_filters provenance falls back to its
-    parser-mode-based rule instead of the sharper user_explicit phrase
-    check -- see ``apps/web/provenance.py::_origin_for_universe_filters``).
+    Persisted ON the record at create time (``PipelineRecord.source_text``),
+    never re-read from the job manager's bounded in-memory retention: a
+    pruned parse job or a server restart must not change a provenance badge
+    or strand the rule-fallback exit. The pre-rework job-store lookup lives
+    on only in ``create_pipeline``, which captures the text exactly once
+    while the parse job is guaranteed to still exist.
     """
 
-    parse_job_id = next((ref.job_id for ref in record.artifact_refs if ref.kind == "parse"), None)
-    if not parse_job_id:
-        return ""
-    try:
-        parse_job = job_manager.get(parse_job_id)
-    except KeyError:
-        return ""
-    return str((parse_job.get("request") or {}).get("text", ""))
+    return record.source_text
 
 
 # ---------------------------------------------------------------------------
@@ -440,45 +458,117 @@ def _working_factor_id_for(pipeline_id: str, parsed_factor_id: str) -> str:
 
 def _working_factor(record: PipelineRecord) -> FactorDefinition:
     base = _factor_from_request(dict(record.factor))
-    return dataclass_replace(base, factor_id=record.working_factor_id)
+    # Self-describing registry row (re-verify Cluster C adjudication): the
+    # working row IS visible in the registry/picker while compute runs (the
+    # documented V1 boundary -- see the module docstring's KNOWN LIMITATION),
+    # so its own content must say what it is instead of masquerading as a
+    # normal draft factor.
+    description = str(getattr(base, "description", "") or "")
+    label = f"[pipeline working draft {record.pipeline_id}]"
+    if not description.startswith(label):
+        description = f"{label} {description}".strip()
+    return dataclass_replace(base, factor_id=record.working_factor_id, description=description)
 
 
-def _delete_working_factor(config: QuantForgeConfig, working_factor_id: str) -> None:
-    """Best-effort cleanup; ``FactorRepository.delete`` itself is a safe
-    no-op (returns 0) when the id was never registered, so this is cheap
-    to call speculatively from every terminal-non-success path (including
-    an expiring draft/awaiting_confirm pipeline whose working row was never
-    actually created)."""
+def _cleanup_working_artifacts(config: QuantForgeConfig, record: PipelineRecord) -> bool:
+    """Remove the working registry row AND its cached value files.
 
+    Covers both the registry (``FactorRepository.delete`` -- a safe no-op
+    when the row was never created) and every value root a compute run can
+    write factor values under (``factor_values_root`` plus the configured
+    overlay root -- re-verify RV-F2: terminal cleanup used to leave orphan
+    ``factor_id=<working_id>`` value directories behind). Returns True only
+    when EVERY step succeeded; a False return is the caller's signal to
+    persist ``cleanup_pending`` so reconciliation retries later instead of
+    the old swallow-and-forget (re-verify RV-F3).
+    """
+
+    working_factor_id = record.working_factor_id
     if not working_factor_id:
-        return
+        return True
+    ok = True
     try:
         FactorRepository(config.paths.factor_root).delete(working_factor_id)
     except Exception:
         LOGGER.warning("failed to delete working factor %s during pipeline cleanup", working_factor_id, exc_info=True)
+        ok = False
+    for root_name in ("factor_values_root", "factor_values_overlay_root"):
+        root = getattr(config.paths, root_name, None)
+        try:
+            remove_stored_values_for_factor_id(root, working_factor_id)
+        except Exception:
+            LOGGER.warning(
+                "failed to remove cached values under %s for %s during pipeline cleanup",
+                root_name,
+                working_factor_id,
+                exc_info=True,
+            )
+            ok = False
+    return ok
 
 
-def _publish_canonical_factor(config: QuantForgeConfig, record: PipelineRecord) -> str | None:
+def _with_cleanup(record: PipelineRecord, config: QuantForgeConfig) -> PipelineRecord:
+    """Run working-artifact cleanup and fold the outcome into the record."""
+
+    return record.with_updates(cleanup_pending=not _cleanup_working_artifacts(config, record))
+
+
+def _canonical_row_fingerprint(config: QuantForgeConfig, canonical_id: str) -> str:
+    """Content fingerprint of the canonical registry row; "" when absent.
+
+    The CAS baseline for publish (re-verify RV-F1): captured at confirm
+    time, re-checked at publish time. Any change to the row's content --
+    formula, name, description, status, anything serialized -- between
+    those two moments makes the fingerprints differ and blocks the publish.
+    """
+
+    if not canonical_id:
+        return ""
+    try:
+        existing = FactorRepository(config.paths.factor_root).get(canonical_id)
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        LOGGER.warning("canonical row read failed for %s; treating as absent", canonical_id, exc_info=True)
+        return ""
+    from dataclasses import asdict
+
+    payload = {key: str(value) for key, value in sorted(asdict(existing).items())}
+    return canonical_fingerprint(payload)
+
+
+def _publish_canonical_factor(config: QuantForgeConfig, record: PipelineRecord) -> tuple[str | None, str]:
     """On success only: consolidate the working row into the canonical id.
 
     The canonical id is the bare id the parser itself produced
     (``record.factor["factor_id"]``, never mutated after create) -- one row
     per distinct formula/idea, matching the pre-P1 convention, so a
     successful run does not permanently multiply registry rows per
-    parameter combination. Refuses to overwrite an EXISTING canonical row
-    that has already been human-promoted (status other than "draft") -- a
-    completed background pipeline must never silently demote or rewrite a
-    candidate/active factor a human already acted on (G3). Returns the
-    published id, or None if publish was declined (row already promoted) --
-    the working row is deleted by the caller either way once compute has
-    succeeded, since nothing downstream re-reads factor_root for an
-    already-completed run's report (the report comes from the job's own
-    serialized result).
+    parameter combination. Two independent guards:
+
+    * G3 (unchanged): refuses to overwrite an EXISTING canonical row that
+      has already been human-promoted (status other than "draft") --
+      ``publish_state="declined_promoted"``.
+    * CAS (re-verify RV-F1): publishes ONLY when the canonical row's
+      CURRENT content fingerprint still equals the baseline captured at
+      confirm time (``record.canonical_baseline_fingerprint``). A
+      concurrent draft edit between confirm and completion is preserved and
+      reported as ``publish_state="conflict"`` instead of silently
+      clobbered by the completed pipeline's snapshot of the past.
+
+    Returns ``(published_id, publish_state)``.
     """
 
     canonical_id = str(record.factor.get("factor_id", ""))
     if not canonical_id:
-        return None
+        return None, ""
+    current_fingerprint = _canonical_row_fingerprint(config, canonical_id)
+    if current_fingerprint != record.canonical_baseline_fingerprint:
+        LOGGER.info(
+            "declining to publish %s: canonical row changed since confirm (CAS mismatch)",
+            canonical_id,
+        )
+        return None, "conflict"
     repo = FactorRepository(config.paths.factor_root)
     try:
         existing = repo.get(canonical_id)
@@ -486,35 +576,85 @@ def _publish_canonical_factor(config: QuantForgeConfig, record: PipelineRecord) 
         existing = None
     if existing is not None and existing.status != "draft":
         LOGGER.info("declining to publish over promoted factor %s (status=%s)", canonical_id, existing.status)
-        return None
+        return None, "declined_promoted"
     working = _factor_from_request(dict(record.factor))
     canonical = dataclass_replace(working, factor_id=canonical_id, status="draft")
     repo.save(canonical)
-    return canonical_id
+    return canonical_id, "published"
 
 
-def _compute_completed_per_run_index(config: QuantForgeConfig, working_factor_id: str) -> bool:
-    """Phase-review F9: independent confirmation that compute finished, even
-    when the job manager has forgotten about it (pruned, or wiped by a
-    restart).
+# ---------------------------------------------------------------------------
+# Completion artifact (re-verify RV-F4): durable, ATTEMPT-SCOPED proof that a
+# compute run finished, written by the compute job itself at the moment of
+# success -- replaces the unscoped RunIndex row-count probe, which could
+# mistake a PRIOR attempt's rows for the current attempt's completion.
+# ---------------------------------------------------------------------------
 
-    ``_record_validate_factor_runs`` (apps/web/api.py) writes exactly one
-    "evaluate" RunIndex row and two "backtest" rows (in_sample_backtest,
-    external_oos_backtest, in that order) -- ONLY after all three results
-    are already fully computed -- as the very last step of a successful
-    compute job. Seeing both backtest rows for this pipeline's working
-    factor id is therefore proof the full chain completed, independent of
-    whatever the in-memory job manager currently remembers.
+
+def _completion_artifact_path(store: PipelineStore, pipeline_id: str) -> Path:
+    _validate_pipeline_id(pipeline_id)
+    return store._root / f"{pipeline_id}.completion.json"  # noqa: SLF001 - module-internal store layout
+
+
+def _write_completion_artifact(
+    store: PipelineStore,
+    *,
+    pipeline_id: str,
+    child_job_id: str,
+    attempt: int,
+    input_hash: str,
+    result: dict[str, Any],
+) -> None:
+    """Atomically persist the completion proof + the full result payload.
+
+    Runs INSIDE the compute job thread, after the validate workflow
+    succeeded and before the job manager marks the job completed. Keyed by
+    (pipeline, child job, attempt, input hash) so reconciliation can never
+    credit the wrong attempt, and carrying the result payload so a recovered
+    pipeline still has a servable report after the in-memory job record is
+    gone (RV-F4's second half).
     """
 
-    if not working_factor_id:
-        return False
+    path = _completion_artifact_path(store, pipeline_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "pipeline_id": pipeline_id,
+        "child_job_id": child_job_id,
+        "attempt": attempt,
+        "input_hash": input_hash,
+        "completed_at": _utc_now(),
+        "result": result,
+    }
+    tmp_path = path.with_name(path.name + f".tmp-{uuid4().hex[:8]}")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _read_completion_artifact(store: PipelineStore, pipeline_id: str) -> dict[str, Any] | None:
     try:
-        rows = RunIndex(config.paths.artifact_root).search(factor_id=working_factor_id, kind="backtest")
-    except Exception:
-        LOGGER.warning("RunIndex probe failed for %s during reconciliation", working_factor_id, exc_info=True)
+        raw = _completion_artifact_path(store, pipeline_id).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        LOGGER.warning("unreadable completion artifact for %s; ignoring it", pipeline_id)
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _completion_matches_record(payload: dict[str, Any] | None, record: PipelineRecord) -> bool:
+    """Completion evidence counts ONLY for the exact attempt it proves."""
+
+    if payload is None:
         return False
-    return len(rows) >= 2
+    compute = record.stage("compute")
+    return (
+        str(payload.get("pipeline_id", "")) == record.pipeline_id
+        and str(payload.get("child_job_id", "")) == str(compute.child_job_id or "")
+        and int(payload.get("attempt", -1)) == record.attempt.number
+        and str(payload.get("input_hash", "")) == record.input_hash
+    )
 
 
 def _compute_input_hash(
@@ -625,14 +765,19 @@ def create_pipeline(
         rd_config=rd_config,
         planning_influence_hash=planning_influence_hash,
     )
-    # Provenance is computed NOW and stored on the record (not re-derived on
-    # every GET -- see specs/pipeline.py's `provenance` field comment) so the
-    # confirm card has a full set of badges from the very first render, not
-    # only after the user's first confirm click (WORKORDER P1 pin: every
-    # confirm-card field carries a badge, missing badge = fail). Baseline
-    # and current are identical here -- this IS the baseline being set.
-    provenance = derive_confirm_provenance(
-        parser=parser, factor=factor, baseline_parameters=parameters, current_parameters=parameters, text=text
+    # The immutable per-field origin artifact is computed ONCE, right here,
+    # while the parse job (and its idea text) is guaranteed to still exist
+    # (re-verify RV-F8); every later badge derivation is a pure function of
+    # this baseline plus the then-current values. The initial current badges
+    # are derived through the SAME pure function the edit/confirm paths use,
+    # so the confirm card has a full badge set from the very first render
+    # (WORKORDER P1 pin: missing badge = fail).
+    baseline_provenance = tuple(
+        entry.to_dict()
+        for entry in derive_baseline_provenance(parser=parser, factor=factor, parameters=parameters, text=text)
+    )
+    provenance = derive_current_provenance(
+        baseline=baseline_provenance, factor=factor, current_parameters=parameters
     )
     pipeline_id = _new_pipeline_id()
     record = PipelineRecord(
@@ -648,9 +793,11 @@ def create_pipeline(
         parser=parser,
         factor=factor,
         parameters=parameters,
+        source_text=text,
         original_parameters=parameters,
         warnings=warnings,
         provenance=tuple(entry.to_dict() for entry in provenance),
+        baseline_provenance=baseline_provenance,
         attempt=AttemptState(number=1, parent_run_id=parent_run_id),
         working_factor_id=_working_factor_id_for(pipeline_id, str(factor["factor_id"])),
         artifact_refs=(ArtifactRef(kind="parse", job_id=parse_job_id),),
@@ -677,11 +824,23 @@ def _reconcile(
     replaces a background sweep thread.
     """
 
+    if record.cleanup_pending:
+        # Re-verify RV-F3: a terminal transition whose working-artifact
+        # cleanup failed persists cleanup_pending; every subsequent load
+        # retries it here until it succeeds, instead of swallowing the
+        # failure once and leaving the _PW row / cached values forever.
+        if _cleanup_working_artifacts(config, record):
+            record = record.with_updates(cleanup_pending=False)
+            record = store.save(record, event="cleanup_retried")
     if record.status in TERMINAL_PIPELINE_STATUSES:
         return record
     now = _utc_now()
     if record.status in {"draft", "awaiting_confirm", "paused_failure"} and _is_expired(record.expires_at, now=now):
-        _delete_working_factor(config, record.working_factor_id)
+        record = _with_cleanup(record, config)
+        # Rotate the confirm token on the expiry mutation too (re-verify
+        # Cluster A): expired is terminal, so no confirm can ever consume the
+        # old token -- rotation makes that structural rather than incidental.
+        record = record.with_updates(confirm=ConfirmState(nonce=_new_nonce(), version=record.confirm.version + 1))
         record = _transition(record, "expired")
         return store.save(record, event="expired")
     if record.status != "running":
@@ -692,12 +851,15 @@ def _reconcile(
     try:
         job = job_manager.get(compute.child_job_id)
     except KeyError:
-        # phase-review F9: do not assume failure just because the in-memory
-        # job manager has forgotten this job -- independently check the
-        # durable RunIndex lineage first.
-        if _compute_completed_per_run_index(config, record.working_factor_id):
+        # Re-verify RV-F4: do not assume failure just because the in-memory
+        # job manager has forgotten this job -- but ONLY the attempt-scoped
+        # completion artifact (pipeline, child job, attempt, input hash),
+        # written by the compute job itself at the moment of success, counts
+        # as completion evidence. The old unscoped RunIndex row-count probe
+        # could credit a PRIOR attempt's rows to the current attempt.
+        if _completion_matches_record(_read_completion_artifact(store, record.pipeline_id), record):
             return _complete_from_reconciliation(record, store=store, config=config, now=now)
-        _delete_working_factor(config, record.working_factor_id)
+        record = _with_cleanup(record, config)
         record = _advance_stage(record, "compute", status="failed", ended_at=now)
         record = _transition(record, "paused_failure", failure=FailureState(stage_id="compute", reason_code="JOB_NOT_FOUND"))
         return store.save(record, event="job_not_found_on_reconcile")
@@ -707,12 +869,12 @@ def _reconcile(
     if job_status == "completed":
         return _complete_from_reconciliation(record, store=store, config=config, now=now, compute_job_id=compute.child_job_id)
     if job_status == "cancelled":
-        _delete_working_factor(config, record.working_factor_id)
+        record = _with_cleanup(record, config)
         record = _advance_stage(record, "compute", status="failed", ended_at=now)
         record = _transition(record, "aborted")
         return store.save(record, event="compute_cancelled")
     # failed
-    _delete_working_factor(config, record.working_factor_id)
+    record = _with_cleanup(record, config)
     reason = str(job.get("error") or "").strip()[:200] or "COMPUTE_FAILED"
     record = _advance_stage(record, "compute", status="failed", ended_at=now)
     record = _transition(record, "paused_failure", failure=FailureState(stage_id="compute", reason_code=reason))
@@ -727,23 +889,67 @@ def _complete_from_reconciliation(
     now: str,
     compute_job_id: str | None = None,
 ) -> PipelineRecord:
-    published = _publish_canonical_factor(config, record)
-    _delete_working_factor(config, record.working_factor_id)
-    report_ref = ArtifactRef(kind="report", job_id=compute_job_id or record.stage("compute").child_job_id)
+    published, publish_state = _publish_canonical_factor(config, record)
+    record = _with_cleanup(record, config)
+    # The report ref names BOTH the job id and the durable completion
+    # artifact path (re-verify RV-F4): the report endpoint serves from the
+    # live job when it still exists and falls back to the artifact when a
+    # restart has wiped the in-memory manager, so a legitimately recovered
+    # pipeline still renders a report.
+    report_ref = ArtifactRef(
+        kind="report",
+        job_id=compute_job_id or record.stage("compute").child_job_id,
+        artifact_path=str(_completion_artifact_path(store, record.pipeline_id)),
+    )
     record = _advance_stage(record, "compute", status="completed", ended_at=now)
     record = _advance_stage(record, "report", status="completed", started_at=now, ended_at=now)
     record = record.with_updates(
         artifact_refs=record.artifact_refs + (report_ref,),
         published_factor_id=published,
+        publish_state=publish_state,
     )
     record = _transition(record, "completed")
-    return store.save(record, event="compute_completed")
+    return store.save(record, event="compute_completed", detail={"publish_state": publish_state})
 
 
 def get_pipeline(store: PipelineStore, pipeline_id: str, *, job_manager: _WebJobManager, config: QuantForgeConfig) -> PipelineRecord:
     with store.lock:
         record = store.load(pipeline_id)
         return _reconcile(record, store=store, job_manager=job_manager, config=config)
+
+
+def pipeline_report(
+    store: PipelineStore, pipeline_id: str, *, job_manager: _WebJobManager, config: QuantForgeConfig
+) -> dict[str, Any]:
+    """The completed pipeline's report payload, restart-proof (re-verify RV-F4).
+
+    Serves the live job result while the job manager still remembers the
+    compute job, and falls back to the durable completion artifact once a
+    restart has wiped it -- so a legitimately recovered pipeline still
+    renders a report instead of a silently-suppressed 404. Raises
+    ``PipelineConflictError`` when the pipeline has not completed, and
+    ``PipelineNotFoundError`` when no evidence of the completed result
+    exists anywhere (job gone AND artifact missing/mismatched).
+    """
+
+    with store.lock:
+        record = store.load(pipeline_id)
+        record = _reconcile(record, store=store, job_manager=job_manager, config=config)
+        if record.status != "completed":
+            raise PipelineConflictError(f"pipeline {pipeline_id} has no report (status={record.status})")
+        report_ref = next((ref for ref in record.artifact_refs if ref.kind == "report"), None)
+        job_id = (report_ref.job_id if report_ref is not None else None) or record.stage("compute").child_job_id
+        if job_id:
+            try:
+                job = job_manager.get(job_id)
+            except KeyError:
+                job = None
+            if job is not None and job.get("status") == "completed" and job.get("result") is not None:
+                return {"pipeline_id": pipeline_id, "source": "job", "result": job.get("result")}
+        payload = _read_completion_artifact(store, pipeline_id)
+        if _completion_matches_record(payload, record):
+            return {"pipeline_id": pipeline_id, "source": "artifact", "result": (payload or {}).get("result")}
+        raise PipelineNotFoundError(f"no durable report evidence for completed pipeline {pipeline_id}")
 
 
 def list_active_pipelines(store: PipelineStore, *, job_manager: _WebJobManager, config: QuantForgeConfig) -> list[PipelineRecord]:
@@ -782,11 +988,15 @@ def confirm_pipeline(
 ) -> PipelineRecord:
     """Idempotent confirm (spec §2.3 / WORKORDER P1 pin), exactly-once launch.
 
-    ``(pipeline_id, nonce, version)`` is the idempotency key. The SAME key
-    seen again -- double click, second tab, retried request -- returns the
-    SAME run untouched; a DIFFERENT/stale key while still awaiting
-    confirmation is rejected (phase-review F1/F2) so a late request from a
-    superseded draft can never confirm the wrong offer.
+    ``(pipeline_id, nonce, version)`` is the idempotency key, and the token
+    is SINGLE-USE per payload (re-verify Cluster A): the SAME key seen again
+    -- double click, second tab, retried request -- returns the SAME run
+    untouched ONLY when its effective parameter payload equals what the
+    consumed confirm actually launched; the same key with a DIFFERENT
+    payload is a conflict (the old behavior silently discarded the second
+    tab's divergent edits as an "idempotent replay"). A different/stale key
+    while still awaiting confirmation is rejected (phase-review F1/F2) so a
+    late request from a superseded draft can never confirm the wrong offer.
 
     Launch ordering (phase-review F1): reserve the child job id, persist the
     ``running`` snapshot naming that id, and only THEN actually start it. If
@@ -800,7 +1010,13 @@ def confirm_pipeline(
         record = store.load(pipeline_id)
         record = _reconcile(record, store=store, job_manager=job_manager, config=config)
         if record.confirm.nonce == nonce and record.confirm.version == version and record.confirm.confirmed_at is not None:
-            return record
+            replay_effective = _flat_parameters_only({**dict(record.parameters), **(parameters or {})})
+            if replay_effective == (record.confirmed_parameters or {}):
+                return record
+            raise PipelineConflictError(
+                "confirm token already consumed with a different parameter payload; "
+                "reload the pipeline to see what actually launched"
+            )
         if record.status not in {"draft", "awaiting_confirm"}:
             raise PipelineConflictError(f"pipeline {pipeline_id} is not awaiting confirmation (status={record.status})")
         if record.confirm.nonce != nonce or record.confirm.version != version:
@@ -810,18 +1026,14 @@ def confirm_pipeline(
         if parameters:
             effective_parameters.update(parameters)
         effective_parameters = _flat_parameters_only(effective_parameters)
-        # Recomputed against the IMMUTABLE parse-time baseline (phase-review
-        # F4), never the mutable current draft -- see provenance.py. Text is
-        # re-derived from the SAME parse job every pipeline already
-        # references, so a confirm with zero edits reproduces the exact
-        # same badges create_pipeline originally computed.
-        text = _source_text_for(record, job_manager=job_manager)
-        provenance = derive_confirm_provenance(
-            parser=record.parser,
+        # Pure function of the PERSISTED baseline artifact + the effective
+        # values (re-verify RV-F8): no job-manager lookup, no idea-text
+        # re-read, so a restart between create and confirm cannot move a
+        # single badge.
+        provenance = derive_current_provenance(
+            baseline=record.baseline_provenance,
             factor=record.factor,
-            baseline_parameters=record.original_parameters,
             current_parameters=effective_parameters,
-            text=text,
         )
         # Recompute input_hash from the EFFECTIVE (post-override) parameters:
         # it must fingerprint what is actually about to run, not the
@@ -845,13 +1057,21 @@ def confirm_pipeline(
         prior_launches = sum(1 for ref in record.artifact_refs if ref.kind == "compute_job")
         child_job_id = job_manager.reserve_id()
         now = _utc_now()
+        attempt_number = prior_launches + 1
         running_record = record.with_updates(
             parameters=effective_parameters,
             confirmed_parameters=effective_parameters,
             confirm=ConfirmState(nonce=record.confirm.nonce, version=record.confirm.version, confirmed_at=now),
             provenance=tuple(entry.to_dict() for entry in provenance),
-            attempt=AttemptState(number=prior_launches + 1, parent_run_id=record.attempt.parent_run_id),
+            attempt=AttemptState(number=attempt_number, parent_run_id=record.attempt.parent_run_id),
             artifact_refs=record.artifact_refs + (ArtifactRef(kind="compute_job", job_id=child_job_id),),
+            # CAS baseline for the completion-time publish (re-verify RV-F1):
+            # whatever the canonical registry row holds at THIS freeze moment
+            # is what publish may later replace -- any concurrent change in
+            # between blocks the publish instead of being clobbered.
+            canonical_baseline_fingerprint=_canonical_row_fingerprint(
+                config, str(record.factor.get("factor_id", ""))
+            ),
         )
         running_record = _advance_stage(running_record, "confirm", status="completed", ended_at=now)
         running_record = _advance_stage(running_record, "compute", status="active", started_at=now, child_job_id=child_job_id)
@@ -861,23 +1081,49 @@ def confirm_pipeline(
             event="confirmed",
             detail={"nonce": nonce, "version": version, "child_job_id": child_job_id},
         )
+        frozen_input_hash = running_record.input_hash
+
+        def _compute_and_mark(cancel_event: Any) -> dict[str, Any]:
+            # Runs in the compute job's own thread. The completion artifact
+            # is the durable, attempt-scoped completion proof (re-verify
+            # RV-F4), written AFTER the workflow succeeds and BEFORE the job
+            # manager flips the job to completed -- so "artifact exists" is
+            # never ahead of the truth, and a restart that wipes the job
+            # manager can still prove (and serve) this attempt's result.
+            result = run_idea_validation_workflow(
+                config,
+                factor,
+                parser=record.parser,
+                parameters=effective_parameters,
+                rd_config=rd_config,
+                cancel_event=cancel_event,
+            )
+            try:
+                _write_completion_artifact(
+                    store,
+                    pipeline_id=pipeline_id,
+                    child_job_id=child_job_id,
+                    attempt=attempt_number,
+                    input_hash=frozen_input_hash,
+                    result=result,
+                )
+            except Exception:
+                # The job manager still remembers this job until a restart,
+                # so completion remains observable; a missing artifact only
+                # narrows RECOVERY to the honest paused_failure + retry path.
+                LOGGER.warning("failed to write completion artifact for %s", pipeline_id, exc_info=True)
+            return result
+
         try:
             job_manager.start(
                 "validate_idea",
-                lambda cancel_event: run_idea_validation_workflow(
-                    config,
-                    factor,
-                    parser=record.parser,
-                    parameters=effective_parameters,
-                    rd_config=rd_config,
-                    cancel_event=cancel_event,
-                ),
+                _compute_and_mark,
                 job_id=child_job_id,
             )
         except Exception as exc:
             LOGGER.warning("job launch failed for pipeline %s after durable save", pipeline_id, exc_info=True)
-            _delete_working_factor(config, running_record.working_factor_id)
-            failed_record = _advance_stage(running_record, "compute", status="failed", ended_at=_utc_now())
+            failed_record = _with_cleanup(running_record, config)
+            failed_record = _advance_stage(failed_record, "compute", status="failed", ended_at=_utc_now())
             failed_record = _transition(
                 failed_record, "paused_failure", failure=FailureState(stage_id="compute", reason_code=f"LAUNCH_FAILED: {exc}"[:200])
             )
@@ -897,7 +1143,7 @@ def cancel_pipeline(store: PipelineStore, pipeline_id: str, *, job_manager: _Web
                 job_manager.cancel(compute.child_job_id)
             except KeyError:
                 pass
-        _delete_working_factor(config, record.working_factor_id)
+        record = _with_cleanup(record, config)
         record = _transition(record, "aborted")
         return store.save(record, event="cancelled")
 
@@ -966,16 +1212,13 @@ def update_pipeline_parameters(
         merged = dict(record.parameters)
         merged.update(parameters)
         merged = _flat_parameters_only(merged)
-        # Compared against the IMMUTABLE baseline (phase-review F4), not the
-        # pre-edit `record.parameters` -- an unrelated field's badge must
-        # never move because THIS field changed.
-        text = _source_text_for(record, job_manager=job_manager)
-        provenance = derive_confirm_provenance(
-            parser=record.parser,
+        # Pure function of the persisted baseline artifact (re-verify RV-F8):
+        # an unrelated field's badge can never move because THIS field
+        # changed, and a restart can never move any badge at all.
+        provenance = derive_current_provenance(
+            baseline=record.baseline_provenance,
             factor=record.factor,
-            baseline_parameters=record.original_parameters,
             current_parameters=merged,
-            text=text,
         )
         changes: dict[str, Any] = {
             "parameters": merged,
@@ -988,13 +1231,26 @@ def update_pipeline_parameters(
 
 
 def fork_pipeline_from_failure(
-    store: PipelineStore, pipeline_id: str, *, job_manager: _WebJobManager, config: QuantForgeConfig, rd_config: ResearchLoopConfig
+    store: PipelineStore,
+    pipeline_id: str,
+    *,
+    job_manager: _WebJobManager,
+    config: QuantForgeConfig,
+    rd_config: ResearchLoopConfig,
+    parameters: dict[str, Any] | None = None,
 ) -> PipelineRecord:
     """paused_failure "edit" exit (spec §2.3 / phase-review F7): forks the
     frozen inputs into a brand-new draft pipeline with its own attempt
     lineage, and terminalizes (aborts) the old one -- it does not mutate the
     failed record in place, so the failed attempt's own history stays
     intact and inspectable under its own id.
+
+    ``parameters`` carries the user's PENDING edits from the paused card
+    (re-verify RV-F9: the old fork posted ``{}`` and silently discarded the
+    edits the user could literally see on screen). The fork's provenance
+    baseline is the FROZEN inputs of the failed attempt, so every carried
+    edit shows up as ``human_override`` against what actually ran -- exactly
+    what "edit and fork" means.
     """
 
     with store.lock:
@@ -1007,24 +1263,33 @@ def fork_pipeline_from_failure(
         # confirmed_parameters if a compute genuinely launched, else the
         # draft parameters at the point of failure (e.g. a launch failure
         # before any job started).
-        frozen_parameters = old.confirmed_parameters if old.confirmed_parameters is not None else old.parameters
+        frozen_parameters = _flat_parameters_only(
+            dict(old.confirmed_parameters if old.confirmed_parameters is not None else old.parameters)
+        )
+        draft_parameters = _flat_parameters_only({**frozen_parameters, **(parameters or {})})
         now = _utc_now()
         new_pipeline_id = _new_pipeline_id()
-        text = _source_text_for(old, job_manager=job_manager)
         input_hash = _compute_input_hash(
             factor=old.factor,
-            parameters=frozen_parameters,
+            parameters=draft_parameters,
             parse_job_id=next((ref.job_id for ref in old.artifact_refs if ref.kind == "parse"), ""),
             parser_source=str(old.parser.get("source", "")),
             rd_config=rd_config,
             planning_influence_hash=old.planning_influence_hash,
         )
-        provenance = derive_confirm_provenance(
-            parser=old.parser,
-            factor=old.factor,
-            baseline_parameters=frozen_parameters,
-            current_parameters=frozen_parameters,
-            text=text,
+        # The fork's baseline is the parent's CURRENT badge truth evaluated
+        # at the frozen inputs: an origin inherited from the parent's own
+        # persisted baseline (including an inherited human_override with its
+        # parent_value) stays honest, and nothing is re-derived from parser
+        # mode or idea text (re-verify RV-F8).
+        fork_baseline = tuple(
+            entry.to_dict()
+            for entry in derive_current_provenance(
+                baseline=old.baseline_provenance, factor=old.factor, current_parameters=frozen_parameters
+            )
+        )
+        provenance = derive_current_provenance(
+            baseline=fork_baseline, factor=old.factor, current_parameters=draft_parameters
         )
         forked = PipelineRecord(
             pipeline_id=new_pipeline_id,
@@ -1038,10 +1303,12 @@ def fork_pipeline_from_failure(
             confirm=ConfirmState(nonce=_new_nonce(), version=1),
             parser=old.parser,
             factor=old.factor,
-            parameters=frozen_parameters,
+            parameters=draft_parameters,
+            source_text=old.source_text,
             original_parameters=frozen_parameters,
             warnings=old.warnings,
             provenance=tuple(entry.to_dict() for entry in provenance),
+            baseline_provenance=fork_baseline,
             attempt=AttemptState(number=1, parent_run_id=old.pipeline_id),
             working_factor_id=_working_factor_id_for(new_pipeline_id, str(old.factor["factor_id"])),
             artifact_refs=tuple(ref for ref in old.artifact_refs if ref.kind == "parse"),
@@ -1051,6 +1318,7 @@ def fork_pipeline_from_failure(
         forked = _advance_stage(forked, "confirm", status="active", started_at=now)
         forked = store.save(forked, event="forked_from_failure", detail={"parent_run_id": old.pipeline_id})
 
+        old = _with_cleanup(old, config)
         old = _transition(old, "aborted")
         store.save(old, event="aborted_by_fork", detail={"forked_to": new_pipeline_id})
         return forked
@@ -1060,30 +1328,99 @@ def create_pipeline_as_fallback(
     store: PipelineStore,
     *,
     job_manager: _WebJobManager,
-    parse_job_id: str,
     rd_config: ResearchLoopConfig,
     parent_pipeline_id: str,
     config: QuantForgeConfig,
 ) -> PipelineRecord:
-    """paused_failure "fall back to rule parse" exit (phase-review F7): the
-    caller already ran a NEW ``parse_idea`` job (parser_mode="rule") against
-    the same idea text; this wraps it into a brand-new pipeline with new
-    parse provenance and ``parent_run_id`` lineage back to the failed
-    pipeline, then terminalizes (aborts) the old one -- atomically from the
-    caller's point of view (one function call), so there is no window where
-    both the new draft and the old failure are simultaneously "live"
-    without the lineage link recorded.
+    """paused_failure "fall back to rule parse" exit, fully server-side
+    (re-verify RV-F10).
+
+    The rule parse runs HERE, against the failed pipeline's own persisted
+    ``source_text`` -- the client no longer supplies a parse job id at all,
+    so it can neither substitute an unrelated parse (the old crafted-request
+    hole) nor be stranded by job-manager pruning (the old durability hole).
+    The freshly parsed artifact seeds a brand-new pipeline with new parse
+    provenance and ``parent_run_id`` lineage back to the failed pipeline,
+    which is then terminalized (aborted) -- atomically from the caller's
+    point of view, so there is no window where both the new draft and the
+    old failure are simultaneously "live" without the lineage link recorded.
     """
+
+    # Deferred import mirrors api.py::_parse_idea's own pattern: the server
+    # facade imports widely and a module-level import here would risk an
+    # apps.web import cycle.
+    from quant_forge.apps.web import server as _server
 
     with store.lock:
         old = store.load(parent_pipeline_id)
         old = _reconcile(old, store=store, job_manager=job_manager, config=config)
         if old.status != "paused_failure":
             raise PipelineConflictError(f"pipeline {parent_pipeline_id} is not paused (status={old.status})")
-        new_record = create_pipeline(
-            store, job_manager=job_manager, parse_job_id=parse_job_id, rd_config=rd_config, parent_run_id=parent_pipeline_id
+        text = _source_text_for(old)
+        if not text.strip():
+            raise PipelineConflictError(
+                f"pipeline {parent_pipeline_id} carries no persisted idea text; rule fallback is unavailable"
+            )
+        parse_result = _server.run_idea_parse_workflow(
+            config,
+            text,
+            parser_mode="rule",
+            llm_provider=None,
+            rd_config=rd_config,
         )
-        old = store.load(parent_pipeline_id)
+        parser = dict(parse_result.get("parser") or {})
+        factor = dict(parse_result.get("factor") or {})
+        parameters = _flat_parameters_only(dict(parse_result.get("parameters") or {}))
+        warnings = tuple(str(item) for item in (parse_result.get("warnings") or ()))
+        if not factor.get("factor_id"):
+            raise PipelineConflictError("rule fallback parse produced no factor_id; cannot create a pipeline")
+
+        now = _utc_now()
+        planning_influence_hash = old.planning_influence_hash
+        input_hash = _compute_input_hash(
+            factor=factor,
+            parameters=parameters,
+            parse_job_id="",  # server-side synchronous parse: no job id exists
+            parser_source=str(parser.get("source", "")),
+            rd_config=rd_config,
+            planning_influence_hash=planning_influence_hash,
+        )
+        baseline_provenance = tuple(
+            entry.to_dict()
+            for entry in derive_baseline_provenance(parser=parser, factor=factor, parameters=parameters, text=text)
+        )
+        provenance = derive_current_provenance(
+            baseline=baseline_provenance, factor=factor, current_parameters=parameters
+        )
+        new_pipeline_id = _new_pipeline_id()
+        new_record = PipelineRecord(
+            pipeline_id=new_pipeline_id,
+            kind=old.kind,
+            created_at=now,
+            expires_at=_expires_at(now, DEFAULT_DRAFT_TTL_SECONDS),
+            status="draft",
+            stages=initial_stages_for(old.kind),
+            input_hash=input_hash,
+            planning_influence_hash=planning_influence_hash,
+            confirm=ConfirmState(nonce=_new_nonce(), version=1),
+            parser=parser,
+            factor=factor,
+            parameters=parameters,
+            source_text=text,
+            original_parameters=parameters,
+            warnings=warnings,
+            provenance=tuple(entry.to_dict() for entry in provenance),
+            baseline_provenance=baseline_provenance,
+            attempt=AttemptState(number=1, parent_run_id=parent_pipeline_id),
+            working_factor_id=_working_factor_id_for(new_pipeline_id, str(factor["factor_id"])),
+            artifact_refs=(ArtifactRef(kind="parse", job_id=None),),
+        )
+        new_record = _advance_stage(new_record, "parse", status="completed", started_at=now, ended_at=now)
+        new_record = _transition(new_record, "awaiting_confirm")
+        new_record = _advance_stage(new_record, "confirm", status="active", started_at=now)
+        new_record = store.save(new_record, event="created_as_rule_fallback", detail={"parent_run_id": parent_pipeline_id})
+
+        old = _with_cleanup(old, config)
         old = _transition(old, "aborted")
         store.save(old, event="aborted_by_rule_fallback", detail={"forked_to": new_record.pipeline_id})
         return new_record

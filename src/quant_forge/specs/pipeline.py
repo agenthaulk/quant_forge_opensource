@@ -303,6 +303,13 @@ class PipelineRecord:
     parser: dict[str, Any] = field(default_factory=dict)
     factor: dict[str, Any] = field(default_factory=dict)
     parameters: dict[str, Any] = field(default_factory=dict)
+    # Re-verify RV-F8/RV-F10: the raw idea text the parse stage actually
+    # consumed, persisted ON the record at create time. Provenance baselines
+    # and the rule-parse fallback both read THIS copy -- never the job
+    # manager's bounded in-memory retention, whose pruning (or a restart)
+    # used to silently flip a user_explicit badge to fixed_policy and strand
+    # the fallback exit.
+    source_text: str = ""
     # Phase-review F4: the IMMUTABLE parse-time baseline every provenance
     # derivation compares against. Never updated after create_pipeline sets
     # it once -- comparing against the mutable `parameters` instead would
@@ -324,6 +331,15 @@ class PipelineRecord:
     # PipelineStore.load() (phase-review F5) so a GET can never serve a
     # confirm card silently missing badges.
     provenance: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    # Re-verify RV-F7/RV-F8: the IMMUTABLE per-field {origin, fingerprint}
+    # parse artifact (each entry shaped like ProvenanceEntry.to_dict()),
+    # written ONCE when the record is created (or forked) and never
+    # re-derived from volatile state afterwards. Current badges are a pure
+    # function of (this baseline, the current values): unchanged fingerprint
+    # keeps the baseline origin, a changed one is human_override. A declared
+    # confirm-card field missing from this artifact raises
+    # MissingProvenanceError -- never a silent default badge.
+    baseline_provenance: tuple[dict[str, Any], ...] = field(default_factory=tuple)
     attempt: AttemptState = field(default_factory=AttemptState)
     artifact_refs: tuple[ArtifactRef, ...] = field(default_factory=tuple)
     failure: FailureState | None = None
@@ -339,6 +355,22 @@ class PipelineRecord:
     # for when it legitimately declines to publish)".
     working_factor_id: str = ""
     published_factor_id: str | None = None
+    # Re-verify RV-F1 (CAS publish): fingerprint of the canonical registry
+    # row's content captured at CONFIRM time ("" = row absent then). The
+    # completion-time publish step re-reads the canonical row and publishes
+    # ONLY if its current fingerprint still equals this baseline -- a
+    # concurrent draft edit between confirm and completion is preserved and
+    # the conflict recorded in publish_state instead of silently clobbered.
+    canonical_baseline_fingerprint: str = ""
+    # "" (not attempted yet) | "published" | "declined_promoted" (row was
+    # human-promoted; G3 forbids overwriting) | "conflict" (RV-F1: canonical
+    # content changed while this pipeline ran).
+    publish_state: str = ""
+    # Re-verify RV-F3: True when a terminal transition could not finish its
+    # working-artifact cleanup (registry row / cached values). Reconciliation
+    # retries the cleanup on every subsequent load until it succeeds, instead
+    # of the old swallow-and-forget.
+    cleanup_pending: bool = False
     # SE-ix cross-track amendment (binding): reserved slot for the
     # self-evolution planning-influence snapshot. Empty until SE-P5 wires it
     # up; the FIELD and its participation in input_hash exist now so the
@@ -410,15 +442,20 @@ class PipelineRecord:
             "parser": dict(self.parser),
             "factor": dict(self.factor),
             "parameters": dict(self.parameters),
+            "source_text": self.source_text,
             "original_parameters": dict(self.original_parameters),
             "confirmed_parameters": dict(self.confirmed_parameters) if self.confirmed_parameters is not None else None,
             "warnings": list(self.warnings),
             "provenance": [dict(entry) for entry in self.provenance],
+            "baseline_provenance": [dict(entry) for entry in self.baseline_provenance],
             "attempt": self.attempt.to_dict(),
             "artifact_refs": [ref.to_dict() for ref in self.artifact_refs],
             "failure": self.failure.to_dict() if self.failure is not None else None,
             "working_factor_id": self.working_factor_id,
             "published_factor_id": self.published_factor_id,
+            "canonical_baseline_fingerprint": self.canonical_baseline_fingerprint,
+            "publish_state": self.publish_state,
+            "cleanup_pending": self.cleanup_pending,
             "revision": self.revision,
         }
 
@@ -440,14 +477,19 @@ class PipelineRecord:
             parser=dict(payload.get("parser", {})),
             factor=dict(payload.get("factor", {})),
             parameters=dict(payload.get("parameters", {})),
+            source_text=str(payload.get("source_text", "")),
             original_parameters=dict(payload.get("original_parameters", {})),
             confirmed_parameters=dict(confirmed_parameters) if confirmed_parameters is not None else None,
             warnings=tuple(str(item) for item in payload.get("warnings", ())),
             provenance=tuple(dict(entry) for entry in payload.get("provenance", ())),
+            baseline_provenance=tuple(dict(entry) for entry in payload.get("baseline_provenance", ())),
             attempt=AttemptState.from_dict(payload.get("attempt", {"number": 1})),
             artifact_refs=tuple(ArtifactRef.from_dict(item) for item in payload.get("artifact_refs", ())),
             failure=FailureState.from_dict(failure_payload) if failure_payload else None,
             working_factor_id=str(payload.get("working_factor_id", "")),
             published_factor_id=payload.get("published_factor_id"),
+            canonical_baseline_fingerprint=str(payload.get("canonical_baseline_fingerprint", "")),
+            publish_state=str(payload.get("publish_state", "")),
+            cleanup_pending=bool(payload.get("cleanup_pending", False)),
             revision=int(payload.get("revision", 0)),
         )

@@ -71,7 +71,8 @@ __all__ = [
     "FACTOR_LEVEL_FIELDS",
     "PARAMETER_FIELDS",
     "CONFIRM_CARD_FIELDS",
-    "derive_confirm_provenance",
+    "derive_baseline_provenance",
+    "derive_current_provenance",
     "provenance_by_field",
     "assert_full_coverage",
     "assert_provenance_matches_current_values",
@@ -92,9 +93,10 @@ PROVENANCE_SOURCES: tuple[str, ...] = (
 # The confirm card's factor-level fields (formula + its supporting fields)
 # and the 11 absorbed simulation/backtest parameters (former
 # apps/web/html.py#validation-controls grid; see WORKORDER P1 减法). Every
-# field in CONFIRM_CARD_FIELDS must appear in derive_confirm_provenance's
-# output for every confirm-able pipeline -- assert_full_coverage enforces
-# this (spec §11 ship gate #3 / WORKORDER pin: "missing badge = fail").
+# field in CONFIRM_CARD_FIELDS must appear in every derivation's output
+# (baseline AND current) for every confirm-able pipeline --
+# assert_full_coverage enforces this (spec §11 ship gate #3 / WORKORDER
+# pin: "missing badge = fail").
 FACTOR_LEVEL_FIELDS: tuple[str, ...] = ("formula", "name", "description", "horizon_days", "universe_filters")
 PARAMETER_FIELDS: tuple[str, ...] = (
     "holding_days",
@@ -128,8 +130,10 @@ class MissingProvenanceError(ValueError):
 
     Spec §11 ship gate #3 / WORKORDER P1 pin: "missing badge = server-side
     assertion failure." Raised, never silently patched over -- a caller that
-    hits this has a real gap in derive_confirm_provenance, not a degraded
-    but safe state.
+    hits this has a real gap in its provenance derivation or a malformed
+    artifact (re-verify RV-F7: a declared field ABSENT from an artifact is
+    this error, never a silent ``None`` badge), not a degraded but safe
+    state.
     """
 
 
@@ -231,11 +235,22 @@ def _origin_for_text_interpreted_field(parser_source: str) -> str:
     return "agent_inferred"
 
 
+def _require_field(container: dict[str, Any], field_name: str, *, artifact: str) -> Any:
+    """Presence-checked read (re-verify RV-F7): a DECLARED confirm-card field
+    missing from its artifact is a malformed artifact and must raise, never
+    silently badge ``None`` with a default origin. ``None`` remains a legal
+    VALUE (e.g. an unset date field) -- only key ABSENCE is an error."""
+
+    if field_name not in container:
+        raise MissingProvenanceError(f"declared confirm-card field {field_name!r} is missing from the {artifact}")
+    return container[field_name]
+
+
 def _factor_level_entries(parser: dict[str, Any], factor: dict[str, Any], text: str) -> list[ProvenanceEntry]:
     parser_source = str(parser.get("source", "")).strip().lower()
     entries = []
     for field_name in FACTOR_LEVEL_FIELDS:
-        value = factor.get(field_name)
+        value = _require_field(factor, field_name, artifact="parse-time factor artifact")
         if field_name == "horizon_days":
             source = _origin_for_horizon_days(parser_source)
         elif field_name == "universe_filters":
@@ -257,14 +272,73 @@ def _parameter_default_source(field_name: str, value: Any) -> str:
     return "profile_default"
 
 
-def _parameter_entries(
-    current_parameters: dict[str, Any],
-    baseline_parameters: dict[str, Any],
-) -> list[ProvenanceEntry]:
+def _baseline_parameter_entries(parameters: dict[str, Any]) -> list[ProvenanceEntry]:
     entries: list[ProvenanceEntry] = []
     for field_name in PARAMETER_FIELDS:
-        baseline_value = baseline_parameters.get(field_name)
-        current_value = current_parameters.get(field_name)
+        value = _require_field(parameters, field_name, artifact="parse-time parameter baseline")
+        entries.append(
+            ProvenanceEntry(field=field_name, value=value, source=_parameter_default_source(field_name, value))
+        )
+    return entries
+
+
+def derive_baseline_provenance(
+    *,
+    parser: dict[str, Any],
+    factor: dict[str, Any],
+    parameters: dict[str, Any],
+    text: str,
+) -> tuple[ProvenanceEntry, ...]:
+    """The IMMUTABLE per-field origin artifact, computed ONCE at record
+    creation (re-verify RV-F8).
+
+    ``parser`` / ``factor`` / ``parameters`` / ``text`` must be the SERVER'S
+    OWN parse artifact (never a client-echoed claim -- FE-L3). This is the
+    only function that reads the idea ``text`` or the parser mode: it runs
+    exactly when both are guaranteed available (the parse just completed),
+    and its output is persisted on the record so no later derivation ever
+    depends on volatile job-manager memory again. Every declared
+    confirm-card field must be present in its artifact -- absence raises
+    ``MissingProvenanceError`` (RV-F7), never a silent ``None`` badge.
+    """
+
+    entries = _factor_level_entries(parser, factor, text) + _baseline_parameter_entries(parameters)
+    assert_full_coverage(entries)
+    return tuple(entries)
+
+
+def derive_current_provenance(
+    *,
+    baseline: tuple[dict[str, Any], ...],
+    factor: dict[str, Any],
+    current_parameters: dict[str, Any],
+) -> tuple[ProvenanceEntry, ...]:
+    """Current badges as a PURE function of (persisted baseline, current
+    values) -- re-verify RV-F8.
+
+    A field whose current value's fingerprint equals its baseline entry's
+    keeps the baseline's origin verbatim (including an inherited
+    ``human_override`` + ``parent_value`` from a fork baseline); a differing
+    fingerprint is ``human_override`` with ``parent_value`` set to the
+    baseline value. Restarts cannot move any badge, because nothing here
+    reads parser mode, idea text, or any other re-derivable input. A
+    declared field missing from the baseline artifact or from the current
+    values raises ``MissingProvenanceError`` (RV-F7).
+    """
+
+    baseline_by_field = {str(entry.get("field", "")): entry for entry in baseline}
+    entries: list[ProvenanceEntry] = []
+    for field_name in CONFIRM_CARD_FIELDS:
+        baseline_entry = baseline_by_field.get(field_name)
+        if baseline_entry is None:
+            raise MissingProvenanceError(
+                f"declared confirm-card field {field_name!r} is missing from the baseline provenance artifact"
+            )
+        if field_name in FACTOR_LEVEL_FIELDS:
+            current_value = _require_field(factor, field_name, artifact="factor artifact")
+        else:
+            current_value = _require_field(current_parameters, field_name, artifact="current parameters")
+        baseline_value = baseline_entry.get("value")
         if _fingerprint(current_value) != _fingerprint(baseline_value):
             entries.append(
                 ProvenanceEntry(
@@ -279,36 +353,10 @@ def _parameter_entries(
                 ProvenanceEntry(
                     field=field_name,
                     value=current_value,
-                    source=_parameter_default_source(field_name, current_value),
+                    source=str(baseline_entry.get("source", "")),
+                    parent_value=baseline_entry.get("parent_value"),
                 )
             )
-    return entries
-
-
-def derive_confirm_provenance(
-    *,
-    parser: dict[str, Any],
-    factor: dict[str, Any],
-    baseline_parameters: dict[str, Any],
-    current_parameters: dict[str, Any] | None = None,
-    text: str = "",
-) -> tuple[ProvenanceEntry, ...]:
-    """Per-value provenance for every confirm-card field (spec §5.1).
-
-    ``parser`` / ``factor`` / ``text`` must be the SERVER'S OWN parse
-    artifact (never a client-echoed claim -- FE-L3). ``baseline_parameters``
-    is the IMMUTABLE parse-time snapshot (phase-review F4: never the
-    mutable current draft); ``current_parameters`` is whatever value is
-    actually being displayed/confirmed right now (defaults to
-    ``baseline_parameters`` when omitted, i.e. nothing has been edited yet).
-    A field whose current value's fingerprint differs from its baseline
-    fingerprint is ``human_override`` with ``parent_value`` set to the
-    baseline; every other field keeps the source its OWN per-field rule
-    assigns (never a single blanket parser-mode label -- phase-review F3).
-    """
-
-    current_parameters = current_parameters if current_parameters is not None else baseline_parameters
-    entries = _factor_level_entries(parser, factor, text) + _parameter_entries(current_parameters, baseline_parameters)
     assert_full_coverage(entries)
     return tuple(entries)
 

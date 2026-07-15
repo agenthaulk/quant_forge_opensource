@@ -45,6 +45,7 @@ from quant_forge.apps.web.api import (
 from quant_forge.apps.web.html import _index_html
 from quant_forge.apps.web.jobs import LOGGER, RequestBodyTooLarge, _WebJobManager, _client_error_message
 from quant_forge.apps.web.pipeline import (
+    pipeline_report,
     PipelineStore,
     cancel_pipeline,
     confirm_pipeline,
@@ -267,6 +268,20 @@ def create_local_web_server(
                                 for record in list_active_pipelines(pipeline_store, job_manager=job_manager, config=config)
                             ]
                         }
+                    )
+                elif path.startswith("/api/pipelines/") and path.endswith("/report"):
+                    # Restart-proof report retrieval (re-verify RV-F4): the
+                    # live job result while the manager remembers it, else
+                    # the durable completion artifact -- a recovered
+                    # completed pipeline must still render a report.
+                    self._require_control_token()
+                    self._json(
+                        pipeline_report(
+                            pipeline_store,
+                            _pipeline_id_from_action_path(path, "report"),
+                            job_manager=job_manager,
+                            config=config,
+                        )
                     )
                 elif path.startswith("/api/pipelines/"):
                     self._require_control_token()
@@ -548,27 +563,32 @@ def create_local_web_server(
                     # a paused_failure pipeline into a brand-new draft
                     # (its own attempt lineage, parent_run_id set) and
                     # terminalizes the old one -- the failed attempt's own
-                    # history stays intact under its own id.
+                    # history stays intact under its own id. The payload's
+                    # `parameters` carries the user's pending edits from the
+                    # paused card (re-verify RV-F9); the server validates and
+                    # applies them as human_override against the frozen
+                    # baseline instead of silently discarding them.
                     record = fork_pipeline_from_failure(
                         pipeline_store,
                         _pipeline_id_from_action_path(path, "fork"),
                         job_manager=job_manager,
                         config=config,
                         rd_config=research_config,
+                        parameters=dict(payload.get("parameters") or {}),
                     )
                     self._json(record.to_dict(), status=201)
                     return
                 if path.startswith("/api/pipelines/") and path.endswith("/fallback-rule-parse"):
-                    # phase-review F7 "fall back to rule parse" exit: the
-                    # caller already ran a fresh parse_idea job in rule mode
-                    # against the same idea text (existing /api/jobs/parse-idea
-                    # endpoint, unchanged) and hands us that job id; this
-                    # wraps it into a new pipeline with parent_run_id lineage
-                    # and terminalizes the failed one atomically.
+                    # phase-review F7 "fall back to rule parse" exit, fully
+                    # server-side (re-verify RV-F10): the rule parse runs
+                    # inside create_pipeline_as_fallback against the failed
+                    # pipeline's own PERSISTED idea text. No client-supplied
+                    # parse job id is accepted anymore -- a crafted request
+                    # can no longer substitute an unrelated parse, and
+                    # job-manager pruning can no longer strand this exit.
                     record = create_pipeline_as_fallback(
                         pipeline_store,
                         job_manager=job_manager,
-                        parse_job_id=str(payload.get("parse_job_id", "")),
                         rd_config=research_config,
                         parent_pipeline_id=_pipeline_id_from_action_path(path, "fallback-rule-parse"),
                         config=config,

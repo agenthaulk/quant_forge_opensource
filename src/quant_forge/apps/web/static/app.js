@@ -11,6 +11,7 @@ import {
   cancelJob,
   configureApi,
   getJob,
+  getPipelineReport,
   onControlTokenStored,
   postJson,
   waitForJob
@@ -411,22 +412,25 @@ initSynthesisModule({ onJobComplete: invalidateJobDependentPanels });
 // that job's result into pixels (FE-L2); this callback only fetches the
 // already-completed job and hands it over.
 async function onPipelineCompleted(pipeline) {
-  const computeStage = (pipeline.stages || []).find(stage => stage.stage_id === 'compute');
-  const jobId = computeStage && computeStage.child_job_id;
-  if (!jobId) return;
   try {
-    const job = await getJob(jobId);
-    if (job.status !== 'completed' || !job.result) return;
-    render(job.result);
-    parsedIdea = { parser: job.result.parser, factor: job.result.factor, parameters: job.result.parameters };
-    validatedFactorId = job.result.factor && job.result.factor.factor_id;
+    // Restart-proof (re-verify RV-F4): the /report endpoint serves the live
+    // job result while the job manager remembers it and falls back to the
+    // durable completion artifact after a restart — the old direct getJob()
+    // fetch rendered nothing for a legitimately recovered pipeline.
+    const report = await getPipelineReport(pipeline.pipeline_id);
+    const result = report && report.result;
+    if (!result) return;
+    render(result);
+    parsedIdea = { parser: result.parser, factor: result.factor, parameters: result.parameters };
+    validatedFactorId = result.factor && result.factor.factor_id;
     document.getElementById('rd-seed').value = validatedFactorId || document.getElementById('rd-seed').value;
     setStaggeredEnabled(Boolean(validatedFactorId));
     invalidateJobDependentPanels();
   } catch (error) {
-    // Best-effort mirror: the pipeline card itself already shows "completed"
-    // truthfully regardless of whether this legacy Factor Tape refresh
-    // succeeds.
+    // Best-effort mirror of the legacy Factor Tape: the pipeline card itself
+    // already shows "completed" truthfully. Log instead of vanishing so a
+    // genuinely missing report is at least diagnosable.
+    console.warn('pipeline report mirror failed', error);
   }
 }
 initPipelineModule({ onCompleted: onPipelineCompleted });

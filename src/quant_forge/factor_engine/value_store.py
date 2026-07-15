@@ -298,6 +298,48 @@ class FactorValueStore:
             )
 
 
+def remove_stored_values_for_factor_id(root: Path | None, factor_id: str) -> int:
+    """Remove every stored-value directory derivable from ``factor_id`` ALONE.
+
+    Cleanup counterpart to ``_resolve_factor_paths`` for pipeline working
+    rows (apps/web/pipeline.py): deletes the ID-derived candidate directory
+    names (canonical ``factor_id=...`` form, the raw id, and its
+    safe-dir-name form) under ``root`` itself and under each category
+    subdirectory. Deliberately NARROWER than ``_factor_dir_candidates``: the
+    name/formula-derived fallbacks are shared namespaces (two factors can
+    share a display name or a precomputed formula key), so a cleanup keyed
+    on them could destroy another factor's cache. Callers pass ids that are
+    globally unique by construction (a pipeline's working id embeds its
+    pipeline_id), which makes the id-derived forms safe to remove
+    recursively. Returns the number of directories removed; a missing root
+    removes nothing.
+    """
+
+    import shutil
+
+    if root is None or not factor_id.strip():
+        return 0
+    base = Path(root).expanduser()
+    if not base.is_dir():
+        return 0
+    candidates = list(
+        dict.fromkeys(
+            name
+            for name in (_canonical_factor_dir_name(factor_id), factor_id, _safe_dir_name(factor_id))
+            if name
+        )
+    )
+    parents = [base, *(base / category_dir for category_dir in FACTOR_CATEGORY_DIRS.values())]
+    removed = 0
+    for parent in parents:
+        for candidate in candidates:
+            target = parent / candidate
+            if target.is_dir():
+                shutil.rmtree(target)
+                removed += 1
+    return removed
+
+
 def _score_keys(panel: pd.DataFrame) -> pd.DataFrame:
     keys = panel[["trade_date", "instrument"]].copy()
     keys["trade_date"] = pd.to_datetime(keys["trade_date"])

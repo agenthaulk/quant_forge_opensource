@@ -88,6 +88,18 @@ export async function listActivePipelines() {
   return body.pipelines || [];
 }
 
+/* Restart-proof report retrieval (re-verify RV-F4): the server serves the
+ * live job result while it still exists and falls back to the durable
+ * completion artifact after a restart — callers never need to know which. */
+export async function getPipelineReport(pipelineId) {
+  const response = await fetch(`/api/pipelines/${encodeURIComponent(pipelineId)}/report`, {
+    headers: controlHeaders()
+  });
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error || 'request failed');
+  return body;
+}
+
 export async function fetchPanelJson(url) {
   const headers = storedControlHeaders();
   if (headers === null) return null;

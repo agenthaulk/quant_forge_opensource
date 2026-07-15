@@ -342,7 +342,7 @@ export function renderPipelineCard(pipeline, options) {
 // fixtures alone.
 // -----------------------------------------------------------------------
 
-import { getJob, getPipeline, listActivePipelines, postJson, sleep } from '../api.js';
+import { getPipeline, listActivePipelines, postJson, sleep } from '../api.js';
 
 const mount = document.getElementById('pipeline-card-mount');
 
@@ -522,41 +522,32 @@ export async function retryCurrentPipeline() {
  * into a brand-new draft (own attempt-1 lineage, parent_run_id set
  * server-side) and terminalizes this one as aborted -- a single endpoint
  * call, since apps/web/pipeline.py::fork_pipeline_from_failure does both
- * atomically under its own lock. */
+ * atomically under its own lock. The user's PENDING edits on the paused
+ * card travel with the fork (re-verify RV-F9): the server validates them
+ * and badges each one human_override against the frozen baseline --
+ * posting {} here used to silently discard edits the user could see. */
 export async function forkCurrentPipeline() {
   if (!currentPipeline) return null;
-  const record = await postJson(`/api/pipelines/${encodeURIComponent(currentPipeline.pipeline_id)}/fork`, {});
+  const overrides = currentDensity === 'expert' ? parametersFromExpertGrid() : draftOverrides;
+  const body = Object.keys(overrides).length ? { parameters: overrides } : {};
+  const record = await postJson(`/api/pipelines/${encodeURIComponent(currentPipeline.pipeline_id)}/fork`, body);
+  draftOverrides = {};
   currentDensity = 'beginner';
   setPipeline(record);
   return record;
 }
 
-async function originalIdeaTextForCurrentPipeline() {
-  const parseRef = (currentPipeline.artifact_refs || []).find(ref => ref.kind === 'parse');
-  if (!parseRef || !parseRef.job_id) throw new Error('缺少原始解析记录，无法改用规则解析重新开始');
-  const parseJob = await getJob(parseRef.job_id);
-  return (parseJob.request && parseJob.request.text) || '';
-}
-
-/* phase-review F7 "fall back to rule parse" exit: runs a fresh parse_idea
- * job in rule mode against the SAME idea text (read back off the original
- * parse job's own recorded request -- FE-L3, never a client-held copy of
- * the text), then wraps it into a new pipeline via
- * apps/web/pipeline.py::create_pipeline_as_fallback, which sets
- * parent_run_id lineage and terminalizes this pipeline atomically. */
+/* phase-review F7 "fall back to rule parse" exit, fully server-side
+ * (re-verify RV-F10): one endpoint call. The server re-parses the failed
+ * pipeline's own PERSISTED idea text in rule mode -- this module no longer
+ * reads the text back, starts a parse job, or hands over a job id, so a
+ * pruned parse job can't strand the exit and no client-chosen job can
+ * substitute a different parse. */
 export async function fallbackToRuleParseForCurrentPipeline() {
   if (!currentPipeline) return null;
   const parentId = currentPipeline.pipeline_id;
-  const text = await originalIdeaTextForCurrentPipeline();
-  let job = await postJson('/api/jobs/parse-idea', { text, parser_mode: 'rule' });
-  while (job.status === 'running' || job.status === 'cancel_requested') {
-    await sleep(500);
-    job = await getJob(job.job_id);
-  }
-  if (job.status !== 'completed') throw new Error(job.error || '规则解析失败');
-  const record = await postJson(`/api/pipelines/${encodeURIComponent(parentId)}/fallback-rule-parse`, {
-    parse_job_id: job.job_id
-  });
+  const record = await postJson(`/api/pipelines/${encodeURIComponent(parentId)}/fallback-rule-parse`, {});
+  draftOverrides = {};
   currentDensity = 'beginner';
   setPipeline(record);
   return record;

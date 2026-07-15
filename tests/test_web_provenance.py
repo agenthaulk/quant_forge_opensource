@@ -29,9 +29,24 @@ from quant_forge.apps.web.provenance import (
     ProvenanceEntry,
     assert_full_coverage,
     assert_provenance_matches_current_values,
-    derive_confirm_provenance,
+    derive_baseline_provenance,
+    derive_current_provenance,
     provenance_by_field,
 )
+
+
+def derive_confirm_provenance(*, parser, factor, baseline_parameters, current_parameters=None, text=""):
+    """Test-local composition of the two REAL derivation stages, exactly as
+    apps/web/pipeline.py composes them (create computes the immutable
+    baseline once; every render derives current badges from it -- re-verify
+    RV-F8). Keeps the pre-rework characterization tests exercising the same
+    production code paths through their original call shape."""
+
+    baseline = derive_baseline_provenance(parser=parser, factor=factor, parameters=baseline_parameters, text=text)
+    effective = current_parameters if current_parameters is not None else baseline_parameters
+    return derive_current_provenance(
+        baseline=tuple(entry.to_dict() for entry in baseline), factor=factor, current_parameters=effective
+    )
 
 
 def _factor(**overrides):
@@ -380,3 +395,111 @@ def test_assert_provenance_matches_current_values_raises_on_stale_value() -> Non
         # The array describes holding_days=5 (from _parameters()'s default);
         # claiming the record currently holds 999 must be caught.
         assert_provenance_matches_current_values(entries, factor=_factor(), parameters=_parameters(holding_days=999))
+
+
+# ---------------------------------------------------------------------------
+# Re-verify RV-F7: declared fields missing from an artifact RAISE -- never a
+# silent None badge with a defaulted origin.
+# ---------------------------------------------------------------------------
+
+
+def test_baseline_raises_when_a_declared_factor_field_is_absent() -> None:
+    factor = _factor()
+    del factor["description"]
+    with pytest.raises(MissingProvenanceError, match="description"):
+        derive_baseline_provenance(
+            parser={"source": "llm"}, factor=factor, parameters=_parameters(), text=IDEA_TEXT_WITH_NON_ST
+        )
+
+
+def test_baseline_raises_when_a_declared_parameter_is_absent() -> None:
+    parameters = _parameters()
+    del parameters["holding_days"]
+    with pytest.raises(MissingProvenanceError, match="holding_days"):
+        derive_baseline_provenance(
+            parser={"source": "llm"}, factor=_factor(), parameters=parameters, text=IDEA_TEXT_WITH_NON_ST
+        )
+
+
+def test_current_raises_when_baseline_artifact_lacks_a_declared_field() -> None:
+    baseline = tuple(
+        entry.to_dict()
+        for entry in derive_baseline_provenance(
+            parser={"source": "llm"}, factor=_factor(), parameters=_parameters(), text=IDEA_TEXT_WITH_NON_ST
+        )
+    )
+    truncated = tuple(entry for entry in baseline if entry["field"] != "formula")
+    with pytest.raises(MissingProvenanceError, match="formula"):
+        derive_current_provenance(baseline=truncated, factor=_factor(), current_parameters=_parameters())
+
+
+def test_current_raises_when_current_parameters_lack_a_declared_field() -> None:
+    baseline = tuple(
+        entry.to_dict()
+        for entry in derive_baseline_provenance(
+            parser={"source": "llm"}, factor=_factor(), parameters=_parameters(), text=IDEA_TEXT_WITH_NON_ST
+        )
+    )
+    current = _parameters()
+    del current["decay_days"]
+    with pytest.raises(MissingProvenanceError, match="decay_days"):
+        derive_current_provenance(baseline=baseline, factor=_factor(), current_parameters=current)
+
+
+# ---------------------------------------------------------------------------
+# Re-verify RV-F8: current badges are a pure function of (persisted baseline,
+# current values) -- no parser mode, no idea text, so a restart cannot move
+# a single badge.
+# ---------------------------------------------------------------------------
+
+
+def test_current_badges_survive_a_restart_without_the_idea_text() -> None:
+    # The sharp case the re-verify demonstrated live: universe_filters earns
+    # user_explicit from the idea text at BASELINE time; after a restart the
+    # text no longer exists anywhere volatile, and the badge must not decay
+    # to fixed_policy. derive_current_provenance never sees text at all, so
+    # the property holds structurally -- this pins it.
+    baseline = tuple(
+        entry.to_dict()
+        for entry in derive_baseline_provenance(
+            parser={"source": "rule"}, factor=_factor(), parameters=_parameters(), text=IDEA_TEXT_WITH_NON_ST
+        )
+    )
+    entries = derive_current_provenance(
+        baseline=baseline, factor=_factor(), current_parameters=_parameters(decay_days=3)
+    )
+    by_field = provenance_by_field(entries)
+    assert by_field["universe_filters"].source == "user_explicit"  # unchanged field keeps its baseline origin
+    assert by_field["decay_days"].source == "human_override"  # only the edited field moves
+    assert by_field["decay_days"].parent_value == 0
+
+
+def test_current_preserves_an_inherited_human_override_baseline_entry() -> None:
+    # Fork semantics: a fork's baseline may carry human_override entries
+    # inherited from the parent's run. Unchanged values keep that origin AND
+    # its parent_value; a further edit overrides against the FORK baseline.
+    baseline = tuple(
+        entry.to_dict()
+        for entry in derive_baseline_provenance(
+            parser={"source": "llm"}, factor=_factor(), parameters=_parameters(), text=""
+        )
+    )
+    inherited = tuple(
+        {**entry, "source": "human_override", "value": 9, "parent_value": 5}
+        if entry["field"] == "holding_days"
+        else entry
+        for entry in baseline
+    )
+    unchanged = derive_current_provenance(
+        baseline=inherited, factor=_factor(), current_parameters=_parameters(holding_days=9)
+    )
+    entry = provenance_by_field(unchanged)["holding_days"]
+    assert entry.source == "human_override"
+    assert entry.parent_value == 5
+
+    edited = derive_current_provenance(
+        baseline=inherited, factor=_factor(), current_parameters=_parameters(holding_days=11)
+    )
+    entry = provenance_by_field(edited)["holding_days"]
+    assert entry.source == "human_override"
+    assert entry.parent_value == 9  # overridden against the fork baseline value
