@@ -258,7 +258,8 @@ Contract (`research_loop/outcomes.py`, `qf.research_outcome.v2`):
   `simulate`/`submit`), verdicts (`passed`/`blocked`/`unknown`/
   `not_applicable`), a neutral reason-code registry, a closed metric-key
   registry with fixed units, and a sample-role axis. Registries are
-  read-only mappings; extending a vocabulary is a reviewed contract change.
+  read-only collections; extending a vocabulary is a reviewed contract
+  change.
 - Outcome identity is the logical evidence run:
   `hash(factor_fingerprint × canonical window × stage)`. Re-measuring the
   same evidence reuses the same `evidence_run_id`, so promotion's
@@ -307,17 +308,20 @@ Read models and surfaces:
   list|activate|deactivate|retire|unretire` (reviewer `--actor` required;
   rationale is redacted before persistence).
 - Web review tab: `GET /api/memory/review` renders promoted
-  findings/failures and rule states from a single-lock snapshot
-  (`promoted_review_snapshot`), and `POST /api/memory/review/rule` /
-  `/api/memory/review/promoted` append exactly one validated review event.
+  findings/failures from `promoted_review_snapshot` and rule states from
+  `rule_review_snapshot` — each a single-lock snapshot — and
+  `POST /api/memory/review/rule` / `/api/memory/review/promoted` append
+  exactly one validated review event.
 - `planning_influence.py` freezes the `planning_influence_snapshot`
-  contract: at pipeline confirm time the engine can capture, in one lock
-  hold, exactly which learned steering could have influenced that run —
-  outcomes-ledger revision, review-event revision, the ordered
-  authenticated active rules, and the prompt-policy constants — and the
-  snapshot hash occupies a reserved slot in the web pipeline `input_hash`.
-  The contract is golden-vector pinned: any change to its canonical form or
-  hash is a reviewed contract change.
+  contract: `capture_planning_influence` reads, in one lock hold, exactly
+  which learned steering could have influenced a run — including the
+  outcomes-ledger revision, the review-event revision, the ordered
+  authenticated active rules, and the prompt-policy constants. The
+  snapshot is designed to be captured at web-pipeline confirm time, its
+  hash filling a reserved `planning_influence_hash` slot in the pipeline
+  `input_hash`; that wiring belongs to the agent-sidecar track and is not
+  present on this branch. The contract is golden-vector pinned: any change
+  to its canonical form or hash is a reviewed contract change.
 
 ## Multi-Factor Synthesis Memory
 
