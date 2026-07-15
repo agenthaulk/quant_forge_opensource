@@ -679,6 +679,11 @@ def _read_completion_artifact(store: PipelineStore, pipeline_id: str) -> dict[st
         raw = _completion_artifact_path(store, pipeline_id).read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
+    except UnicodeDecodeError:
+        # RV3-F3: a byte-corrupt artifact is NON-EVIDENCE (honest pause
+        # downstream), never an exception escaping reconciliation.
+        LOGGER.warning("undecodable completion artifact for %s; ignoring it", pipeline_id)
+        return None
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
@@ -698,9 +703,12 @@ def _completion_matches_record(payload: dict[str, Any] | None, record: PipelineR
     if payload is None:
         return False
     compute = record.stage("compute")
-    try:
-        attempt = int(payload.get("attempt", -1))
-    except (TypeError, ValueError):
+    attempt = payload.get("attempt")
+    # Strict type, not int() coercion (re-verify RV3-F2): True, 1.9 and "1"
+    # all coerce to a matching attempt number, and forged near-miss types
+    # must never count as completion evidence. `type(...) is int` also
+    # excludes bool (a subclass of int).
+    if type(attempt) is not int:
         return False
     return (
         str(payload.get("pipeline_id", "")) == record.pipeline_id

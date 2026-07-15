@@ -1670,3 +1670,60 @@ def test_value_cleanup_skips_directories_contested_by_another_factor_id(tmp_path
     assert contested.is_dir()  # contested canonical spelling survives
     assert not exclusive.exists()  # our raw-id dir is gone
     assert removed == 1
+
+
+def test_value_cleanup_claims_compare_casefolded(tmp_path) -> None:
+    # RV3-F1: the default macOS volume is case-insensitive -- "foo" and
+    # "FOO" alias one directory, so ownership claims must compare
+    # casefolded or the cleanup deletes the other spelling's data.
+    from quant_forge.factor_engine.value_store import remove_stored_values_for_factor_id
+
+    root = tmp_path / "values"
+    contested = root / "foo_PWaaaaaaaaaaaaaaaa"
+    contested.mkdir(parents=True)
+    (contested / "2024.parquet").write_bytes(b"stub")
+
+    removed = remove_stored_values_for_factor_id(
+        root, "foo_PWaaaaaaaaaaaaaaaa", other_known_factor_ids=("FOO_PWAAAAAAAAAAAAAAAA",)
+    )
+    assert removed == 0
+    assert contested.is_dir()  # case-variant claim protects the alias
+
+
+def test_completion_artifact_attempt_requires_exact_int_type(tmp_path) -> None:
+    # RV3-F2: True / 1.9 / "1" coerce to a matching attempt via int();
+    # strict typing keeps forged near-miss artifacts non-evidence.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    _wait_job(job_manager, confirmed.stage("compute").child_job_id)
+    running_on_disk = PipelineStore(config.paths.artifact_root).load(pipeline.pipeline_id)
+    assert running_on_disk.status == "running"
+
+    artifact_path = pipeline_module._completion_artifact_path(store, pipeline.pipeline_id)
+    payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    for bad_attempt in (True, 1.9, "1"):
+        forged = dict(payload)
+        forged["attempt"] = bad_attempt
+        assert pipeline_module._completion_matches_record(forged, running_on_disk) is False
+    assert pipeline_module._completion_matches_record(payload, running_on_disk) is True
+
+
+def test_byte_corrupt_completion_artifact_is_non_evidence(tmp_path) -> None:
+    # RV3-F3: invalid UTF-8 in the artifact degrades to the honest pause,
+    # never a UnicodeDecodeError out of reconciliation.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    _wait_job(job_manager, confirmed.stage("compute").child_job_id)
+
+    artifact_path = pipeline_module._completion_artifact_path(store, pipeline.pipeline_id)
+    artifact_path.write_bytes(b"\xff\xfe broken bytes")
+
+    rejoined = get_pipeline(
+        PipelineStore(config.paths.artifact_root), pipeline.pipeline_id, job_manager=_WebJobManager(), config=config
+    )
+    assert rejoined.status == "paused_failure"
+    assert rejoined.failure.reason_code == "JOB_NOT_FOUND"

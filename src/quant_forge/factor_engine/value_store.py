@@ -348,20 +348,24 @@ def remove_stored_values_for_factor_id(
             if name
         )
     )
+    # Claims compare CASEFOLDED (re-verify RV3-F1): the default macOS/APFS
+    # volume is case-insensitive, so "/values/foo" and "/values/FOO" are the
+    # SAME directory -- an exact-case claim check would happily delete the
+    # other spelling's data through the alias.
     foreign_claims: set[str] = set()
     for other_id in other_known_factor_ids:
         other = str(other_id)
         if not other or other == factor_id:
             continue
         foreign_claims.update(
-            name for name in (_canonical_factor_dir_name(other), other, _safe_dir_name(other)) if name
+            name.casefold() for name in (_canonical_factor_dir_name(other), other, _safe_dir_name(other)) if name
         )
     parents = [base, *(base / category_dir for category_dir in FACTOR_CATEGORY_DIRS.values())]
     removed = 0
     for parent in parents:
         for candidate in candidates:
-            if candidate in foreign_claims:
-                continue  # shared canonical spelling: never delete a contested dir
+            if candidate.casefold() in foreign_claims:
+                continue  # shared spelling (any case): never delete a contested dir
             target = parent / candidate
             try:
                 mode = _os.stat(target).st_mode
