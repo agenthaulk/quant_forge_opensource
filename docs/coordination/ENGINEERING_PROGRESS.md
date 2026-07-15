@@ -651,3 +651,77 @@ golden vectors unchanged throughout.
 Gates at close: 1589 passed / CLI OK / diff clean / release scan 249
 files. SE-P5 priors + planning_influence_snapshot freeze is now unblocked
 (P2 folded).
+
+## 2026-07-15 — Workflow B / SE-P5: priors view + planning-influence freeze (CLOSED)
+
+Trunk chain `8ef6d9f` (research_loop/priors.py computed view: evidence-run
+supersession, four-verdict separation with scientific-only rate
+denominators, OOS-role exclusion, R5-3 strength-tier weighting beside raw
+counts, FP-4 null floors, unknown-dims unbucketed; planning_influence.py
+frozen SE-ix snapshot; store outcome_records(); `qf memory priors` CLI) →
+`f945776` (dual-review rework: ordered {event_id, scope, activation_seq}
+rule disclosure + frozen PROMPT_POLICY constants inside the hash — same
+rule SET with different activation order can no longer collide, the
+BLOCKING finding; review_events_revision replaces the regressing seq-max
+pseudo-cutoff; single-lock planning_influence_inputs; dedup-before-OOS so
+a stale in-sample pass cannot outlive its OOS re-measurement; read-path
+row validation with invalid_rows surfacing; fail-closed from_dict; RO-
+safe reads) → `631a214` (non-mapping rows; stage↔strength tier-inflation
+kill + verdict/reason + lifecycle coherence; frozen dimensions; canonical
+serialized-form equality) → `9df3e06` (bidirectional stage↔lifecycle;
+exact-int type gates).
+
+Review trail (all pins rollout-verified): dual review — sol-high REWORK 8
+(1 BLOCKING) ∥ opus executed probes P1–P8 ACCEPT-WITH-FIXES 4 (validated
+determinism, supersession semantics incl. the direct-append attack,
+OOS-leak absence, steering-boundary zero-touch, independent golden-vector
+recomputation) → all 9 distinct findings fixed → sol re-verify: 12/12
+prior findings CLOSED + 4 residuals → fixed → final spot-check: 4/4
+CLOSED + 2 reviewer-prescribed adjacent items → implemented with
+probe-level regressions → steward-adjudicated CLOSED (both final fixes
+are the reviewer's own minimal-fix prescriptions, machine-verified — the
+recorded R3 closure precedent). Convergence 12→4→2→0.
+
+The snapshot contract is now FROZEN (golden vector `dacfe8f43001…`); the
+FE track folds `snapshot_hash` into the pipeline `input_hash` and renders
+the disclosure in its P3 phase. Steering boundaries unchanged (SE-iv):
+nothing new reaches prompts or the planner. Gates at close: 1614 passed /
+CLI OK / diff clean / release scan 252 files. THE ENGINE-SIDE SE TRACK
+(P1–P5) IS COMPLETE; the web review tab (P4b) is the remaining SE-branch
+deliverable.
+
+## 2026-07-15 — Workflow A / FE-P1: pipeline A hardening (CLOSED)
+
+FE-track chain `c27226f` (P1 skeleton: server-owned aggregate, confirm
+card, idempotent confirm, working-row isolation, deletion ledger) →
+`0bd5745` (five-cluster rework: exactly-once launch epochs, per-field
+provenance, isolation redesign replacing the input-hash registry suffix,
+durable rejoin journal, three failure exits + pins) → `4d603c2` (round 2:
+attempt-scoped completion artifact written by the compute thread replaces
+the unscoped RunIndex probe, restart-proof /report endpoint; CAS-guarded
+publish with publish_state; working-artifact cleanup across registry +
+both value roots with cleanup_pending retry; persisted source_text +
+immutable per-field provenance baseline — restarts can no longer move
+badges; fully server-side rule-parse fallback; payload-scoped single-use
+confirm tokens; byte-level torn-tail journal reads; journal-union
+discovery) → `89d4d02` (round-2 residuals: publisher-lock CAS with
+fail-closed reads + documented frozen-api residual window; ownership-safe
+value cleanup; cleanup_pending gates retry/confirm; sanitized artifact
+payloads with propagating write failures; one-shot terminal listing for
+restart-recovered completions; fork preserves durable next-attempt edits)
+→ `88c4eba` (casefolded cleanup claims for case-insensitive volumes;
+exact-int artifact evidence; byte-corrupt artifacts as non-evidence).
+
+Review trail (all pins verified): strict review REWORK 14 → rework → sol
+re-verify FAIL all clusters 10 findings → steward-owned round 2 → 5/11
+closed + 10 sub-findings → round 3 → 9/10 closed + 3 residuals → round 4
+→ final spot-check PASS, zero new findings. Convergence 14→10→10→3→0
+over five adversarial rounds. Adjudicated boundaries on record: the
+working row's registry visibility while running is the documented V1
+boundary (self-describing row + airtight cleanup + CAS publish, all
+built); the publish CAS residual window against the frozen api.py edit
+route is registered for the deferred register (registry-level
+versioning); semantic confirm idempotency (same effective payload =
+replay) is design, documented and pinned. api.py: zero net additions
+across the entire phase (D12 net shrink stands). Gates at close: 1411
+passed / CLI OK / diff clean / release scan 251 files.
