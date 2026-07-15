@@ -766,3 +766,74 @@ Gates at close: 1670 passed / CLI OK / diff clean / release scan 255
 files. THE SE ENGINE TRACK (P1–P5 + the P4b review surface) IS COMPLETE
 on this branch; the remaining SE-branch work is the endgame (docs sync +
 CP-INT + the neutral rename before the PR).
+
+## 2026-07-15 — FE-P3 closed: pipeline B (rd_optimize), pre-validation, planning-influence disclosure (FE branch @ dac01a8)
+
+The terminal FE phase landed as a three-commit chain 96b4690 → 4c98fc9 →
+dac01a8 on top of the P2 tip d163b2a, and fable/fe-p0-mode-shell
+fast-forwarded to dac01a8 — the sidecar workflow (P0–P3) is COMPLETE on
+that branch. Scope shipped: web pipeline B (kind="rd_optimize": RD
+confirm card → one research job → leaderboard through the canonical
+research renderer, external-OOS column labelled audit-only), a
+side-effect-free formula pre-validation endpoint (canonical fingerprint;
+unknown operator → deterministic operator_drafts review ref, never
+executed), the editable-formula card as its own static/views/formula.js
+(textarea-as-source-of-truth + aria-hidden canonical highlight overlay +
+IME composition latch), planning-influence disclosure plumbing with the
+SE-ix seam kept THIN (injectable capture callable defaulting to ""; the
+reserved planning_influence_hash slot participates in input_hash both
+ways — empty-stable and value-sensitive — with NO import of the SE-trunk
+planning_influence module), and the R3.1 subtraction (auto-cycle RD
+controls deleted, #staggered-run migrated to a post-report follow-up).
+
+Review trail: implementer lane (interrupted once mid-build; the resumed
+lane audited the uncommitted draft hunk-by-hunk before building on it) →
+sol-xhigh strict review verdict FAIL — 5 BLOCKING + 4 MAJOR + 1 MINOR,
+pins P1/P7/P8/P9/P10 CONFIRMED, P2/P4/P5/P6 violated → adjudicated
+rework 4c98fc9 closing all ten: follow-up actions re-seeded from the
+SERVER's published_factor_id gated on publish_state (the report's factor
+id is the working row that completion deletes); compare-loop disclosure
+per spec §2.3/§5.4 via an ADDITIVE durable failed_attempts counter
+(incremented at every paused_failure transition, never cleared by
+retry), attempt/parent/fingerprint disclosure on every RD card, and an
+edited-formula branch route whose edited_by=human_override is derived
+server-side by fingerprint comparison; canonical pre-validation
+fingerprint + deterministic review ref; availability-aware leaderboard
+and comparison (status rows render n/a and never enter numeric ranking)
+— additive only; dedup disposition made truthful (Option B: 执行后判定
+重复, disjoint counts — the prior "reused/not rerun" claim was false,
+duplicates are detected AFTER execution); cancel-vs-completion race
+re-reconciles so a completion that won is never overwritten as aborted;
+RD records rejected by the factor-study-only /parameters and /fork
+routes (clean 400) and retry reactivates the confirm stage coherently;
+synchronous 400s for candidates outside 1..10, unknown objective,
+nonexistent seed, and non-strict pre-validate types; the canonical
+integration prompt rewritten off the deleted P1 stepper UI; the stale
+auto-RD rows in integration_workflow.md replaced with the backend-only
+note → opus re-verification (fresh context) PASS-WITH-NITS: all ten
+closures verified CLOSED under independent reproduction with genuine
+races/guards; three residuals — the zero-side-effect test guarded
+unreachable symbols (NEW-1, fixed in dac01a8: guards moved to the real
+evaluation/backtest/job-spawn entrypoints and the persistence snapshot
+widened to every writable root), the edit-formula docstring overstated
+its parent-state contract (NEW-2, fixed: any-status parent is deliberate
+— the confirm-card edit branches before the parent runs), and a "Codex"
+workflow-descriptor comment (NEW-3, adjudicated no-change: it matches
+the repository-wide operator-draft wording in architecture.md and
+integration_workflow.md).
+
+Adjudicated + on record: the RD kernel scoring path consumes legacy
+zero-filled metric aliases (research_loop/candidate_gate.py:349-353 maps
+rank_ic_mean/rank_icir scalars into the objective score ignoring
+MetricValue status; service.py:290 reads the zero-filled scalar) — left
+byte-untouched in this FE phase per the F4 split ruling and REGISTERED
+for CP-INT/owner adjudication. The backend /api/research/schedule
+endpoint and CLI scheduling remain (only the frontend auto-cycle UI was
+deleted). The fe-p3-pipeline-b worktree and branch label were removed
+after the fast-forward fold.
+
+Gates at close: 1553 passed / CLI OK / diff clean / release scan 261
+files / api.py byte-identical to the FE base across all three commits.
+THE FE SIDECAR TRACK (P0–P3) IS COMPLETE on fable/fe-p0-mode-shell; the
+remaining cross-track work is the endgame (CP-INT union + the SE-ix real
+capture wiring + neutral renames + the two PRs).
