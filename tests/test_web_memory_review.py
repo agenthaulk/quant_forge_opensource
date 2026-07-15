@@ -230,95 +230,101 @@ def test_failure_payload_shape_and_retire(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_promoted_retirement_survives_a_supersession_race_between_reads(tmp_path: Path, monkeypatch) -> None:
-    # list_promoted() and retired_signatures() are each independently
-    # locked; a promote_pending() landing between them can supersede a row
-    # exactly when its retire event's reviewed_entry_id no longer matches
-    # the live row -- the frozen contract then makes that event lapse
-    # (truthfully NOT retired relative to the new row). Simulate the
-    # interleaving: list_promoted's FIRST call returns the STALE
-    # pre-supersession row; every later call returns the real (post-
-    # supersession) row. retired_signatures is left untouched -- it always
-    # answers with the CURRENT truth. A naive "call both once" read would
-    # zip the stale rows-read together with retired_signatures and could
-    # only get lucky or unlucky depending on call order; the fix must
-    # detect the mismatch and retry until the (signature -> entry_id)
-    # mapping stabilizes.
+def test_promoted_retirement_read_is_one_atomic_store_snapshot(tmp_path: Path, monkeypatch) -> None:
+    # P4B-F2 / RV3-F1: rows and retirement come from ONE store call
+    # (promoted_review_snapshot), never two independently-locked reads that
+    # could straddle a promote_pending(). The payload path must not call the
+    # split-locked list_promoted / retired_signatures at all -- if it did,
+    # the whole race the atomic snapshot closes would be reintroduced.
     store = _store(tmp_path)
-    old_row = _promote_finding_or_failure(store, signature="sig_race")
-    review_promoted(store, kind="finding", signature_prefix="sig_race", action="retire", actor="alice")
+    _promote_finding_or_failure(store, signature="sig_atomic")
 
+    calls = {"snapshot": 0, "list_promoted": 0, "retired_signatures": 0}
+    real_snapshot = store.promoted_review_snapshot
+    real_list = store.list_promoted
+    real_retired = store.retired_signatures
+
+    def traced_snapshot(kind: str):
+        calls["snapshot"] += 1
+        return real_snapshot(kind)
+
+    def traced_list(kind: str):
+        calls["list_promoted"] += 1
+        return real_list(kind)
+
+    def traced_retired(kind: str):
+        calls["retired_signatures"] += 1
+        return real_retired(kind)
+
+    monkeypatch.setattr(store, "promoted_review_snapshot", traced_snapshot)
+    monkeypatch.setattr(store, "list_promoted", traced_list)
+    monkeypatch.setattr(store, "retired_signatures", traced_retired)
+
+    memory_review_payload(store)
+    # One snapshot per promoted kind (finding + failure); the split-locked
+    # readers are never used by the join.
+    assert calls["snapshot"] == 2
+    assert calls["list_promoted"] == 0
+    assert calls["retired_signatures"] == 0
+
+
+def test_fresh_retirement_of_a_superseded_row_is_shown_retired(tmp_path: Path) -> None:
+    # RV3-F1 (the finding the per-row bracket got wrong): a row superseded
+    # to a NEW entry_id and then GENUINELY retired against that new row must
+    # render retired -- the atomic snapshot binds retirement to the exact
+    # live row it returns, so a fresh new-row retirement is honored (not
+    # dropped as if it were a stale old-row flag).
+    store = _store(tmp_path)
+    old_row = _promote_finding_or_failure(store, signature="sig_fresh")
+
+    # Supersede the row (new entry_id), then retire the NEW row.
     store.record_observation(
-        signature="sig_race", statement="statement for sig_race", run_id="sig_race-3", observed_at=T3
+        signature="sig_fresh", statement="statement for sig_fresh", run_id="sig_fresh-3", observed_at=T3
     )
     store.promote_pending()
-    new_row = store.resolve_signature_prefix("finding", "sig_race")
+    new_row = store.resolve_signature_prefix("finding", "sig_fresh")
     assert new_row["entry_id"] != old_row["entry_id"]
-    # The frozen contract's own truth: the retire event lapsed, since it is
-    # bound to old_row's entry_id, not the new live row's.
-    assert "sig_race" not in store.retired_signatures("finding")
-
-    real_list_promoted = store.list_promoted
-    calls = {"count": 0}
-
-    def flaky_list_promoted(kind: str):
-        # memory_review_payload() also reads kind="failure" (empty, always
-        # stable in one extra pair) -- scope the staleness simulation and
-        # the call count to "finding" only, so the count assertion below
-        # is a precise, meaningful pin on THIS kind's retry behavior rather
-        # than incidentally counting an unrelated kind's own reads too.
-        if kind != "finding":
-            return real_list_promoted(kind)
-        calls["count"] += 1
-        if calls["count"] == 1:
-            return (old_row,)
-        return real_list_promoted(kind)
-
-    monkeypatch.setattr(store, "list_promoted", flaky_list_promoted)
+    review_promoted(store, kind="finding", signature_prefix="sig_fresh", action="retire", actor="alice")
+    assert "sig_fresh" in store.retired_signatures("finding")  # bound to the NEW row
 
     payload = memory_review_payload(store)
-    entry = next(item for item in payload["findings"] if item["signature"] == "sig_race")
-    # Converges on the NEW row with its correctly-lapsed (not retired)
-    # status -- never the new row mislabeled retired from the stale first
-    # read, and never stuck serving the stale old row either.
+    entry = next(item for item in payload["findings"] if item["signature"] == "sig_fresh")
+    assert entry["entry_id"] == new_row["entry_id"]
+    assert entry["review_state"] == "retired"  # honored, NOT dropped as a "moved row"
+
+
+def test_lapsed_retirement_of_a_superseded_row_is_shown_active(tmp_path: Path) -> None:
+    # The mirror case: a row retired against its OLD entry_id, then
+    # superseded, renders active -- the old retire event lapsed (bound to a
+    # now-dead entry_id) and the atomic snapshot correctly does not carry it
+    # onto the fresh row.
+    store = _store(tmp_path)
+    old_row = _promote_finding_or_failure(store, signature="sig_lapse")
+    review_promoted(store, kind="finding", signature_prefix="sig_lapse", action="retire", actor="alice")
+
+    store.record_observation(
+        signature="sig_lapse", statement="statement for sig_lapse", run_id="sig_lapse-3", observed_at=T3
+    )
+    store.promote_pending()
+    new_row = store.resolve_signature_prefix("finding", "sig_lapse")
+    assert new_row["entry_id"] != old_row["entry_id"]
+    assert "sig_lapse" not in store.retired_signatures("finding")  # genuinely lapsed
+
+    payload = memory_review_payload(store)
+    entry = next(item for item in payload["findings"] if item["signature"] == "sig_lapse")
     assert entry["entry_id"] == new_row["entry_id"]
     assert entry["review_state"] == "active"
-    assert calls["count"] == 3  # 1 stale + 1 mismatch-detected + 1 confirming match
 
 
-def test_promoted_stable_read_is_bounded_and_uses_latest_pair_on_persistent_churn(
-    tmp_path: Path, monkeypatch
-) -> None:
-    # Pathological case: the (signature -> entry_id) mapping never
-    # stabilizes across the bounded attempt budget. The read must still
-    # terminate (never hang/retry forever) and must return a
-    # SELF-CONSISTENT pairing from its own last attempt, not some
-    # undefined mix of two different attempts.
+def test_stable_retired_row_keeps_its_retired_flag(tmp_path: Path) -> None:
+    # A genuinely retired, unchanged row keeps its retired state.
     store = _store(tmp_path)
-    _promote_finding_or_failure(store, signature="sig_churn")
+    _promote_finding_or_failure(store, signature="sig_stable_retired")
+    review_promoted(store, kind="finding", signature_prefix="sig_stable_retired", action="retire", actor="alice")
 
-    real_list_promoted = store.list_promoted
-    calls = {"count": 0}
-
-    def churning_list_promoted(kind: str):
-        # Scope to "finding" only -- see the identical note in
-        # test_promoted_retirement_survives_a_supersession_race_between_reads;
-        # the empty "failure" kind is also read by memory_review_payload()
-        # and would otherwise pollute this count.
-        if kind != "finding":
-            return real_list_promoted(kind)
-        calls["count"] += 1
-        rows = real_list_promoted(kind)
-        # A fabricated, ever-changing entry_id: the mapping is different on
-        # every single call, so consecutive reads can never agree.
-        return tuple({**row, "entry_id": f"{row['entry_id']}-{calls['count']}"} for row in rows)
-
-    monkeypatch.setattr(store, "list_promoted", churning_list_promoted)
-
-    payload = memory_review_payload(store)  # must not hang, must not raise
-    assert calls["count"] == 3  # bounded: exactly _PROMOTED_STABLE_READ_ATTEMPTS, never unbounded
-    entry = next(item for item in payload["findings"] if item["signature"] == "sig_churn")
-    assert entry["entry_id"].endswith("-3")  # the LATEST attempt's pair, not the first or a mix
+    payload = memory_review_payload(store)
+    entry = next(item for item in payload["findings"] if item["signature"] == "sig_stable_retired")
+    assert entry["review_state"] == "retired"
 
 
 # ---------------------------------------------------------------------------

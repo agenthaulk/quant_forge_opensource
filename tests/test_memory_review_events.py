@@ -390,6 +390,48 @@ def test_retired_signatures_rejects_rule_target_kind(tmp_path: Path) -> None:
         store.retired_signatures("rule")
 
 
+def test_promoted_review_snapshot_binds_retirement_to_the_returned_rows(tmp_path: Path) -> None:
+    # SE-P4b: (rows, retired) come from ONE lock hold and retirement is
+    # bound to the CURRENT entry_id of the exact rows returned. A retire of
+    # the OLD row that then gets superseded lapses; a retire of the NEW row
+    # is honored -- both against the rows the snapshot itself returns.
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    old_row = _promote_finding(store, signature="sig_snap")
+    store.record_review_event(
+        target_kind="finding", target_signature="sig_snap", reviewed_entry_id=old_row["entry_id"],
+        action="retire", actor="dave", decided_at=T1,
+    )
+    rows, retired = store.promoted_review_snapshot("finding")
+    assert {row["signature"] for row in rows} == {"sig_snap"}
+    assert retired == frozenset({"sig_snap"})  # retired against the live (old) row
+
+    # Supersede: the old-row retire lapses.
+    store.record_observation(
+        signature="sig_snap", statement="statement for sig_snap", run_id="sig_snap-3", observed_at=T3
+    )
+    store.promote_pending()
+    new_row = store.resolve_signature_prefix("finding", "sig_snap")
+    assert new_row["entry_id"] != old_row["entry_id"]
+    rows2, retired2 = store.promoted_review_snapshot("finding")
+    assert {row["entry_id"] for row in rows2} == {new_row["entry_id"]}
+    assert retired2 == frozenset()  # lapsed, not carried onto the fresh row
+
+    # Retire the NEW row: honored.
+    store.record_review_event(
+        target_kind="finding", target_signature="sig_snap", reviewed_entry_id=new_row["entry_id"],
+        action="retire", actor="dave", decided_at=T3,
+    )
+    rows3, retired3 = store.promoted_review_snapshot("finding")
+    assert {row["entry_id"] for row in rows3} == {new_row["entry_id"]}
+    assert retired3 == frozenset({"sig_snap"})
+
+
+def test_promoted_review_snapshot_rejects_rule_target_kind(tmp_path: Path) -> None:
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    with pytest.raises(ValueError, match="finding.*failure|failure.*finding"):
+        store.promoted_review_snapshot("rule")
+
+
 # ---------------------------------------------------------------------------
 # P4a rework items 2 + 3: row binding, supersedes integrity, and the row-
 # content-change activation lapse.

@@ -6,8 +6,10 @@ Pure orchestration over the already-reviewed, frozen engine-side contracts in
 this codebase already computes elsewhere. It only:
 
 - shapes :meth:`ResearchMemoryStore.rule_review_snapshot`,
-  :meth:`ResearchMemoryStore.list_promoted`, :meth:`ResearchMemoryStore.
-  retired_signatures`, and :func:`quant_forge.research_loop.priors.
+  :meth:`ResearchMemoryStore.promoted_review_snapshot` (the atomic
+  rows+retirement read for the finding/failure lists -- never the
+  separately-locked ``list_promoted`` + ``retired_signatures`` pair, whose
+  race the snapshot closes), and :func:`quant_forge.research_loop.priors.
   compute_priors` into one JSON-serializable payload for the Web tab
   (:func:`memory_review_payload`);
 - appends exactly one review event per action, through
@@ -104,63 +106,26 @@ def _rules_payload(store: ResearchMemoryStore, *, include_actions: bool) -> list
     return rows
 
 
-_PROMOTED_STABLE_READ_ATTEMPTS = 3
-
-
-def _entry_id_mapping(rows: tuple[dict[str, Any], ...]) -> dict[str, str]:
-    return {str(row.get("signature") or ""): str(row.get("entry_id") or "") for row in rows}
-
-
 def _stable_promoted_rows_and_retired(
     store: ResearchMemoryStore, kind: str
 ) -> tuple[tuple[dict[str, Any], ...], frozenset[str]]:
-    """(rows, retired_signatures) for ``kind``, read as one consistent
-    snapshot -- without a single atomic store method to do it in one read
-    (review finding P4B-F2).
+    """(rows, retired_signatures) for ``kind`` as ONE atomic store read.
 
-    :meth:`ResearchMemoryStore.list_promoted` and :meth:`ResearchMemoryStore.
-    retired_signatures` are each independently locked (the store takes and
-    releases its advisory lock once per call), so calling them back to back
-    is two separate snapshots of the store, not one: a ``promote_pending()``
-    landing between them can supersede a row (new ``entry_id``) exactly when
-    that signature's retire event was bound to the OLD ``entry_id`` -- the
-    frozen contract (``_latest_events_by_signature_unlocked``) then makes
-    that event lapse, so the signature is no longer retired, but a
-    ``retired_signatures()`` read from BEFORE the supersession would still
-    say it is. Pairing that stale flag with the NEW (post-supersession) row
-    falsely labels fresh, never-reviewed content as retired.
-
-    Unlike rules (:meth:`ResearchMemoryStore.rule_review_snapshot` already
-    reads rows and events in ONE lock hold), there is no equivalent single
-    public method for finding/failure retirement -- adding one would touch
-    the frozen store contract, which is out of scope here. Instead this
-    reads the SAME two public methods repeatedly and only trusts a pairing
-    once it has evidence nothing moved underneath it: two consecutive
-    ``list_promoted`` reads whose ``(signature -> entry_id)`` mapping is
-    IDENTICAL bracket the ``retired_signatures`` read in between them, so
-    nothing could have superseded a row inside that bracket without ALSO
-    changing the second rows read -- the retired set read inside a stable
-    bracket safely corresponds to the rows on either side of it. Bounded to
-    :data:`_PROMOTED_STABLE_READ_ATTEMPTS` attempts; on persistent churn (a
-    pathological continuously-promoting workload that never lets two
-    consecutive reads agree) this returns the LATEST pair rather than
-    blocking forever -- append-only, single-host-writer files (the store's
-    own operating assumption) make convergence the overwhelmingly common
-    case in practice, and an unbounded retry loop would be a new liveness
-    risk this read-only surface should not own.
+    Delegates to :meth:`ResearchMemoryStore.promoted_review_snapshot`, which
+    reads the live rows AND the row-bound retire events under a single
+    advisory-lock hold. This replaces the earlier caller-side dance over two
+    independently-locked reads (``list_promoted`` then
+    ``retired_signatures``): those could straddle a ``promote_pending()`` and
+    either strand a stale retire flag on a fresh row (review finding P4B-F2)
+    or -- in the per-row-bracketing follow-up -- DROP a fresh retirement of a
+    just-superseded new row (re-verify RV3-F1), because entry-id stability
+    alone cannot tell a stale old-row binding from a genuine new-row one.
+    The atomic snapshot binds retirement to the exact rows it returns, so
+    both cases are correct by construction; the join here is a pure
+    signature membership check.
     """
 
-    rows: tuple[dict[str, Any], ...] = ()
-    retired: frozenset[str] = frozenset()
-    previous_mapping: dict[str, str] | None = None
-    for _ in range(_PROMOTED_STABLE_READ_ATTEMPTS):
-        rows = store.list_promoted(kind)
-        retired = store.retired_signatures(kind)
-        mapping = _entry_id_mapping(rows)
-        if previous_mapping is not None and mapping == previous_mapping:
-            break
-        previous_mapping = mapping
-    return rows, retired
+    return store.promoted_review_snapshot(kind)
 
 
 def _promoted_payload(store: ResearchMemoryStore, kind: str, *, include_actions: bool) -> list[dict[str, Any]]:

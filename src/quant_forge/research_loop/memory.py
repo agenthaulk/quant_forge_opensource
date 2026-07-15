@@ -579,6 +579,37 @@ class ResearchMemoryStore:
             events = self._latest_events_by_signature_unlocked(target_kind)
         return frozenset(signature for signature, event in events.items() if event.action == "retire")
 
+    def promoted_review_snapshot(self, target_kind: str) -> tuple[tuple[dict[str, Any], ...], frozenset[str]]:
+        """(live rows, retired signatures) for a finding/failure kind, read
+        in ONE advisory-lock hold so the retirement overlay is always
+        consistent with the rows it labels.
+
+        The finding/failure analog of :meth:`rule_review_snapshot` /
+        :meth:`effective_active_rules` (same single-hold discipline). Both
+        the rows (:meth:`_list_promoted_unlocked`) and the retire events
+        (:meth:`_latest_events_by_signature_unlocked`, which itself binds
+        every event to the CURRENTLY live row's ``entry_id``) are computed
+        from the SAME in-lock read of the store, so the two split-locked
+        reads a caller would otherwise make -- ``list_promoted`` then
+        ``retired_signatures`` -- can no longer straddle a
+        ``promote_pending()``. That race (SE-P4b) could otherwise strand a
+        stale retire flag on a freshly-superseded row OR drop a fresh
+        retirement of a just-superseded row: here a retire event bound to
+        the new row's ``entry_id`` correctly retires it, and a retire event
+        bound to a superseded old ``entry_id`` correctly lapses -- both
+        against the exact rows returned.
+        """
+
+        if target_kind not in _RETIRE_TARGET_KINDS:
+            raise ValueError(
+                f"promoted_review_snapshot target_kind must be one of {sorted(_RETIRE_TARGET_KINDS)}, got {target_kind!r}"
+            )
+        with advisory_file_lock(self._lock_path):
+            rows = self._list_promoted_unlocked(target_kind)
+            events = self._latest_events_by_signature_unlocked(target_kind)
+        retired = frozenset(signature for signature, event in events.items() if event.action == "retire")
+        return rows, retired
+
     def rule_tier_signatures(self) -> frozenset[str]:
         """Every signature with a LIVE rule-tier row, active or pending
         (P4a rework item 1: pre-activation silencing). A signature reaching
