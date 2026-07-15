@@ -516,7 +516,7 @@ adversarial rounds.
 
 ## 2026-07-13 — Workflow B / SE-P1: ResearchOutcome v2 contract (CLOSED)
 
-Branch `fable/self-evolution-design` @ `4a42972` (chain: design `c1a20c2` →
+Branch `feature/self-evolution-engine` @ `4a42972` (chain: design `c1a20c2` →
 CP0 rulings `6bbef79`/`e12b894` → contract `9cb0967` → battery `d01073d` →
 review rework `3fb734d` → extended battery `80f7ab4` → coherence matrix
 `4a42972`). Deliverable: `research_loop/outcomes.py` (neutral four-axis
@@ -539,7 +539,7 @@ per SE-x.
 
 ## 2026-07-13 — Workflow A / FE-P0: mode shell (CLOSED)
 
-Branch `fable/fe-p0-mode-shell` @ `3fe4307` (chain `774023f` → rework
+Branch `feature/agent-sidecar-frontend` @ `3fe4307` (chain `774023f` → rework
 `b47837e` → residuals `3fe4307`, forked from main `3d98230`). Deliverable:
 simple/expert mode shell per WORKORDER §5 P0 — persistent `#mode-header`
 toggle (hoisted after the FE0 trap finding), idea box + seeds + runtime
@@ -770,7 +770,7 @@ CP-INT + the neutral rename before the PR).
 ## 2026-07-15 — FE-P3 closed: pipeline B (rd_optimize), pre-validation, planning-influence disclosure (FE branch @ dac01a8)
 
 The terminal FE phase landed as a three-commit chain 96b4690 → 4c98fc9 →
-dac01a8 on top of the P2 tip d163b2a, and fable/fe-p0-mode-shell
+dac01a8 on top of the P2 tip d163b2a, and feature/agent-sidecar-frontend
 fast-forwarded to dac01a8 — the sidecar workflow (P0–P3) is COMPLETE on
 that branch. Scope shipped: web pipeline B (kind="rd_optimize": RD
 confirm card → one research job → leaderboard through the canonical
@@ -834,6 +834,6 @@ after the fast-forward fold.
 
 Gates at close: 1553 passed / CLI OK / diff clean / release scan 261
 files / api.py byte-identical to the FE base across all three commits.
-THE FE SIDECAR TRACK (P0–P3) IS COMPLETE on fable/fe-p0-mode-shell; the
+THE FE SIDECAR TRACK (P0–P3) IS COMPLETE on feature/agent-sidecar-frontend; the
 remaining cross-track work is the endgame (CP-INT union + the SE-ix real
 capture wiring + neutral renames + the two PRs).

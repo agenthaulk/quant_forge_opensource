@@ -132,11 +132,12 @@ provider 已识别、key env 已继承但真实 key 未打印、各数据/因子
 用**真实 Chrome**，按**当前 Phase D 的信息架构（IA）**逐项走。每一步保留截图或页面状态
 摘要（screenshots / page-state）作为真实前端操作证据。
 
-**当前 IA：6 个顶层页签（tabs）** —— 「LLM 因子工作台」（内含两个模块：单因子研究 /
-多因子策略回测）·「研究历史」·「数据」·「注册表」·「文档」·「扩展」。
+**当前 IA：7 个顶层页签（tabs）** —— 「LLM 因子工作台」（内含两个模块：单因子研究 /
+多因子策略回测）·「研究历史」·「数据」·「注册表」·「文档」·「扩展」·「记忆治理」。
 顶层 tab id 依次为 `lab-tab-factor` / `lab-tab-history` / `lab-tab-data` /
-`lab-tab-registry` / `lab-tab-docs` / `lab-tab-extensions`；工作台内两个模块 id 为
-`lab-module-single`（单因子研究）与 `lab-module-multi`（多因子策略回测）。
+`lab-tab-registry` / `lab-tab-docs` / `lab-tab-extensions` / `lab-tab-memory`；
+工作台内两个模块 id 为 `lab-module-single`（单因子研究）与
+`lab-module-multi`（多因子策略回测）。
 
 ### 4.0 Shell 与 IA / shell and IA
 

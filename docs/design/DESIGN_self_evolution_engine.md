@@ -322,9 +322,9 @@ items marked). Recommendations given, but the executor owns the ruling.
 ## 9. Phase plan (checkpointed; file-scope disjoint; update ENGINEERING_PROGRESS per phase)
 
 **CP0 (executor, in person):** adjudicate `SE-i..SE-viii`; branch (suggest
-`fable/phase-f-self-evolution` off `main`); model routing (assign by difficulty —
+`phase-self-evolution` off `main`); model routing (assign by difficulty —
 hard/contract lanes to Opus/qf-opus-reviewer, mechanical lanes to Sonnet/qf-sonnet-dev,
-never all-fable); one adversarial review pass on this design. Owner approval before P1.
+never a single lane); one adversarial review pass on this design. Owner approval before P1.
 
 | Phase | Scope (file ownership) | Deliverable |
 | --- | --- | --- |
