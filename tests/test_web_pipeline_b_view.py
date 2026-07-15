@@ -9,8 +9,12 @@
   a read-only pre-validation call, and — the load-bearing behavioural pin — a
   Node smoke proving the overlay is NEVER repainted mid-IME-composition;
 - the leaderboard reuse of ``static/views/research.js``: the external-OOS
-  column labelled audit-only (「审计」) and the dedup disposition rendered
-  executed / reused / skipped from server-authoritative fields.
+  column labelled audit-only (「审计」), the dedup disposition rendered
+  truthfully as executed / executed-unique / duplicate-after-execution /
+  skipped (F5 — result-signature dups are detected AFTER full execution, never
+  "reused"), availability-aware metrics that render n/a + status for a withheld
+  metric and exclude unscorable rows from the numeric ranking (F4), and the
+  canonical dsl highlighter in the comparison formula cell (F2c).
 
 Mirrors this project's web-test conventions (string-contract pins on the JS
 source + a stdlib Node smoke harness that imports the REAL modules and drives
@@ -89,7 +93,12 @@ def test_rd_leaderboard_card_is_terminal_and_points_to_the_audit_only_leaderboar
     body = pipeline_js[fn_start:fn_end]
     assert "排行榜已生成" in body
     assert "审计" in body
-    assert "executed / reused / skipped" in body
+    # F5: the leaderboard names the TRUTHFUL post-execution disposition, never
+    # the old false "reused" (which implied "not rerun").
+    assert "执行 / 执行后判定重复 / 执行前跳过" in body
+    assert "reused" not in body
+    # F2: the terminal card still discloses the attempt lineage.
+    assert "renderRdAttemptDisclosure(pipeline)" in body
     # Terminal: no confirm/run action buttons on the leaderboard card.
     assert "data-pipeline-action=\"confirm\"" not in body
     assert "pipeline-actions" not in body
@@ -131,18 +140,26 @@ def test_research_comparison_labels_external_oos_audit_only() -> None:
     assert "external OOS 只用于审计展示，不参与 winner 选择" in research_js
 
 
-def test_research_renders_dedup_disposition_executed_reused_skipped() -> None:
+def test_research_renders_truthful_post_execution_dedup_disposition() -> None:
+    # F5 (OPTION B): the disposition is truthful about POST-execution dedup --
+    # executed / executed-unique / duplicate-after-execution / skipped, disjoint,
+    # never the old false "reused"/"复用" that implied "not rerun".
     research_js = _static_module_text("views/research.js")
     assert "export function dedupDisposition(" in research_js
     assert "export function renderDedupDisposition(" in research_js
     fn_start = research_js.index("export function dedupDisposition(")
     fn_end = research_js.index("\n}", fn_start)
     body = research_js[fn_start:fn_end]
-    # All three counts come from SERVER-authoritative fields, never invented.
-    assert "payload.candidates" in body            # executed
-    assert "result_duplicates" in body             # reused
-    assert "formula_skipped" in body and "diversity_skipped" in body  # skipped
-    # renderResearch actually mounts the disposition panel.
+    # All counts come from SERVER-authoritative fields, never invented.
+    assert "payload.candidates" in body            # executed (all ran)
+    assert "result_duplicates" in body             # duplicate-after-execution
+    assert "formula_skipped" in body and "diversity_skipped" in body  # skipped (pre-execution)
+    # The rendered panel says 执行后判定重复 and NEVER claims reused / not rerun.
+    render_start = research_js.index("export function renderDedupDisposition(")
+    render_end = research_js.index("\n}", render_start)
+    render_body = research_js[render_start:render_end]
+    assert "执行后判定重复" in render_body
+    assert "reused" not in render_body and "复用" not in render_body
     assert "renderDedupDisposition(payload)" in research_js
 
 
@@ -325,7 +342,7 @@ globalThis.document = { getElementById: () => null, createElement: () => ({}), q
 const pipeline = await import(process.env.QF_PIPELINE_URL);
 const research = await import(process.env.QF_RESEARCH_URL);
 const { renderPipelineCard } = pipeline;
-const { renderComparisonTable, renderDedupDisposition, dedupDisposition } = research;
+const { renderComparisonTable, renderDedupDisposition, dedupDisposition, isRowScorable } = research;
 
 let failed = 0;
 function check(name, cond, detail) { if (cond) console.log('PASS ' + name); else { failed++; console.log('FAIL ' + name + (detail ? ': ' + detail : '')); } }
@@ -373,34 +390,74 @@ const rdProvenance = [
   check('rd.leaderboard_no_actions', !html.includes('pipeline-actions'));
 }
 
-// (c) dedup disposition is server-authoritative executed/reused/skipped.
+// (c) F5 dedup disposition: result-signature duplicates are detected AFTER full
+// execution — BOTH candidates ran; one is ALSO flagged duplicate-post-execution.
+// Disjoint buckets (executed_unique + duplicate_after_execution === executed);
+// the UI never claims "not rerun"/"复用". Driven from a real payload shape with
+// a genuine duplicate-result trace (the second candidate carries the exact
+// "duplicate result signature matches …" gate reason service.py records, and
+// is STILL present in `candidates` because it executed).
 {
   const payload = {
-    candidates: [{}, {}, {}],
-    deduplication: { result_duplicates: 2, formula_skipped: 1, diversity_skipped: 1 }
+    candidates: [
+      { factor: { factor_id: 'FTR_A', formula: 'rank(close)' }, gate_reasons: ['passed smoke research gate'] },
+      { factor: { factor_id: 'FTR_B', formula: 'rank( close )' }, gate_reasons: ['duplicate result signature matches FTR_A'] }
+    ],
+    deduplication: { result_duplicates: 1, formula_skipped: 1, diversity_skipped: 1 }
   };
   const d = dedupDisposition(payload);
-  check('dedup.executed', d.executed === 3, JSON.stringify(d));
-  check('dedup.reused', d.reused === 2, JSON.stringify(d));
-  check('dedup.skipped', d.skipped === 2, JSON.stringify(d));
+  check('dedup.executed_all_ran', d.executed === 2, JSON.stringify(d));
+  check('dedup.executed_unique', d.executedUnique === 1, JSON.stringify(d));
+  check('dedup.duplicate_after_execution', d.duplicateAfterExecution === 1, JSON.stringify(d));
+  check('dedup.skipped_pre_execution', d.skipped === 2, JSON.stringify(d));
+  check('dedup.disjoint', d.executedUnique + d.duplicateAfterExecution === d.executed, JSON.stringify(d));
   const html = renderDedupDisposition(payload);
-  check('dedup.render_executed', html.includes('executed 3'));
-  check('dedup.render_reused', html.includes('reused 2'));
-  check('dedup.render_skipped', html.includes('skipped 2'));
+  check('dedup.render_execution_after_dup', html.includes('执行后判定重复 1'));
+  check('dedup.render_no_false_reused', !html.includes('reused') && !html.includes('复用'), html);
+  check('dedup.render_states_both_ran', html.includes('之后') && html.includes('都已实际运行'));
 }
 
-// (d) external OOS column labelled 审计; status-word / null metrics render n/a,
-// never a fabricated number entering the comparison.
+// (d) F4: external OOS labelled 审计; a row whose rank_icir is
+// status=insufficient_sample renders its status label (n/a), NEVER a 0.00
+// scalar, and is EXCLUDED from the numeric ranking (isRowScorable === false).
 {
   const payload = { comparison_rows: [
-    { round: 1, factor_id: 'FTR_A', formula: 'x', selection_score: null, gate_passed: false },
-    { round: 1, factor_id: 'FTR_B', formula: 'y', selection_score: 'insufficient_sample', gate_passed: true }
+    { round: 1, factor_id: 'FTR_LOW', formula: 'rank(close)', selection_score: 0.10,
+      selection_rank_ic: 0.02, selection_rank_ic_status: 'available',
+      selection_icir: 0.5, selection_icir_status: 'available', gate_passed: true },
+    { round: 1, factor_id: 'FTR_NA', formula: 'ts_mean(close, 5)', selection_score: 0.0,
+      selection_rank_ic: 0.0, selection_rank_ic_status: 'insufficient_sample',
+      selection_icir: 0.0, selection_icir_status: 'insufficient_sample', gate_passed: false }
   ] };
   const html = renderComparisonTable(payload);
   check('cmp.external_oos_audit_label', html.includes('审计'));
-  check('cmp.null_score_is_na', html.includes('n/a'));
-  // The status word never appears as, or is coerced into, a numeric score.
-  check('cmp.status_word_not_rendered_as_number', !html.includes('>insufficient_sample<'), html);
+  // The withheld icir renders its status label, never the zero-filled scalar.
+  check('cmp.status_label_rendered', html.includes('insufficient_sample'));
+  check('cmp.status_not_zero_scalar', !html.includes('ICIR 0.00') && !html.includes('IC 0.0000'), html);
+  // Exclusion from the numeric ranking is server-status-driven, not guessed.
+  check('cmp.scorable_row_included', isRowScorable(payload.comparison_rows[0]) === true);
+  check('cmp.status_row_excluded', isRowScorable(payload.comparison_rows[1]) === false);
+  // Canonical dsl highlighter (F2c): the formula cell defers to formulaHtml.
+  check('cmp.formula_uses_dsl_highlighter', html.includes('dsl-fn'));
+}
+
+// (e) F2: RD cards disclose the SERVER-authoritative attempt lineage +
+// multiple-comparison honesty. failed_attempts is durable on the record — a
+// retry clears `failure` but NOT this count, so "此前 N 次尝试失败" survives.
+{
+  const rd = {
+    pipeline_id: 'PL_rd3', kind: 'rd_optimize', status: 'awaiting_confirm',
+    factor: { factor_id: 'FTR_SEED' },
+    parameters: { rounds: 2, candidates_per_round: 3, objective: 'balanced' },
+    warnings: [], failure: null, confirmed_parameters: null,
+    attempt: { number: 3, parent_run_id: 'PL_parent' }, failed_attempts: 2,
+    input_hash: 'abcdef0123456789', stages: rdStages({ confirm: 'active' })
+  };
+  const html = renderPipelineCard(rd, { provenance: rdProvenance });
+  check('rd.attempt_number_disclosed', html.includes('第 3 次尝试'));
+  check('rd.failed_attempts_disclosed', html.includes('此前 2 次尝试失败'));
+  check('rd.input_fingerprint_disclosed', html.includes('abcdef012345'));
+  check('rd.parent_lineage_disclosed', html.includes('PL_parent'));
 }
 
 console.log('SMOKE RESULT: ' + failed + ' failed');
@@ -434,11 +491,19 @@ def test_node_rd_cards_and_research_leaderboard_smoke(tmp_path) -> None:
         "PASS rd.no_factor_study_grid",
         "PASS rd.leaderboard_terminal",
         "PASS rd.leaderboard_no_actions",
-        "PASS dedup.executed",
-        "PASS dedup.reused",
-        "PASS dedup.skipped",
+        "PASS dedup.executed_all_ran",
+        "PASS dedup.executed_unique",
+        "PASS dedup.duplicate_after_execution",
+        "PASS dedup.skipped_pre_execution",
+        "PASS dedup.disjoint",
+        "PASS dedup.render_execution_after_dup",
+        "PASS dedup.render_no_false_reused",
         "PASS cmp.external_oos_audit_label",
-        "PASS cmp.null_score_is_na",
-        "PASS cmp.status_word_not_rendered_as_number",
+        "PASS cmp.status_label_rendered",
+        "PASS cmp.status_row_excluded",
+        "PASS cmp.formula_uses_dsl_highlighter",
+        "PASS rd.attempt_number_disclosed",
+        "PASS rd.failed_attempts_disclosed",
+        "PASS rd.parent_lineage_disclosed",
     ):
         assert marker in result.stdout, result.stdout

@@ -363,6 +363,16 @@ class PipelineRecord:
     # MissingProvenanceError -- never a silent default badge.
     baseline_provenance: tuple[dict[str, Any], ...] = field(default_factory=tuple)
     attempt: AttemptState = field(default_factory=AttemptState)
+    # F2 (compare-loop disclosure, spec §5.4 "failed/cancelled counting
+    # policy"): a monotonic COUNT of attempts that reached paused_failure
+    # (a launched compute/run that ended un-completed). Unlike `failure`
+    # -- which `_transition` clears the moment the pipeline leaves
+    # paused_failure on a retry -- this counter is NEVER decremented or
+    # cleared, so the multiple-comparison honesty disclosure ("attempt N
+    # failed") survives every retry and stays visible on the aggregate.
+    # It is a plain integer count, not a per-attempt ledger (steward
+    # boundary: no general append-only ledger beyond what §5.4 requires).
+    failed_attempts: int = 0
     artifact_refs: tuple[ArtifactRef, ...] = field(default_factory=tuple)
     failure: FailureState | None = None
     # Phase-review F6 (snapshot isolation redesign): `working_factor_id` is
@@ -433,6 +443,8 @@ class PipelineRecord:
             raise ValueError("paused_failure requires a failure record")
         if self.revision < 0:
             raise ValueError("revision must be >= 0")
+        if self.failed_attempts < 0:
+            raise ValueError("failed_attempts must be >= 0")
 
     def stage(self, stage_id: str) -> StageRecord:
         for stage in self.stages:
@@ -471,6 +483,7 @@ class PipelineRecord:
             "provenance": [dict(entry) for entry in self.provenance],
             "baseline_provenance": [dict(entry) for entry in self.baseline_provenance],
             "attempt": self.attempt.to_dict(),
+            "failed_attempts": self.failed_attempts,
             "artifact_refs": [ref.to_dict() for ref in self.artifact_refs],
             "failure": self.failure.to_dict() if self.failure is not None else None,
             "working_factor_id": self.working_factor_id,
@@ -506,6 +519,7 @@ class PipelineRecord:
             provenance=tuple(dict(entry) for entry in payload.get("provenance", ())),
             baseline_provenance=tuple(dict(entry) for entry in payload.get("baseline_provenance", ())),
             attempt=AttemptState.from_dict(payload.get("attempt", {"number": 1})),
+            failed_attempts=int(payload.get("failed_attempts", 0)),
             artifact_refs=tuple(ArtifactRef.from_dict(item) for item in payload.get("artifact_refs", ())),
             failure=FailureState.from_dict(failure_payload) if failure_payload else None,
             working_factor_id=str(payload.get("working_factor_id", "")),

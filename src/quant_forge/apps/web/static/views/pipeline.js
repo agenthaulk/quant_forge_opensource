@@ -277,6 +277,26 @@ function rdCostText(rounds, candidates) {
   return `成本预告：约 ${esc(rounds)} 轮 × ${esc(candidates)} 候选 = ${esc(totalText)} 次候选评测（研究口径；真实 LLM + 全量数据耗时可能很长）。`;
 }
 
+/* F2 (compare-loop disclosure, spec §5.4): the SERVER-authoritative attempt
+ * lineage + multiple-comparison honesty for pipeline B, rendered on every RD
+ * card. `attempt.number` and `failed_attempts` are durable on the aggregate --
+ * `failed_attempts` is NEVER cleared by a retry (unlike `failure`), so the
+ * disclosure "attempt N; M prior attempts failed" survives leaving the failure
+ * state. `input_hash` is the RD input fingerprint (seed + rounds/candidates/
+ * objective + config); `attempt.parent_run_id` is the seed lineage. All are
+ * read straight off the record — never client-computed. */
+export function renderRdAttemptDisclosure(pipeline) {
+  const attempt = pipeline.attempt || {};
+  const attemptNo = attempt.number || 1;
+  const failed = pipeline.failed_attempts || 0;
+  const fingerprint = pipeline.input_hash ? String(pipeline.input_hash).slice(0, 12) : 'n/a';
+  const parts = [`第 ${esc(attemptNo)} 次尝试`];
+  if (failed > 0) parts.push(`此前 ${esc(failed)} 次尝试失败（多重比较披露）`);
+  parts.push(`输入指纹 ${esc(fingerprint)}`);
+  if (attempt.parent_run_id) parts.push(`源自 ${esc(attempt.parent_run_id)}`);
+  return `<p class="meta pipeline-rd-attempts">${parts.join(' · ')}</p>`;
+}
+
 export function renderRdConfirmCard(pipeline, provenance) {
   const provenanceByField = provenanceEntryByField(provenance || []);
   const params = pipeline.parameters || {};
@@ -292,6 +312,7 @@ export function renderRdConfirmCard(pipeline, provenance) {
       ${statusRowHtml(pipeline, '确认 RD 优化（管线 B）')}
       ${renderStageStrip(pipeline)}
       ${renderNegativeEvidence(pipeline)}
+      ${renderRdAttemptDisclosure(pipeline)}
       <p class="meta">从因子 <code>${esc(seedFactorId)}</code> 出发做 RD 优化。RD 是一条由你显式发起的独立管线——报告不会自动进入 RD（无 A→B 自动桥）。</p>
       <div class="pipeline-rd-disclosure">
         ${provenanceBadgeHtml({ source: 'fixed_policy' })}
@@ -322,6 +343,7 @@ export function renderRdRunningCard(pipeline) {
       ${statusRowHtml(pipeline, '正在运行 RD 优化')}
       ${renderStageStrip(pipeline)}
       ${renderNegativeEvidence(pipeline)}
+      ${renderRdAttemptDisclosure(pipeline)}
       <p class="meta">RD 的 N 轮在同一个后台任务内运行（不拆分每轮灯）；完成后候选排行榜会在下方 RD 循环区展开。</p>
       <div class="pipeline-actions">
         <button type="button" class="secondary danger" data-pipeline-action="cancel">中断本次 RD</button>
@@ -335,7 +357,8 @@ export function renderRdPausedFailureCard(pipeline) {
       ${statusRowHtml(pipeline, 'RD 尝试失败')}
       ${renderStageStrip(pipeline)}
       ${renderNegativeEvidence(pipeline)}
-      <p class="meta">seed 与 RD 参数已冻结保留。可沿用原参数重试，或放弃本次 RD。</p>
+      ${renderRdAttemptDisclosure(pipeline)}
+      <p class="meta">seed 与 RD 参数已冻结保留。可沿用原参数重试，或放弃本次 RD。重试会保留此前失败尝试的计数披露。</p>
       <div class="pipeline-actions">
         <button type="button" data-pipeline-action="retry">重试（沿用原参数）</button>
         <button type="button" class="secondary danger" data-pipeline-action="cancel">放弃本次 RD</button>
@@ -348,7 +371,8 @@ export function renderRdLeaderboardCard(pipeline) {
     <div class="panel pipeline-card" id="pipeline-card">
       ${statusRowHtml(pipeline, '排行榜已生成')}
       ${renderStageStrip(pipeline)}
-      <p class="meta">RD 优化完成，候选排行榜在下方 RD 循环区展开：external OOS 列仅供审计（不参与 winner 选择），并按 executed / reused / skipped 披露去重处置。</p>
+      ${renderRdAttemptDisclosure(pipeline)}
+      <p class="meta">RD 优化完成，候选排行榜在下方 RD 循环区展开：external OOS 列仅供审计（不参与 winner 选择），并按 执行 / 执行后判定重复 / 执行前跳过 披露去重处置。</p>
     </div>`;
 }
 
@@ -677,6 +701,28 @@ export async function createRdPipeline(seedFactorId, options) {
   if (opts.candidates_per_round !== undefined) body.candidates_per_round = opts.candidates_per_round;
   if (opts.objective !== undefined) body.objective = opts.objective;
   const record = await postJson('/api/pipelines', body);
+  currentDensity = 'beginner';
+  setPipeline(record);
+  return record;
+}
+
+/* F2d (editable-formula compare loop, spec §5.3/§5.4): run a validated formula
+ * edit as a NEW immutable factor_study run branched from the CURRENT pipeline.
+ * `edited_by=human` is derived SERVER-side by fingerprint comparison inside
+ * create_pipeline_from_edited_formula (the request asserts no edited_by). The
+ * server pre-validates the edit and refuses a non-runnable one; on success the
+ * card is replaced with the new run's confirm gate, while the parent (a
+ * completed report) stays intact server-side for side-by-side comparison. */
+export async function createEditedFormulaRun(formula, options) {
+  if (!currentPipeline) throw new Error('没有可编辑的管线');
+  const opts = options || {};
+  const body = { formula };
+  if (opts.universe_filters !== undefined) body.universe_filters = opts.universe_filters;
+  if (opts.horizon_days !== undefined) body.horizon_days = opts.horizon_days;
+  const record = await postJson(
+    `/api/pipelines/${encodeURIComponent(currentPipeline.pipeline_id)}/edit-formula`,
+    body
+  );
   currentDensity = 'beginner';
   setPipeline(record);
   return record;

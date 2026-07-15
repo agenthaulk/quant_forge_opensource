@@ -51,6 +51,7 @@ from quant_forge.apps.web.pipeline import (
     confirm_pipeline,
     create_pipeline,
     create_pipeline_as_fallback,
+    create_pipeline_from_edited_formula,
     create_rd_pipeline,
     fork_pipeline_from_failure,
     get_pipeline,
@@ -275,15 +276,17 @@ def _sidecar_invoke_tool(
 def _optional_universe_filters(value: Any) -> tuple[str, ...]:
     """Shape a request ``universe_filters`` list into a tuple of strings.
 
-    Pre-validation is read-only: this only normalizes the input shape; the
-    ValidationGate remains the single authority on which filter FORMS are
-    accepted (``specs/validation_gate.py``)."""
+    Strict (F8): a non-list, or a list with any non-string item, is a 400 --
+    no ``str()`` coercion of a numeric/object item into a fake filter. An
+    absent/empty value is an empty tuple. The ValidationGate remains the single
+    authority on which filter FORMS are accepted (``specs/validation_gate.py``).
+    """
 
     if value in (None, ""):
         return ()
-    if not isinstance(value, list):
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError("universe_filters must be a JSON array of strings")
-    return tuple(str(item) for item in value)
+    return tuple(value)
 
 
 def create_local_web_server(
@@ -699,11 +702,15 @@ def create_local_web_server(
                     # ValidationGate, NO persist / eval / backtest. An unknown
                     # operator returns an operator_drafts review-packet ref and
                     # NEVER hot-executes. Distinct from /api/validate-idea, which
-                    # runs the whole evaluation chain.
+                    # runs the whole evaluation chain. Request types are STRICT
+                    # (F8): the raw formula/horizon are passed through UNCOERCED
+                    # so pre_validate_formula can 400 a non-string formula or a
+                    # non-integer/invalid horizon instead of silently str()/
+                    # int()-coercing or defaulting it.
                     self._json(
                         pre_validate_formula(
-                            str(payload.get("formula", "")),
-                            name=str(payload.get("name", "")),
+                            payload.get("formula"),
+                            name=payload.get("name", ""),
                             horizon_days=payload.get("horizon_days", 5),
                             universe_filters=_optional_universe_filters(payload.get("universe_filters")),
                         )
@@ -802,6 +809,30 @@ def create_local_web_server(
                         config=config,
                         rd_config=research_config,
                         parameters=dict(payload.get("parameters") or {}),
+                    )
+                    self._json(record.to_dict(), status=201)
+                    return
+                if path.startswith("/api/pipelines/") and path.endswith("/edit-formula"):
+                    # F2d (compare loop, spec §5.3/§5.4): a validated formula
+                    # edit the user RUNS branches a NEW immutable factor_study
+                    # run from this (completed) pipeline. edited_by=human is
+                    # derived SERVER-side by fingerprint comparison inside
+                    # create_pipeline_from_edited_formula -- the request never
+                    # asserts it. The edit must pass read-only pre-validation
+                    # (ready) first; an unknown-operator edit is refused here.
+                    record = create_pipeline_from_edited_formula(
+                        pipeline_store,
+                        job_manager=job_manager,
+                        config=config,
+                        rd_config=research_config,
+                        parent_pipeline_id=_pipeline_id_from_action_path(path, "edit-formula"),
+                        formula=payload.get("formula"),
+                        universe_filters=(
+                            _optional_universe_filters(payload["universe_filters"])
+                            if "universe_filters" in payload
+                            else None
+                        ),
+                        horizon_days=payload.get("horizon_days"),
                     )
                     self._json(record.to_dict(), status=201)
                     return

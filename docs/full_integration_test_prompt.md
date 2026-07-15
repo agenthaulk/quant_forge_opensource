@@ -159,17 +159,21 @@ provider 已识别、key env 已继承但真实 key 未打印、各数据/因子
 
 切到「单因子研究」模块。用三个 seed（**逐字**，见附录 C）各跑一遍。
 
-对每个 seed：在 `#idea` 输入自然语言 → 点「解析因子」（`#run`，真实 LLM 调用）→ 观察
-研究流程 stepper（`.lab-stepper`）依次点亮 **想法 → 解析 → 验证 → 因子报告 → RD 循环**
-（data-step：`idea` / `parse` / `validate` / `report` / `rd`）。解析阶段**只生成 factor
-草稿 + 待确认参数（draft + pending params），不得提前触发评价/回测**。
+对每个 seed：在 `#idea` 输入自然语言 → 点「解析因子」（`#run`，真实 LLM 调用）→ 服务端把
+这次解析包成一个**管线 A（factor_study）**，管线卡（`#pipeline-card-mount`）打开**假设确认
+闸门**，其四段阶段条 **解析 → 假设确认 → 计算 → 报告**（stage_id：`parse` / `confirm` /
+`compute` / `report`；旧的 `.lab-stepper` 五步条已在 P1 删除，由管线卡取代）依次推进。解析
+阶段**只生成 factor 草稿 + 待确认参数（draft + pending params），不得提前触发评价/回测**。
 
 - **诚实性检查（HONESTY）：** 在“本地规则解析”模式下输入乱码/无意义文本，报告顶部必须
   出现 fallback 警告卡（warn notice，`renderParseWarnings`）——fallback 解析不能伪装成
   自信解析。
-- **调整 11 个评测参数（`#validation-controls`）：** 持有期/天（`#param-holding-days`）、
+- **调整 11 个评测参数（在管线确认卡的**专家密度**网格 `#pipeline-expert-params` 内，输入项
+  `data-pipeline-param-field="…"`；旧的常驻 `#validation-controls` 网格已在 P1 删除并吸收进
+  确认卡）：** 持有期/天（`data-pipeline-param-field="holding_days"`）、
   Decay/天、Top Quantile、Delay/天、评测开始、评测结束、回测开始、回测结束、手续费 bps、
-  滑点 bps、融券成本 bps/年。
+  滑点 bps、融券成本 bps/年。切到「专家」密度后逐项修改，负面证据（`INSUFFICIENT_*` 等）
+  两档密度均可见。
 - 点「验证并评测」（`#validate-run`），因子报告应包含：
   - **诚实 MetricValue 状态：** 缺失/不足样本显示 `insufficient_sample` / `n/a` 等
     status 标签，**绝不是裸 0**（`metric.js` 单一渲染器纪律）。

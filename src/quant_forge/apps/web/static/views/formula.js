@@ -53,6 +53,18 @@ export function renderPreValidationResult(result) {
   if (result.fingerprint) {
     lines.push(`<p class="meta">canonical fingerprint: <code>${esc(result.fingerprint)}</code></p>`);
   }
+  if (status === 'ready') {
+    // F2d (compare loop, spec §5.3/§5.4): only a runnable ("ready") edit may
+    // create a run. Running it branches a NEW immutable factor_study run from
+    // the current pipeline; edited_by=human is derived SERVER-side by
+    // fingerprint comparison (never asserted here).
+    lines.push(
+      `<div class="formula-run-edited">`
+      + `<button type="button" data-formula-action="run-edited">运行编辑后的公式（新建对比运行）</button>`
+      + `<span class="meta">新建一次不可变运行；edited_by 由服务端按指纹比对判定（human），非客户端声明。</span>`
+      + `</div>`
+    );
+  }
   const blocking = result.blocking_reasons || [];
   if (blocking.length) {
     lines.push(`<p class="meta">阻塞原因：${esc(blocking.join('；'))}</p>`);
@@ -127,6 +139,9 @@ let composing = false;
 let inputEl = null;
 let overlayEl = null;
 let resultEl = null;
+// F2d: app.js wires this to pipeline.js::createEditedFormulaRun so the module
+// stays a pure formula editor with no direct pipeline-lifecycle coupling.
+let onRunEditedFormula = null;
 
 /* Repaint the aria-hidden highlight overlay from the textarea's CURRENT value.
  * The IME guard (below) is the ONLY thing that gates this: it is a no-op while
@@ -167,7 +182,31 @@ function ensureRendered() {
     const action = btn.dataset.formulaAction;
     if (action === 'close') { closeFormulaCard(); return; }
     if (action === 'pre-validate') { runPreValidation(btn); return; }
+    if (action === 'run-edited') { runEditedFormula(btn); return; }
   });
+}
+
+/* F2d: hand the validated edit to app.js's wired runner (pipeline.js). This
+ * module never touches the pipeline lifecycle directly; it only forwards the
+ * current textarea formula once the user asks to run it. */
+async function runEditedFormula(btn) {
+  if (!inputEl || typeof onRunEditedFormula !== 'function') return;
+  const formula = inputEl.value;
+  if (!formula.trim()) return;
+  if (btn) btn.disabled = true;
+  try {
+    await onRunEditedFormula(formula);
+    closeFormulaCard();
+  } catch (error) {
+    if (resultEl) {
+      resultEl.innerHTML = renderPreValidationResult({
+        status: 'blocked', executed: false, persisted: false,
+        blocking_reasons: [(error && error.message) || '运行编辑后的公式失败']
+      });
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 async function runPreValidation(btn) {
@@ -219,7 +258,8 @@ export function currentFormula() {
   return inputEl ? inputEl.value : '';
 }
 
-export function initFormulaModule() {
+export function initFormulaModule(options) {
+  onRunEditedFormula = (options && options.onRunEditedFormula) || null;
   if (!mount) return;
   // "[hidden] until the expert opens it" (html.py mount comment): hidden from
   // the first paint, rendered lazily on the first openFormulaCard().

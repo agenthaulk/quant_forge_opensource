@@ -35,6 +35,7 @@ import { activateModule, activateTab, initLabTabs, isRecognizedExpertHash, setTa
 import { initSynthesisModule, refreshSynthesisPanel } from './views/synthesis.js';
 import {
   confirmCurrentPipeline,
+  createEditedFormulaRun,
   createPipelineFromParseJob,
   createRdPipeline,
   currentPipelineParameters,
@@ -74,6 +75,7 @@ const rdStatusEl = document.getElementById('rd-status');
 // seeded from THIS report's factor (the ONLY A→B path — no automatic bridge);
 // #formula-edit opens the expert editable-formula card (pre-validation).
 const reportFollowups = document.getElementById('report-followups');
+const reportFollowupsReason = document.getElementById('report-followups-reason');
 const rdEntryButton = document.getElementById('rd-entry');
 const formulaEditButton = document.getElementById('formula-edit');
 let activeIdeaJobId = null;
@@ -352,7 +354,10 @@ async function submitValidation() {
   );
 }
 async function submitStaggeredEntry() {
-  const factorId = validatedFactorId || (parsedIdea && parsedIdea.factor && parsedIdea.factor.factor_id);
+  // F1: only the PUBLISHED canonical id (validatedFactorId) is a valid seed —
+  // never parsedIdea.factor.factor_id, which post-completion is the deleted
+  // working (_PW…) id.
+  const factorId = validatedFactorId;
   if (!factorId) throw new Error('请先完成验证并评测');
   const job = await postJson('/api/jobs/staggered-entry', {
       factor_id: factorId,
@@ -443,6 +448,44 @@ initSynthesisModule({ onJobComplete: invalidateJobDependentPanels });
 function revealReportFollowups(hasFactor) {
   if (!reportFollowups) return;
   reportFollowups.hidden = !hasFactor;
+  if (!hasFactor && reportFollowupsReason) {
+    reportFollowupsReason.textContent = '';
+    reportFollowupsReason.hidden = true;
+  }
+}
+// F1: follow-ups (RD optimize + staggered) need a REAL registered factor id —
+// the pipeline record's `published_factor_id`, set ONLY when the canonical
+// factor was actually published on completion (publish_state === 'published').
+// The completion result's `factor.factor_id` is the pipeline WORKING id
+// (`…_PW…`), which `_cleanup_working_artifacts` deletes — so it must NEVER seed
+// a follow-up. When publishing did not succeed, the id-dependent follow-ups are
+// refused with a visible reason and `validatedFactorId` stays null.
+const PUBLISH_UNAVAILABLE_REASONS = {
+  conflict: '因子未发布：规范因子在本次运行期间被并发修改（发布冲突）。RD 优化 / 稳健性回测暂不可用；可重新运行本因子。',
+  declined_promoted: '因子未覆盖：同名规范因子已被人工提升（promoted）。RD 优化 / 稳健性回测请从「注册表」中的该因子发起。'
+};
+function applyPublishedFollowups(pipeline) {
+  const publishedId = pipeline && pipeline.published_factor_id;
+  const publishState = pipeline && pipeline.publish_state;
+  if (reportFollowups) reportFollowups.hidden = false; // formula-edit stays reachable regardless
+  if (publishState === 'published' && publishedId) {
+    validatedFactorId = publishedId;
+    if (rdEntryButton) rdEntryButton.disabled = false;
+    document.getElementById('rd-seed').value = publishedId;
+    setStaggeredEnabled(true);
+    if (reportFollowupsReason) { reportFollowupsReason.textContent = ''; reportFollowupsReason.hidden = true; }
+    return;
+  }
+  // Not published: refuse the id-dependent follow-ups, never fall back to the
+  // deleted working id.
+  validatedFactorId = null;
+  setStaggeredEnabled(false);
+  if (rdEntryButton) rdEntryButton.disabled = true;
+  if (reportFollowupsReason) {
+    reportFollowupsReason.textContent =
+      PUBLISH_UNAVAILABLE_REASONS[publishState] || '因子未成功发布，RD 优化 / 稳健性回测不可用。';
+    reportFollowupsReason.hidden = false;
+  }
 }
 async function onPipelineCompleted(pipeline) {
   try {
@@ -456,7 +499,7 @@ async function onPipelineCompleted(pipeline) {
     if (pipeline.kind === 'rd_optimize') {
       // Pipeline B terminal (spec §2.1/§5.4): the candidate leaderboard
       // renders through the canonical research.js renderer (FE-L2) — external
-      // OOS labelled audit-only, dedup disposition executed/reused/skipped —
+      // OOS labelled audit-only, dedup disposition executed/duplicate/skipped —
       // into the existing RD result area, never a bespoke second renderer. The
       // pipeline card itself already shows the terminal leaderboard status, so
       // this path does not also drive the workbench RD dot (pipeline B started
@@ -469,11 +512,11 @@ async function onPipelineCompleted(pipeline) {
       return;
     }
     render(result);
+    // parsedIdea keeps the formula for the editable-formula card; its
+    // factor_id is the DELETED working id post-completion, so follow-ups are
+    // seeded from published_factor_id (below), never from result.factor.
     parsedIdea = { parser: result.parser, factor: result.factor, parameters: result.parameters };
-    validatedFactorId = result.factor && result.factor.factor_id;
-    document.getElementById('rd-seed').value = validatedFactorId || document.getElementById('rd-seed').value;
-    setStaggeredEnabled(Boolean(validatedFactorId));
-    revealReportFollowups(Boolean(validatedFactorId));
+    applyPublishedFollowups(pipeline);
     invalidateJobDependentPanels();
   } catch (error) {
     // Best-effort mirror of the legacy Factor Tape: the pipeline card itself
@@ -488,7 +531,17 @@ async function onPipelineCompleted(pipeline) {
 // is tri-state and refreshed on load + on token arrival; the pre-fetch default
 // stays `unknown` so a token-redacted boot never pre-judges (spec §5.6).
 initNarrationModule();
-initFormulaModule();
+// F2d: the editable-formula card's "run edited formula" action creates a NEW
+// immutable factor_study run branched from the current pipeline (edited_by
+// derived server-side). app.js owns the pipeline-card handoff + scroll; the
+// formula module stays a pure editor.
+initFormulaModule({
+  onRunEditedFormula: async formula => {
+    await createEditedFormulaRun(formula);
+    const mount = document.getElementById('pipeline-card-mount');
+    if (mount && mount.scrollIntoView) mount.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
 initPipelineModule({
   onCompleted: onPipelineCompleted,
   onPipeline: pipeline => { attachToPipeline(pipeline && pipeline.pipeline_id).catch(() => {}); }
@@ -676,15 +729,16 @@ validateButton.addEventListener('click', async () => {
   try {
     const payload = await submitValidation();
     render(payload);
+    // parsedIdea keeps the formula for the editable-formula card only; its
+    // factor_id here is the pipeline WORKING id (…_PW…). Follow-up seeding
+    // (validatedFactorId / rd-seed / staggered / the follow-up bar) is owned
+    // SOLELY by onPipelineCompleted, which reads the reconciled record's
+    // published_factor_id — never this working id (F1).
     parsedIdea = {
       parser: payload.parser,
       factor: payload.factor,
       parameters: payload.parameters || validationParameters()
     };
-    validatedFactorId = payload.factor.factor_id;
-    document.getElementById('rd-seed').value = payload.factor.factor_id;
-    setStaggeredEnabled(true);
-    revealReportFollowups(true);
     setWorkbenchDot('idea', 'done');
     invalidateJobDependentPanels();
     statusEl.innerHTML = '<span class="ok">验证完成</span>';
@@ -820,7 +874,9 @@ rdCancel.addEventListener('click', async () => {
 // nothing here fires unless the user clicks this report follow-up button.
 if (rdEntryButton) {
   rdEntryButton.addEventListener('click', async () => {
-    const seed = validatedFactorId || (parsedIdea && parsedIdea.factor && parsedIdea.factor.factor_id);
+    // F1: seed pipeline B from the PUBLISHED canonical id only — never the
+    // deleted working id that result.factor would carry post-completion.
+    const seed = validatedFactorId;
     if (!seed) return;
     rdEntryButton.disabled = true;
     activateTab('lab-tab-factor');

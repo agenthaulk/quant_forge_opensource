@@ -5,6 +5,7 @@
 
 import { esc, metricNum, num, pct, valueOr } from '../metric.js';
 import { barChart } from './charts.js';
+import { formulaHtml } from './dsl.js';
 import { profilePeriodText } from './factor.js';
 
 const rdResultEl = document.getElementById('rd-result');
@@ -36,35 +37,62 @@ function gatePillHtml(gate) {
   return `<span class="status-pill status-pill--${modifier}">${esc(gate)}</span>`;
 }
 
+/* F4: a comparison row is numerically scorable only when its scoring-driving
+ * metric (rank_icir) is available/legacy AND its selection_score is a finite
+ * number. An unavailable status (insufficient_sample, …) — or a non-numeric
+ * score — makes the row UNSCORABLE: it renders n/a (never 0.00) and is EXCLUDED
+ * from the numeric ranking, so a status row can never out/under-rank a real
+ * score. Availability comes from the qf.metrics.v2 status carried alongside the
+ * legacy scalar (server-authoritative), not from guessing at the scalar. */
+export function isRowScorable(row) {
+  const status = row.selection_icir_status;
+  if (status && status !== 'available' && status !== 'legacy') return false;
+  const value = row.selection_score;
+  return !(value === undefined || value === null || Number.isNaN(Number(value)));
+}
+
 export function renderComparisonTable(payload) {
   const rows = comparisonRows(payload);
   const body = rows.map(row => {
     const gate = row.gate_passed === true ? 'pass' : (row.gate_passed === false ? 'fail' : 'n/a');
+    const scorable = isRowScorable(row);
+    // F4: IC / ICIR through the availability-aware renderer — a withheld
+    // status renders its label, never a zero-filled scalar. The score cell is
+    // n/a for an unscorable row so it never presents a number that would
+    // enter the ranking.
     return `
       <tr>
         <td>${esc(row.round || 1)}</td>
         <td>${esc(row.role || '')}</td>
         <td><code>${esc(row.factor_id || '')}</code><br><span class="meta">${esc(row.factor_status || '')}</span></td>
-        <td><code>${esc(row.formula || '')}</code></td>
-        <td>${num(row.selection_score, 4)}<br><span class="meta">IC ${num(row.selection_rank_ic, 4)} / ICIR ${num(row.selection_icir, 2)}</span></td>
+        <td class="formula">${formulaHtml(row.formula || '')}</td>
+        <td>${scorable ? num(row.selection_score, 4) : 'n/a'}<br><span class="meta">IC ${metricNum(row.selection_rank_ic, row.selection_rank_ic_status, 4)} / ICIR ${metricNum(row.selection_icir, row.selection_icir_status, 2)}</span></td>
         <td>${pct(row.selection_net_cumulative_return)}<br><span class="meta">ann ${pct(row.selection_net_annualized_return)} · periods ${esc(row.selection_completed_periods ?? row.selection_backtest_periods ?? '')}</span></td>
         <td>${pct(row.external_oos_net_cumulative_return)}<br><span class="meta">ann ${pct(row.external_oos_net_annualized_return)} · periods ${esc(row.external_oos_completed_periods ?? row.external_oos_periods ?? '')}</span></td>
         <td>${gatePillHtml(gate)}<br><span class="meta">${esc((row.gate_reasons || []).join('; '))}</span></td>
       </tr>`;
   }).join('');
-  // C7: RD candidate selection score per comparison row (null score ⇒ n/a
-  // tick, never 0); 0-based. selection_score arrives as number|null from
-  // _json_safe, so barChart's finite check drives the n/a rendering.
+  // F4 leaderboard ranking: scorable rows sorted by selection_score DESCENDING;
+  // unscorable rows appended as n/a ticks (value null → barChart renders a n/a
+  // tick, never a 0 bar). The sort order proves the exclusion — a status row is
+  // always last, never ranked among the numeric scores.
+  const scoredBars = rows
+    .filter(isRowScorable)
+    .map(row => ({ label: row.factor_id || '', value: Number(row.selection_score) }))
+    .sort((a, b) => b.value - a.value);
+  const unscorableBars = rows
+    .filter(row => !isRowScorable(row))
+    .map(row => ({ label: row.factor_id || '', value: null }));
   const scoreChart = rows.length
     ? `<div class="qf-chart-row">${barChart(
-        rows.map(row => ({ label: row.factor_id || '', value: row.selection_score })),
-        { ariaLabel: 'RD 候选选择分数', yFormat: value => num(value, 4), emptyMessage: '暂无候选分数' }
+        [...scoredBars, ...unscorableBars],
+        { ariaLabel: 'RD 候选选择分数（不可评分候选以 n/a 排除，不参与数值排序）', yFormat: value => num(value, 4), emptyMessage: '暂无候选分数' }
       )}</div>`
     : '';
   return `
     <div class="panel report-section" id="rd-comparison">
       <h3>RD 因子迭代对比</h3>
-      <p class="meta">selection 样本用于 RD 排序和 gate；external OOS 只用于审计展示，不参与 winner 选择。</p>
+      <p class="meta">selection 样本用于 RD 排序和 gate；external OOS 只用于审计展示，不参与 winner 选择。状态词指标（如 insufficient_sample）显示为 n/a，不参与数值排序。</p>
       ${scoreChart}
       <table class="comparison-table">
         <thead>
@@ -84,33 +112,41 @@ export function renderComparisonTable(payload) {
     </div>`;
 }
 
-/* Dedup disposition (agent_sidecar_frontend.md §5.4): every candidate the RD
- * run considered is disposed as executed | reused | skipped, and all three
- * counts are SERVER-AUTHORITATIVE — they are read straight off the run
- * payload, never inferred client-side. `executed` = candidates that actually
- * ran evaluation/backtest (payload.candidates); `reused` = result-signature
- * duplicates the server collapsed instead of re-running
- * (deduplication.result_duplicates); `skipped` = plans the dedup gate dropped
- * before execution (formula fingerprint + candidate diversity). These are the
- * multiple-comparison honesty counts the leaderboard must disclose. */
+/* Dedup disposition (agent_sidecar_frontend.md §5.4, F5 — OPTION B, truthful
+ * post-execution disclosure). The server detects result-signature duplicates
+ * ONLY AFTER a candidate has been FULLY EXECUTED (evaluation + backtest run
+ * first; the signature is computed from the result — research_loop/service.py
+ * ~L1562/L919). So `deduplication.result_duplicates` counts candidates that
+ * DID run and were then flagged duplicate — NOT candidates that were "reused"
+ * or "not rerun". This must be disclosed truthfully, with DISJOINT buckets (a
+ * candidate is in exactly one):
+ *   - executed_unique             = ran, not a post-hoc duplicate
+ *   - duplicate_after_execution   = ran AND flagged a result-signature dup
+ *   - skipped                     = dropped BEFORE execution (formula
+ *                                   fingerprint / diversity gate) — never ran
+ * `executed` (= executed_unique + duplicate_after_execution) is every
+ * candidate that actually ran. All counts are SERVER-AUTHORITATIVE (read off
+ * the run payload, never inferred). The UI never claims "not rerun"/"复用". */
 export function dedupDisposition(payload) {
   const dedup = payload.deduplication || {};
   const executed = (payload.candidates || []).length;
-  const reused = Number(dedup.result_duplicates || 0);
+  const duplicateAfterExecution = Math.min(executed, Number(dedup.result_duplicates || 0));
+  const executedUnique = Math.max(0, executed - duplicateAfterExecution);
   const skipped = Number(dedup.formula_skipped || 0) + Number(dedup.diversity_skipped || 0);
-  return { executed, reused, skipped };
+  return { executed, executedUnique, duplicateAfterExecution, skipped };
 }
 
 export function renderDedupDisposition(payload) {
-  const { executed, reused, skipped } = dedupDisposition(payload);
+  const { executed, executedUnique, duplicateAfterExecution, skipped } = dedupDisposition(payload);
   return `
     <div class="panel report-section" id="rd-dedup-disposition">
       <h3>候选去重处置</h3>
-      <p class="meta">服务端权威计数：executed 为真正评测/回测的候选，reused 为结果指纹重复而复用的候选，skipped 为去重门在执行前丢弃的方案。</p>
+      <p class="meta">服务端权威、互斥计数。结果指纹重复是在候选<strong>完整执行（评测+回测）之后</strong>才判定的，二者都已实际运行，既非执行前跳过、也非略过不跑。</p>
       <p>
         <span class="pill">executed ${esc(executed)}</span>
-        <span class="pill">reused ${esc(reused)}</span>
-        <span class="pill">skipped ${esc(skipped)}</span>
+        <span class="pill">executed-unique 执行（唯一） ${esc(executedUnique)}</span>
+        <span class="pill">duplicate-after-execution 执行后判定重复 ${esc(duplicateAfterExecution)}</span>
+        <span class="pill">skipped 执行前跳过 ${esc(skipped)}</span>
       </p>
     </div>`;
 }

@@ -344,6 +344,74 @@ def test_rd_pipeline_rejects_out_of_range_rounds_over_http(web_app) -> None:
     assert "rounds must be" in error["error"]
 
 
+def test_f7_rd_optimize_parameters_and_fork_routes_are_rejected_over_http(web_app) -> None:
+    # F7 (reject-by-kind): /parameters and /fork are factor-study machinery; an
+    # rd_optimize pipeline gets a clean 400 from both, not a kind-blind mutation.
+    status, pipeline = _post(
+        web_app, "/api/pipelines", {"kind": "rd_optimize", "seed_factor_id": "FTR_DEMO_MOMENTUM", "rounds": 1}
+    )
+    assert status == 201, pipeline
+    pid = pipeline["pipeline_id"]
+    status, error = _post(web_app, f"/api/pipelines/{pid}/parameters", {"parameters": {"rounds": 2}})
+    assert status == 400, error
+    assert "kind=rd_optimize" in error["error"]
+    status, error = _post(web_app, f"/api/pipelines/{pid}/fork", {})
+    assert status == 400, error
+    assert "kind=rd_optimize" in error["error"]
+
+
+def test_f8_rd_create_synchronous_400s_over_http(web_app) -> None:
+    # F8: candidates out of range, unknown objective, and a nonexistent seed are
+    # all synchronous 400s at create -- never a research job that dies later.
+    status, error = _post(
+        web_app, "/api/pipelines",
+        {"kind": "rd_optimize", "seed_factor_id": "FTR_DEMO_MOMENTUM", "rounds": 1, "candidates_per_round": 11},
+    )
+    assert status == 400 and "candidates_per_round must be" in error["error"], error
+    status, error = _post(
+        web_app, "/api/pipelines",
+        {"kind": "rd_optimize", "seed_factor_id": "FTR_DEMO_MOMENTUM", "objective": "totally_bogus"},
+    )
+    assert status == 400 and "objective" in error["error"], error
+    status, error = _post(
+        web_app, "/api/pipelines", {"kind": "rd_optimize", "seed_factor_id": "FTR_NOPE_NOT_REAL"}
+    )
+    assert status == 400 and "seed factor not found" in error["error"], error
+
+
+def test_f8_pre_validate_strict_types_over_http(web_app) -> None:
+    # F8: strict request types at the pre-validate endpoint -- a non-string
+    # formula, an invalid horizon, and non-string filters are all 400s, with no
+    # str()/int() coercion or silent horizon default.
+    status, error = _post(web_app, "/api/pipelines/pre-validate", {"formula": 123})
+    assert status == 400 and "formula must be a string" in error["error"], error
+    status, error = _post(web_app, "/api/pipelines/pre-validate", {"formula": "rank(close)", "horizon_days": 0})
+    assert status == 400 and "horizon_days must be a positive integer" in error["error"], error
+    status, error = _post(
+        web_app, "/api/pipelines/pre-validate", {"formula": "rank(close)", "universe_filters": [1, 2]}
+    )
+    assert status == 400 and "universe_filters" in error["error"], error
+
+
+def test_f2d_edit_formula_route_creates_a_branched_run_over_http(web_app) -> None:
+    # F2d: /edit-formula branches a NEW factor_study run from a parent pipeline
+    # with server-derived edited_by (human_override) and parent lineage; a
+    # non-runnable edit is refused with a 400.
+    parse_job_id = _completed_parse_job(web_app)
+    status, parent = _post(web_app, "/api/pipelines", {"parse_job_id": parse_job_id, "kind": "factor_study"})
+    assert status == 201, parent
+    pid = parent["pipeline_id"]
+    status, edited = _post(web_app, f"/api/pipelines/{pid}/edit-formula", {"formula": "-rank(close)"})
+    assert status == 201, edited
+    assert edited["kind"] == "factor_study"
+    assert edited["attempt"]["parent_run_id"] == pid
+    formula_badge = {e["field"]: e for e in edited["provenance"]}["formula"]
+    assert formula_badge["source"] == "human_override"  # server-derived, not client-asserted
+    # A non-runnable (unknown-operator) edit is refused synchronously.
+    status, error = _post(web_app, f"/api/pipelines/{pid}/edit-formula", {"formula": "ts_made_up_operator(close, 5)"})
+    assert status == 400 and "not runnable" in error["error"], error
+
+
 @pytest.mark.parametrize(
     "probe",
     ["/api/pipelines/../html.py", "/api/pipelines/not-a-real-id", "/api/pipelines/PL_short"],

@@ -288,6 +288,31 @@ def test_app_module_drops_rd_autocycle_scheduler_wiring() -> None:
     assert "getElementById('formula-edit')" in app_js
 
 
+def test_app_module_seeds_followups_from_published_id_not_the_working_id() -> None:
+    # F1: onPipelineCompleted seeds follow-ups from the record's
+    # published_factor_id + publish_state, NEVER from result.factor.factor_id
+    # (the working _PW id cleanup deletes). The completion path drives
+    # applyPublishedFollowups, which only enables the id-dependent follow-ups on
+    # a real 'published' state; the working-id fallbacks are gone.
+    app_js = _static_module_text("app.js")
+    # The completion path routes follow-up seeding through the published-id
+    # helper and never re-reads result.factor.factor_id (the working id) as the
+    # seed (checked against the live assignment/expression, not the explanatory
+    # comment that NAMES the deleted pattern).
+    assert "applyPublishedFollowups(pipeline)" in app_js
+    assert "result.factor && result.factor.factor_id" not in app_js
+    assert "validatedFactorId = result.factor" not in app_js
+    # The helper gates on published_factor_id + publish_state === 'published'.
+    helper_start = app_js.index("function applyPublishedFollowups(")
+    helper_end = app_js.index("\nasync function onPipelineCompleted(", helper_start)
+    helper = app_js[helper_start:helper_end]
+    assert "pipeline.published_factor_id" in helper
+    assert "publishState === 'published'" in helper
+    # Follow-up ACTIONS no longer fall back to the working id via
+    # parsedIdea.factor.factor_id (the live fallback expression is gone).
+    assert "parsedIdea && parsedIdea.factor && parsedIdea.factor.factor_id" not in app_js
+
+
 # ---------------------------------------------------------------------------
 # No duplicate DOM ids anywhere on the served page (general regression pin)
 # ---------------------------------------------------------------------------

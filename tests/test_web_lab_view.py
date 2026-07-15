@@ -618,7 +618,12 @@ def test_dsl_module_is_a_pure_structural_tokenizer() -> None:
     assert '`<div class="formula">${formulaHtml(formula)}</div>`' in registry_js
     assert "${esc(formula.slice(PRECOMPUTED_PREFIX.length))}" in registry_js
     assert '<span class="registry-row-formula">${esc(text)}</span>' in registry_js
-    assert "formulaHtml" not in _static_module_text("views/research.js")
+    # F2c: the RD comparison surface renders its formula cell through THE
+    # canonical dsl highlighter (formulaHtml), not a bespoke esc()-only second
+    # renderer -- a legitimate single-renderer application site.
+    research_js = _static_module_text("views/research.js")
+    assert "from './dsl.js'" in research_js
+    assert 'class="formula">${formulaHtml(row.formula' in research_js
 
 
 # ---------------------------------------------------------------------------

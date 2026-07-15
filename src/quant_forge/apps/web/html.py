@@ -915,6 +915,8 @@ def _index_html(
     .report-followups {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }}
     .report-followups[hidden] {{ display: none; }}
     .report-followups button {{ width: auto; margin: 0; min-height: 44px; flex: 1 1 auto; }}
+    .report-followups-reason {{ margin: 4px 0 12px; color: var(--warn); font-size: 13px; }}
+    .report-followups-reason[hidden] {{ display: none; }}
     .formula-card {{ border-top: 4px solid var(--accent-2); margin-top: 12px; }}
     .formula-card[hidden] {{ display: none; }}
     .formula-card-header {{ display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center;
@@ -1267,6 +1269,12 @@ def _index_html(
           <button id="formula-edit" class="secondary">编辑并预验证公式</button>
           <button id="staggered-run" class="secondary" disabled>首月逐日建仓稳健性回测</button>
         </div>
+        <!-- F1: when the pipeline completes but the canonical factor was NOT
+             published (publish_state conflict/declined, or no published id),
+             follow-ups that need a real registered factor id are refused with
+             this visible reason — never silently seeded from the deleted
+             working (_PW…) id. -->
+        <p id="report-followups-reason" class="report-followups-reason" role="status" hidden></p>
         <div id="staggered-result"></div>
         <section class="report-section" id="report-comparison">
           <div class="section-title">

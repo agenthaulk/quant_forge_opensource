@@ -1881,6 +1881,19 @@ def weighted_split_icir(evaluation: EvaluationResult) -> float:
     return float(sum(value * weight for value, weight in weighted) / total_weight)
 
 
+def _comparison_metric_status(assessment: FactorAssessmentBundle, key: str) -> str:
+    """Availability status of a legacy comparison-row metric from the
+    qf.metrics.v2 map (F4). Mirrors ``apps/web/api.py::_apply_metric_display``:
+    a metric present in the map carries its real status; a metric absent from
+    the map (old artifact) is ``legacy``. Additive only -- carried ALONGSIDE
+    the legacy scalar so the rendered leaderboard/comparison can show n/a +
+    status for an unavailable metric instead of a zero-filled scalar, with
+    ZERO change to how RD scoring itself consumes those legacy aliases."""
+
+    metric = assessment.evaluation.metrics.get(key)
+    return str(metric.status) if metric is not None else "legacy"
+
+
 def _assessment_comparison_row(
     assessment: FactorAssessmentBundle,
     factor: FactorDefinition,
@@ -1902,6 +1915,12 @@ def _assessment_comparison_row(
         "gate_passed": assessment.gate_passed,
         "gate_reasons": list(assessment.gate_reasons),
         "selection_rank_ic": assessment.evaluation.rank_ic_mean,
+        # F4 additive: availability status of the two legacy scalars above, so
+        # the rendered surface can show n/a + status (never 0.00) for an
+        # unavailable metric. Flows through the frozen api.py aggregate builder
+        # (_aggregate_research_comparison_rows copies every row field).
+        "selection_rank_ic_status": _comparison_metric_status(assessment, "rank_ic_mean"),
+        "selection_icir_status": _comparison_metric_status(assessment, "rank_icir"),
         "selection_icir": assessment.evaluation.rank_icir,
         "selection_ic_days": assessment.evaluation.ic_days,
         "selection_coverage": assessment.evaluation.coverage,

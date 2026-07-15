@@ -37,10 +37,12 @@ from quant_forge.apps.web.pipeline import (
     confirm_pipeline,
     create_pipeline,
     create_pipeline_as_fallback,
+    create_pipeline_from_edited_formula,
     create_rd_pipeline,
     fork_pipeline_from_failure,
     get_pipeline,
     list_active_pipelines,
+    pipeline_report,
     pre_validate_formula,
     retry_pipeline,
     update_pipeline_parameters,
@@ -48,6 +50,7 @@ from quant_forge.apps.web.pipeline import (
 from quant_forge.apps.web.provenance import InvalidProvenanceError, ProvenanceEntry, provenance_by_field
 from quant_forge.apps.web.server import run_idea_parse_workflow
 from quant_forge.config import QuantForgeConfig
+from quant_forge.core.contracts import FactorDefinition
 from quant_forge.data.local import create_demo_workspace
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.lineage.store import RunIndex
@@ -1967,3 +1970,346 @@ def test_byte_corrupt_completion_artifact_is_non_evidence(tmp_path) -> None:
     )
     assert rejoined.status == "paused_failure"
     assert rejoined.failure.reason_code == "JOB_NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
+# FE-P3 REWORK round 1 (F1-F8): closing the adversarial-review findings.
+# ---------------------------------------------------------------------------
+
+
+def test_f1_completion_publishes_and_followup_seed_is_the_published_not_working_id(tmp_path) -> None:
+    # F1: follow-ups must seed from the record's published_factor_id (the
+    # canonical id), NOT result.factor.factor_id (the working _PW id cleanup
+    # deletes). Prove the published id is canonical + registered, the working id
+    # is gone, and an RD create seeded with the PUBLISHED id succeeds while one
+    # seeded with the WORKING id now fails-closed.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    canonical_id = str(parse_job["result"]["factor"]["factor_id"])
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    working_id = confirmed.working_factor_id
+    _wait_job(job_manager, confirmed.stage("compute").child_job_id, timeout=60.0)
+    completed = get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+
+    assert completed.status == "completed"
+    assert completed.publish_state == "published"
+    assert completed.published_factor_id == canonical_id
+    assert completed.published_factor_id != working_id  # never the working _PW id
+    repo = FactorRepository(config.paths.factor_root)
+    assert repo.get(canonical_id).factor_id == canonical_id   # published id registered
+    with pytest.raises(FileNotFoundError):
+        repo.get(working_id)                                   # working id deleted
+
+    # The fixed follow-up seed (published id) drives pipeline B all the way to
+    # the leaderboard (test-strengthening item 1: completed A -> canonical
+    # published id -> explicit B create + confirm + completion)…
+    rd = create_rd_pipeline(
+        store, job_manager=job_manager, config=config,
+        seed_factor_id=completed.published_factor_id, rd_config=_rd_config(), rounds=1, candidates_per_round=1,
+    )
+    assert rd.kind == "rd_optimize"
+    confirmed_rd = _confirm(config, store, rd, job_manager)
+    _wait_job(job_manager, confirmed_rd.stage("run").child_job_id, timeout=90.0)
+    leaderboard = get_pipeline(store, rd.pipeline_id, job_manager=job_manager, config=config)
+    assert leaderboard.status == "completed"
+    assert leaderboard.stage("leaderboard").status == "completed"
+    # …while the OLD working-id seed fails closed (never a live pipeline B).
+    with pytest.raises(ValueError, match="seed factor not found"):
+        create_rd_pipeline(
+            store, job_manager=job_manager, config=config,
+            seed_factor_id=working_id, rd_config=_rd_config(), rounds=1,
+        )
+
+
+def test_f1_publish_conflict_leaves_published_id_none_with_a_disclosed_state(tmp_path) -> None:
+    # F1: a completion whose canonical factor was human-promoted first declines
+    # to publish -> published_factor_id stays None and publish_state records the
+    # decline, the exact signal the frontend uses to DISABLE id-dependent
+    # follow-ups (never fall back to the deleted working id).
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    canonical_id = str(parse_job["result"]["factor"]["factor_id"])
+    repo = FactorRepository(config.paths.factor_root)
+    # Pre-register the canonical id as a PROMOTED (non-draft) factor, so the
+    # completion-time publish declines (G3 / declined_promoted).
+    repo.save(FactorDefinition(factor_id=canonical_id, name=canonical_id, formula="-rank(market_cap)", status="candidate"))
+
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    _wait_job(job_manager, confirmed.stage("compute").child_job_id, timeout=60.0)
+    completed = get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+
+    assert completed.status == "completed"
+    assert completed.published_factor_id is None
+    assert completed.publish_state == "declined_promoted"
+    assert repo.get(canonical_id).status == "candidate"  # untouched
+
+
+def test_f2_rd_failed_attempts_count_survives_retry_and_stages_stay_coherent(tmp_path, monkeypatch) -> None:
+    # F2 (§5.4 counting policy) + F7 (retry coherence): a failed RD attempt is
+    # counted durably; a retry clears `failure` but NOT the count, and the
+    # confirm stage is reactivated so awaiting_confirm is coherent with the
+    # stage rows.
+    import quant_forge.apps.web.pipeline as pl
+
+    config, store, job_manager = _new_env(tmp_path)
+    seed = _seed_factor_id(config, job_manager)
+    monkeypatch.setattr(pl, "run_research_once_workflow", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("rd boom")))
+
+    pipeline = create_rd_pipeline(
+        store, job_manager=job_manager, config=config, seed_factor_id=seed, rd_config=_rd_config(), rounds=1, candidates_per_round=1
+    )
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    _wait_job(job_manager, confirmed.stage("run").child_job_id, timeout=30.0)
+    failed = get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert failed.status == "paused_failure"
+    assert failed.failed_attempts == 1
+    assert failed.failure is not None  # the current failure is visible while paused
+
+    retried = retry_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert retried.status == "awaiting_confirm"
+    # The failure record is cleared on leaving paused_failure, but the COUNT
+    # survives -> the "a prior attempt failed" disclosure is never erased.
+    assert retried.failure is None
+    assert retried.failed_attempts == 1
+    # F7 coherence: the confirm stage is active again (not still 'completed'),
+    # and the run stage is reset to pending.
+    assert retried.stage("confirm").status == "active"
+    assert retried.stage("confirm").ended_at is None
+    assert retried.stage("run").status == "pending"
+
+
+def test_f2_edited_formula_creates_a_new_immutable_run_with_server_derived_edited_by(tmp_path) -> None:
+    # F2d: a validated formula edit branches a NEW factor_study run whose
+    # formula provenance is human_override (edited_by=human) ONLY when the
+    # formula's fingerprint actually differs from the parent's -- derived
+    # server-side, never client-asserted. A same-formula "edit" keeps the
+    # parent's origin, proving the derivation is by fingerprint comparison.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    parent = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    parent_formula = str(parent.factor["formula"])
+
+    edited = create_pipeline_from_edited_formula(
+        store, job_manager=job_manager, config=config, rd_config=_rd_config(),
+        parent_pipeline_id=parent.pipeline_id, formula="-rank(close)",
+    )
+    assert edited.kind == "factor_study"
+    assert edited.status == "awaiting_confirm"
+    assert edited.attempt.parent_run_id == parent.pipeline_id
+    assert edited.factor["formula"] == "-rank(close)"
+    assert edited.factor["factor_id"] != parent.factor["factor_id"]  # its own canonical id
+    formula_badge = {e["field"]: e for e in edited.provenance}["formula"]
+    assert formula_badge["source"] == "human_override"
+    assert formula_badge["parent_value"] == parent_formula
+
+    # A same-formula edit is NOT a human_override (server-side fingerprint match).
+    same = create_pipeline_from_edited_formula(
+        store, job_manager=job_manager, config=config, rd_config=_rd_config(),
+        parent_pipeline_id=parent.pipeline_id, formula=parent_formula,
+    )
+    same_badge = {e["field"]: e for e in same.provenance}["formula"]
+    assert same_badge["source"] != "human_override"
+
+
+def test_f2_edited_formula_run_refuses_a_non_runnable_edit(tmp_path) -> None:
+    # F2d: only a "ready" edit may create a run -- an unknown-operator edit is
+    # refused here (it must go through operator-draft review first), so a run is
+    # only ever created from a canonicalized, gate-passing formula.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    parent = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    with pytest.raises(PipelineConflictError, match="not runnable"):
+        create_pipeline_from_edited_formula(
+            store, job_manager=job_manager, config=config, rd_config=_rd_config(),
+            parent_pipeline_id=parent.pipeline_id, formula="ts_made_up_operator(close, 5)",
+        )
+
+
+def _cancel_race_env(tmp_path, monkeypatch, workflow_attr):
+    """Gate a workflow so its worker blocks right before completing, and return
+    (config, store, job_manager, started, release) so a test can model
+    'completion won concurrently with cancel' deterministically."""
+
+    import quant_forge.apps.web.pipeline as pl
+
+    config, store, job_manager = _new_env(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    real = getattr(pl, workflow_attr)
+
+    def gated(*args, **kwargs):
+        started.set()
+        release.wait(30)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pl, workflow_attr, gated)
+    return config, store, job_manager, started, release
+
+
+def test_f6_cancel_honors_a_completion_that_won_the_race_factor_study(tmp_path, monkeypatch) -> None:
+    # F6: the job manager's completion-wins semantics mean a worker that already
+    # returned a result is 'completed' even with cancel requested. cancel must
+    # re-reconcile and honor that, not blindly abort. Barrier: the worker is
+    # released and driven to a DURABLE completion the instant cancel is called.
+    config, store, job_manager, started, release = _cancel_race_env(tmp_path, monkeypatch, "run_idea_validation_workflow")
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    assert confirmed.status == "running"
+    assert started.wait(10)  # the worker is blocked just before the real compute
+
+    real_cancel = job_manager.cancel
+
+    def racing_cancel(job_id):
+        # Release the worker and wait for it to reach a DURABLE completion
+        # (completion artifact + job 'completed') before the (now no-op) real
+        # cancel -- so by the time cancel_pipeline re-reconciles, completion won.
+        release.set()
+        _wait_job(job_manager, job_id, timeout=60.0)
+        return real_cancel(job_id)
+
+    monkeypatch.setattr(job_manager, "cancel", racing_cancel)
+    final = cancel_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert final.status == "completed"  # completion honored, not overwritten by abort
+    report = pipeline_report(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert report["result"]  # the result is visible
+
+
+def test_f6_cancel_honors_a_completion_that_won_the_race_rd_optimize(tmp_path, monkeypatch) -> None:
+    config, store, job_manager, started, release = _cancel_race_env(tmp_path, monkeypatch, "run_research_once_workflow")
+    seed = _seed_factor_id(config, job_manager)
+    pipeline = create_rd_pipeline(
+        store, job_manager=job_manager, config=config, seed_factor_id=seed, rd_config=_rd_config(), rounds=1, candidates_per_round=1
+    )
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    assert confirmed.status == "running"
+    assert started.wait(10)
+
+    real_cancel = job_manager.cancel
+
+    def racing_cancel(job_id):
+        release.set()
+        _wait_job(job_manager, job_id, timeout=60.0)
+        return real_cancel(job_id)
+
+    monkeypatch.setattr(job_manager, "cancel", racing_cancel)
+    final = cancel_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert final.status == "completed"
+    assert final.stage("leaderboard").status == "completed"
+
+
+def test_f7_rd_optimize_parameters_route_is_rejected(tmp_path) -> None:
+    # F7 (reject-by-kind): /parameters is factor-study machinery; an rd_optimize
+    # pipeline has no such draft grid, so it is a clean 400 (PipelineConflictError).
+    config, store, job_manager = _new_env(tmp_path)
+    seed = _seed_factor_id(config, job_manager)
+    pipeline = create_rd_pipeline(store, job_manager=job_manager, config=config, seed_factor_id=seed, rd_config=_rd_config(), rounds=1)
+    with pytest.raises(PipelineConflictError, match="not available for kind=rd_optimize"):
+        update_pipeline_parameters(store, pipeline.pipeline_id, {"rounds": 2}, job_manager=job_manager, config=config)
+
+
+def test_f7_rd_optimize_fork_route_is_rejected(tmp_path) -> None:
+    # F7 (reject-by-kind): /fork is factor-study's fork-from-failure exit; RD's
+    # edit exit is the formula card / a new run, so a fork is a clean 400 --
+    # checked before the status gate so the reason names the real cause.
+    config, store, job_manager = _new_env(tmp_path)
+    seed = _seed_factor_id(config, job_manager)
+    pipeline = create_rd_pipeline(store, job_manager=job_manager, config=config, seed_factor_id=seed, rd_config=_rd_config(), rounds=1)
+    with pytest.raises(PipelineConflictError, match="not available for kind=rd_optimize"):
+        fork_pipeline_from_failure(store, pipeline.pipeline_id, job_manager=job_manager, config=config, rd_config=_rd_config())
+
+
+@pytest.mark.parametrize("bad_candidates", [0, -1, 11, 99])
+def test_f8_rd_candidates_out_of_range_rejected_at_create_and_confirm(tmp_path, bad_candidates) -> None:
+    # F8: candidates_per_round is bounded to the research service's real 1..10
+    # range at create AND at confirm (so a confirm-bypass edit can't launch it).
+    config, store, job_manager = _new_env(tmp_path)
+    seed = _seed_factor_id(config, job_manager)
+    with pytest.raises(ValueError, match="candidates_per_round must be"):
+        create_rd_pipeline(
+            store, job_manager=job_manager, config=config, seed_factor_id=seed,
+            rd_config=_rd_config(), rounds=1, candidates_per_round=bad_candidates,
+        )
+    # confirm-bypass: create valid, then hand an out-of-range value at confirm.
+    pipeline = create_rd_pipeline(
+        store, job_manager=job_manager, config=config, seed_factor_id=seed, rd_config=_rd_config(), rounds=1, candidates_per_round=1
+    )
+    with pytest.raises(ValueError, match="candidates_per_round must be"):
+        confirm_pipeline(
+            config, store, pipeline.pipeline_id, nonce=pipeline.confirm.nonce, version=pipeline.confirm.version,
+            job_manager=job_manager, rd_config=_rd_config(), parameters={"candidates_per_round": bad_candidates},
+        )
+
+
+def test_f8_rd_unknown_objective_and_nonexistent_seed_rejected_at_create(tmp_path) -> None:
+    # F8: objective validated against the ACTUAL known set; seed existence
+    # checked at create -- both synchronous 400s, not late job failures.
+    config, store, job_manager = _new_env(tmp_path)
+    seed = _seed_factor_id(config, job_manager)
+    with pytest.raises(ValueError, match="objective"):
+        create_rd_pipeline(
+            store, job_manager=job_manager, config=config, seed_factor_id=seed, rd_config=_rd_config(), objective="totally_bogus",
+        )
+    with pytest.raises(ValueError, match="seed factor not found"):
+        create_rd_pipeline(
+            store, job_manager=job_manager, config=config, seed_factor_id="FTR_DOES_NOT_EXIST", rd_config=_rd_config(),
+        )
+
+
+@pytest.mark.parametrize("bad", [123, None, {"x": 1}, ["rank(close)"]])
+def test_f8_pre_validate_rejects_non_string_formula(bad) -> None:
+    # F8: strict request types -- a non-string formula is a 400, never str()-coerced.
+    with pytest.raises(ValueError, match="formula must be a string"):
+        pre_validate_formula(bad)
+
+
+@pytest.mark.parametrize("bad_horizon", [0, -3, "x", 1.5, True])
+def test_f8_pre_validate_rejects_invalid_horizon(bad_horizon) -> None:
+    # F8: an invalid horizon is a 400, never silently int()-coerced or defaulted.
+    with pytest.raises(ValueError, match="horizon_days must be a positive integer"):
+        pre_validate_formula("rank(close)", horizon_days=bad_horizon)
+
+
+def test_f3_pre_validate_canonical_equivalence_repeat_equality_and_zero_side_effects(tmp_path, monkeypatch) -> None:
+    # F3 + test-strengthening item 2: the fingerprint is canonical (alias /
+    # whitespace / case / filter-order variants collapse to one), repeat calls
+    # are byte-identical, an unknown operator carries a deterministic review ref
+    # derived from that fingerprint, and NOTHING is ever persisted / evaluated /
+    # backtested (persist + eval + backtest entrypoints raise if touched).
+    config, store, job_manager = _new_env(tmp_path)
+
+    import quant_forge.apps.web.server as _server
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("pre-validation must not persist / evaluate / backtest")
+
+    monkeypatch.setattr(FactorRepository, "save", _boom)
+    monkeypatch.setattr(_server, "run_idea_validation_workflow", _boom)
+    monkeypatch.setattr(_server, "evaluate_factor", _boom, raising=False)
+
+    def _snapshot(root):
+        return {p: p.stat().st_mtime_ns for p in sorted(root.rglob("*")) if p.is_file()}
+
+    before = _snapshot(config.paths.factor_root)
+
+    base = pre_validate_formula("rank(close)", horizon_days=5, universe_filters=("is_st == false", "close > 1"))
+    alias_ws_case = pre_validate_formula("  RANK( close )  ", horizon_days=5, universe_filters=("is_st == false", "close > 1"))
+    filter_order = pre_validate_formula("rank(close)", horizon_days=5, universe_filters=("close > 1", "is_st == false"))
+    assert base["fingerprint"] == alias_ws_case["fingerprint"] == filter_order["fingerprint"]
+    # A different horizon is a DIFFERENT canonical spec.
+    assert pre_validate_formula("rank(close)", horizon_days=21)["fingerprint"] != base["fingerprint"]
+    # Repeat call is byte-identical.
+    assert pre_validate_formula("rank(close)", horizon_days=5, universe_filters=("is_st == false", "close > 1")) == base
+
+    unknown = pre_validate_formula("ts_made_up_operator(close, 5)", horizon_days=5)
+    assert unknown["status"] == "review_required"
+    ref = unknown["review_packet"]["review_ref"]
+    assert ref == f"operator_drafts/prevalidate-{unknown['fingerprint'][:32]}"
+    assert unknown["review_packet"]["hot_executed"] is False
+    assert unknown["executed"] is False and unknown["persisted"] is False
+    # Repeat call for the unknown operator is byte-identical too (ref stable).
+    assert pre_validate_formula("ts_made_up_operator(close, 5)", horizon_days=5)["review_packet"]["review_ref"] == ref
+
+    assert _snapshot(config.paths.factor_root) == before  # zero persistence
