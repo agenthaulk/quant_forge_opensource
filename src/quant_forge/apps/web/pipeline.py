@@ -487,15 +487,24 @@ def _cleanup_working_artifacts(config: QuantForgeConfig, record: PipelineRecord)
     if not working_factor_id:
         return True
     ok = True
+    repo = FactorRepository(config.paths.factor_root)
     try:
-        FactorRepository(config.paths.factor_root).delete(working_factor_id)
+        repo.delete(working_factor_id)
     except Exception:
         LOGGER.warning("failed to delete working factor %s during pipeline cleanup", working_factor_id, exc_info=True)
         ok = False
+    # Ownership guard input (rv2 round): the canonical value-dir naming is
+    # non-injective, so hand the removal helper every OTHER registered id --
+    # a contested directory spelling is skipped rather than deleted.
+    try:
+        other_ids = tuple(item.factor_id for item in repo.list() if item.factor_id != working_factor_id)
+    except Exception:
+        LOGGER.warning("registry listing failed during cleanup; treating cleanup as incomplete", exc_info=True)
+        return False
     for root_name in ("factor_values_root", "factor_values_overlay_root"):
         root = getattr(config.paths, root_name, None)
         try:
-            remove_stored_values_for_factor_id(root, working_factor_id)
+            remove_stored_values_for_factor_id(root, working_factor_id, other_known_factor_ids=other_ids)
         except Exception:
             LOGGER.warning(
                 "failed to remove cached values under %s for %s during pipeline cleanup",
@@ -513,6 +522,10 @@ def _with_cleanup(record: PipelineRecord, config: QuantForgeConfig) -> PipelineR
     return record.with_updates(cleanup_pending=not _cleanup_working_artifacts(config, record))
 
 
+class _CanonicalRowUnreadable(Exception):
+    """A registry read failed for a reason OTHER than absence."""
+
+
 def _canonical_row_fingerprint(config: QuantForgeConfig, canonical_id: str) -> str:
     """Content fingerprint of the canonical registry row; "" when absent.
 
@@ -520,6 +533,12 @@ def _canonical_row_fingerprint(config: QuantForgeConfig, canonical_id: str) -> s
     time, re-checked at publish time. Any change to the row's content --
     formula, name, description, status, anything serialized -- between
     those two moments makes the fingerprints differ and blocks the publish.
+    An UNREADABLE row raises (rv2 round: mapping read errors to "" made an
+    unreadable row indistinguishable from an absent one, which could match
+    an absent-at-confirm baseline and publish blind over content we never
+    saw). ``confirm_pipeline`` maps the raise back to "" for the BASELINE
+    capture (an unreadable row there simply guarantees a later conflict --
+    fail-closed in the safe direction).
     """
 
     if not canonical_id:
@@ -528,13 +547,16 @@ def _canonical_row_fingerprint(config: QuantForgeConfig, canonical_id: str) -> s
         existing = FactorRepository(config.paths.factor_root).get(canonical_id)
     except FileNotFoundError:
         return ""
-    except Exception:
-        LOGGER.warning("canonical row read failed for %s; treating as absent", canonical_id, exc_info=True)
-        return ""
+    except Exception as exc:
+        raise _CanonicalRowUnreadable(canonical_id) from exc
     from dataclasses import asdict
 
     payload = {key: str(value) for key, value in sorted(asdict(existing).items())}
     return canonical_fingerprint(payload)
+
+
+def _publish_lock_path(config: QuantForgeConfig) -> Path:
+    return Path(config.paths.factor_root).expanduser() / ".qf_pipeline_publish.lock"
 
 
 def _publish_canonical_factor(config: QuantForgeConfig, record: PipelineRecord) -> tuple[str | None, str]:
@@ -544,17 +566,22 @@ def _publish_canonical_factor(config: QuantForgeConfig, record: PipelineRecord) 
     (``record.factor["factor_id"]``, never mutated after create) -- one row
     per distinct formula/idea, matching the pre-P1 convention, so a
     successful run does not permanently multiply registry rows per
-    parameter combination. Two independent guards:
+    parameter combination. Guards:
 
     * G3 (unchanged): refuses to overwrite an EXISTING canonical row that
       has already been human-promoted (status other than "draft") --
       ``publish_state="declined_promoted"``.
-    * CAS (re-verify RV-F1): publishes ONLY when the canonical row's
-      CURRENT content fingerprint still equals the baseline captured at
-      confirm time (``record.canonical_baseline_fingerprint``). A
-      concurrent draft edit between confirm and completion is preserved and
-      reported as ``publish_state="conflict"`` instead of silently
-      clobbered by the completed pipeline's snapshot of the past.
+    * CAS (re-verify RV-F1, tightened in rv2): the check+save sequence runs
+      under a publisher advisory file lock with the fingerprint re-read
+      IMMEDIATELY before the save, so two publishers can never interleave
+      and a concurrent edit's window shrinks to the single read->write
+      step. An unreadable row fails CLOSED as a conflict. KNOWN RESIDUAL
+      (documented, adjudicated): a non-publisher writer (the registry edit
+      route in the frozen api.py) takes no lock, so a sub-millisecond
+      last-instant edit can still be overwritten -- full CAS needs
+      registry-level versioning, a kernel change recorded in the deferred
+      register; within this local single-user tool the residual window is
+      human-scale unreachable.
 
     Returns ``(published_id, publish_state)``.
     """
@@ -562,24 +589,41 @@ def _publish_canonical_factor(config: QuantForgeConfig, record: PipelineRecord) 
     canonical_id = str(record.factor.get("factor_id", ""))
     if not canonical_id:
         return None, ""
-    current_fingerprint = _canonical_row_fingerprint(config, canonical_id)
-    if current_fingerprint != record.canonical_baseline_fingerprint:
-        LOGGER.info(
-            "declining to publish %s: canonical row changed since confirm (CAS mismatch)",
-            canonical_id,
-        )
-        return None, "conflict"
-    repo = FactorRepository(config.paths.factor_root)
-    try:
-        existing = repo.get(canonical_id)
-    except FileNotFoundError:
-        existing = None
-    if existing is not None and existing.status != "draft":
-        LOGGER.info("declining to publish over promoted factor %s (status=%s)", canonical_id, existing.status)
-        return None, "declined_promoted"
-    working = _factor_from_request(dict(record.factor))
-    canonical = dataclass_replace(working, factor_id=canonical_id, status="draft")
-    repo.save(canonical)
+    # Underscore spelling on purpose: this branch's lineage/store.py still
+    # has only the private def, while the sibling engine track promoted a
+    # public `advisory_file_lock` and kept `_advisory_file_lock` as an
+    # alias -- the private name is the one import valid on BOTH sides of
+    # the eventual union merge.
+    from quant_forge.lineage.store import _advisory_file_lock
+
+    lock_path = _publish_lock_path(config)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _advisory_file_lock(lock_path):
+        try:
+            current_fingerprint = _canonical_row_fingerprint(config, canonical_id)
+        except _CanonicalRowUnreadable:
+            LOGGER.warning("declining to publish %s: canonical row unreadable (fail closed)", canonical_id)
+            return None, "conflict"
+        if current_fingerprint != record.canonical_baseline_fingerprint:
+            LOGGER.info(
+                "declining to publish %s: canonical row changed since confirm (CAS mismatch)",
+                canonical_id,
+            )
+            return None, "conflict"
+        repo = FactorRepository(config.paths.factor_root)
+        try:
+            existing = repo.get(canonical_id)
+        except FileNotFoundError:
+            existing = None
+        except Exception:
+            LOGGER.warning("declining to publish %s: canonical row unreadable (fail closed)", canonical_id)
+            return None, "conflict"
+        if existing is not None and existing.status != "draft":
+            LOGGER.info("declining to publish over promoted factor %s (status=%s)", canonical_id, existing.status)
+            return None, "declined_promoted"
+        working = _factor_from_request(dict(record.factor))
+        canonical = dataclass_replace(working, factor_id=canonical_id, status="draft")
+        repo.save(canonical)
     return canonical_id, "published"
 
 
@@ -644,15 +688,24 @@ def _read_completion_artifact(store: PipelineStore, pipeline_id: str) -> dict[st
 
 
 def _completion_matches_record(payload: dict[str, Any] | None, record: PipelineRecord) -> bool:
-    """Completion evidence counts ONLY for the exact attempt it proves."""
+    """Completion evidence counts ONLY for the exact attempt it proves.
+
+    Malformed field TYPES are non-evidence, never an exception (rv2 round:
+    ``attempt="bad"`` used to raise out of reconciliation instead of
+    degrading to the honest JOB_NOT_FOUND pause).
+    """
 
     if payload is None:
         return False
     compute = record.stage("compute")
+    try:
+        attempt = int(payload.get("attempt", -1))
+    except (TypeError, ValueError):
+        return False
     return (
         str(payload.get("pipeline_id", "")) == record.pipeline_id
         and str(payload.get("child_job_id", "")) == str(compute.child_job_id or "")
-        and int(payload.get("attempt", -1)) == record.attempt.number
+        and attempt == record.attempt.number
         and str(payload.get("input_hash", "")) == record.input_hash
     )
 
@@ -948,7 +1001,18 @@ def pipeline_report(
                 return {"pipeline_id": pipeline_id, "source": "job", "result": job.get("result")}
         payload = _read_completion_artifact(store, pipeline_id)
         if _completion_matches_record(payload, record):
-            return {"pipeline_id": pipeline_id, "source": "artifact", "result": (payload or {}).get("result")}
+            # Defensive re-sanitize (rv2 round): new artifacts are written
+            # public-projected already, but artifacts written by the
+            # pre-fix build carried the raw workflow result (absolute
+            # artifact/value paths) -- serve-side projection guarantees no
+            # stored copy, old or new, can leak them.
+            from quant_forge.apps.web import server as _server
+
+            return {
+                "pipeline_id": pipeline_id,
+                "source": "artifact",
+                "result": _server._web_public_json((payload or {}).get("result")),
+            }
         raise PipelineNotFoundError(f"no durable report evidence for completed pipeline {pipeline_id}")
 
 
@@ -968,8 +1032,15 @@ def list_active_pipelines(store: PipelineStore, *, job_manager: _WebJobManager, 
                 record = store.load(pipeline_id)
             except PipelineNotFoundError:
                 continue
+            was_terminal = record.status in TERMINAL_PIPELINE_STATUSES
             record = _reconcile(record, store=store, job_manager=job_manager, config=config)
-            if record.status not in TERMINAL_PIPELINE_STATUSES:
+            # A record that JUST transitioned to terminal inside THIS
+            # reconcile pass is returned once (rv2 round: filtering purely
+            # on the post-reconcile status made a restart-recovered
+            # completion invisible -- the startup listing was the only
+            # discovery path, so the client could never learn the pipeline
+            # id to fetch /report for).
+            if record.status not in TERMINAL_PIPELINE_STATUSES or not was_terminal:
                 records.append(record)
     records.sort(key=lambda item: item.created_at, reverse=True)
     return records
@@ -989,14 +1060,24 @@ def confirm_pipeline(
     """Idempotent confirm (spec §2.3 / WORKORDER P1 pin), exactly-once launch.
 
     ``(pipeline_id, nonce, version)`` is the idempotency key, and the token
-    is SINGLE-USE per payload (re-verify Cluster A): the SAME key seen again
-    -- double click, second tab, retried request -- returns the SAME run
-    untouched ONLY when its effective parameter payload equals what the
-    consumed confirm actually launched; the same key with a DIFFERENT
-    payload is a conflict (the old behavior silently discarded the second
-    tab's divergent edits as an "idempotent replay"). A different/stale key
-    while still awaiting confirmation is rejected (phase-review F1/F2) so a
-    late request from a superseded draft can never confirm the wrong offer.
+    is SINGLE-USE per EFFECTIVE payload (re-verify Cluster A): the SAME key
+    seen again -- double click, second tab, retried request -- returns the
+    SAME run untouched ONLY when its effective parameter payload equals
+    what the consumed confirm actually launched; the same key with a
+    DIFFERENT payload is a conflict (the old behavior silently discarded
+    the second tab's divergent edits as an "idempotent replay").
+
+    Equality is deliberately SEMANTIC, not raw-request-shape (rv2-round
+    adjudication, upheld by design): ``{}`` after ``{"holding_days": 5}``
+    replays cleanly when 5 was already the displayed draft value, because
+    both requests mean "launch exactly what the card shows" -- the human
+    meaning of the confirm gesture. Hashing the raw request body instead
+    would reject that harmless refresh-then-reclick while adding no
+    protection: any payload whose EFFECTIVE values differ already
+    conflicts, and unknown fields are dropped by the same flat-field
+    filter every write path applies. A different/stale key while still
+    awaiting confirmation is rejected (phase-review F1/F2) so a late
+    request from a superseded draft can never confirm the wrong offer.
 
     Launch ordering (phase-review F1): reserve the child job id, persist the
     ``running`` snapshot naming that id, and only THEN actually start it. If
@@ -1019,6 +1100,14 @@ def confirm_pipeline(
             )
         if record.status not in {"draft", "awaiting_confirm"}:
             raise PipelineConflictError(f"pipeline {pipeline_id} is not awaiting confirmation (status={record.status})")
+        if record.cleanup_pending:
+            # Defense-in-depth twin of the retry gate (rv2 round): never
+            # launch a compute over a working id whose prior-attempt cleanup
+            # is still owed -- a later cleanup retry would delete the live
+            # attempt's artifacts.
+            raise PipelineConflictError(
+                f"pipeline {pipeline_id} has unfinished working-artifact cleanup; cannot launch"
+            )
         if record.confirm.nonce != nonce or record.confirm.version != version:
             raise PipelineConflictError("stale confirm token; reload the pipeline and try again")
 
@@ -1098,20 +1187,27 @@ def confirm_pipeline(
                 rd_config=rd_config,
                 cancel_event=cancel_event,
             )
-            try:
-                _write_completion_artifact(
-                    store,
-                    pipeline_id=pipeline_id,
-                    child_job_id=child_job_id,
-                    attempt=attempt_number,
-                    input_hash=frozen_input_hash,
-                    result=result,
-                )
-            except Exception:
-                # The job manager still remembers this job until a restart,
-                # so completion remains observable; a missing artifact only
-                # narrows RECOVERY to the honest paused_failure + retry path.
-                LOGGER.warning("failed to write completion artifact for %s", pipeline_id, exc_info=True)
+            # PUBLIC-sanitized before persisting (rv2 round: the raw workflow
+            # result carries absolute artifact paths; the job manager applies
+            # the same projection before storing its own copy, so the
+            # artifact and the live job serve identical, leak-free payloads).
+            from quant_forge.apps.web import server as _server
+
+            public_result = _server._web_public_json(result)
+            # A write failure PROPAGATES (rv2 round: swallowing it let the
+            # record complete from job memory and silently lose its report at
+            # the next restart). The workflow's own RunIndex rows stand --
+            # computed truth is recorded -- but this pipeline pauses honestly
+            # (paused_failure via the failed job) with retry available,
+            # instead of claiming a durable completion it cannot prove.
+            _write_completion_artifact(
+                store,
+                pipeline_id=pipeline_id,
+                child_job_id=child_job_id,
+                attempt=attempt_number,
+                input_hash=frozen_input_hash,
+                result=public_result,
+            )
             return result
 
         try:
@@ -1172,6 +1268,18 @@ def retry_pipeline(store: PipelineStore, pipeline_id: str, *, job_manager: _WebJ
         record = _reconcile(record, store=store, job_manager=job_manager, config=config)
         if record.status != "paused_failure":
             raise PipelineConflictError(f"pipeline {pipeline_id} is not paused (status={record.status})")
+        if record.cleanup_pending:
+            # rv2 round: a pending old-attempt cleanup must NEVER escape into
+            # a new attempt -- the retry reuses the SAME working id, so a
+            # delayed cleanup firing later would delete the live attempt's
+            # row and cached values out from under it. One synchronous
+            # attempt here; still failing -> the retry is refused, honestly.
+            if _cleanup_working_artifacts(config, record):
+                record = store.save(record.with_updates(cleanup_pending=False), event="cleanup_retried")
+            else:
+                raise PipelineConflictError(
+                    f"pipeline {pipeline_id} has unfinished working-artifact cleanup; retry once it clears"
+                )
         now = _utc_now()
         record = _reset_stage(record, "compute")
         record = _transition(record, "awaiting_confirm")
@@ -1266,7 +1374,12 @@ def fork_pipeline_from_failure(
         frozen_parameters = _flat_parameters_only(
             dict(old.confirmed_parameters if old.confirmed_parameters is not None else old.parameters)
         )
-        draft_parameters = _flat_parameters_only({**frozen_parameters, **(parameters or {})})
+        # The fork draft starts from the parent's DURABLE next-attempt draft
+        # (old.parameters -- the 「仅用于下次尝试」 edits the user already
+        # SAVED), then the request's unsaved overrides on top (rv2 round: a
+        # refreshed client posts no local overrides, and starting from the
+        # frozen inputs silently reverted saved edits the user could see).
+        draft_parameters = _flat_parameters_only({**dict(old.parameters), **(parameters or {})})
         now = _utc_now()
         new_pipeline_id = _new_pipeline_id()
         input_hash = _compute_input_hash(

@@ -627,9 +627,16 @@ def test_list_active_pipelines_includes_awaiting_confirm_and_excludes_terminal(t
     )
     _wait_job(job_manager, confirmed.stage("compute").child_job_id)
 
-    active_ids = {record.pipeline_id for record in list_active_pipelines(store, job_manager=job_manager, config=config)}
-    assert awaiting.pipeline_id in active_ids
-    assert completed_pipeline.pipeline_id not in active_ids
+    # rv2 semantics: the FIRST list observes the running->completed
+    # transition (returned once, so the caller can fetch /report); every
+    # later list excludes the now-terminal record.
+    first = {record.pipeline_id: record for record in list_active_pipelines(store, job_manager=job_manager, config=config)}
+    assert awaiting.pipeline_id in first
+    assert first[completed_pipeline.pipeline_id].status == "completed"
+
+    second = {record.pipeline_id for record in list_active_pipelines(store, job_manager=job_manager, config=config)}
+    assert awaiting.pipeline_id in second
+    assert completed_pipeline.pipeline_id not in second
 
 
 def test_rejoin_after_a_simulated_server_restart_reconciles_to_paused_failure(tmp_path, monkeypatch) -> None:
@@ -778,15 +785,23 @@ def test_expired_draft_reconciles_to_expired_on_read(tmp_path) -> None:
     assert reconciled.status == "expired"
 
 
-def test_expired_pipelines_are_excluded_from_list_active(tmp_path) -> None:
+def test_expired_pipelines_are_reported_once_then_excluded_from_list_active(tmp_path) -> None:
+    # rv2 semantics: a record that transitions to terminal INSIDE a list
+    # call's own reconcile pass is returned that once (so the client that
+    # triggered the discovery actually sees the transition -- the same rule
+    # that lets a restart-recovered completion surface its report), and is
+    # excluded from every later listing.
     config, store, job_manager = _new_env(tmp_path)
     parse_job = _parsed_job_with_request(config, job_manager)
     pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
     stale = pipeline.with_updates(expires_at="2000-01-01T00:00:00Z")
     store.save(stale, event="test_backdate")
 
-    active_ids = {record.pipeline_id for record in list_active_pipelines(store, job_manager=job_manager, config=config)}
-    assert pipeline.pipeline_id not in active_ids
+    first = {record.pipeline_id: record for record in list_active_pipelines(store, job_manager=job_manager, config=config)}
+    assert first[pipeline.pipeline_id].status == "expired"  # surfaced once, honestly terminal
+
+    second = {record.pipeline_id for record in list_active_pipelines(store, job_manager=job_manager, config=config)}
+    assert pipeline.pipeline_id not in second
 
 
 # ---------------------------------------------------------------------------
@@ -1508,3 +1523,150 @@ def test_fork_carries_pending_parameter_edits_as_human_override(tmp_path, monkey
     )["holding_days"]
     assert badge.source == "human_override"
     assert badge.parent_value == failed.confirmed_parameters["holding_days"]
+
+
+# ---------------------------------------------------------------------------
+# Re-verify round 3 (rv2 sub-findings)
+# ---------------------------------------------------------------------------
+
+
+def test_retry_is_refused_while_cleanup_is_pending(tmp_path, monkeypatch) -> None:
+    # RV2-F4: a pending old-attempt cleanup must never escape into a new
+    # attempt that reuses the same working id.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    monkeypatch.setattr(
+        pipeline_module,
+        "run_idea_validation_workflow",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    _wait_job(job_manager, confirmed.stage("compute").child_job_id)
+
+    def _boom_delete(self, factor_id):
+        raise RuntimeError("simulated registry outage")
+
+    original_delete = pipeline_module.FactorRepository.delete
+    monkeypatch.setattr(pipeline_module.FactorRepository, "delete", _boom_delete)
+    failed = get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert failed.status == "paused_failure"
+    assert failed.cleanup_pending is True
+
+    with pytest.raises(PipelineConflictError, match="unfinished working-artifact cleanup"):
+        retry_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+
+    # Once cleanup can succeed, the retry path clears the flag and proceeds.
+    monkeypatch.setattr(pipeline_module.FactorRepository, "delete", original_delete)
+    retried = retry_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert retried.status == "awaiting_confirm"
+    assert retried.cleanup_pending is False
+
+
+def test_fork_preserves_durable_next_attempt_edits_on_empty_payload(tmp_path, monkeypatch) -> None:
+    # RV2-F8: saved 「仅用于下次尝试」 edits (old.parameters) survive a fork
+    # posted by a refreshed client with no local overrides.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    monkeypatch.setattr(
+        pipeline_module,
+        "run_idea_validation_workflow",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    _wait_job(job_manager, confirmed.stage("compute").child_job_id)
+    monkeypatch.undo()
+    failed = get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert failed.status == "paused_failure"
+
+    # Durable next-attempt edit saved while paused...
+    update_pipeline_parameters(store, pipeline.pipeline_id, {"holding_days": 13}, job_manager=job_manager, config=config)
+    # ...then a refreshed client forks with an empty payload.
+    forked = fork_pipeline_from_failure(
+        store, pipeline.pipeline_id, job_manager=job_manager, config=config, rd_config=_rd_config(), parameters={}
+    )
+    assert forked.parameters["holding_days"] == 13  # not silently reverted to frozen
+    badge = provenance_by_field(tuple(ProvenanceEntry(**entry) for entry in forked.provenance))["holding_days"]
+    assert badge.source == "human_override"
+
+
+def test_completion_artifact_is_public_sanitized(tmp_path) -> None:
+    # RV2-F7 (write side): the persisted artifact carries the same public
+    # projection the live job endpoint serves -- no absolute local paths.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    _wait_job(job_manager, confirmed.stage("compute").child_job_id)
+
+    artifact_path = pipeline_module._completion_artifact_path(store, pipeline.pipeline_id)
+    raw = artifact_path.read_text(encoding="utf-8")
+    assert str(config.paths.artifact_root) not in raw
+    assert str(tmp_path) not in raw
+
+    # Serve side agrees (defensive re-projection).
+    report = pipeline_module.pipeline_report(store, pipeline.pipeline_id, job_manager=_WebJobManager(), config=config)
+    assert report["source"] == "artifact"
+    assert str(tmp_path) not in json.dumps(report)
+
+
+def test_completion_artifact_write_failure_pauses_instead_of_completing(tmp_path, monkeypatch) -> None:
+    # RV2-F5: the artifact is the only durable result copy; failing to
+    # write it must surface as a paused failure with retry, never a
+    # completion that silently loses its report at the next restart.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    monkeypatch.setattr(
+        pipeline_module,
+        "_write_completion_artifact",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    _wait_job(job_manager, confirmed.stage("compute").child_job_id)
+    reconciled = get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert reconciled.status == "paused_failure"
+
+
+def test_forged_artifact_with_malformed_attempt_is_non_evidence(tmp_path) -> None:
+    # RV2-F9: schema garbage in the artifact degrades to the honest
+    # JOB_NOT_FOUND pause, never an exception out of reconciliation.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    _wait_job(job_manager, confirmed.stage("compute").child_job_id)
+
+    artifact_path = pipeline_module._completion_artifact_path(store, pipeline.pipeline_id)
+    payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    payload["attempt"] = "bad"
+    artifact_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    rejoined = get_pipeline(
+        PipelineStore(config.paths.artifact_root), pipeline.pipeline_id, job_manager=_WebJobManager(), config=config
+    )
+    assert rejoined.status == "paused_failure"
+    assert rejoined.failure.reason_code == "JOB_NOT_FOUND"
+
+
+def test_value_cleanup_skips_directories_contested_by_another_factor_id(tmp_path) -> None:
+    # RV2-F2: the canonical dir naming is non-injective (case folding,
+    # hyphen->underscore); a directory another registered id also derives
+    # is skipped -- residue over deleting someone else's cache.
+    from quant_forge.factor_engine.value_store import remove_stored_values_for_factor_id
+
+    root = tmp_path / "values"
+    ours = "Foo-Bar_PWaaaaaaaaaaaaaaaa"
+    theirs = "FOO_BAR_PWAAAAAAAAAAAAAAAA"
+    contested = root / "factor_id=FOO_BAR_PWAAAAAAAAAAAAAAAA"
+    contested.mkdir(parents=True)
+    (contested / "2024.parquet").write_bytes(b"stub")
+    exclusive = root / ours
+    exclusive.mkdir(parents=True)
+    (exclusive / "2024.parquet").write_bytes(b"stub")
+
+    removed = remove_stored_values_for_factor_id(root, ours, other_known_factor_ids=(theirs,))
+    assert contested.is_dir()  # contested canonical spelling survives
+    assert not exclusive.exists()  # our raw-id dir is gone
+    assert removed == 1
