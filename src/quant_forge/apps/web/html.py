@@ -899,6 +899,7 @@ def _index_html(
       <button class="lab-tab" role="tab" id="lab-tab-registry" aria-controls="lab-panel-registry" aria-selected="false" tabindex="-1">注册表 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-docs" aria-controls="lab-panel-docs" aria-selected="false" tabindex="-1">文档 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-extensions" aria-controls="lab-panel-extensions" aria-selected="false" tabindex="-1">扩展 <span class="lab-tab-dot" hidden></span></button>
+      <button class="lab-tab" role="tab" id="lab-tab-memory" aria-controls="lab-panel-memory" aria-selected="false" tabindex="-1">记忆治理 <span class="lab-tab-dot" hidden></span></button>
     </div>
     <div id="error" class="err"></div>
     <section class="lab-tabpanel" role="tabpanel" id="lab-panel-factor" aria-labelledby="lab-tab-factor" tabindex="0">
@@ -1056,9 +1057,22 @@ def _index_html(
         </div>
       </div>
     </section>
+    <section class="lab-tabpanel" role="tabpanel" id="lab-panel-memory" aria-labelledby="lab-tab-memory" tabindex="0" hidden>
+      <div class="section-title">
+        <h2>记忆治理</h2>
+        <p>规则治理、发现/失败与先验视图（SE-P4b）</p>
+      </div>
+      <div id="memory-result">
+        <div class="panel empty-state">
+          <h3>等待加载</h3>
+          <p class="meta">打开本页签后，规则治理、发现/失败列表与先验视图会展示在这里。</p>
+        </div>
+      </div>
+    </section>
   </section>
 </main>
 <script type="application/json" id="qf-page-config">{page_config_json}</script>
 <script type="module" src="/static/app.js"></script>
+<script type="module" src="/static/views/memory.js"></script>
 </body>
 </html>"""

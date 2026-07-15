@@ -44,9 +44,11 @@ from quant_forge.apps.web.api import (
 )
 from quant_forge.apps.web.html import _index_html
 from quant_forge.apps.web.jobs import LOGGER, RequestBodyTooLarge, _WebJobManager, _client_error_message
+from quant_forge.apps.web.memory_review import memory_review_payload, review_promoted, review_rule
 from quant_forge.config import QuantForgeConfig
 from quant_forge.mcp.read_models import list_available_fields, list_available_operators
 from quant_forge.research_loop.config import ResearchLoopConfig, load_research_loop_config
+from quant_forge.research_loop.memory import ResearchMemoryStore
 from quant_forge.research_loop.scheduler import (
     ResearchLoopScheduler,
     ResearchScheduleRequest,
@@ -206,6 +208,18 @@ def create_local_web_server(
                 elif path == "/api/extensions":
                     self._require_control_token()
                     self._json(_server._extensions_payload(config))
+                elif path == "/api/memory/review":
+                    # SE-P4b: rule governance + findings/failures + priors +
+                    # optional read-only plugin pane (memory_review_payload's
+                    # plugin_store parameter). No config/env hook resolves a
+                    # plugin artifact root anywhere in this repo yet, so V1
+                    # never constructs one here and the plugin pane always
+                    # renders omitted (payload["plugin"] is None) until one
+                    # is added deliberately -- see memory_review.py's
+                    # docstring for the full plugin-pane contract.
+                    self._require_control_token()
+                    memory_store = ResearchMemoryStore(config.paths.artifact_root)
+                    self._json(memory_review_payload(memory_store))
                 elif path == "/api/status":
                     self._require_control_token()
                     active_llm = _active_llm(config)
@@ -461,6 +475,38 @@ def create_local_web_server(
                         self._json(_json_safe(scheduler.stop()))
                         return
                     self._json({"error": "action must be start or stop"}, status=400)
+                    return
+                if path == "/api/memory/review/rule":
+                    # SE-P4b: review_rule validates actor/action and appends
+                    # exactly one event via the store's atomic
+                    # resolve_validate_append; ValueError (empty actor,
+                    # unknown action, ambiguous/absent signature prefix)
+                    # falls through to the generic ValueError -> 400 mapping
+                    # below. No plugin_store passed in V1, matching the GET
+                    # route above.
+                    memory_store = ResearchMemoryStore(config.paths.artifact_root)
+                    self._json(
+                        review_rule(
+                            memory_store,
+                            signature_prefix=str(payload.get("signature_prefix", "")),
+                            action=str(payload.get("action", "")),
+                            actor=str(payload.get("actor", "")),
+                            rationale=str(payload.get("rationale", "")),
+                        )
+                    )
+                    return
+                if path == "/api/memory/review/promoted":
+                    memory_store = ResearchMemoryStore(config.paths.artifact_root)
+                    self._json(
+                        review_promoted(
+                            memory_store,
+                            kind=str(payload.get("kind", "")),
+                            signature_prefix=str(payload.get("signature_prefix", "")),
+                            action=str(payload.get("action", "")),
+                            actor=str(payload.get("actor", "")),
+                            rationale=str(payload.get("rationale", "")),
+                        )
+                    )
                     return
                 self._json({"error": f"unknown endpoint: {path}"}, status=404)
             except KeyError as exc:

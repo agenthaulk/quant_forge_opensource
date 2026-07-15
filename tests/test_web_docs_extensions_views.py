@@ -74,9 +74,10 @@ def test_index_page_hosts_docs_and_extensions_tabs_and_panels(web_config) -> Non
     assert html.index('id="lab-panel-docs"') < html.index('id="docs-result"')
     assert html.index('id="docs-result"') < html.index('id="lab-panel-extensions"')
     assert html.index('id="lab-panel-extensions"') < html.index('id="extensions-result"')
-    # 6 top-level tabs + 2 workbench module tabs (CP9-2 IA consolidation).
-    assert html.count('role="tab"') == 8
-    assert html.count('role="tabpanel"') == 8
+    # 7 top-level tabs (CP9-2 IA consolidation + SE-P4b's 记忆治理) + 2
+    # workbench module tabs.
+    assert html.count('role="tab"') == 9
+    assert html.count('role="tabpanel"') == 9
 
 
 def test_index_page_ships_cp64_css_with_theme_tokens_only(web_config) -> None:
