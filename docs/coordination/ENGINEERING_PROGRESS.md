@@ -725,3 +725,44 @@ versioning); semantic confirm idempotency (same effective payload =
 replay) is design, documented and pinned. api.py: zero net additions
 across the entire phase (D12 net shrink stands). Gates at close: 1411
 passed / CLI OK / diff clean / release scan 251 files.
+
+## 2026-07-15 — Workflow B / SE-P4b: web memory-review tab (CLOSED)
+
+Trunk chain `344574d` (memory_review.py payload/action module +
+static/views/memory.js self-contained tab + additive-only html.py nav/
+section + routing GET/POST handlers; consumes the P4a rule snapshot APIs +
+the P5 priors view with its honesty counters invalid_rows/oos_excluded/
+unbucketed rendered) → `6fb8355` (review findings P4B-F1..F3: HTTP fields
+string-type-validated before dispatch — non-string actor is a 400 with no
+event appended; tab deactivation on non-memory hashchange + a .lab-tabs
+aria-selected MutationObserver catching app.js's replaceState activation;
+a first pass at the promoted-retirement read consistency) → `cf871f9`
+(the retirement-join race, chased across three re-verify rounds, closed by
+a new ATOMIC store method ResearchMemoryStore.promoted_review_snapshot:
+live rows + their row-bound retire events under ONE advisory-lock hold,
+the finding/failure analog of rule_review_snapshot — retirement binds to
+the exact rows returned, so a stale old-entry_id flag lapses and a genuine
+new-row retirement is honored; the interim caller-side bounded-retry loop
+and per-row bracket, each of which the reviewer broke, are gone).
+
+Review trail (all pins verified): sol-high strict review REWORK 3 MAJOR →
+rework → re-verify reopened the retirement join (RV-F1) → per-row bracket
+→ re-verify found the bracket's exhaustion hazard (RV2-F1) and a
+non-order-pinning test (RV2-F2) → single-pass per-row bracket → final
+spot-check found the per-row bracket drops a genuine fresh retirement of a
+superseded row (RV3-F1) → steward adopts the reviewer's own prescribed fix
+(atomic snapshot) → final spot-check PASS, one LOW doc residual (RV4-F1,
+fixed in place). Adjudicated + on record: rule retire/unretire is
+findings/failures-ONLY per the frozen event contract (the workorder wording
+was imprecise; DECISIONS SE-iii summary sentence likewise); the plugin
+read-only pane is honestly omitted in V1 (no config hook exists — the
+payload param is unit-tested for the future wiring); memory.js is
+deliberately self-contained with its own script entry (app.js/lab.js are
+FE-track-owned) — the arrow-key roving-tabindex gap and the absence of a
+JS-render Node harness for memory.js are recorded for the CP-INT register.
+The atomic store method is purely additive (+31/-0 on memory.py).
+
+Gates at close: 1670 passed / CLI OK / diff clean / release scan 255
+files. THE SE ENGINE TRACK (P1–P5 + the P4b review surface) IS COMPLETE
+on this branch; the remaining SE-branch work is the endgame (docs sync +
+CP-INT + the neutral rename before the PR).
