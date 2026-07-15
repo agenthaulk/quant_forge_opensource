@@ -2107,9 +2107,11 @@ def create_pipeline_from_edited_formula(
     read-only pre-validation (``status="ready"``) before it can create a run --
     an unknown-operator / unparseable edit is not runnable and is refused here
     (the user resolves it via operator-draft review first), so a run is only
-    ever created from a canonicalized, gate-passing formula. The parent (a
-    completed report) is NOT terminalized -- the compare surface needs both the
-    parent run and this new one side by side.
+    ever created from a canonicalized, gate-passing formula. The parent may be
+    any factor_study pipeline in any status (deliberately unguarded): the
+    confirm-card formula edit branches BEFORE the parent ever runs, while the
+    report compare loop branches after completion. The parent is NOT
+    terminalized -- the compare surface needs both runs side by side.
     """
 
     with store.lock:

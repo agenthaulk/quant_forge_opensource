@@ -2280,19 +2280,38 @@ def test_f3_pre_validate_canonical_equivalence_repeat_equality_and_zero_side_eff
     # backtested (persist + eval + backtest entrypoints raise if touched).
     config, store, job_manager = _new_env(tmp_path)
 
-    import quant_forge.apps.web.server as _server
+    import quant_forge.backtesting.service as _backtesting_service
+    import quant_forge.evaluation.service as _evaluation_service
 
     def _boom(*args, **kwargs):
-        raise AssertionError("pre-validation must not persist / evaluate / backtest")
+        raise AssertionError("pre-validation must not persist / evaluate / backtest / spawn jobs")
 
+    # Guard the REAL execution entrypoints at their source modules (re-verify
+    # NEW-1: the earlier _server.* patches guarded symbols pre-validation never
+    # reaches, so they proved nothing). _WebJobManager.start is patched at the
+    # class so ANY instance spawning a background job trips the guard.
     monkeypatch.setattr(FactorRepository, "save", _boom)
-    monkeypatch.setattr(_server, "run_idea_validation_workflow", _boom)
-    monkeypatch.setattr(_server, "evaluate_factor", _boom, raising=False)
+    monkeypatch.setattr(_evaluation_service, "evaluate_factor", _boom)
+    monkeypatch.setattr(_backtesting_service, "run_factor_backtest", _boom)
+    monkeypatch.setattr(_backtesting_service, "run_staggered_entry_backtest", _boom)
+    monkeypatch.setattr(_WebJobManager, "start", _boom)
 
     def _snapshot(root):
+        if root is None or not root.exists():
+            return {}
         return {p: p.stat().st_mtime_ns for p in sorted(root.rglob("*")) if p.is_file()}
 
-    before = _snapshot(config.paths.factor_root)
+    # Snapshot EVERY writable root (re-verify NEW-1: factor_root alone missed
+    # the value/manifest roots and artifact_root, where an operator_drafts
+    # review packet would land if pre-validation ever persisted one).
+    watched_roots = (
+        config.paths.factor_root,
+        config.paths.artifact_root,
+        getattr(config.paths, "factor_values_root", None),
+        getattr(config.paths, "factor_values_overlay_root", None),
+        getattr(config.paths, "factor_values_manifest_root", None),
+    )
+    before = [_snapshot(root) for root in watched_roots]
 
     base = pre_validate_formula("rank(close)", horizon_days=5, universe_filters=("is_st == false", "close > 1"))
     alias_ws_case = pre_validate_formula("  RANK( close )  ", horizon_days=5, universe_filters=("is_st == false", "close > 1"))
@@ -2312,4 +2331,4 @@ def test_f3_pre_validate_canonical_equivalence_repeat_equality_and_zero_side_eff
     # Repeat call for the unknown operator is byte-identical too (ref stable).
     assert pre_validate_formula("ts_made_up_operator(close, 5)", horizon_days=5)["review_packet"]["review_ref"] == ref
 
-    assert _snapshot(config.paths.factor_root) == before  # zero persistence
+    assert [_snapshot(root) for root in watched_roots] == before  # zero persistence anywhere
