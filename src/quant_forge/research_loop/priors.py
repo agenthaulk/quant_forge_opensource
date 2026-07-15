@@ -69,9 +69,14 @@ from quant_forge.lineage.store import canonical_fingerprint
 from quant_forge.research_loop.memory import ResearchMemoryStore
 from quant_forge.research_loop.outcomes import (
     EVIDENCE_STRENGTHS,
+    ORIGINS,
     REASON_CODES,
+    REASON_NONE,
     RESEARCH_OUTCOME_RECORD_SCHEMA_VERSION,
     SAMPLE_ROLES,
+    STAGE_EVIDENCE_STRENGTH,
+    STAGES,
+    SUBMIT_LIFECYCLE_VERDICTS,
     VERDICTS,
 )
 
@@ -223,32 +228,55 @@ class PriorsView:
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
-def _record_is_valid(record: dict[str, Any]) -> bool:
-    """Read-path re-validation of one ledger envelope (P5-F6/OP5-F1/OP5-F2).
+def _record_is_valid(record: Any) -> bool:
+    """Read-path re-validation of one ledger envelope (P5-F6/OP5-F1/OP5-F2,
+    tightened per re-verify RV2-F1/RV2-F2).
 
     The write path already enforces all of this through the frozen
-    ``ResearchOutcome`` contract; the view reads RAW DISK DICTS, so a
+    ``ResearchOutcome`` contract; the view reads RAW DISK VALUES, so a
     foreign or corrupt writer under the artifact root could otherwise push
-    reserved sentinels, invented reason strings, or unknown strengths into
-    cells and terminal output. Invalid rows are EXCLUDED and counted --
-    never silently zero-weighted, never a bucket.
+    reserved sentinels, invented reason strings, unknown strengths -- or
+    vocabulary-VALID but incoherent combinations -- into cells and
+    terminal output. Beyond per-field closed sets, the frozen contract's
+    own CROSS-FIELD invariants are re-checked: evidence_strength must be
+    exactly the stage's derived tier (a "gate" row cannot claim
+    "submitted_live" weight -- the tier-inflation attack), passed carries
+    exactly NONE while blocked carries real codes, and a submit lifecycle
+    pins its one admissible verdict. Invalid rows are EXCLUDED and counted
+    -- never silently zero-weighted, never a bucket, never an exception
+    out of the read path (a non-mapping JSON value is just invalid).
     """
 
+    if not isinstance(record, dict):
+        return False
     if str(record.get("record_schema", "")) != RESEARCH_OUTCOME_RECORD_SCHEMA_VERSION:
         return False
     if not _HEX64_RE.fullmatch(str(record.get("evidence_run_id", ""))):
         return False
-    if str(record.get("evidence_strength", "")) not in EVIDENCE_STRENGTHS:
-        return False
     outcome = record.get("outcome")
     if not isinstance(outcome, dict):
         return False
-    if str(outcome.get("verdict", "")) not in VERDICTS:
+    origin = str(outcome.get("origin", ""))
+    stage = str(outcome.get("stage", ""))
+    verdict = str(outcome.get("verdict", ""))
+    if origin not in ORIGINS or stage not in STAGES or verdict not in VERDICTS:
+        return False
+    # Cross-field coherence (RV2-F2): strength is DERIVED from the stage in
+    # the frozen contract -- any other pairing is unmintable tier inflation.
+    if str(record.get("evidence_strength", "")) != STAGE_EVIDENCE_STRENGTH[stage]:
         return False
     if str(outcome.get("sample_role", "")) not in SAMPLE_ROLES:
         return False
     reasons = outcome.get("reason_codes")
-    if not isinstance(reasons, list) or not all(str(code) in REASON_CODES for code in reasons):
+    if not isinstance(reasons, list) or not reasons or not all(str(code) in REASON_CODES for code in reasons):
+        return False
+    reason_set = {str(code) for code in reasons}
+    if verdict == "passed" and reason_set != {REASON_NONE}:
+        return False
+    if verdict == "blocked" and (REASON_NONE in reason_set):
+        return False
+    lifecycle = str(outcome.get("lifecycle_status", "") or "")
+    if lifecycle and SUBMIT_LIFECYCLE_VERDICTS.get(lifecycle) != verdict:
         return False
     scope = outcome.get("scope")
     if not isinstance(scope, dict):

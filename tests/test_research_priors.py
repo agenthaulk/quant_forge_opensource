@@ -461,3 +461,81 @@ def test_compute_priors_on_absent_root_reads_nothing_and_writes_nothing(tmp_path
     assert view.as_of == 0
     assert view.total_envelopes == 0
     assert not root.exists()  # the read created NOTHING
+
+
+# ---------------------------------------------------------------------------
+# re-verify round 2 residuals (RV2-F1..F4)
+# ---------------------------------------------------------------------------
+
+
+def test_non_mapping_ledger_row_is_invalid_not_a_crash(tmp_path: Path) -> None:
+    # RV2-F1: a JSON-valid but non-object row ([]) must count as invalid,
+    # never raise out of the read path.
+    store = _store(tmp_path)
+    ingest_outcome(store, _outcome(_fp(1)))
+    with store.outcomes_ledger_path.open("a", encoding="utf-8") as handle:
+        handle.write("[]\n")
+        handle.write('"just a string"\n')
+
+    view = compute_priors(store)
+    assert view.invalid_rows == 2
+    assert view.total_evidence_runs == 1
+
+
+def test_tier_inflated_row_fails_cross_field_coherence(tmp_path: Path) -> None:
+    # RV2-F2: vocabulary-valid but incoherent -- a gate-stage row claiming
+    # submitted_live weight is unmintable tier inflation and must be
+    # excluded, not weighted at 1.0.
+    store = _store(tmp_path)
+    ingest_outcome(store, _outcome(_fp(1), verdict="blocked"))
+    ledger = store.outcomes_ledger_path
+    genuine = json.loads(ledger.read_text(encoding="utf-8").splitlines()[0])
+    inflated = json.loads(json.dumps(genuine))
+    inflated["evidence_run_id"] = "4" * 64
+    inflated["evidence_strength"] = "submitted_live"  # stage stays "gate"
+    with ledger.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(inflated) + "\n")
+
+    view = compute_priors(store)
+    assert view.invalid_rows == 1
+    cell = next(
+        item for item in next(t for t in view.tables if t.dimension == "factor_family").cells if item.bucket == "momentum"
+    )
+    assert cell.weighted_blocked == pytest.approx(EVIDENCE_STRENGTH_WEIGHTS["local_backtest"])  # only the honest row
+
+    # Incoherent verdict/reason pairings are equally unmintable.
+    bad_pass = json.loads(json.dumps(genuine))
+    bad_pass["evidence_run_id"] = "5" * 64
+    bad_pass["outcome"]["verdict"] = "passed"  # reasons still TURNOVER_TOO_HIGH
+    with ledger.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(bad_pass) + "\n")
+    assert compute_priors(store).invalid_rows == 2
+
+
+def test_snapshot_freezes_caller_owned_dimension_list() -> None:
+    # RV2-F3: mutating the caller's list after construction must not be able
+    # to change an already-computable hash.
+    dimensions = ["factor_family", "settings_profile"]
+    snapshot = PlanningInfluenceSnapshot(
+        as_of=1,
+        review_events_revision=0,
+        active_rules=(),
+        rule_channel_stats={"total": 0, "accepted": 0, "dropped": 0},
+        priors_query_fingerprint="f" * 64,
+        priors_dimensions=dimensions,  # type: ignore[arg-type]
+    )
+    before = snapshot.snapshot_hash()
+    dimensions.append("universe")
+    assert snapshot.snapshot_hash() == before
+    assert snapshot.priors_dimensions == ("factor_family", "settings_profile")
+
+
+def test_from_dict_rejects_non_canonical_field_types(tmp_path: Path) -> None:
+    # RV2-F4: int-coercible strings round-trip to the same hash, so
+    # canonical-form equality must reject them outright.
+    store = _store(tmp_path)
+    snapshot = capture_planning_influence(store)
+    payload = json.loads(json.dumps(snapshot.to_dict()))
+    payload["as_of"] = str(payload["as_of"])
+    with pytest.raises(ValueError, match="canonical serialized form"):
+        PlanningInfluenceSnapshot.from_dict(payload)

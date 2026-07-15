@@ -147,6 +147,17 @@ class PlanningInfluenceSnapshot:
                 MappingProxyType({"event_id": event_id, "scope": str(rule["scope"]), "activation_seq": seq})
             )
         object.__setattr__(self, "active_rules", tuple(frozen_rules))
+        # RV2-F3: canonicalize + freeze the dimensions HERE -- a caller-owned
+        # mutable list would let the hash change after construction.
+        dimensions = tuple(str(item) for item in self.priors_dimensions)
+        if len(set(dimensions)) != len(dimensions):
+            raise ValueError("priors_dimensions must be unique")
+        object.__setattr__(self, "priors_dimensions", dimensions)
+        if not (
+            isinstance(self.priors_query_fingerprint, str)
+            and (self.priors_query_fingerprint == "" or _HEX64_RE.fullmatch(self.priors_query_fingerprint))
+        ):
+            raise ValueError("priors_query_fingerprint must be empty or 64-hex")
         if set(self.rule_channel_stats) != _STATS_KEYS:
             raise ValueError(f"rule_channel_stats must carry exactly {sorted(_STATS_KEYS)}")
         stats = {key: int(self.rule_channel_stats[key]) for key in _STATS_KEYS}
@@ -205,6 +216,14 @@ class PlanningInfluenceSnapshot:
             priors_query_fingerprint=str(payload["priors_query_fingerprint"]),
             priors_dimensions=tuple(str(item) for item in payload["priors_dimensions"]),
         )
+        # RV2-F4: the constructors above COERCE (int("5") == 5), so a
+        # non-canonically-typed payload could round-trip to the same hash.
+        # Canonical-serialization equality closes the whole class: the
+        # incoming payload must be BIT-IDENTICAL to what this build would
+        # re-mint, types included.
+        incoming = {key: payload[key] for key in _PAYLOAD_KEYS}
+        if incoming != snapshot.payload():
+            raise ValueError("planning_influence payload is not in canonical serialized form")
         if recorded_hash != snapshot.snapshot_hash():
             raise ValueError("planning_influence snapshot_hash does not match its payload (tampered or corrupt)")
         return snapshot
