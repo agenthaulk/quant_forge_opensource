@@ -838,7 +838,10 @@ def _index_html(
     .pipeline-summary-line:last-child {{ border-bottom: 0; padding-bottom: 0; }}
     .pipeline-summary-label {{ color: var(--muted); font-size: 12px; font-weight: 800; min-width: 84px; }}
     .pipeline-summary-value {{ font-family: var(--mono); font-size: 13px; color: var(--ink); overflow-wrap: anywhere; }}
-    .pipeline-expert-grid input {{ min-width: 0; }}
+    /* min-height 44px (phase-review F12): the expert grid's inputs are real
+       touch targets on a true 375px viewport, matching the same pin already
+       applied to .pipeline-density-btn / .pipeline-actions button above. */
+    .pipeline-expert-grid input {{ min-width: 0; min-height: 44px; }}
     .pipeline-field-badges {{ display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }}
     .provenance-badge {{ display: inline-flex; align-items: center; border-radius: 999px;
       padding: 1px 8px; font-size: 10px; font-weight: 800; border: 1px solid var(--line);
@@ -848,6 +851,12 @@ def _index_html(
     .provenance-badge--data_resolved {{ color: var(--blue); border-color: var(--blue); }}
     .provenance-badge--agent_inferred {{ color: var(--accent-2); border-color: var(--accent-2); }}
     .provenance-badge--human_override {{ color: var(--warn); border-color: var(--warn-line); background: var(--warn-wash); }}
+    /* Not a member of the closed 7-value source vocabulary (phase-review
+       F4): a pending, unsaved local edit has no server badge yet, so this
+       dashed/neutral treatment is deliberately distinct from every real
+       source badge above rather than reusing (and thereby lying via) one
+       of them. */
+    .provenance-badge--unverified {{ color: var(--muted); border-style: dashed; border-color: var(--line-strong); background: var(--wash); }}
     .pipeline-negative-evidence {{ display: grid; gap: 6px; margin-bottom: 10px; }}
     .pipeline-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }}
     .pipeline-actions button {{ width: auto; margin: 0; min-height: 44px; flex: 1 1 auto; }}

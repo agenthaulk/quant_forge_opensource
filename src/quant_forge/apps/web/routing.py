@@ -49,6 +49,8 @@ from quant_forge.apps.web.pipeline import (
     cancel_pipeline,
     confirm_pipeline,
     create_pipeline,
+    create_pipeline_as_fallback,
+    fork_pipeline_from_failure,
     get_pipeline,
     list_active_pipelines,
     retry_pipeline,
@@ -262,13 +264,15 @@ def create_local_web_server(
                         {
                             "pipelines": [
                                 record.to_dict()
-                                for record in list_active_pipelines(pipeline_store, job_manager=job_manager)
+                                for record in list_active_pipelines(pipeline_store, job_manager=job_manager, config=config)
                             ]
                         }
                     )
                 elif path.startswith("/api/pipelines/"):
                     self._require_control_token()
-                    record = get_pipeline(pipeline_store, _pipeline_id_from_path(path), job_manager=job_manager)
+                    record = get_pipeline(
+                        pipeline_store, _pipeline_id_from_path(path), job_manager=job_manager, config=config
+                    )
                     self._json(record.to_dict())
                 elif path.startswith(STATIC_URL_PREFIX):
                     # Static frontend modules are public like the index page
@@ -377,17 +381,26 @@ def create_local_web_server(
                     )
                     return
                 if path == "/api/jobs/parse-idea":
+                    parse_text = str(payload.get("text", ""))
+                    parse_mode = str(payload.get("parser_mode", "llm"))
                     self._json(
                         job_manager.start(
                             "parse_idea",
                             lambda cancel_event: _server.run_idea_parse_workflow(
                                 config,
-                                str(payload.get("text", "")),
-                                parser_mode=str(payload.get("parser_mode", "llm")),
+                                parse_text,
+                                parser_mode=parse_mode,
                                 llm_provider=_optional_str(payload.get("llm_provider")),
                                 rd_config=research_config,
                                 cancel_event=cancel_event,
                             ),
+                            # Echoed back through job_manager.get() only for
+                            # apps/web/pipeline.py::create_pipeline's genuine
+                            # per-field provenance derivation (phase-review
+                            # F3) -- never re-parsed or trusted as a claim
+                            # about the RESULT, just the recorded INPUT the
+                            # parser itself was given.
+                            request={"text": parse_text, "parser_mode": parse_mode},
                         ),
                         status=202,
                     )
@@ -510,12 +523,14 @@ def create_local_web_server(
                     return
                 if path.startswith("/api/pipelines/") and path.endswith("/cancel"):
                     record = cancel_pipeline(
-                        pipeline_store, _pipeline_id_from_action_path(path, "cancel"), job_manager=job_manager
+                        pipeline_store, _pipeline_id_from_action_path(path, "cancel"), job_manager=job_manager, config=config
                     )
                     self._json(record.to_dict())
                     return
                 if path.startswith("/api/pipelines/") and path.endswith("/retry"):
-                    record = retry_pipeline(pipeline_store, _pipeline_id_from_action_path(path, "retry"))
+                    record = retry_pipeline(
+                        pipeline_store, _pipeline_id_from_action_path(path, "retry"), job_manager=job_manager, config=config
+                    )
                     self._json(record.to_dict())
                     return
                 if path.startswith("/api/pipelines/") and path.endswith("/parameters"):
@@ -524,8 +539,41 @@ def create_local_web_server(
                         _pipeline_id_from_action_path(path, "parameters"),
                         dict(payload.get("parameters") or {}),
                         job_manager=job_manager,
+                        config=config,
                     )
                     self._json(record.to_dict())
+                    return
+                if path.startswith("/api/pipelines/") and path.endswith("/fork"):
+                    # phase-review F7 "edit" exit: forks the frozen inputs of
+                    # a paused_failure pipeline into a brand-new draft
+                    # (its own attempt lineage, parent_run_id set) and
+                    # terminalizes the old one -- the failed attempt's own
+                    # history stays intact under its own id.
+                    record = fork_pipeline_from_failure(
+                        pipeline_store,
+                        _pipeline_id_from_action_path(path, "fork"),
+                        job_manager=job_manager,
+                        config=config,
+                        rd_config=research_config,
+                    )
+                    self._json(record.to_dict(), status=201)
+                    return
+                if path.startswith("/api/pipelines/") and path.endswith("/fallback-rule-parse"):
+                    # phase-review F7 "fall back to rule parse" exit: the
+                    # caller already ran a fresh parse_idea job in rule mode
+                    # against the same idea text (existing /api/jobs/parse-idea
+                    # endpoint, unchanged) and hands us that job id; this
+                    # wraps it into a new pipeline with parent_run_id lineage
+                    # and terminalizes the failed one atomically.
+                    record = create_pipeline_as_fallback(
+                        pipeline_store,
+                        job_manager=job_manager,
+                        parse_job_id=str(payload.get("parse_job_id", "")),
+                        rd_config=research_config,
+                        parent_pipeline_id=_pipeline_id_from_action_path(path, "fallback-rule-parse"),
+                        config=config,
+                    )
+                    self._json(record.to_dict(), status=201)
                     return
                 if path == "/api/research/schedule":
                     action = str(payload.get("action", "")).strip().lower()

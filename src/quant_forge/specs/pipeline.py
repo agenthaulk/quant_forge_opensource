@@ -9,14 +9,20 @@ that can sit `awaiting_confirm` indefinitely with NO worker thread parked on
 a human.
 
 Only ``factor_study`` (pipeline A: 解析→假设确认→计算→报告, report TERMINAL) is
-constructible today. ``rd_optimize`` (pipeline B) is a reserved kind name so
-the schema and legal-transition table never need to migrate when P3 wires it
-up; :func:`quant_forge.apps.web.pipeline.create_pipeline` refuses to build one
-in P1.
+constructible or deserializable in this P1 build (phase-review finding F14):
+``PIPELINE_KINDS`` is closed to that one value, so a payload claiming
+``kind="rd_optimize"`` fails ``PipelineRecord.__post_init__``/``from_dict``
+outright rather than silently round-tripping. Pipeline B's kind, stage ids,
+and legal transitions land as a real schema addition in P3, not as a
+today-inert placeholder value that could be constructed by accident.
 
 Every function here is pure (dataclasses + validation + serialization only);
 no filesystem or clock access. Persistence, locking, and journaling live in
-:mod:`quant_forge.apps.web.pipeline`.
+:mod:`quant_forge.apps.web.pipeline`. Confirm-card-field-coverage validation
+(phase-review F5) deliberately does NOT live here either: it needs
+``apps.web.provenance``'s vocabulary, and this module stays a pure type layer
+with no dependency the other direction (apps.web already depends on specs,
+not vice versa) -- see ``apps/web/pipeline.py::PipelineStore.load``.
 """
 
 from __future__ import annotations
@@ -31,7 +37,6 @@ __all__ = [
     "STAGE_STATUSES",
     "TERMINAL_PIPELINE_STATUSES",
     "FACTOR_STUDY_STAGE_IDS",
-    "RD_OPTIMIZE_STAGE_IDS",
     "STAGE_IDS_BY_KIND",
     "LEGAL_TRANSITIONS",
     "PipelineKind",
@@ -49,10 +54,12 @@ __all__ = [
 
 PIPELINE_SCHEMA_VERSION = "qf.pipeline.v1"
 
-PipelineKind = Literal["factor_study", "rd_optimize"]
-# rd_optimize is a reserved name (P3, spec §2.1/D11); only factor_study is
-# constructible in P1 -- see apps/web/pipeline.py::create_pipeline.
-PIPELINE_KINDS: frozenset[str] = frozenset({"factor_study", "rd_optimize"})
+# F14 (phase review, binding): closed to factor_study only. P3 adds
+# "rd_optimize" here, plus its own stage ids and legal-transition edges, as a
+# deliberate schema change reviewed at that time -- not a value that exists
+# in the type system today but is merely unused.
+PipelineKind = Literal["factor_study"]
+PIPELINE_KINDS: frozenset[str] = frozenset({"factor_study"})
 
 PipelineStatus = Literal[
     "draft",
@@ -83,20 +90,19 @@ STAGE_STATUSES: tuple[str, ...] = ("pending", "active", "completed", "failed", "
 # per-round or per-substep stages exist until the backend emits real
 # stage/round events (spec §12 open question #1).
 FACTOR_STUDY_STAGE_IDS: tuple[str, ...] = ("parse", "confirm", "compute", "report")
-# Reserved for P3 (rd_optimize: RD确认→RD运行→候选排行榜); not constructed in P1.
-RD_OPTIMIZE_STAGE_IDS: tuple[str, ...] = ("rd_confirm", "rd_run", "leaderboard")
 
 STAGE_IDS_BY_KIND: dict[str, tuple[str, ...]] = {
     "factor_study": FACTOR_STUDY_STAGE_IDS,
-    "rd_optimize": RD_OPTIMIZE_STAGE_IDS,
 }
 
 # Legal transitions (spec §2.3). Keyed by FROM status; value is the set of
 # TO statuses one transition may target. paused_failure -> awaiting_confirm
 # is "retry" (re-enter confirm with the same frozen inputs, new nonce);
-# paused_failure -> aborted is the terminal exit ("fall back to rule parse"
-# is a NEW pipeline via create_pipeline, not a transition of this one, so it
-# does not appear here -- see apps/web/pipeline.py module docstring).
+# paused_failure -> aborted is one terminal exit among three (spec §2.3 /
+# phase-review F7: edit-fork and rule-parse-fallback are NEW pipelines
+# created via create_pipeline with parent_run_id set, terminalizing this one
+# via the SAME aborted transition -- they are not additional edges on THIS
+# table).
 LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
     "draft": frozenset({"awaiting_confirm", "aborted", "expired"}),
     "awaiting_confirm": frozenset({"running", "aborted", "expired"}),
@@ -152,7 +158,15 @@ class StageRecord:
 class ConfirmState:
     """Idempotent-confirm token (spec §2.3). A double click, a second tab, or a
     retried request that carries the SAME ``(pipeline_id, nonce, version)``
-    must resolve to the same run -- never start a second one."""
+    must resolve to the same run -- never start a second one.
+
+    Phase-review F1/F2: ``version``/``nonce`` advance on every mutation to an
+    ``awaiting_confirm`` draft (apps/web/pipeline.py's
+    ``update_pipeline_parameters``), so a token held by a stale tab that
+    missed that mutation is provably stale -- ``confirm_pipeline`` rejects it
+    instead of silently applying a confirm against values the token-holder
+    never saw.
+    """
 
     nonce: str
     version: int = 1
@@ -179,8 +193,13 @@ class ConfirmState:
 @dataclass(frozen=True)
 class AttemptState:
     """Server-authoritative lineage (spec §5.4): attempt numbers reflect
-    research history, not browser behavior -- a double-click / idempotent
-    replay never increments this."""
+    research history, not browser behavior.
+
+    Phase-review F1: incremented ONLY when a compute job is durably
+    launched (apps/web/pipeline.py::confirm_pipeline, at the moment the
+    running snapshot is saved) -- never on a bare retry click, an idempotent
+    replay, or a retry that is itself abandoned before the next confirm.
+    """
 
     number: int = 1
     parent_run_id: str | None = None
@@ -284,6 +303,13 @@ class PipelineRecord:
     parser: dict[str, Any] = field(default_factory=dict)
     factor: dict[str, Any] = field(default_factory=dict)
     parameters: dict[str, Any] = field(default_factory=dict)
+    # Phase-review F4: the IMMUTABLE parse-time baseline every provenance
+    # derivation compares against. Never updated after create_pipeline sets
+    # it once -- comparing against the mutable `parameters` instead would
+    # let editing field B silently "revert" field A's badge from
+    # human_override back to profile_default the moment A's current value
+    # happened to re-equal ITS OWN original default while B was mid-edit.
+    original_parameters: dict[str, Any] = field(default_factory=dict)
     confirmed_parameters: dict[str, Any] | None = None
     warnings: tuple[str, ...] = field(default_factory=tuple)
     # Per-value provenance badges (spec §5.1), stored as plain dicts (each
@@ -294,16 +320,37 @@ class PipelineRecord:
     # source (create / confirm / a next-attempt parameter edit), so a plain
     # GET never needs to re-derive it: WORKORDER P1 pin "missing badge =
     # server-side assertion failure" is enforced at those write sites via
-    # apps.web.provenance.assert_full_coverage, not re-checked on every read.
+    # apps.web.provenance.assert_full_coverage, AND re-checked on every
+    # PipelineStore.load() (phase-review F5) so a GET can never serve a
+    # confirm card silently missing badges.
     provenance: tuple[dict[str, Any], ...] = field(default_factory=tuple)
     attempt: AttemptState = field(default_factory=AttemptState)
     artifact_refs: tuple[ArtifactRef, ...] = field(default_factory=tuple)
     failure: FailureState | None = None
+    # Phase-review F6 (snapshot isolation redesign): `working_factor_id` is
+    # the pipeline-EXCLUSIVE, never-shared factor_root id compute runs
+    # against (set at confirm time; distinct per pipeline_id, so no two
+    # pipelines -- even confirmed with byte-identical input -- ever share a
+    # row, and a failure-triggered restore on one can never clobber
+    # another). `published_factor_id` is set ONLY once compute succeeds and
+    # the canonical (non-pipeline-scoped) definition has been published;
+    # None means either "not confirmed yet" or "published step has not run
+    # (or was skipped -- see apps/web/pipeline.py::_publish_canonical_factor
+    # for when it legitimately declines to publish)".
+    working_factor_id: str = ""
+    published_factor_id: str | None = None
     # SE-ix cross-track amendment (binding): reserved slot for the
     # self-evolution planning-influence snapshot. Empty until SE-P5 wires it
     # up; the FIELD and its participation in input_hash exist now so the
     # hash contract never migrates later.
     planning_influence_hash: str = ""
+    # Phase-review F10: monotonic revision, bumped by
+    # apps/web/pipeline.py::PipelineStore.save on every write. Lets the
+    # journal carry a strictly-increasing sequence independent of wall-clock
+    # timestamps (which can collide or, on a clock step, go backwards) and
+    # lets snapshot-recovery detect "the journal has rows newer than this
+    # snapshot" unambiguously.
+    revision: int = 0
     schema_version: str = PIPELINE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -330,6 +377,8 @@ class PipelineRecord:
             raise ValueError("failure may only be set while status == paused_failure")
         if self.status == "paused_failure" and self.failure is None:
             raise ValueError("paused_failure requires a failure record")
+        if self.revision < 0:
+            raise ValueError("revision must be >= 0")
 
     def stage(self, stage_id: str) -> StageRecord:
         for stage in self.stages:
@@ -361,12 +410,16 @@ class PipelineRecord:
             "parser": dict(self.parser),
             "factor": dict(self.factor),
             "parameters": dict(self.parameters),
+            "original_parameters": dict(self.original_parameters),
             "confirmed_parameters": dict(self.confirmed_parameters) if self.confirmed_parameters is not None else None,
             "warnings": list(self.warnings),
             "provenance": [dict(entry) for entry in self.provenance],
             "attempt": self.attempt.to_dict(),
             "artifact_refs": [ref.to_dict() for ref in self.artifact_refs],
             "failure": self.failure.to_dict() if self.failure is not None else None,
+            "working_factor_id": self.working_factor_id,
+            "published_factor_id": self.published_factor_id,
+            "revision": self.revision,
         }
 
     @staticmethod
@@ -387,10 +440,14 @@ class PipelineRecord:
             parser=dict(payload.get("parser", {})),
             factor=dict(payload.get("factor", {})),
             parameters=dict(payload.get("parameters", {})),
+            original_parameters=dict(payload.get("original_parameters", {})),
             confirmed_parameters=dict(confirmed_parameters) if confirmed_parameters is not None else None,
             warnings=tuple(str(item) for item in payload.get("warnings", ())),
             provenance=tuple(dict(entry) for entry in payload.get("provenance", ())),
             attempt=AttemptState.from_dict(payload.get("attempt", {"number": 1})),
             artifact_refs=tuple(ArtifactRef.from_dict(item) for item in payload.get("artifact_refs", ())),
             failure=FailureState.from_dict(failure_payload) if failure_payload else None,
+            working_factor_id=str(payload.get("working_factor_id", "")),
+            published_factor_id=payload.get("published_factor_id"),
+            revision=int(payload.get("revision", 0)),
         )

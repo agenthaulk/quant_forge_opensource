@@ -43,8 +43,11 @@ const PARAMETER_FIELD_META = {
 };
 export const PARAMETER_FIELD_ORDER = Object.keys(PARAMETER_FIELD_META);
 
+// phase-review F11: every server-declared confirm-card field renders with
+// its badge at BOTH densities -- name/horizon_days were previously absent
+// from the beginner-density summary (only formula/description appeared).
 const SUMMARY_GROUPS = [
-  { label: '因子定义', fields: ['formula', 'description'] },
+  { label: '因子定义', fields: ['name', 'formula', 'description', 'horizon_days'] },
   { label: '股票池', fields: ['universe_filters'] },
   { label: '持有与执行', fields: ['holding_days', 'execution_delay_days', 'decay_days', 'top_quantile'] },
   { label: '评测区间', fields: ['evaluation_start', 'evaluation_end'] },
@@ -66,7 +69,9 @@ const STATUS_META = {
 
 function fieldLabel(field) {
   if (field === 'formula') return '公式';
+  if (field === 'name') return '因子名称';
   if (field === 'description') return '说明';
+  if (field === 'horizon_days') return '预测周期';
   if (field === 'universe_filters') return '股票池筛选';
   const meta = PARAMETER_FIELD_META[field];
   return meta ? meta.shortLabel : field;
@@ -78,13 +83,28 @@ function fieldDisplayValue(field, value) {
     const list = value || [];
     return list.length ? esc(list.join(' · ')) : '<span class="pill muted">无筛选（全市场）</span>';
   }
+  if (field === 'name') return esc(value || '（未命名）');
   if (field === 'description') return esc(value || '（无说明）');
+  if (field === 'horizon_days') {
+    return value === null || value === undefined ? '<span class="metric-missing">未设置</span>' : `${esc(value)}天`;
+  }
   const meta = PARAMETER_FIELD_META[field];
   if (!meta) return esc(value === undefined || value === null ? '' : String(value));
   if (value === null || value === undefined || value === '') {
     return '<span class="metric-missing">未设置（按可用数据自动解析）</span>';
   }
   return `${esc(value)}${meta.unit ? esc(meta.unit) : ''}`;
+}
+
+/* phase-review F4: a field with an unsaved local edit must never display a
+ * stale server-derived badge -- see views/provenance.js's
+ * provenanceUnverifiedBadgeHtml. Strictly value-based (not merely "has a
+ * draftOverrides entry"): editing a field back to the value the server
+ * already classified is genuinely no longer "unverified". */
+function isFieldDirty(pipeline, draftOverrides, field) {
+  if (!draftOverrides || !Object.prototype.hasOwnProperty.call(draftOverrides, field)) return false;
+  const serverValue = (pipeline.parameters || {})[field];
+  return draftOverrides[field] !== serverValue;
 }
 
 /* Effective parameter set for rendering: server parameters overlaid with
@@ -128,7 +148,7 @@ export function renderSummaryLines(pipeline, provenanceByField, draftOverrides) 
   const lines = SUMMARY_GROUPS.map(group => {
     const parts = group.fields.map(field => {
       const value = Object.prototype.hasOwnProperty.call(parameters, field) ? parameters[field] : factor[field];
-      const badge = provenanceBadgeRowHtml(provenanceByField[field]);
+      const badge = provenanceBadgeRowHtml(provenanceByField[field], isFieldDirty(pipeline, draftOverrides, field));
       return (
         `<span class="pipeline-summary-value">${esc(fieldLabel(field))}` +
         `${field === 'formula' || field === 'description' ? '' : ' '}${fieldDisplayValue(field, value)}</span>${badge}`
@@ -139,7 +159,7 @@ export function renderSummaryLines(pipeline, provenanceByField, draftOverrides) 
   return `<div class="pipeline-summary-lines">${lines}</div>`;
 }
 
-function expertFieldHtml(field, value, entry, disabled) {
+function expertFieldHtml(field, value, entry, disabled, isDirty) {
   const meta = PARAMETER_FIELD_META[field];
   const labelSpan = meta.tip
     ? `<span class="term-tip" tabindex="0" data-tip="${esc(meta.tip)}">${esc(meta.gridLabel)}</span>`
@@ -148,17 +168,25 @@ function expertFieldHtml(field, value, entry, disabled) {
   const displayValue = value === null || value === undefined ? '' : esc(String(value));
   return (
     `<label>${labelSpan}<input ${attrs} data-pipeline-param-field="${field}" value="${displayValue}"${disabled ? ' disabled' : ''}>` +
-    `${provenanceBadgeRowHtml(entry)}</label>`
+    `${provenanceBadgeRowHtml(entry, isDirty)}</label>`
   );
 }
 
+// phase-review F11: expert density previously showed only formula and
+// universe_filters -- name/description/horizon_days carried badges nowhere
+// on this density even though the server derives them for every pipeline.
+const EXPERT_FACTOR_FIELDS = ['name', 'formula', 'description', 'horizon_days', 'universe_filters'];
+
 export function renderExpertGrid(pipeline, provenanceByField, draftOverrides, disabled) {
   const parameters = effectivePipelineParameters(pipeline, draftOverrides);
-  const factorFields = ['formula', 'universe_filters'].map(field => {
+  const factor = pipeline.factor || {};
+  const factorFields = EXPERT_FACTOR_FIELDS.map(field => {
     const badge = provenanceBadgeRowHtml(provenanceByField[field]);
-    return `<div class="pipeline-summary-line"><span class="pipeline-summary-label">${esc(fieldLabel(field))}</span><span class="pipeline-summary-value">${fieldDisplayValue(field, pipeline.factor[field])}</span>${badge}</div>`;
+    return `<div class="pipeline-summary-line"><span class="pipeline-summary-label">${esc(fieldLabel(field))}</span><span class="pipeline-summary-value">${fieldDisplayValue(field, factor[field])}</span>${badge}</div>`;
   }).join('');
-  const grid = PARAMETER_FIELD_ORDER.map(field => expertFieldHtml(field, parameters[field], provenanceByField[field], disabled)).join('');
+  const grid = PARAMETER_FIELD_ORDER.map(field => (
+    expertFieldHtml(field, parameters[field], provenanceByField[field], disabled, isFieldDirty(pipeline, draftOverrides, field))
+  )).join('');
   return `<div class="pipeline-summary-lines">${factorFields}</div><div class="param-grid pipeline-expert-grid" id="pipeline-expert-params">${grid}</div>`;
 }
 
@@ -230,6 +258,15 @@ export function renderRunningCard(pipeline, density, provenance, draftOverrides)
     </div>`;
 }
 
+// phase-review F7: paused_failure offers all three spec §2.3 exits, plus
+// the pre-existing lightweight retry (Cluster A/F1/F8 -- same pipeline_id,
+// same attempt lineage, the common "transient failure, try again" path).
+// "edit" and "fall back to rule parse" are both heavier: each forks the
+// frozen inputs into a brand-new pipeline_id with its own attempt-1
+// lineage (parent_run_id pointing back here) and terminalizes THIS
+// aggregate as aborted -- so unlike retry, this pipeline's own failed
+// history stays put, inspectable under its own id, rather than being
+// reused for the next attempt.
 export function renderPausedFailureCard(pipeline, density, provenance, draftOverrides) {
   const provenanceByField = provenanceEntryByField(provenance);
   const body = renderDensityBody(pipeline, density, provenanceByField, draftOverrides, false);
@@ -238,11 +275,13 @@ export function renderPausedFailureCard(pipeline, density, provenance, draftOver
       ${statusRowHtml(pipeline, '本次尝试失败')}
       ${renderStageStrip(pipeline)}
       ${renderNegativeEvidence(pipeline)}
-      <p class="meta">原始输入已冻结保留。可编辑下方参数后重试（编辑仅作用于下一次尝试），或放弃本次研究。</p>
+      <p class="meta">原始输入已冻结保留。可直接重试、编辑后另起一次新尝试、改用规则解析重新开始，或放弃本次研究。</p>
       ${renderDensityToggle(density)}
       ${body}
       <div class="pipeline-actions">
-        <button type="button" data-pipeline-action="retry">重试</button>
+        <button type="button" data-pipeline-action="retry">重试（沿用原参数）</button>
+        <button type="button" data-pipeline-action="fork">编辑后另起新尝试</button>
+        <button type="button" data-pipeline-action="fallback-rule-parse">改用规则解析重新开始</button>
         <button type="button" class="secondary danger" data-pipeline-action="cancel">放弃本次研究</button>
       </div>
     </div>`;
@@ -303,7 +342,7 @@ export function renderPipelineCard(pipeline, options) {
 // fixtures alone.
 // -----------------------------------------------------------------------
 
-import { getPipeline, listActivePipelines, postJson, sleep } from '../api.js';
+import { getJob, getPipeline, listActivePipelines, postJson, sleep } from '../api.js';
 
 const mount = document.getElementById('pipeline-card-mount');
 
@@ -314,6 +353,12 @@ let draftOverrides = {};
 let pollToken = 0;
 let onCompletedCallback = null;
 let lastRenderedHtml = null;
+// phase-review F12: "focus the revealed heading on meaningful transitions,
+// restore focus on dismissal" -- remembers whatever had focus right before
+// a card first grabbed it, so leaving the card (a terminal status, or an
+// explicit reset) can hand focus back instead of silently dropping it to
+// <body> once the heading's DOM node is replaced/removed.
+let preCardFocusElement = null;
 
 function parametersFromExpertGrid() {
   if (!mount) return {};
@@ -355,11 +400,38 @@ function renderCurrent() {
   if (html !== lastRenderedHtml) {
     mount.innerHTML = html;
     lastRenderedHtml = html;
-    // Focus follows the revealed card on a stage transition (spec §9); a
-    // fresh confirm card is the one case worth moving focus to, since it is
-    // a genuine new gate the user must act on. Re-renders that merely
-    // refresh the SAME status (e.g. a running-state badge tick) do not
-    // steal focus away from whatever the user is doing.
+    // Focus management for this new markup happens in setPipeline (below
+    // renderCurrent's only caller path that also knows statusChanged) --
+    // see the FOCUS_REVEAL_STATUSES/FOCUS_RESTORE_STATUSES comment there.
+  }
+}
+
+// phase-review F12: "focus the revealed heading on meaningful transitions,
+// restore focus on dismissal." A fresh confirm card (awaiting_confirm) and
+// a fresh failure card (paused_failure, now presenting three new exits per
+// F7) are both genuine new gates the user must act on; `running` and
+// `completed` are not (see the comment above renderCurrent -- a background
+// poll tick must never yank focus away from whatever the user is doing
+// elsewhere on the page). `aborted`/`expired` are the "dismissal" side:
+// the card's actionable content just emptied out, so focus returns to
+// wherever it was BEFORE the card first took it, rather than silently
+// dropping to <body> once the heading node is replaced.
+const FOCUS_REVEAL_STATUSES = new Set(['awaiting_confirm', 'paused_failure']);
+const FOCUS_RESTORE_STATUSES = new Set(['aborted', 'expired']);
+
+function focusRevealedHeading() {
+  const heading = mount && mount.querySelector('.pipeline-card-title');
+  if (!heading) return;
+  if (!preCardFocusElement) preCardFocusElement = document.activeElement;
+  heading.setAttribute('tabindex', '-1');
+  heading.focus();
+}
+
+function restoreFocusFromCard() {
+  const target = preCardFocusElement;
+  preCardFocusElement = null;
+  if (target && typeof target.focus === 'function' && document.contains(target)) {
+    target.focus();
   }
 }
 
@@ -377,10 +449,10 @@ function setPipeline(pipeline) {
   currentProvenance = pipeline.provenance || [];
   if (isNewPipeline) draftOverrides = {};
   renderCurrent();
-  if (statusChanged && pipeline.status === 'awaiting_confirm') {
-    const heading = mount && mount.querySelector('.pipeline-card-title');
-    if (heading) heading.setAttribute('tabindex', '-1');
-    if (heading) heading.focus();
+  if (statusChanged && FOCUS_REVEAL_STATUSES.has(pipeline.status)) {
+    focusRevealedHeading();
+  } else if (statusChanged && FOCUS_RESTORE_STATUSES.has(pipeline.status)) {
+    restoreFocusFromCard();
   }
   if (pipeline.status === 'running') {
     schedulePoll(pipeline.pipeline_id);
@@ -446,6 +518,50 @@ export async function retryCurrentPipeline() {
   return record;
 }
 
+/* phase-review F7 "edit" exit: forks the failed pipeline's frozen inputs
+ * into a brand-new draft (own attempt-1 lineage, parent_run_id set
+ * server-side) and terminalizes this one as aborted -- a single endpoint
+ * call, since apps/web/pipeline.py::fork_pipeline_from_failure does both
+ * atomically under its own lock. */
+export async function forkCurrentPipeline() {
+  if (!currentPipeline) return null;
+  const record = await postJson(`/api/pipelines/${encodeURIComponent(currentPipeline.pipeline_id)}/fork`, {});
+  currentDensity = 'beginner';
+  setPipeline(record);
+  return record;
+}
+
+async function originalIdeaTextForCurrentPipeline() {
+  const parseRef = (currentPipeline.artifact_refs || []).find(ref => ref.kind === 'parse');
+  if (!parseRef || !parseRef.job_id) throw new Error('缺少原始解析记录，无法改用规则解析重新开始');
+  const parseJob = await getJob(parseRef.job_id);
+  return (parseJob.request && parseJob.request.text) || '';
+}
+
+/* phase-review F7 "fall back to rule parse" exit: runs a fresh parse_idea
+ * job in rule mode against the SAME idea text (read back off the original
+ * parse job's own recorded request -- FE-L3, never a client-held copy of
+ * the text), then wraps it into a new pipeline via
+ * apps/web/pipeline.py::create_pipeline_as_fallback, which sets
+ * parent_run_id lineage and terminalizes this pipeline atomically. */
+export async function fallbackToRuleParseForCurrentPipeline() {
+  if (!currentPipeline) return null;
+  const parentId = currentPipeline.pipeline_id;
+  const text = await originalIdeaTextForCurrentPipeline();
+  let job = await postJson('/api/jobs/parse-idea', { text, parser_mode: 'rule' });
+  while (job.status === 'running' || job.status === 'cancel_requested') {
+    await sleep(500);
+    job = await getJob(job.job_id);
+  }
+  if (job.status !== 'completed') throw new Error(job.error || '规则解析失败');
+  const record = await postJson(`/api/pipelines/${encodeURIComponent(parentId)}/fallback-rule-parse`, {
+    parse_job_id: job.job_id
+  });
+  currentDensity = 'beginner';
+  setPipeline(record);
+  return record;
+}
+
 export async function saveNextAttemptParameters() {
   if (!currentPipeline) return null;
   const overrides = currentDensity === 'expert' ? parametersFromExpertGrid() : draftOverrides;
@@ -493,12 +609,15 @@ export function resetPipelineCard() {
   currentProvenance = [];
   draftOverrides = {};
   renderCurrent();
+  restoreFocusFromCard(); // F12: an explicit reset is also a "dismissal"
 }
 
 const ACTION_HANDLERS = {
   confirm: confirmCurrentPipeline,
   cancel: cancelCurrentPipeline,
   retry: retryCurrentPipeline,
+  fork: forkCurrentPipeline,
+  'fallback-rule-parse': fallbackToRuleParseForCurrentPipeline,
   'save-next-attempt': saveNextAttemptParameters
 };
 

@@ -47,14 +47,35 @@ export function provenanceBadgeHtml(entry) {
   return `<span class="provenance-badge provenance-badge--${esc(entry.source)}"${title}>${esc(label)}</span>`;
 }
 
+/* phase-review F4: "pending unsaved edits render as unverified ... they
+ * must never display a stale server badge." A field with an in-progress,
+ * not-yet-sent local edit has no SERVER badge describing its NEW value --
+ * the last badge the server derived still describes the OLD value, so
+ * re-displaying it next to the freshly-typed number would misattribute the
+ * new value to whatever provenance the old one happened to have. This is
+ * the one dedicated badge variant that is NOT a member of the closed
+ * 7-value PROVENANCE_SOURCES vocabulary (apps/web/provenance.py) -- it is a
+ * client-side "not yet verified by the server" marker, never persisted,
+ * never confused with a real source. */
+export function provenanceUnverifiedBadgeHtml() {
+  return '<span class="provenance-badge provenance-badge--unverified" title="尚未保存，保存后由服务器重新核定来源">未保存</span>';
+}
+
 /* A confirm-card VALUE can carry more than one badge (spec §5.1: "mixed-
  * origin grouped lines carry multiple badges -- badges are per value, not
  * per row"). Accepts one entry or a list so a single-value row and a
  * grouped beginner-density line share one call; a missing/undefined entry
  * renders nothing here -- callers are expected to have already asserted
  * full coverage server-side (missing badge = fail, WORKORDER P1 pin), so a
- * gap reaching this renderer is a display of that fact, not a silent patch. */
-export function provenanceBadgeRowHtml(entries) {
+ * gap reaching this renderer is a display of that fact, not a silent patch.
+ *
+ * `isDirty` (phase-review F4) overrides `entries` entirely and renders the
+ * unverified marker instead -- the caller (views/pipeline.js) sets this
+ * when a field has a local draft edit the server has not yet seen, so a
+ * stale server-derived badge can never be shown next to a value the server
+ * never actually classified. */
+export function provenanceBadgeRowHtml(entries, isDirty) {
+  if (isDirty) return `<span class="pipeline-field-badges">${provenanceUnverifiedBadgeHtml()}</span>`;
   const list = Array.isArray(entries) ? entries : [entries];
   const html = list.filter(Boolean).map(provenanceBadgeHtml).join('');
   return `<span class="pipeline-field-badges">${html}</span>`;

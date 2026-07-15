@@ -179,6 +179,29 @@ def test_pipeline_density_buttons_meet_the_44px_touch_target(web_config) -> None
         assert "min-height: 44px;" in html[start:end], selector
 
 
+def test_pipeline_expert_grid_inputs_meet_the_44px_touch_target(web_config) -> None:
+    # phase-review F12: the expert-density grid's own <input> elements are
+    # real touch targets, matching the density toggle and action buttons.
+    html = web_server._index_html(web_config)
+    start = html.index(".pipeline-expert-grid input {")
+    end = html.index("}", start)
+    assert "min-height: 44px;" in html[start:end]
+
+
+def test_unverified_badge_variant_is_token_only_css(web_config) -> None:
+    # phase-review F4: the pending-local-edit badge is styled distinctly
+    # from every real source badge, using existing tokens only.
+    html = web_server._index_html(web_config)
+    block_start = html.index("/* P1 pipeline card + provenance badges")
+    block_end = html.index(".registry-layout {", block_start)
+    block = html[block_start:block_end]
+    assert ".provenance-badge--unverified" in block
+    start = html.index(".provenance-badge--unverified {")
+    end = html.index("}", start)
+    assert "var(--" in html[start:end]
+    assert not re.search(r"#[0-9a-fA-F]{3,6}\b", html[start:end])
+
+
 # ---------------------------------------------------------------------------
 # HTTP route surface: create / get / list / confirm / cancel / retry / parameters
 # ---------------------------------------------------------------------------
@@ -382,19 +405,90 @@ def test_pipeline_module_absorbs_the_deleted_validation_controls_grid_verbatim()
     assert positions == sorted(positions), "field order drifted from the deleted grid's order"
 
 
-def test_pipeline_module_moves_focus_to_a_newly_revealed_confirm_card() -> None:
-    # spec §9: "focus moves to the revealed card on stage transitions".
-    # Scoped to the transition that actually reveals a NEW gate the user
-    # must act on (entering awaiting_confirm) -- a re-render that merely
-    # refreshes the same status (e.g. a running-state poll tick) must not
-    # steal focus, which the surrounding statusChanged guard enforces.
+def test_pipeline_module_moves_focus_to_a_newly_revealed_confirm_or_failure_card() -> None:
+    # spec §9 / phase-review F12: "focus the revealed heading on meaningful
+    # transitions, restore focus on dismissal". Scoped to the transitions
+    # that actually reveal a NEW gate the user must act on -- entering
+    # awaiting_confirm (a fresh confirm card) or paused_failure (a fresh
+    # failure card presenting the F7 three-exit choice) -- never a
+    # re-render that merely refreshes the SAME status (e.g. a running-state
+    # poll tick), which the surrounding statusChanged guard prevents.
     pipeline_js = _static_module_text("views/pipeline.js")
     fn_start = pipeline_js.index("function setPipeline(pipeline) {")
     fn_end = pipeline_js.index("\nfunction schedulePoll(")
     body = pipeline_js[fn_start:fn_end]
-    assert "statusChanged && pipeline.status === 'awaiting_confirm'" in body
-    assert "heading.focus();" in body
-    assert "heading.setAttribute('tabindex', '-1');" in body
+    assert "statusChanged && FOCUS_REVEAL_STATUSES.has(pipeline.status)" in body
+    assert "focusRevealedHeading();" in body
+    reveal_start = pipeline_js.index("const FOCUS_REVEAL_STATUSES = new Set(")
+    reveal_end = pipeline_js.index(");", reveal_start)
+    reveal_set = pipeline_js[reveal_start:reveal_end]
+    assert "'awaiting_confirm'" in reveal_set
+    assert "'paused_failure'" in reveal_set
+    focus_fn_start = pipeline_js.index("function focusRevealedHeading(")
+    focus_fn_end = pipeline_js.index("\n}", focus_fn_start)
+    focus_fn = pipeline_js[focus_fn_start:focus_fn_end]
+    assert "heading.focus();" in focus_fn
+    assert "heading.setAttribute('tabindex', '-1');" in focus_fn
+
+
+def test_pipeline_module_restores_focus_on_dismissal() -> None:
+    # phase-review F12's other half: aborted/expired (the card's actionable
+    # content just emptied out) and an explicit resetPipelineCard() both
+    # hand focus back to whatever had it before the card first took it,
+    # instead of silently dropping focus to <body>.
+    pipeline_js = _static_module_text("views/pipeline.js")
+    assert "statusChanged && FOCUS_RESTORE_STATUSES.has(pipeline.status)" in pipeline_js
+    restore_start = pipeline_js.index("const FOCUS_RESTORE_STATUSES = new Set(")
+    restore_end = pipeline_js.index(");", restore_start)
+    restore_set = pipeline_js[restore_start:restore_end]
+    assert "'aborted'" in restore_set
+    assert "'expired'" in restore_set
+    reset_start = pipeline_js.index("export function resetPipelineCard(")
+    reset_end = pipeline_js.index("\n}", reset_start)
+    assert "restoreFocusFromCard();" in pipeline_js[reset_start:reset_end]
+
+
+def test_paused_failure_card_offers_all_three_spec_exits_plus_retry() -> None:
+    # phase-review F7: edit (fork), fall back to rule parse, and abort, in
+    # addition to the pre-existing lightweight retry (Cluster A/F1/F8).
+    pipeline_js = _static_module_text("views/pipeline.js")
+    fn_start = pipeline_js.index("export function renderPausedFailureCard(")
+    fn_end = pipeline_js.index("\n}", fn_start)
+    body = pipeline_js[fn_start:fn_end]
+    assert 'data-pipeline-action="retry"' in body
+    assert 'data-pipeline-action="fork"' in body
+    assert 'data-pipeline-action="fallback-rule-parse"' in body
+    assert 'data-pipeline-action="cancel"' in body
+
+
+def test_action_handlers_wire_fork_and_fallback_rule_parse() -> None:
+    pipeline_js = _static_module_text("views/pipeline.js")
+    handlers_start = pipeline_js.index("const ACTION_HANDLERS = {")
+    handlers_end = pipeline_js.index("};", handlers_start)
+    handlers = pipeline_js[handlers_start:handlers_end]
+    assert "fork: forkCurrentPipeline" in handlers
+    assert "'fallback-rule-parse': fallbackToRuleParseForCurrentPipeline" in handlers
+    assert "export async function forkCurrentPipeline(" in pipeline_js
+    assert "export async function fallbackToRuleParseForCurrentPipeline(" in pipeline_js
+    # F7: the fork/fallback endpoints match the routing.py contract exactly.
+    assert "/fork`" in pipeline_js
+    assert "/fallback-rule-parse`" in pipeline_js
+
+
+def test_every_confirm_card_field_renders_at_both_densities() -> None:
+    # phase-review F11: name/description/horizon_days previously had no
+    # badge anywhere on the beginner summary, and the expert grid only ever
+    # showed formula/universe_filters among the factor-level fields.
+    pipeline_js = _static_module_text("views/pipeline.js")
+    groups_start = pipeline_js.index("const SUMMARY_GROUPS = [")
+    groups_end = pipeline_js.index("];", groups_start)
+    summary_fields = pipeline_js[groups_start:groups_end]
+    expert_start = pipeline_js.index("const EXPERT_FACTOR_FIELDS = [")
+    expert_end = pipeline_js.index("];", expert_start)
+    expert_fields = pipeline_js[expert_start:expert_end]
+    for field in ("'name'", "'formula'", "'description'", "'horizon_days'", "'universe_filters'"):
+        assert field in summary_fields, field
+        assert field in expert_fields, field
 
 
 def test_pipeline_module_reuses_the_canonical_formula_highlighter() -> None:
@@ -449,17 +543,34 @@ def test_pipeline_module_registers_in_expected_static_modules() -> None:
 
 
 def test_provenance_badge_is_defined_exactly_once_across_the_bundle() -> None:
+    # phase-review F13: the single-renderer sweep must scan EVERY entry in
+    # EXPECTED_STATIC_MODULES except provenance.js itself, not just
+    # pipeline.js -- a badge improvised in some OTHER, unrelated module
+    # (e.g. a copy-pasted synthesis/registry view) would previously have
+    # passed this test silently.
+    from tests.test_web_static_frontend import EXPECTED_STATIC_MODULES
+
     bundle = _frontend_js_bundle()
     provenance_js = _static_module_text("views/provenance.js")
     definition = "export function provenanceBadgeHtml("
     assert bundle.count(definition) == 1, "provenanceBadgeHtml must be defined exactly once"
     assert definition in provenance_js
     # Nothing outside provenance.js constructs a `provenance-badge` CSS
-    # class string in markup -- the single-renderer sweep proper.
-    for name in ("views/pipeline.js",):
+    # class string in markup -- the single-renderer sweep proper, now over
+    # the full static module registry.
+    swept = 0
+    for name in EXPECTED_STATIC_MODULES:
+        if name == "views/provenance.js":
+            continue
         module_text = _static_module_text(name)
         assert 'class="provenance-badge' not in module_text, name
-        assert "provenanceBadgeHtml(" not in module_text or "from './provenance.js'" in module_text
+        assert "provenanceBadgeHtml(" not in module_text or "from './provenance.js'" in module_text, name
+        swept += 1
+    # The sweep itself must actually cover more than one module -- guards
+    # against EXPECTED_STATIC_MODULES silently shrinking to just the one
+    # module this test used to hardcode.
+    assert swept == len(EXPECTED_STATIC_MODULES) - 1
+    assert swept > 1
 
 
 def test_pipeline_module_imports_badges_from_provenance_module_only() -> None:
@@ -560,6 +671,32 @@ function stages(overrides) {
   check('a.expert.has_11_inputs', (expert.match(/data-pipeline-param-field=/g) || []).length === 11, expert);
   check('a.expert.has_badge', expert.includes('provenance-badge--profile_default'));
   check('a.stage_strip.confirm_active', beginner.includes('aria-current="step"'));
+  // phase-review F11: name/description/horizon_days carry badges at BOTH
+  // densities now, not just formula/universe_filters.
+  check('a.beginner.has_name', beginner.includes('small_cap_non_st'));
+  check('a.beginner.has_horizon_days', beginner.includes('预测周期'));
+  check('a.expert.has_name', expert.includes('small_cap_non_st'));
+  check('a.expert.has_description', expert.includes('Small market-cap stocks'));
+  check('a.expert.has_horizon_days', expert.includes('预测周期'));
+  const factorBadgeCount = (beginner.match(/provenance-badge--fixed_policy/g) || []).length;
+  check('a.beginner.every_factor_field_has_a_badge', factorBadgeCount >= 5, String(factorBadgeCount));
+}
+
+// (a2) phase-review F4: a field with a pending, unsaved local edit renders
+// the neutral "unverified" marker instead of the stale server badge for
+// THAT field only -- every other field's real badge is untouched.
+{
+  const pipeline = {
+    pipeline_id: 'PL_a2', status: 'awaiting_confirm', factor, parameters, warnings: [],
+    confirmed_parameters: null, failure: null, stages: stages({ parse: 'completed', confirm: 'active' })
+  };
+  const dirtyOverrides = { holding_days: 9 };
+  const expert = renderPipelineCard(pipeline, { density: 'expert', provenance, draftOverrides: dirtyOverrides });
+  check('a2.dirty_field_shows_unverified', expert.includes('provenance-badge--unverified'));
+  check('a2.dirty_field_value_reflects_the_edit', /data-pipeline-param-field="holding_days"[^>]*value="9"/.test(expert), expert);
+  // decay_days was never touched -- still its real server-derived badge.
+  const decaySection = expert.slice(expert.indexOf('decay_days'));
+  check('a2.untouched_field_keeps_its_real_badge', decaySection.includes('provenance-badge--profile_default'));
 }
 
 // (b) negative evidence visible at BOTH densities (parse warning).
@@ -587,6 +724,10 @@ function stages(overrides) {
   check('c.failure_reason_visible', html.includes('synthetic failure xyz'));
   check('c.retry_action_present', html.includes('data-pipeline-action="retry"'));
   check('c.no_confirm_action', !html.includes('data-pipeline-action="confirm"'));
+  // phase-review F7: the other two spec §2.3 exits, alongside retry+cancel.
+  check('c.fork_action_present', html.includes('data-pipeline-action="fork"'));
+  check('c.fallback_rule_parse_action_present', html.includes('data-pipeline-action="fallback-rule-parse"'));
+  check('c.cancel_action_present', html.includes('data-pipeline-action="cancel"'));
 }
 
 // (d) running with a next-attempt edit already saved: the freeze label
@@ -657,11 +798,23 @@ def test_node_pipeline_render_smoke(tmp_path) -> None:
         "PASS a.expert.has_11_inputs",
         "PASS a.expert.has_badge",
         "PASS a.stage_strip.confirm_active",
+        "PASS a.beginner.has_name",
+        "PASS a.beginner.has_horizon_days",
+        "PASS a.expert.has_name",
+        "PASS a.expert.has_description",
+        "PASS a.expert.has_horizon_days",
+        "PASS a.beginner.every_factor_field_has_a_badge",
+        "PASS a2.dirty_field_shows_unverified",
+        "PASS a2.dirty_field_value_reflects_the_edit",
+        "PASS a2.untouched_field_keeps_its_real_badge",
         "PASS b.beginner.warning_visible",
         "PASS b.expert.warning_visible",
         "PASS c.failure_reason_visible",
         "PASS c.retry_action_present",
         "PASS c.no_confirm_action",
+        "PASS c.fork_action_present",
+        "PASS c.fallback_rule_parse_action_present",
+        "PASS c.cancel_action_present",
         "PASS d.next_attempt_label_visible",
         "PASS d.no_confirm_action_while_running",
         "PASS e.terminal_no_actions",
