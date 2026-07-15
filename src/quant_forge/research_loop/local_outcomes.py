@@ -544,22 +544,32 @@ def _settings_profile_token(gate: "ResearchGate") -> str:
 
 
 def _canonical_settings_value(value: object) -> object:
-    """Numeric canonicalization so EQUAL gates hash equal (RV2-F2).
+    """Numeric canonicalization so EQUAL gates hash equal -- and ONLY equal
+    gates (RV2-F2 + RV3-F1).
 
     Raw JSON spelling splits values Python compares equal: ``0`` vs ``0.0``
     serialize differently, and ``-0.0 == 0.0`` while ``json.dumps`` spells
-    them apart -- so ``ResearchGate(min_score=0.0)`` and
-    ``ResearchGate(min_score=-0.0)`` (equal dataclasses) minted different
-    tokens and could never promote together. Every non-bool number
-    canonicalizes to a float with signed zero collapsed; bools/str/None
-    pass through. Non-finite values never reach here --
+    them apart -- so equal dataclasses minted different tokens and could
+    never promote together. The first fix (cast everything to float)
+    over-corrected: distinct integers above 2**53 collapse in float, so two
+    UNEQUAL gates could share a token. Canonical form is therefore INT for
+    every integral value (ints kept exact; integral floats like ``5.0``
+    normalized to ``5``; signed zero to ``0``) and the float itself for
+    genuinely fractional values -- Python's ``==`` across int/float agrees
+    with this normalization in both directions. bools/str/None pass
+    through. Non-finite values never reach here --
     ``ResearchGate.__post_init__`` rejects them (RV2-F4).
     """
 
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return value
-    number = float(value)
-    return 0.0 if number == 0.0 else number
+    if isinstance(value, int):
+        return value
+    if value == 0.0:
+        return 0
+    if value.is_integer():
+        return int(value)
+    return value
 
 
 def _clean_scope_dim(value: str) -> str:

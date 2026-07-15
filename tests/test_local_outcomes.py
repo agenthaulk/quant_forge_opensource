@@ -583,9 +583,15 @@ def test_settings_token_canonicalizes_numeric_spelling(  # RV2-F2
     assert _settings_profile_token(ResearchGate(min_ic_days=5)) == _settings_profile_token(
         ResearchGate(min_ic_days=5.0)  # type: ignore[arg-type]
     )
-    # And genuinely different numbers still split.
+    # And genuinely different numbers still split -- including distinct
+    # integers ABOVE 2**53, where a float cast would collapse them (RV3-F1).
     assert _settings_profile_token(ResearchGate(min_score=0.0)) != _settings_profile_token(
         ResearchGate(min_score=0.5)
+    )
+    big, bigger = 9007199254740992, 9007199254740993
+    assert float(big) == float(bigger)  # the collapse the float cast caused
+    assert _settings_profile_token(ResearchGate(min_ic_days=big)) != _settings_profile_token(
+        ResearchGate(min_ic_days=bigger)
     )
 
 
