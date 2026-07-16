@@ -27,6 +27,7 @@ from quant_forge.core.contracts import (
     EvaluationResult,
     EvaluationSplitMetric,
     FactorDefinition,
+    MetricValue,
     SimulationProfile,
 )
 from quant_forge.research_loop import local_outcomes
@@ -78,6 +79,18 @@ def _evaluation(
     )
 
 
+def _mv(value: float | None, *, unit: str = "ratio") -> MetricValue:
+    # A structured qf.metrics.v2 reading: "available" iff a real value is
+    # present -- the status the F4 producer now gates on when building the
+    # outcome metric_snapshot (a None value is a non-available reading).
+    return MetricValue(
+        value=value,
+        unit=unit,
+        status="available" if value is not None else "insufficient_sample",
+        observation_count=1,
+    )
+
+
 def _backtest(
     *,
     sample_role: str = EXTERNAL_OOS_ROLE,
@@ -89,6 +102,17 @@ def _backtest(
     gross_max_drawdown: float | None = -0.06,
     turnover_rate: float | None = 0.3,
 ) -> BacktestResult:
+    # F4: the producer reads the STRUCTURED metrics mapping, so populate it
+    # from the same net/gross/turnover inputs (mirrors backtesting.service).
+    metrics = {
+        "net_long_short_sharpe": _mv(net_long_short_sharpe),
+        "long_short_sharpe": _mv(gross_long_short_sharpe),
+        "net_annualized_return": _mv(net_annualized_return, unit="fraction_per_year"),
+        "annualized_return": _mv(gross_annualized_return, unit="fraction_per_year"),
+        "net_max_drawdown": _mv(net_max_drawdown, unit="fraction"),
+        "max_drawdown": _mv(gross_max_drawdown, unit="fraction"),
+        "rebalance_turnover_mean": _mv(turnover_rate),
+    }
     return BacktestResult(
         factor_id="FTR_TEST",
         periods=50,
@@ -106,6 +130,7 @@ def _backtest(
         net_max_drawdown=net_max_drawdown,
         gross_max_drawdown=gross_max_drawdown,
         turnover_rate=turnover_rate,
+        metrics=metrics,
     )
 
 
@@ -326,13 +351,16 @@ def test_metric_snapshot_only_allowlisted_keys_ever_populated() -> None:
     assert "redundancy" not in outcome.metric_snapshot
 
 
-def test_metric_snapshot_unavailable_metrics_are_none_not_zero() -> None:
+def test_metric_snapshot_unavailable_metrics_are_absent_not_zero() -> None:
+    # F4: metrics with no available structured source are OMITTED from the
+    # snapshot entirely -- neither a fabricated 0 nor a present-with-None
+    # placeholder. This producer has no structured source for these three.
     outcome = experiment_result_to_outcome(_result(gate_passed=True), run_id=REAL_RUN_ID, gate=_GATE)
     assert outcome is not None
     for key in ("subwindow_sharpe", "self_correlation", "max_weight"):
-        reading = outcome.metric_snapshot[key]
-        assert reading.value is None
-        assert reading.basis == ""
+        assert key not in outcome.metric_snapshot
+    # No reading present carries a fabricated 0.0 either.
+    assert all(reading.value != 0.0 for reading in outcome.metric_snapshot.values())
 
 
 def test_metric_snapshot_prefers_net_falls_back_to_gross_labeled_honestly() -> None:
@@ -379,11 +407,14 @@ def test_metric_snapshot_max_drawdown_is_nonnegative_magnitude() -> None:
         _result(gate_passed=True, selection_backtest=absent), run_id=REAL_RUN_ID, gate=_GATE
     )
     assert outcome_absent is not None
-    assert outcome_absent.metric_snapshot["max_drawdown"].value is None
-    assert outcome_absent.metric_snapshot["max_drawdown"].basis == ""
+    # F4: no available net or gross structured reading -> key omitted, never
+    # a present-with-None placeholder.
+    assert "max_drawdown" not in outcome_absent.metric_snapshot
 
 
-def test_metric_snapshot_absent_both_sides_is_none() -> None:
+def test_metric_snapshot_absent_both_sides_is_omitted() -> None:
+    # F4: no available net or gross structured reading -> the key is omitted
+    # entirely (previously present with value=None).
     selection = _backtest(
         sample_role=IN_SAMPLE_ROLE,
         net_long_short_sharpe=None,
@@ -394,8 +425,8 @@ def test_metric_snapshot_absent_both_sides_is_none() -> None:
         _result(gate_passed=True, selection_backtest=selection), run_id=REAL_RUN_ID, gate=_GATE
     )
     assert outcome is not None
-    assert outcome.metric_snapshot["sharpe"].value is None
-    assert outcome.metric_snapshot["turnover"].value is None
+    assert "sharpe" not in outcome.metric_snapshot
+    assert "turnover" not in outcome.metric_snapshot
 
 
 def test_metric_snapshot_uses_selection_backtest_not_the_oos_field() -> None:
@@ -411,6 +442,30 @@ def test_metric_snapshot_uses_selection_backtest_not_the_oos_field() -> None:
     )
     assert outcome is not None
     assert outcome.metric_snapshot["sharpe"].value == 1.5
+
+
+def test_metric_snapshot_degenerate_backtest_yields_empty_snapshot() -> None:
+    # F4: a BacktestResult carrying only default scalars and an EMPTY structured
+    # metrics mapping must produce an EMPTY metric snapshot -- no value=0.0
+    # readings fabricated from the legacy scalars' 0.0 dataclass defaults. The
+    # verdict/reasons are computed elsewhere and are unaffected (still passed).
+    degenerate = BacktestResult(
+        factor_id="FTR_TEST",
+        periods=0,
+        holding_days=5,
+        cumulative_return=0.0,
+        annualized_return=None,
+        annualized_volatility=None,
+        max_drawdown=None,
+        artifact_path=Path("backtest.json"),
+        sample_role=IN_SAMPLE_ROLE,
+    )  # metrics defaults to {} -- the degenerate, source-free case
+    outcome = experiment_result_to_outcome(
+        _result(gate_passed=True, selection_backtest=degenerate), run_id=REAL_RUN_ID, gate=_GATE
+    )
+    assert outcome is not None
+    assert outcome.verdict == "passed"
+    assert outcome.metric_snapshot == {}
 
 
 # ---------------------------------------------------------------------------

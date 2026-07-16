@@ -97,27 +97,34 @@ mapper) is ever reached.
 
 metric_snapshot (closed allowlist; SE-ii)
 -------------------------------------------
-Only ``sharpe``, ``annualized_return``, ``max_drawdown``, ``turnover``
-carry real numbers here -- read off the IN-SAMPLE selection backtest (see
-"sample_role" below), preferring the ``net_*`` (after-cost) field and
-falling back to the explicit ``gross_*`` field, honestly labeled either way
+Sourced from the STRUCTURED ``qf.metrics.v2`` mapping on the IN-SAMPLE
+selection backtest (``BacktestResult.metrics``; see "sample_role" below),
+never the legacy scalar attributes -- each reading is emitted ONLY where the
+structured metric's ``status`` is ``"available"`` (SE-P2 review finding F4).
+``sharpe``, ``annualized_return``, ``max_drawdown``, ``turnover`` are the
+only keys this producer can source: each prefers the ``net_*`` (after-cost)
+structured metric and falls back to the ``gross_*`` one, honestly labeled
 via ``MetricReading.basis``. ``max_drawdown`` is converted to ``abs()`` of
 the selected reading: the local backtester reports drawdown in its
 negative-return convention, while the frozen contract (``outcomes.
-METRIC_SPECS["max_drawdown"]``) defines a NON-NEGATIVE magnitude -- the
-sign is a reporting convention, not information, so taking the magnitude is
-a lossless unit conversion, never a rewrite of a measurement (SE-P2 review
-finding P2-F3). ``None`` stays ``None``. ``subwindow_sharpe``, ``self_correlation``,
-``max_weight`` are allowlisted in the target vocabulary but this local
-smoke-gate pipeline has no numeric source for any of the three (sub-window
-Sharpe and self/redundancy correlation live only in the BRAIN-facing
-``integrations/gate.py``, which this neutral module must never import --
-see "circular-import and neutrality notes"; no local backtest computes a
-per-name weight at all) -- they are simply absent (``None``, never a
-fabricated 0), not populated by guesswork. ``fitness``/``icir``/``ic_mean``/
-``redundancy`` are never populated (outside the design's allowlisted set
-for this producer; the local score is a blended composite, not any one of
-these single metrics -- see the ``score`` reason-code note above).
+METRIC_SPECS["max_drawdown"]``) defines a NON-NEGATIVE magnitude -- the sign
+is a reporting convention, not information, so taking the magnitude is a
+lossless unit conversion, never a rewrite of a measurement (P2-F3). A metric
+with no available structured reading is OMITTED from the snapshot entirely,
+never emitted as a fabricated 0 read off a scalar's 0.0 dataclass default:
+a degenerate backtest (defaults only, empty ``metrics`` mapping) therefore
+yields an EMPTY snapshot (verdict/reasons are computed elsewhere and are
+unaffected). ``subwindow_sharpe``, ``self_correlation``, ``max_weight`` are
+allowlisted in the target vocabulary but this local smoke-gate pipeline has
+no structured source for any of the three (sub-window Sharpe and
+self/redundancy correlation live only in the BRAIN-facing
+``integrations/gate.py``, which this neutral module must never import -- see
+"circular-import and neutrality notes"; no local backtest computes a
+per-name weight at all), so they are simply never emitted. ``fitness``/
+``icir``/``ic_mean``/``redundancy`` are never populated (outside the
+design's allowlisted set for this producer; the local score is a blended
+composite, not any one of these single metrics -- see the ``score``
+reason-code note above).
 
 sample_role (do-not-guess-OOS; explicit design constraint)
 --------------------------------------------------------------
@@ -284,6 +291,9 @@ from quant_forge.research_loop.outcomes import (
 from quant_forge.workbench.service import evaluation_data_window
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from quant_forge.core.contracts import MetricValue
     from quant_forge.research_loop.service import ResearchCandidateResult, ResearchGate
 
 __all__ = ["experiment_result_to_outcome"]
@@ -579,12 +589,33 @@ def _clean_scope_dim(value: str) -> str:
     return ""
 
 
-def _net_or_gross(net: float | None, gross: float | None) -> MetricReading:
-    if net is not None:
-        return MetricReading(value=net, basis="net")
-    if gross is not None:
-        return MetricReading(value=gross, basis="gross")
-    return MetricReading()
+def _reading_from_metric(metric: MetricValue | None, *, basis: str) -> MetricReading | None:
+    """A structured ``qf.metrics.v2`` reading -> outcome ``MetricReading``, or None.
+
+    F4 (no fabricated zeros): ONLY a metric the backtester marked
+    ``status == "available"`` (with a real value) becomes a reading. A missing
+    key, a non-available status (insufficient_sample / not_applicable /
+    invalid / ...), or a null value yields ``None`` so the caller omits the
+    key -- a degenerate ``BacktestResult`` (empty ``metrics`` mapping) then
+    produces NO readings instead of the ``value=0.0`` the old code read off the
+    legacy scalar attributes' ``0.0`` dataclass defaults.
+    """
+
+    if metric is None or metric.status != "available" or metric.value is None:
+        return None
+    return MetricReading(value=metric.value, basis=basis)
+
+
+def _net_first_reading(metrics: Mapping[str, MetricValue], net_key: str, gross_key: str) -> MetricReading | None:
+    """Prefer the NET structured metric, fall back to GROSS, else ``None``.
+
+    Preserves the historical net-first-then-gross preference while gating each
+    candidate on ``status == "available"`` (F4).
+    """
+
+    return _reading_from_metric(metrics.get(net_key), basis="net") or _reading_from_metric(
+        metrics.get(gross_key), basis="gross"
+    )
 
 
 def _magnitude(reading: MetricReading) -> MetricReading:
@@ -602,12 +633,29 @@ def _magnitude(reading: MetricReading) -> MetricReading:
 
 
 def _metric_snapshot(backtest: BacktestResult) -> dict[str, MetricReading]:
-    return {
-        "sharpe": _net_or_gross(backtest.net_long_short_sharpe, backtest.gross_long_short_sharpe),
-        "annualized_return": _net_or_gross(backtest.net_annualized_return, backtest.gross_annualized_return),
-        "max_drawdown": _magnitude(_net_or_gross(backtest.net_max_drawdown, backtest.gross_max_drawdown)),
-        "turnover": MetricReading(value=backtest.turnover_rate),
-        "subwindow_sharpe": MetricReading(),
-        "self_correlation": MetricReading(),
-        "max_weight": MetricReading(),
-    }
+    """Outcome metric snapshot from the STRUCTURED ``qf.metrics.v2`` mapping.
+
+    Sources every reading from ``BacktestResult.metrics`` (which carries a
+    per-metric ``status``), emitting a key ONLY where ``status == "available"``
+    (F4). The legacy scalar attributes default to ``0.0``, so the old snapshot
+    fabricated a ``value=0.0`` reading for a degenerate result; sourcing from
+    ``metrics`` (empty by default) makes such a result yield an EMPTY snapshot.
+    Only ``sharpe``/``annualized_return``/``max_drawdown``/``turnover`` have a
+    structured source here (see the module docstring's metric_snapshot note).
+    """
+
+    metrics = backtest.metrics
+    snapshot: dict[str, MetricReading] = {}
+    sharpe = _net_first_reading(metrics, "net_long_short_sharpe", "long_short_sharpe")
+    if sharpe is not None:
+        snapshot["sharpe"] = sharpe
+    annualized_return = _net_first_reading(metrics, "net_annualized_return", "annualized_return")
+    if annualized_return is not None:
+        snapshot["annualized_return"] = annualized_return
+    drawdown = _net_first_reading(metrics, "net_max_drawdown", "max_drawdown")
+    if drawdown is not None:
+        snapshot["max_drawdown"] = _magnitude(drawdown)
+    turnover = _reading_from_metric(metrics.get("rebalance_turnover_mean"), basis="")
+    if turnover is not None:
+        snapshot["turnover"] = turnover
+    return snapshot
