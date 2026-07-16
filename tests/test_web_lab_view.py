@@ -138,24 +138,21 @@ def test_index_page_hosts_mounts_inside_lab_tab_panels(web_config) -> None:
     assert html.index('id="error"') < html.index('id="lab-panel-factor"')
 
 
-def test_index_page_renders_the_flow_stepper(web_config) -> None:
+def test_index_page_no_longer_renders_the_flow_stepper(web_config) -> None:
+    # P1 (agent_sidecar_frontend.md §8, WORKORDER P1 减法): .lab-stepper is
+    # DELETED -- semantically duplicated by the server-owned pipeline card
+    # (tests/test_web_pipeline_view.py pins its replacement markers: the
+    # #pipeline-card-mount id and the .pipeline-stage-strip it renders).
+    # Both presence AND absence are locked in the same commit as the
+    # deletion.
     html = web_server._index_html(web_config)
-    assert 'class="lab-stepper"' in html
-    assert 'aria-label="研究流程"' in html
-    for step, label in (
-        ("idea", "想法"),
-        ("parse", "解析"),
-        ("validate", "验证"),
-        ("report", "因子报告"),
-        ("rd", "RD 循环"),
-    ):
-        assert f'data-step="{step}"' in html, step
-        assert label in html, label
-    # Only the report and rd steps are interactive; the report step-link
-    # stays disabled until a full report exists.
-    assert html.count('class="step-link"') == 2
-    assert 'data-step-action="report" disabled' in html
-    assert 'data-step-action="rd"' in html
+    assert 'class="lab-stepper"' not in html
+    assert 'aria-label="研究流程"' not in html
+    for step in ("idea", "parse", "validate", "report", "rd"):
+        assert f'data-step="{step}"' not in html, step
+    assert 'class="step-link"' not in html
+    assert 'data-step-action="report"' not in html
+    assert 'data-step-action="rd"' not in html
 
 
 def test_index_page_ships_theme_tokens_and_status_conventions(web_config) -> None:
@@ -183,12 +180,20 @@ def test_lab_modules_served_with_js_content_type(web_app) -> None:
 
 def test_lab_module_is_a_pure_client_side_controller() -> None:
     lab_js = _static_module_text("views/lab.js")
+    # P1: setStep/STEP_IDS are DELETED alongside .lab-stepper (WORKORDER P1
+    # 减法) -- the pipeline card (static/views/pipeline.js) owns run-status
+    # display now; lab.js goes back to pure tab/hash chrome. (The historical
+    # note in this module's own header comment mentions the deleted names
+    # by name, so the absence check below targets the CODE forms only, not
+    # a bare substring match that would also catch that prose.)
+    assert "export function setStep(" not in lab_js
+    assert "function syncIdeaStep(" not in lab_js
+    assert "const STEP_IDS" not in lab_js
     for marker in (
         "export function initLabTabs(",
         "export function activateTab(",
         "export function activateModule(",
         "export function setTabDot(",
-        "export function setStep(",
         # CP9-2 TAB_IDS literal: six top-level tabs, workbench first.
         "'lab-tab-factor', 'lab-tab-history', 'lab-tab-data',",
         "'lab-tab-registry', 'lab-tab-docs', 'lab-tab-extensions'",
@@ -615,7 +620,12 @@ def test_dsl_module_is_a_pure_structural_tokenizer() -> None:
     assert '`<div class="formula">${formulaHtml(formula)}</div>`' in registry_js
     assert "${esc(formula.slice(PRECOMPUTED_PREFIX.length))}" in registry_js
     assert '<span class="registry-row-formula">${esc(text)}</span>' in registry_js
-    assert "formulaHtml" not in _static_module_text("views/research.js")
+    # F2c: the RD comparison surface renders its formula cell through THE
+    # canonical dsl highlighter (formulaHtml), not a bespoke esc()-only second
+    # renderer -- a legitimate single-renderer application site.
+    research_js = _static_module_text("views/research.js")
+    assert "from './dsl.js'" in research_js
+    assert 'class="formula">${formulaHtml(row.formula' in research_js
 
 
 # ---------------------------------------------------------------------------
@@ -641,7 +651,7 @@ def test_module_nav_click_and_keyboard_wiring_is_pinned() -> None:
     # tabindex over MODULE_IDS (Arrow / Home / End -> activateModule).
     assert "function onModuleNavKeydown(event) {" in lab_js
     keydown_fn = lab_js.index("function onModuleNavKeydown(event) {")
-    body = lab_js[keydown_fn : lab_js.index("function syncIdeaStep(", keydown_fn)]
+    body = lab_js[keydown_fn : lab_js.index("export function initLabTabs(", keydown_fn)]
     assert "event.target.closest('.lab-module-tab')" in body
     for key in ("'ArrowRight'", "'ArrowLeft'", "'Home'", "'End'"):
         assert key in body, key

@@ -346,3 +346,51 @@ integration testing: a ~3.19M-row `cn_a` panel fitted (`ic_weighted`) run
 completed in ~230 s on an unconstrained container; on a memory-tight container
 an earlier build that rebuilt the standardized matrix and the forward-return
 sweep once per consumer was OOM-killed (exit 137) before it could finish.
+
+## Agent Sidecar and Research Pipelines
+
+The local web workbench runs its research flow through server-owned pipeline
+aggregates with an agent sidecar. The design contract lives in the design
+docs; the load-bearing invariants are:
+
+- **Two explicit pipeline kinds.** `factor_study` (pipeline A:
+  parse → confirm → compute → report) and `rd_optimize` (pipeline B:
+  RD confirm → one research job → leaderboard). There is no automatic A→B
+  bridge — the report exposes an explicit entry action, seeded from the
+  server's published factor id, never from the working row that completion
+  cleans up. The legacy auto-cycle RD controls are deleted; RD inherits the
+  evaluation period contract and adds no interval parameter.
+- **Server-owned aggregates.** Stage state, attempt lineage, input
+  fingerprints, and failed/cancelled-attempt disclosure are computed
+  server-side and survive restarts through attempt-scoped durable completion
+  artifacts. Completion publishes the canonical factor by compare-and-set
+  under an advisory publisher lock, records `publish_state` honestly
+  (`published` / `declined_promoted` / `conflict`), and cleans working
+  artifacts; a cancel that races a completion re-reconciles and never
+  overwrites a won completion.
+- **Provenance.** The baseline provenance of a pipeline is immutable from
+  confirm time; current provenance (including `edited_by=human_override`)
+  is derived server-side by fingerprint comparison — never client-asserted.
+- **Typed narration.** Sidecar chat renders a typed narration AST; numeric
+  values reach the UI only through the canonical renderers via refs — chat
+  text is never the sole carrier of a number.
+- **Closed tool registry.** The sidecar invokes a closed catalog of read and
+  action tools behind the control token plus a per-pipeline capability
+  grant; a grant for one pipeline cannot act on another (cross-pipeline
+  arguments are rejected server-side before the token gate).
+- **Read-only pre-validation.** Formula edits pre-validate through the
+  canonical fingerprint and the validation gate with zero side effects; an
+  unknown operator yields a deterministic operator-draft review reference
+  and never executes. A validated edit the user runs branches a NEW
+  immutable run.
+- **Availability-honest rendering.** Status-carrying metrics render as
+  `n/a` plus status and never enter numeric ranking; the dedup disposition
+  discloses duplicates as detected after execution.
+- **`api.py` freeze.** New endpoints live in `routing.py` handlers
+  delegating to sidecar modules; `api.py` only shrank (dependency direction
+  stays routing → api).
+- **Planning-influence disclosure seam.** The pipeline record reserves a
+  `planning_influence_hash` slot that participates in `input_hash`
+  (empty-stable and value-sensitive); the real capture wires up together
+  with the self-evolution engine's frozen snapshot contract once both
+  tracks are merged.

@@ -113,10 +113,10 @@ def _index_html(
     factor_values_root = escape(paths["factor_values_root"])
     factor_values_overlay_root = escape(paths["factor_values_overlay_root"])
     artifact_root = escape(paths["artifact_root"])
-    interval_options = "\n".join(
-        f'      <option value="{day}"{_selected_attr(day == research_config.default_interval_days)}>{day}天</option>'
-        for day in research_config.allowed_interval_days
-    )
+    # R3.1 (owner-ruled, spec §8): the rd-interval 自动周期 select is DELETED, so
+    # its <option> generation from research_config.allowed_interval_days is gone
+    # too. RD inherits the factor evaluation interval; explicit pipeline B
+    # replaces implicit timed RD. The CLI research scheduler is untouched.
     objective_options = "\n".join(
         f'      <option value="{value}"{_selected_attr(value == research_config.objective)}>{label}</option>'
         for value, label in (
@@ -146,6 +146,14 @@ def _index_html(
         if seed_factor_id
         else '<input id="rd-seed" value="" placeholder="先创建或配置一个因子">'
     )
+    # P0 mode shell (agent_sidecar_frontend.md §5.6): the simple landing's
+    # idea box shares the SAME default seed text as the expert control
+    # rail's #idea textarea (single Python source, not a second literal) so
+    # both surfaces stay in sync without runtime wiring, and the one-line
+    # runtime status reuses the identical provider/model/rd_optimizer_label
+    # values already computed above for the runtime strip.
+    default_idea_text = "非ST的小市值股票未来表现更好"
+    simple_runtime_line = f"LLM {provider} / {model} · RD {rd_optimizer_label}"
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -177,6 +185,20 @@ def _index_html(
       --warn-line: #e3cf9a;
       --bad-wash: #f9ecec;
       --bad-line: #e5bcbc;
+      /* R2 fix (phase review, binding): the ONE shared source for the
+         persistent mode-header's height, so every OTHER sticky-at-the-top
+         element (.control-rail, .lab-tabs) can offset below it instead of
+         colliding at the same pinned y:0 (the collision the reviewer
+         found: header z-index:50 painting over the rail's/tab strip's top
+         content once both are pinned mid-scroll). Not a color
+         token, but :root is where every other shared value already lives,
+         and CSS custom properties inherit from here to both — .mode-header
+         sits outside .app-shell entirely, so no closer common ancestor
+         exists. Value = the header's own real rendered height (44px
+         button min-height + 4px*2 .mode-toggle padding + 2px .mode-toggle
+         border + 8px*2 .mode-header padding + 1px border-bottom = 71px),
+         confirmed against a live getBoundingClientRect() measurement. */
+      --mode-header-height: 71px;
     }}
     * {{ box-sizing: border-box; }}
     html {{ min-width: 320px; }}
@@ -195,10 +217,171 @@ def _index_html(
       display: grid;
       grid-template-columns: minmax(300px, 388px) minmax(0, 1fr);
     }}
-    .control-rail {{
+    /* P0 mode shell (agent_sidecar_frontend.md §5.6): simple-mode landing +
+       mode toggle + advanced-params disclosure + terminology tooltips.
+       Token-referencing declarations only, so both themes come from the
+       variables; no fixed widths beyond the centered reading column, and
+       every row wraps so 375px stays overflow-free. */
+    /* Both shells declare their own `display` (grid), so the UA's [hidden]
+       rule (also display:none at equal 0-1-0 specificity) loses to the
+       author stylesheet regardless of source order — the same gotcha
+       .lab-tab-dot[hidden] documents above. An explicit id+[hidden]
+       override (0-1-1/1-0-1, decisively higher) is required or app.js's
+       mode toggle silently has no visual effect. */
+    #simple-shell[hidden], #expert-shell[hidden] {{ display: none; }}
+    /* FE0 fix (phase review, binding): the toggle used to live INSIDE
+       #simple-shell, so switching to expert mode hid the only way back —
+       a dead end until reload. It now lives in this persistent header,
+       a sibling of both shells, so it is never a descendant of either
+       `[hidden]` container and stays reachable in both modes. Sticky +
+       a z-index above the control-rail's own sticky aside (which has no
+       explicit z-index, so implicit stacking would otherwise let it paint
+       over this bar once both are pinned at scroll:0) keeps the toggle
+       reachable at any scroll position, not just at the top of the page. */
+    .mode-header {{
       position: sticky;
       top: 0;
-      height: 100vh;
+      z-index: 50;
+      display: flex;
+      justify-content: center;
+      padding: 8px 16px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-translucent);
+      backdrop-filter: blur(8px);
+    }}
+    .simple-shell {{
+      box-sizing: border-box;
+      max-width: 640px;
+      min-height: 100vh;
+      margin: 0 auto;
+      padding: 48px 22px;
+      display: grid;
+      align-content: start;
+      gap: 18px;
+    }}
+    .simple-shell .brand {{ border-bottom: 0; padding-bottom: 0; text-align: center; }}
+    .simple-shell .brand-mark {{ margin-inline: auto; }}
+    .mode-toggle {{
+      display: inline-flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--wash);
+    }}
+    /* FE2 fix (phase review, binding): touch targets below the spec's
+       44px minimum (§9). min-height + flex centering instead of relying
+       on padding alone, so shorter label text still gets the full target
+       height. */
+    .mode-toggle-btn {{
+      width: auto;
+      min-height: 44px;
+      margin: 0;
+      padding: 8px 16px;
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid transparent;
+      border-radius: 7px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+    }}
+    .mode-toggle-btn:hover {{ color: var(--ink); background: var(--wash); }}
+    .mode-toggle-btn[aria-pressed="true"] {{ background: var(--panel); border-color: var(--accent); color: var(--accent); }}
+    .mode-toggle-btn:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .simple-idea-panel {{ border-top: 4px solid var(--accent); }}
+    .simple-idea-panel textarea {{ min-height: 96px; }}
+    .simple-seeds {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 10px 0 4px; }}
+    .simple-seeds-label {{ color: var(--muted); font-size: 12px; font-weight: 800; }}
+    .simple-seed-btn {{
+      width: auto; min-height: 44px; margin: 0; padding: 6px 10px;
+      display: inline-flex; align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 999px; background: var(--panel); color: var(--muted);
+      font-size: 12px; font-weight: 700; cursor: pointer;
+    }}
+    .simple-seed-btn:hover {{ color: var(--accent); border-color: var(--accent-2); background: var(--wash); }}
+    .simple-seed-btn:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .simple-run-btn {{ margin-top: 16px; }}
+    .simple-runtime-status {{ text-align: center; overflow-wrap: anywhere; }}
+    .advanced-params {{ margin: 14px 0; }}
+    .advanced-params summary {{
+      min-height: 44px;
+      display: flex; align-items: center;
+      cursor: pointer; color: var(--muted); font-size: 12px; font-weight: 800;
+      letter-spacing: .02em; padding: 4px 0;
+    }}
+    .advanced-params summary .meta {{ font-weight: 400; }}
+    .advanced-params summary:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .advanced-params[open] summary {{ margin-bottom: 4px; }}
+    .term-tip {{
+      position: relative;
+      border-bottom: 1px dotted var(--line-strong);
+      cursor: help;
+    }}
+    /* FE3/R1 fix (phase review, binding). History: `left: 0` anchored the
+       popover to the term-tip's own left edge, overflowing the viewport's
+       RIGHT edge for a right-column label. A first fix centered it
+       (`left: 50%; transform: translateX(-50%)`), which happens to stay
+       inside the viewport TODAY only because `.param-grid span` (above)
+       makes `.term-tip` block-level and column-wide — an implicit,
+       fragile cross-rule dependency a future edit could silently break
+       and reintroduce LEFT-edge overflow for the narrower left column.
+       R1 removes that dependency: column-aware anchoring per the
+       reviewer's own suggestion. param-grid fills row-major (odd
+       `<label>` = column 1, even = column 2 — CP9's existing 2-column
+       grid, no collapse breakpoint even at 375px), so a left-column
+       popover only ever needs to extend RIGHTWARD (anchored at its own
+       left edge, always positive) and a right-column popover only ever
+       needs to extend LEFTWARD (anchored at its own right edge, always
+       inside the viewport) — verified for all 5 tooltips, both edges,
+       at a true 375px viewport (see the phase commit message). The
+       viewport-relative max-width stays as a second safety net. */
+    .term-tip:hover::after, .term-tip:focus-visible::after {{
+      content: attr(data-tip);
+      position: absolute;
+      bottom: 100%;
+      margin-bottom: 6px;
+      padding: 6px 8px;
+      max-width: min(180px, calc(100vw - 40px));
+      width: max-content;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      background: var(--panel);
+      color: var(--ink);
+      font-size: 11px;
+      font-weight: 400;
+      line-height: 1.4;
+      z-index: 10;
+    }}
+    /* Column-aware anchor: left column (odd label = param-grid column 1)
+       extends rightward from its own left edge; right column (even label
+       = column 2) extends leftward from its own right edge. Strictly
+       higher specificity than the base rule above (an extra class plus
+       an extra pseudo-class), so no forced-priority declaration is
+       needed to win the cascade. */
+    .param-grid label:nth-child(odd) .term-tip:hover::after,
+    .param-grid label:nth-child(odd) .term-tip:focus-visible::after {{
+      left: 0;
+    }}
+    .param-grid label:nth-child(even) .term-tip:hover::after,
+    .param-grid label:nth-child(even) .term-tip:focus-visible::after {{
+      right: 0;
+    }}
+    .term-tip:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    @media (max-width: 480px) {{
+      .simple-shell {{ padding: 28px 16px; }}
+    }}
+    .control-rail {{
+      /* R2 fix (phase review, binding): offset below the persistent
+         .mode-header (shared --mode-header-height) instead of both
+         sticking at top:0 — see the :root definition for why. */
+      position: sticky;
+      top: var(--mode-header-height);
+      height: calc(100vh - var(--mode-header-height));
       overflow: auto;
       padding: 22px;
       border-right: 1px solid var(--line);
@@ -532,22 +715,11 @@ def _index_html(
       font-size: 13px;
       letter-spacing: .08em;
     }}
-    .lab-stepper ol {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 14px; padding: 0; list-style: none; }}
-    .lab-stepper .step {{ display: inline-flex; align-items: center; gap: 6px;
-      padding: 5px 10px; border: 1px solid var(--line); border-radius: 999px;
-      background: var(--panel); color: var(--muted); font-size: 12px; font-weight: 800; }}
-    .lab-stepper .step-index {{ display: inline-grid; place-items: center; width: 16px; height: 16px;
-      border-radius: 50%; background: var(--wash); font-family: var(--mono); font-size: 10px; }}
-    .lab-stepper .step.is-done   {{ border-color: var(--accent-2); color: var(--accent-2); }}
-    .lab-stepper .step.is-done .step-index {{ background: var(--ok-wash); }}
-    .lab-stepper .step.is-active {{ border-color: var(--accent); background: var(--accent); color: var(--accent-ink); }}
-    .lab-stepper .step.is-active .step-index {{ background: rgba(255,255,255,.2); }}
-    .lab-stepper .step-link {{ width: auto; margin: 0; padding: 0; border: 0;
-      background: transparent; color: inherit; font: inherit; cursor: pointer; }}
-    .lab-stepper .step-link:disabled {{ opacity: 1; cursor: default; }}
-    .lab-stepper .step-link:not(:disabled):hover {{ text-decoration: underline; }}
-    .lab-stepper .step-link:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
-    .lab-tabs {{ position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 8px;
+    /* R2 audit (phase review, binding): .lab-tabs is ALSO `position:
+       sticky; top: 0` inside .workbench (the app-shell's right column),
+       so it collides with .mode-header exactly like .control-rail did —
+       offset below it via the same shared variable. */
+    .lab-tabs {{ position: sticky; top: var(--mode-header-height); z-index: 5; display: flex; flex-wrap: wrap; gap: 8px;
       margin: 0 -4px 18px; padding: 8px 4px; background: var(--surface-translucent);
       backdrop-filter: blur(6px); border-bottom: 1px solid var(--line); }}
     .lab-tab {{ width: auto; margin: 0; padding: 9px 14px; border: 1px solid var(--line);
@@ -641,6 +813,142 @@ def _index_html(
     .tile-range {{ display: block; margin-top: 10px; color: var(--ink);
       font-family: var(--mono); font-size: 13px; line-height: 1.4; }}
     .tag-chips  {{ margin-top: 6px; }}
+    /* P1 pipeline card + provenance badges (agent_sidecar_frontend.md
+       §2.3/§5.1/§9; static/views/pipeline.js + static/views/provenance.js):
+       token-referencing declarations only (zero new color literals), so
+       both themes come from the variables above; every row wraps so a true
+       375px viewport stays overflow-free (spec §9). */
+    .pipeline-card {{ border-top: 4px solid var(--accent); }}
+    .pipeline-card-status-row {{ display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; margin-bottom: 10px; }}
+    .pipeline-card-title {{ margin: 0; font-size: 15px; }}
+    .pipeline-frozen-note {{ display: inline-flex; align-items: center; gap: 4px;
+      border: 1px solid var(--warn-line); background: var(--warn-wash); color: var(--warn);
+      border-radius: 999px; padding: 2px 9px; font-size: 11px; font-weight: 800; }}
+    .pipeline-density-toggle {{ display: inline-flex; flex-wrap: wrap; gap: 4px; padding: 4px;
+      border: 1px solid var(--line); border-radius: 10px; background: var(--wash); margin-bottom: 10px; }}
+    .pipeline-density-btn {{ width: auto; min-height: 44px; margin: 0; padding: 6px 14px;
+      display: inline-flex; align-items: center; border: 1px solid transparent; border-radius: 7px;
+      background: transparent; color: var(--muted); font-size: 12px; font-weight: 800; cursor: pointer; }}
+    .pipeline-density-btn:hover {{ color: var(--ink); background: var(--wash); }}
+    .pipeline-density-btn[aria-pressed="true"] {{ background: var(--panel); border-color: var(--accent); color: var(--accent); }}
+    .pipeline-density-btn:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .pipeline-summary-lines {{ display: grid; gap: 10px; }}
+    .pipeline-summary-line {{ display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline;
+      min-width: 0; padding-bottom: 8px; border-bottom: 1px solid var(--line); }}
+    .pipeline-summary-line:last-child {{ border-bottom: 0; padding-bottom: 0; }}
+    .pipeline-summary-label {{ color: var(--muted); font-size: 12px; font-weight: 800; min-width: 84px; }}
+    .pipeline-summary-value {{ font-family: var(--mono); font-size: 13px; color: var(--ink); overflow-wrap: anywhere; }}
+    /* min-height 44px (phase-review F12): the expert grid's inputs are real
+       touch targets on a true 375px viewport, matching the same pin already
+       applied to .pipeline-density-btn / .pipeline-actions button above. */
+    .pipeline-expert-grid input {{ min-width: 0; min-height: 44px; }}
+    .pipeline-field-badges {{ display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }}
+    .provenance-badge {{ display: inline-flex; align-items: center; border-radius: 999px;
+      padding: 1px 8px; font-size: 10px; font-weight: 800; border: 1px solid var(--line);
+      color: var(--muted); background: var(--panel); white-space: nowrap; }}
+    .provenance-badge--profile_default, .provenance-badge--fixed_policy {{ color: var(--muted); border-color: var(--line-strong); }}
+    .provenance-badge--user_explicit, .provenance-badge--user_answer {{ color: var(--accent); border-color: var(--accent); background: var(--ok-wash); }}
+    .provenance-badge--data_resolved {{ color: var(--blue); border-color: var(--blue); }}
+    .provenance-badge--agent_inferred {{ color: var(--accent-2); border-color: var(--accent-2); }}
+    .provenance-badge--human_override {{ color: var(--warn); border-color: var(--warn-line); background: var(--warn-wash); }}
+    /* Not a member of the closed 7-value source vocabulary (phase-review
+       F4): a pending, unsaved local edit has no server badge yet, so this
+       dashed/neutral treatment is deliberately distinct from every real
+       source badge above rather than reusing (and thereby lying via) one
+       of them. */
+    .provenance-badge--unverified {{ color: var(--muted); border-style: dashed; border-color: var(--line-strong); background: var(--wash); }}
+    .pipeline-negative-evidence {{ display: grid; gap: 6px; margin-bottom: 10px; }}
+    .pipeline-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }}
+    .pipeline-actions button {{ width: auto; margin: 0; min-height: 44px; flex: 1 1 auto; }}
+    .pipeline-card[hidden] {{ display: none; }}
+    .pipeline-stage-strip {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; padding: 0; list-style: none; }}
+    .pipeline-stage {{ display: inline-flex; align-items: center; gap: 6px;
+      padding: 5px 10px; border: 1px solid var(--line); border-radius: 999px;
+      background: var(--panel); color: var(--muted); font-size: 12px; font-weight: 800; }}
+    .pipeline-stage--completed {{ border-color: var(--accent-2); color: var(--accent-2); background: var(--ok-wash); }}
+    .pipeline-stage--active {{ border-color: var(--accent); background: var(--accent); color: var(--accent-ink); }}
+    .pipeline-stage--failed {{ border-color: var(--bad); color: var(--bad); background: var(--bad-wash); }}
+    @media (max-width: 480px) {{
+      .pipeline-summary-label {{ min-width: 0; }}
+    }}
+    /* P2 sidecar: narration drawer + clarify card (agent_sidecar_frontend.md
+       §5.5/§5.2/§9; static/views/narration.js). Token-only (both themes from
+       the variables above, zero new color literals); every row wraps so a
+       true 375px viewport stays overflow-free. Attaches beside/under the
+       pipeline card -- NOT a standalone chat column (spec §5.5). */
+    .narration-drawer {{ display: grid; gap: 10px; margin: 10px 0 14px; padding: 12px; min-width: 0;
+      border: 1px solid var(--line); border-left: 4px solid var(--accent-2); border-radius: 10px; background: var(--wash); }}
+    .narration-drawer[hidden] {{ display: none; }}
+    .narration-readiness {{ margin: 0; color: var(--muted); font-size: 12px; font-weight: 800; overflow-wrap: anywhere; }}
+    .narration-stream {{ display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }}
+    .narration-node {{ padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px;
+      background: var(--panel); color: var(--ink); font-size: 13px; overflow-wrap: anywhere; }}
+    .narration-ref-link, .narration-action-btn {{ width: auto; min-height: 44px; margin: 0 0 0 4px; padding: 4px 12px;
+      border: 1px solid var(--accent); border-radius: 7px; background: var(--panel); color: var(--accent);
+      font-size: 12px; font-weight: 800; cursor: pointer; }}
+    .narration-ref-link:hover, .narration-action-btn:hover {{ background: var(--ok-wash); }}
+    .narration-ref-link:focus-visible, .narration-action-btn:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    .clarify-card {{ display: grid; gap: 10px; }}
+    .clarify-card-title {{ margin: 0; font-size: 14px; }}
+    .clarify-question {{ min-width: 0; margin: 0; padding: 10px; border: 1px solid var(--line);
+      border-radius: 8px; background: var(--panel); display: grid; gap: 6px; }}
+    .clarify-question legend {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+      padding: 0 4px; font-size: 13px; font-weight: 800; color: var(--ink); }}
+    .clarify-tier {{ border-radius: 999px; padding: 1px 8px; font-size: 10px; font-weight: 800; border: 1px solid var(--line); }}
+    .clarify-tier--blocking {{ color: var(--warn); border-color: var(--warn-line); background: var(--warn-wash); }}
+    .clarify-tier--semantic {{ color: var(--muted); border-color: var(--line-strong); }}
+    .clarify-default {{ color: var(--accent-2); font-size: 10px; font-weight: 800; }}
+    .clarify-answered {{ color: var(--accent-2); font-size: 11px; font-weight: 800; }}
+    .clarify-option {{ display: flex; gap: 8px; align-items: baseline; min-height: 44px;
+      font-size: 13px; color: var(--ink); overflow-wrap: anywhere; }}
+    .clarify-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }}
+    .clarify-actions button {{ width: auto; margin: 0; min-height: 44px; flex: 1 1 auto; }}
+    @media (min-width: 921px) {{
+      .narration-drawer {{ max-width: 420px; }}
+    }}
+    /* P3 editable-formula card + pipeline B (rd_optimize) confirm card + report
+       follow-up bar (agent_sidecar_frontend.md §5.3/§2.1/§8;
+       static/views/formula.js + static/views/pipeline.js). Token-only (both
+       themes from the variables above, zero new color literals); every row
+       wraps so a true 375px viewport stays overflow-free; the editable
+       controls are 44px touch targets. */
+    .report-followups {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }}
+    .report-followups[hidden] {{ display: none; }}
+    .report-followups button {{ width: auto; margin: 0; min-height: 44px; flex: 1 1 auto; }}
+    .report-followups-reason {{ margin: 4px 0 12px; color: var(--warn); font-size: 13px; }}
+    .report-followups-reason[hidden] {{ display: none; }}
+    .formula-card {{ border-top: 4px solid var(--accent-2); margin-top: 12px; }}
+    .formula-card[hidden] {{ display: none; }}
+    .formula-card-header {{ display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center;
+      justify-content: space-between; margin-bottom: 8px; }}
+    .formula-card-title {{ margin: 0; font-size: 15px; }}
+    .formula-card-header button {{ width: auto; margin: 0; min-height: 44px; }}
+    .formula-editor {{ position: relative; margin: 8px 0; min-width: 0; }}
+    .formula-overlay, .formula-input {{ margin: 0; padding: 10px; border: 1px solid var(--line);
+      border-radius: 8px; font-family: var(--mono); font-size: 13px; line-height: 1.5;
+      white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; box-sizing: border-box; }}
+    .formula-overlay {{ position: absolute; inset: 0; pointer-events: none; color: var(--ink);
+      background: var(--panel); overflow: auto; border-color: transparent; }}
+    .formula-input {{ position: relative; display: block; width: 100%; min-height: 96px; resize: vertical;
+      background: transparent; color: transparent; caret-color: var(--ink); }}
+    .formula-input:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    /* F15 (IME preedit visibility): during an active CJK composition the raw
+       textarea text is what the user is editing, so make it visible and hide
+       the (now-stale, un-composed) highlight overlay for the composition's
+       duration; formula.js toggles `is-composing` on both and resyncs on end. */
+    .formula-input.is-composing {{ color: var(--ink); }}
+    .formula-overlay.is-composing {{ visibility: hidden; }}
+    .formula-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }}
+    .formula-actions button {{ width: auto; margin: 0; min-height: 44px; flex: 1 1 auto; }}
+    .formula-prevalidate-result {{ margin-top: 10px; min-width: 0; }}
+    .formula-prevalidate-status {{ display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }}
+    .formula-review-packet {{ margin-top: 8px; padding: 8px 10px; border: 1px solid var(--warn-line);
+      border-radius: 8px; background: var(--warn-wash); overflow-wrap: anywhere; }}
+    .pipeline-rd-disclosure {{ display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; margin-bottom: 10px; }}
+    .pipeline-rd-grid {{ display: grid; gap: 10px; margin-bottom: 10px; }}
+    .pipeline-rd-grid label {{ display: grid; gap: 4px; min-width: 0; }}
+    .pipeline-rd-grid input, .pipeline-rd-grid select {{ min-width: 0; min-height: 44px; }}
+    .pipeline-rd-cost {{ overflow-wrap: anywhere; }}
     .registry-layout {{ display: grid; grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
       gap: 14px; align-items: start; }}
     .registry-list {{ display: grid; gap: 8px; align-content: start; }}
@@ -793,7 +1101,34 @@ def _index_html(
   </style>
 </head>
 <body>
-<main class="app-shell">
+<header id="mode-header" class="mode-header">
+  <div class="mode-toggle" role="group" aria-label="界面模式">
+    <button type="button" id="mode-simple-btn" class="mode-toggle-btn" aria-pressed="true">简洁模式</button>
+    <button type="button" id="mode-expert-btn" class="mode-toggle-btn" aria-pressed="false">专家模式</button>
+  </div>
+</header>
+<section id="simple-shell" class="simple-shell" aria-label="简洁模式">
+  <div class="brand">
+    <div class="brand-mark">QF</div>
+    <h1>Quant Forge</h1>
+    <p class="brand-subtitle">因子研究控制台</p>
+  </div>
+  <div class="panel simple-idea-panel">
+    <h2>一句话，开始研究</h2>
+    <p class="meta">输入你的选股想法，系统会自动解析成可回测的因子；没有配置 LLM 时自动改用本地规则解析。</p>
+    <label for="simple-idea" class="sr-only">因子观点</label>
+    <textarea id="simple-idea" aria-describedby="simple-runtime-status">{default_idea_text}</textarea>
+    <div class="simple-seeds" aria-label="示例想法">
+      <span class="simple-seeds-label">试试：</span>
+      <button type="button" class="simple-seed-btn" data-seed-text="非ST的小市值股票未来表现更好">非ST 小市值</button>
+      <button type="button" class="simple-seed-btn" data-seed-text="过去5天涨幅较大的股票，短期动量继续">短期动量</button>
+      <button type="button" class="simple-seed-btn" data-seed-text="估值越低的股票，长期收益越好">低估值</button>
+    </div>
+    <button type="button" id="simple-run" class="simple-run-btn">开始研究</button>
+    <p id="simple-runtime-status" class="meta simple-runtime-status" aria-live="polite">{simple_runtime_line}</p>
+  </div>
+</section>
+<main id="expert-shell" class="app-shell" hidden>
   <aside class="control-rail">
     <div class="brand">
       <div class="brand-mark">QF</div>
@@ -817,7 +1152,7 @@ def _index_html(
         <p>idea → factor</p>
       </div>
       <label for="idea">因子观点</label>
-      <textarea id="idea">非ST的小市值股票未来表现更好</textarea>
+      <textarea id="idea">{default_idea_text}</textarea>
       <label for="parser">解析方式</label>
       <select id="parser">
         <option value="llm">LLM 语义解析: {parser_label}</option>
@@ -834,23 +1169,19 @@ def _index_html(
       </select>
       <input id="llm-api-key" type="password" autocomplete="off" data-secret-policy="not-submitted" disabled>
       <p id="llm-api-key-status" class="meta"></p>
-      <label>评测参数</label>
-      <div class="param-grid" id="validation-controls">
-        <label><span>持有期 / 天</span><input id="param-holding-days" type="number" min="1" step="1" disabled></label>
-        <label><span>Decay / 天</span><input id="param-decay-days" type="number" min="0" step="1" disabled></label>
-        <label><span>Top Quantile</span><input id="param-top-quantile" type="number" min="0.01" max="0.5" step="0.01" disabled></label>
-        <label><span>Delay / 天</span><input id="param-delay-days" type="number" min="1" step="1" disabled></label>
-        <label><span>评测开始</span><input id="param-evaluation-start" type="date" disabled></label>
-        <label><span>评测结束</span><input id="param-evaluation-end" type="date" disabled></label>
-        <label><span>回测开始</span><input id="param-backtest-start" type="date" disabled></label>
-        <label><span>回测结束</span><input id="param-backtest-end" type="date" disabled></label>
-        <label><span>手续费 bps</span><input id="param-commission-bps" type="number" min="0" step="0.1" disabled></label>
-        <label><span>滑点 bps</span><input id="param-slippage-bps" type="number" min="0" step="0.1" disabled></label>
-        <label><span>融券成本 bps/年</span><input id="param-short-borrow-bps" type="number" min="0" step="1" disabled></label>
-      </div>
+      <!-- P1 (agent_sidecar_frontend.md §5.1/§8): the resident 11-parameter
+           grid (formerly #validation-controls, wrapped in #advanced-params)
+           is ABSORBED into the pipeline confirm card's expert density
+           (static/views/pipeline.js, rendered into #pipeline-card-mount
+           below) and DELETED from here -- the same .param-grid / .term-tip
+           / .advanced-params CSS classes are reused by the card's rendered
+           markup, so this deletion costs no styling. -->
       <button id="run">解析因子</button>
       <button id="validate-run" class="secondary" disabled>验证并评测</button>
-      <button id="staggered-run" class="secondary" disabled>首月逐日建仓稳健性回测</button>
+      <!-- R3.1 / spec §8: #staggered-run is MIGRATED out of this control rail
+           into the post-report follow-up bar (#report-followups, below), next
+           to the explicit pipeline B (RD) entry -- it is a report follow-up
+           action, not a resident control. -->
       <button id="cancel-run" class="secondary danger" disabled>中断本次运行</button>
       <p id="status" class="meta"></p>
     </div>
@@ -869,29 +1200,20 @@ def _index_html(
       <input id="rd-max" type="number" min="1" max="10" value="{research_config.default_max_candidates}">
       <label for="rd-iterations">RD迭代次数</label>
       <input id="rd-iterations" type="number" min="1" max="{MAX_RD_ITERATIONS}" step="1" value="1">
-      <label for="rd-interval">自动周期</label>
-      <select id="rd-interval">
-{interval_options}
-      </select>
+      <!-- R3.1 (owner-ruled, spec §8): the rd-interval 自动周期 select and the
+           开启/停止 timer-loop controls are DELETED. RD inherits the factor
+           evaluation interval/sample contract -- there is no independent RD
+           interval parameter -- and an explicit pipeline B (rd_optimize),
+           started from the report follow-up entry below, replaces implicit
+           timed RD. CLI `research run-once` and its scheduler are kept. -->
       <div class="button-row">
         <button id="rd-run">运行一次</button>
-        <button id="rd-start" class="secondary">开启</button>
-        <button id="rd-stop" class="secondary">停止</button>
       </div>
       <button id="rd-cancel" class="secondary danger" disabled>中断本次RD</button>
       <p id="rd-status" class="meta"></p>
     </div>
   </aside>
   <section class="workbench">
-    <nav class="lab-stepper" aria-label="研究流程">
-      <ol>
-        <li class="step is-active" data-step="idea"><span class="step-index">1</span>想法</li>
-        <li class="step is-pending" data-step="parse"><span class="step-index">2</span>解析</li>
-        <li class="step is-pending" data-step="validate"><span class="step-index">3</span>验证</li>
-        <li class="step is-pending" data-step="report"><span class="step-index">4</span><button type="button" class="step-link" data-step-action="report" disabled>因子报告</button></li>
-        <li class="step is-pending" data-step="rd"><span class="step-index">5</span><button type="button" class="step-link" data-step-action="rd">RD 循环</button></li>
-      </ol>
-    </nav>
     <div class="lab-tabs" role="tablist" aria-label="工作台视图">
       <button class="lab-tab" role="tab" id="lab-tab-factor" aria-controls="lab-panel-factor" aria-selected="true">LLM 因子工作台 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-history" aria-controls="lab-panel-history" aria-selected="false" tabindex="-1">研究历史 <span class="lab-tab-dot" hidden></span></button>
@@ -908,6 +1230,30 @@ def _index_html(
         <button class="lab-module-tab" role="tab" id="lab-module-multi" aria-controls="lab-module-panel-multi" aria-selected="false" tabindex="-1">多因子策略回测</button>
       </div>
       <div class="lab-module-panel" role="tabpanel" id="lab-module-panel-single" aria-labelledby="lab-module-single" tabindex="0">
+        <!-- P1 pipeline card mount (agent_sidecar_frontend.md §2.3/§3 G1):
+             replaces .lab-stepper's "show where the current run is" role
+             with the real server-owned pipeline aggregate -- state machine
+             + card rendering + rejoin-on-load live in
+             static/views/pipeline.js; provenance badges live in
+             static/views/provenance.js. Throttled aria-live (spec §9): the
+             controller only writes here on an actual status/content change,
+             never on every poll tick. Empty and [hidden] until a pipeline
+             exists for this page view. -->
+        <div id="pipeline-card-mount" aria-live="polite" aria-atomic="false"></div>
+        <!-- P3 editable-formula card mount (agent_sidecar_frontend.md §5.3):
+             THE expert formula editor -- a <textarea> single source of truth
+             with an aria-hidden canonical-highlight overlay (views/dsl.js) and
+             a fast pre-validation call (/api/pipelines/pre-validate: no persist
+             / eval / backtest). Its own module static/views/formula.js (one
+             face, one module). Empty and [hidden] until the expert opens it. -->
+        <div id="formula-card-mount" hidden></div>
+        <!-- P2 sidecar narration + clarify drawer (agent_sidecar_frontend.md
+             §5.5/§5.2): THE narration renderer (static/views/narration.js)
+             attaches its event stream + clarify Q&A card HERE, beside the
+             pipeline card -- there is no standalone chat column (spec §5.5).
+             Throttled aria-live (spec §9); empty and [hidden] until the
+             sidecar has something to say. -->
+        <div id="narration-drawer" class="narration-drawer" aria-live="polite" aria-atomic="false" aria-label="副驾叙述与澄清" hidden></div>
         <div class="section-title">
           <h2>Factor Tape</h2>
           <p>解析、评价、回测集中展示</p>
@@ -918,6 +1264,24 @@ def _index_html(
             <p class="meta">输入因子观点后运行，公式、IC、回测收益、缓存路径会在这里展开。</p>
           </div>
         </div>
+        <!-- P3 (spec §2.1 / §8): post-report follow-up actions. The report is
+             the TERMINAL stage of pipeline A. From here the user MAY explicitly
+             start pipeline B (rd_optimize) seeded from THIS report's factor --
+             there is NO automatic A->B bridge, only this entry button -- and
+             re-run the first-month staggered-entry robustness check (migrated
+             here from the former 01 Parse control rail). Hidden until a report
+             exists. -->
+        <div id="report-followups" class="report-followups" hidden>
+          <button id="rd-entry" class="secondary">开始 RD 优化（管线 B）</button>
+          <button id="formula-edit" class="secondary">编辑并预验证公式</button>
+          <button id="staggered-run" class="secondary" disabled>首月逐日建仓稳健性回测</button>
+        </div>
+        <!-- F1: when the pipeline completes but the canonical factor was NOT
+             published (publish_state conflict/declined, or no published id),
+             follow-ups that need a real registered factor id are refused with
+             this visible reason — never silently seeded from the deleted
+             working (_PW…) id. -->
+        <p id="report-followups-reason" class="report-followups-reason" role="status" hidden></p>
         <div id="staggered-result"></div>
         <section class="report-section" id="report-comparison">
           <div class="section-title">

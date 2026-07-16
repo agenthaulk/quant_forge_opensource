@@ -631,10 +631,13 @@ allowed_interval_days: [42]
     )
     monkeypatch.setattr(web_server, "DEFAULT_RD_CONFIG_PATH", rd_path)
 
-    # _index_html resolves the seam when no rd_config is passed.
+    # _index_html resolves the seam when no rd_config is passed. R3.1
+    # (owner-ruled, spec §8) DELETED the rd-interval select, so the seam is
+    # now witnessed through default_max_candidates (value="7") instead of the
+    # former interval option; the deleted interval option must not reappear.
     html = web_server._index_html(config)
-    assert '<option value="42" selected>42天</option>' in html
     assert 'id="rd-max" type="number" min="1" max="10" value="7"' in html
+    assert '<option value="42" selected>42天</option>' not in html
 
     # create_local_web_server resolves the seam again for routing.
     server = create_local_web_server(host="127.0.0.1", port=0, config=config)
@@ -644,7 +647,7 @@ allowed_interval_days: [42]
         status, content_type, body = _get(f"http://127.0.0.1:{server.server_address[1]}/")
         assert status == 200
         assert content_type == HTML_CONTENT_TYPE
-        assert '<option value="42" selected>42天</option>' in body.decode("utf-8")
+        assert 'id="rd-max" type="number" min="1" max="10" value="7"' in body.decode("utf-8")
     finally:
         server.shutdown()
         server.server_close()

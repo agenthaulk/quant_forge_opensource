@@ -6,10 +6,12 @@
  * resources, no inline application script).
  */
 
-import { esc, valueOr } from './metric.js';
+import { esc } from './metric.js';
 import {
   cancelJob,
   configureApi,
+  getJob,
+  getPipelineReport,
   onControlTokenStored,
   postJson,
   waitForJob
@@ -29,8 +31,22 @@ import { refreshDataPanel } from './views/data.js';
 import { refreshRegistryPanel } from './views/registry.js';
 import { refreshDocsPanel } from './views/docs.js';
 import { refreshExtensionsPanel } from './views/extensions.js';
-import { activateModule, activateTab, initLabTabs, setStep, setTabDot } from './views/lab.js';
+import { activateModule, activateTab, initLabTabs, isRecognizedExpertHash, setTabDot } from './views/lab.js';
 import { initSynthesisModule, refreshSynthesisPanel } from './views/synthesis.js';
+import {
+  confirmCurrentPipeline,
+  createEditedFormulaRun,
+  createPipelineFromParseJob,
+  createRdPipeline,
+  currentPipelineId,
+  currentPipelineParameters,
+  hasActivePipeline,
+  initPipelineModule,
+  rejoinActivePipelines,
+  resetPipelineCard
+} from './views/pipeline.js';
+import { attachToPipeline, initNarrationModule, refreshReadiness } from './views/narration.js';
+import { initFormulaModule, openFormulaCard } from './views/formula.js';
 
 const pageConfig = JSON.parse(document.getElementById('qf-page-config').textContent || '{}');
 const controlTokenRequired = Boolean(pageConfig.controlTokenRequired);
@@ -47,28 +63,100 @@ const llmApiKeyMode = document.getElementById('llm-api-key-mode');
 const llmApiKeyInput = document.getElementById('llm-api-key');
 const llmApiKeyStatus = document.getElementById('llm-api-key-status');
 let llmProviderOptions = pageConfig.llmProviderOptions || [];
-const validationInputs = {
-  holding_days: document.getElementById('param-holding-days'),
-  decay_days: document.getElementById('param-decay-days'),
-  top_quantile: document.getElementById('param-top-quantile'),
-  execution_delay_days: document.getElementById('param-delay-days'),
-  evaluation_start: document.getElementById('param-evaluation-start'),
-  evaluation_end: document.getElementById('param-evaluation-end'),
-  backtest_start: document.getElementById('param-backtest-start'),
-  backtest_end: document.getElementById('param-backtest-end'),
-  commission_bps: document.getElementById('param-commission-bps'),
-  slippage_bps: document.getElementById('param-slippage-bps'),
-  short_borrow_bps_annual: document.getElementById('param-short-borrow-bps')
-};
 const rdRun = document.getElementById('rd-run');
-const rdStart = document.getElementById('rd-start');
-const rdStop = document.getElementById('rd-stop');
+// R3.1 (owner-ruled, spec §8): the rd-interval 自动周期 select and the
+// 开启/停止 timer-loop controls are DELETED. RD inherits the factor evaluation
+// interval/sample contract (no independent RD interval parameter); an explicit
+// pipeline B (rd_optimize), started from the report follow-up #rd-entry below,
+// replaces implicit timed RD. CLI `research run-once` and its scheduler stay.
 const rdCancel = document.getElementById('rd-cancel');
 const rdStatusEl = document.getElementById('rd-status');
+// P3 (spec §2.1 / §8): the post-report follow-up bar. #report-followups is
+// hidden until pipeline A produces a report; #rd-entry starts pipeline B
+// seeded from THIS report's factor (the ONLY A→B path — no automatic bridge);
+// #formula-edit opens the expert editable-formula card (pre-validation).
+const reportFollowups = document.getElementById('report-followups');
+const reportFollowupsReason = document.getElementById('report-followups-reason');
+const rdEntryButton = document.getElementById('rd-entry');
+const formulaEditButton = document.getElementById('formula-edit');
 let activeIdeaJobId = null;
 let activeRdJobId = null;
 let parsedIdea = null;
 let validatedFactorId = null;
+
+// P0 mode shell (agent_sidecar_frontend.md §5.6): simple landing + expert
+// workbench toggle. #idea stays the single source of truth for the idea
+// text; #simple-idea is a separate presentational surface synced on every
+// mode switch (never a duplicate id, never a second parse pipeline).
+const simpleShell = document.getElementById('simple-shell');
+const expertShell = document.getElementById('expert-shell');
+const modeSimpleBtn = document.getElementById('mode-simple-btn');
+const modeExpertBtn = document.getElementById('mode-expert-btn');
+const ideaEl = document.getElementById('idea');
+const simpleIdeaEl = document.getElementById('simple-idea');
+const simpleRunButton = document.getElementById('simple-run');
+
+// Mode precedence (component contract 5.6): recognized expert deep link >
+// saved preference > default simple. localStorage access is guarded: a
+// Storage exception (privacy mode, quota, disabled storage) degrades to
+// "no saved preference" / "cannot persist" rather than breaking the module.
+const MODE_STORAGE_KEY = 'qf_ui_mode';
+function readSavedMode() {
+  try {
+    const saved = window.localStorage.getItem(MODE_STORAGE_KEY);
+    return saved === 'expert' || saved === 'simple' ? saved : null;
+  } catch (error) {
+    return null;
+  }
+}
+function writeSavedMode(mode) {
+  try {
+    window.localStorage.setItem(MODE_STORAGE_KEY, mode);
+  } catch (error) {
+    // Storage unavailable: the mode still applies for this page view, it
+    // just cannot persist across reloads.
+  }
+}
+// Pure DOM application, no persistence: used for the deep-link-forced
+// landing so a shared/bookmarked expert link wins ONLY that navigation
+// without rewriting the saved preference (component contract 5.6). #idea
+// is the shared draft; whichever surface is becoming hidden hands its
+// current text to the surface becoming visible so mode switches never
+// destroy state.
+function applyMode(mode) {
+  const simple = mode !== 'expert';
+  if (simple) {
+    simpleIdeaEl.value = ideaEl.value;
+  } else {
+    ideaEl.value = simpleIdeaEl.value;
+  }
+  simpleShell.hidden = !simple;
+  expertShell.hidden = simple;
+  modeSimpleBtn.setAttribute('aria-pressed', String(simple));
+  modeExpertBtn.setAttribute('aria-pressed', String(!simple));
+}
+// Applies AND persists: used for every explicit mode decision (toggle
+// clicks, the simple-run handoff into the expert view) but never for the
+// deep-link-forced initial landing.
+function setMode(mode) {
+  applyMode(mode);
+  writeSavedMode(mode);
+}
+// Initial landing. A recognized expert deep link (views/lab.js hash
+// vocabulary) wins this navigation via applyMode (no write); otherwise the
+// saved preference wins, defaulting to simple when nothing is saved yet.
+const deepLinkIsExpert = isRecognizedExpertHash(window.location.hash);
+applyMode(deepLinkIsExpert ? 'expert' : (readSavedMode() || 'simple'));
+// Same-document hash navigation (e.g. the address bar's fragment edited
+// while the page is already open) fires 'hashchange' WITHOUT re-running
+// the module's top-level code above, so the initial-landing precedence
+// never re-evaluates on its own. A later recognized expert hash still
+// wins THAT navigation via applyMode (never setMode, same no-write rule);
+// an unrecognized/cleared hash intentionally does nothing here — it must
+// not force a user who deliberately toggled modes back to simple.
+window.addEventListener('hashchange', () => {
+  if (isRecognizedExpertHash(window.location.hash)) applyMode('expert');
+});
 
 // The workbench tab hosts two concurrent job families that share one status
 // dot: the idea lane (parse / validate / staggered, all on activeIdeaJobId)
@@ -111,12 +199,6 @@ function showJobFailureNotice(mountId, reason) {
   if (!mount) return;
   mount.innerHTML = `<div class="notice err"><span class="status-pill status-pill--fail">失败</span> ${esc(reason)}</div>`;
 }
-function setValidationInputsEnabled(enabled) {
-  Object.values(validationInputs).forEach(input => {
-    input.disabled = !enabled;
-  });
-  validateButton.disabled = !enabled;
-}
 function setStaggeredEnabled(enabled) {
   staggeredButton.disabled = !enabled;
 }
@@ -149,6 +231,7 @@ function hydrateRuntimeStatus(status) {
   setRuntimeText('runtime-artifact-root', paths.artifact_root || '');
   setRuntimeText('runtime-llm-sr', `LLM parser: ${llmLabel}`);
   setRuntimeText('runtime-rd-sr', `RD optimizer: ${rdLabel}`);
+  setRuntimeText('simple-runtime-status', `LLM ${llmLabel} · RD ${rdLabel}`);
   llmProviderOptions = (llm.providers || []).map(option => ({
     provider: option.provider || '',
     model: option.model || '',
@@ -196,89 +279,14 @@ function syncLlmApiKeyControls() {
     ? 'API key 已由配置文件 / 环境变量加载，前端不展示密钥'
     : 'LLM 运行前需要在本地配置 API key 环境变量名并设置对应环境变量';
 }
-function fillValidationInputs(parameters) {
-  const values = parameters || {};
-  const evaluationPeriod = ((values.evaluation || {}).test_period) || {};
-  const backtest = values.backtest || {};
-  const backtestSimulation = backtest.simulation || {};
-  const backtestPeriod = backtest.test_period || {};
-  const costs = values.transaction_costs || {};
-  const resolved = {
-    holding_days: values.holding_days,
-    decay_days: valueOr(values.decay_days, backtestSimulation.decay_days),
-    top_quantile: valueOr(values.top_quantile, backtestSimulation.top_quantile),
-    execution_delay_days: valueOr(values.execution_delay_days, backtestSimulation.execution_delay_days),
-    evaluation_start: valueOr(values.evaluation_start, evaluationPeriod.start),
-    evaluation_end: valueOr(values.evaluation_end, evaluationPeriod.end),
-    backtest_start: valueOr(values.backtest_start, backtestPeriod.start),
-    backtest_end: valueOr(values.backtest_end, backtestPeriod.end),
-    commission_bps: valueOr(values.commission_bps, costs.commission_bps),
-    slippage_bps: valueOr(values.slippage_bps, costs.slippage_bps),
-    short_borrow_bps_annual: valueOr(values.short_borrow_bps_annual, costs.short_borrow_bps_annual)
-  };
-  Object.entries(validationInputs).forEach(([name, input]) => {
-    const value = resolved[name];
-    input.value = value === undefined || value === null ? '' : value;
-  });
-}
-function currentEvaluationSimulation() {
-  const source = (parsedIdea && parsedIdea.parameters && parsedIdea.parameters.evaluation) || {};
-  const simulation = source.simulation || {};
-  return {
-    decay_days: simulation.decay_days,
-    top_quantile: simulation.top_quantile,
-    execution_delay_days: simulation.execution_delay_days
-  };
-}
+// P1 (agent_sidecar_frontend.md §2.3/§5.1, WORKORDER P1 减法): the resident
+// 11-input #validation-controls grid this used to read is deleted; the
+// confirm card (static/views/pipeline.js) is now the single source for
+// these 11 values (its own expert-density inputs, or the server-resolved
+// defaults when the user hasn't touched anything). Staggered-entry is the
+// remaining caller -- it reuses whatever the pipeline card currently shows.
 function validationParameters() {
-  const evaluationStart = validationInputs.evaluation_start.value || null;
-  const evaluationEnd = validationInputs.evaluation_end.value || null;
-  const backtestStart = validationInputs.backtest_start.value || null;
-  const backtestEnd = validationInputs.backtest_end.value || null;
-  const decayDays = Number(validationInputs.decay_days.value);
-  const topQuantile = Number(validationInputs.top_quantile.value);
-  const executionDelayDays = Number(validationInputs.execution_delay_days.value);
-  const commissionBps = Number(validationInputs.commission_bps.value);
-  const slippageBps = Number(validationInputs.slippage_bps.value);
-  const shortBorrowBpsAnnual = Number(validationInputs.short_borrow_bps_annual.value);
-  const payload = {
-    holding_days: Number(validationInputs.holding_days.value),
-    decay_days: decayDays,
-    top_quantile: topQuantile,
-    execution_delay_days: executionDelayDays,
-    evaluation_start: evaluationStart,
-    evaluation_end: evaluationEnd,
-    backtest_start: backtestStart,
-    backtest_end: backtestEnd,
-    commission_bps: commissionBps,
-    slippage_bps: slippageBps,
-    short_borrow_bps_annual: shortBorrowBpsAnnual,
-    evaluation: {
-      test_period: { start: evaluationStart, end: evaluationEnd }
-    },
-    backtest: {
-      simulation: {
-        decay_days: decayDays,
-        top_quantile: topQuantile,
-        execution_delay_days: executionDelayDays
-      },
-      test_period: { start: backtestStart, end: backtestEnd }
-    },
-    transaction_costs: {
-      commission_bps: commissionBps,
-      slippage_bps: slippageBps,
-      short_borrow_bps_annual: shortBorrowBpsAnnual
-    }
-  };
-  const evaluationSimulation = currentEvaluationSimulation();
-  if (
-    evaluationSimulation.decay_days !== undefined ||
-    evaluationSimulation.top_quantile !== undefined ||
-    evaluationSimulation.execution_delay_days !== undefined
-  ) {
-    payload.evaluation.simulation = evaluationSimulation;
-  }
-  return payload;
+  return currentPipelineParameters() || {};
 }
 function rdPayload() {
   return {
@@ -288,6 +296,20 @@ function rdPayload() {
     iterations: Number(document.getElementById('rd-iterations').value)
   };
 }
+// WORKORDER P2 §8 deletion item — DEFERRED / ESCALATED (steward to adjudicate).
+// The design calls for this parse/validate orchestration to converge into
+// pipeline.js so app.js returns to "read config + assemble + route". It is NOT
+// done here: the honest, safe extraction (a pipeline.js `parseIntoPipeline`
+// that app.js routes to) is entangled with app.js-owned concerns this security
+// commit should not destabilize -- the shared activeIdeaJobId cancel tracking,
+// the two-family workbench-dot priority, the simple/expert mode handoff, the
+// job-dependent panel invalidation -- and the exact parse->create fetch
+// sequence is pinned by tests/test_web_pipeline_view.py's end-to-end node
+// smoke. Deferring the orthogonal refactor (no P2 pin or acceptance depends on
+// it) keeps the P1 green baseline intact; recommend a focused follow-up (or
+// folding it into P3, where pipeline.js gains the rd_optimize kind and this
+// wiring re-homes naturally). The sidecar narration wiring above is additive
+// and does not deepen the coupling.
 async function submitParse(parserMode) {
   const job = await postJson('/api/jobs/parse-idea', {
       text: document.getElementById('idea').value,
@@ -296,31 +318,47 @@ async function submitParse(parserMode) {
   });
   activeIdeaJobId = job.job_id;
   cancelButton.disabled = false;
-  return waitForJob(
+  const result = await waitForJob(
     job.job_id,
     statusEl,
     '已运行超过10秒，LLM 仍在解析因子',
     jobId => activeIdeaJobId === jobId
   );
+  // job_id rides along so the caller can hand this SAME completed job to
+  // the pipeline aggregate (createPipelineFromParseJob) without a second
+  // parse -- FE-L3: the pipeline reads its parser/factor from the job
+  // manager's own stored result for this id, never from this object.
+  return { ...result, job_id: job.job_id };
 }
+// P1 (agent_sidecar_frontend.md §2.3, WORKORDER P1 pin: idempotent confirm):
+// the resident #validate-run button now triggers the pipeline aggregate's
+// own confirm action (see pipeline.js) instead of starting a bare compute
+// job directly, so a double click / a reload-then-click carries the SAME
+// server-issued nonce and resolves to the SAME run rather than starting a
+// second compute. The confirm response's compute-stage child_job_id is a
+// real job id, so the rest of this function (activeIdeaJobId + waitForJob)
+// is unchanged.
 async function submitValidation() {
   if (!parsedIdea) throw new Error('请先解析因子');
-  const job = await postJson('/api/jobs/validate-idea', {
-      factor: parsedIdea.factor,
-      parser: parsedIdea.parser,
-      parameters: validationParameters()
-  });
-  activeIdeaJobId = job.job_id;
+  if (!hasActivePipeline()) throw new Error('请先解析因子');
+  const confirmed = await confirmCurrentPipeline();
+  const computeStage = confirmed.stages.find(stage => stage.stage_id === 'compute');
+  const jobId = computeStage && computeStage.child_job_id;
+  if (!jobId) throw new Error('管线未能启动计算任务');
+  activeIdeaJobId = jobId;
   cancelButton.disabled = false;
   return waitForJob(
-    job.job_id,
+    jobId,
     statusEl,
     '已运行超过10秒，系统仍在计算因子或回测',
-    jobId => activeIdeaJobId === jobId
+    activeJobId => activeIdeaJobId === activeJobId
   );
 }
 async function submitStaggeredEntry() {
-  const factorId = validatedFactorId || (parsedIdea && parsedIdea.factor && parsedIdea.factor.factor_id);
+  // F1: only the PUBLISHED canonical id (validatedFactorId) is a valid seed —
+  // never parsedIdea.factor.factor_id, which post-completion is the deleted
+  // working (_PW…) id.
+  const factorId = validatedFactorId;
   if (!factorId) throw new Error('请先完成验证并评测');
   const job = await postJson('/api/jobs/staggered-entry', {
       factor_id: factorId,
@@ -399,6 +437,119 @@ const extensionsPanel = trackedPanelRefresh(refreshExtensionsPanel);
 // "module-panel not hidden", not "the module is actually visible".
 const synthesisPanel = trackedPanelRefresh(refreshSynthesisPanel);
 initSynthesisModule({ onJobComplete: invalidateJobDependentPanels });
+// P1 rejoin (agent_sidecar_frontend.md §2.3): a pipeline can reach
+// `completed` without this page view ever calling submitValidation() itself
+// -- e.g. the compute stage finished while a REJOINED card (after a
+// refresh) was still polling. The canonical report renderer (render(), the
+// same one submitValidation()'s own success path uses) still owns turning
+// that job's result into pixels (FE-L2); this callback only fetches the
+// already-completed job and hands it over.
+// P3: the report follow-up bar (pipeline B entry + expert formula edit +
+// staggered check) is hidden until pipeline A yields a factor to seed from.
+function revealReportFollowups(hasFactor) {
+  if (!reportFollowups) return;
+  reportFollowups.hidden = !hasFactor;
+  if (!hasFactor && reportFollowupsReason) {
+    reportFollowupsReason.textContent = '';
+    reportFollowupsReason.hidden = true;
+  }
+}
+// F1: follow-ups (RD optimize + staggered) need a REAL registered factor id —
+// the pipeline record's `published_factor_id`, set ONLY when the canonical
+// factor was actually published on completion (publish_state === 'published').
+// The completion result's `factor.factor_id` is the pipeline WORKING id
+// (`…_PW…`), which `_cleanup_working_artifacts` deletes — so it must NEVER seed
+// a follow-up. When publishing did not succeed, the id-dependent follow-ups are
+// refused with a visible reason and `validatedFactorId` stays null.
+const PUBLISH_UNAVAILABLE_REASONS = {
+  conflict: '因子未发布：规范因子在本次运行期间被并发修改（发布冲突）。RD 优化 / 稳健性回测暂不可用；可重新运行本因子。',
+  declined_promoted: '因子未覆盖：同名规范因子已被人工提升（promoted）。RD 优化 / 稳健性回测请从「注册表」中的该因子发起。'
+};
+function applyPublishedFollowups(pipeline) {
+  const publishedId = pipeline && pipeline.published_factor_id;
+  const publishState = pipeline && pipeline.publish_state;
+  if (reportFollowups) reportFollowups.hidden = false; // formula-edit stays reachable regardless
+  if (publishState === 'published' && publishedId) {
+    validatedFactorId = publishedId;
+    if (rdEntryButton) rdEntryButton.disabled = false;
+    document.getElementById('rd-seed').value = publishedId;
+    setStaggeredEnabled(true);
+    if (reportFollowupsReason) { reportFollowupsReason.textContent = ''; reportFollowupsReason.hidden = true; }
+    return;
+  }
+  // Not published: refuse the id-dependent follow-ups, never fall back to the
+  // deleted working id.
+  validatedFactorId = null;
+  setStaggeredEnabled(false);
+  if (rdEntryButton) rdEntryButton.disabled = true;
+  if (reportFollowupsReason) {
+    reportFollowupsReason.textContent =
+      PUBLISH_UNAVAILABLE_REASONS[publishState] || '因子未成功发布，RD 优化 / 稳健性回测不可用。';
+    reportFollowupsReason.hidden = false;
+  }
+}
+async function onPipelineCompleted(pipeline) {
+  try {
+    // Restart-proof (re-verify RV-F4): the /report endpoint serves the live
+    // job result while the job manager remembers it and falls back to the
+    // durable completion artifact after a restart — the old direct getJob()
+    // fetch rendered nothing for a legitimately recovered pipeline.
+    const report = await getPipelineReport(pipeline.pipeline_id);
+    const result = report && report.result;
+    if (!result) return;
+    if (pipeline.kind === 'rd_optimize') {
+      // Pipeline B terminal (spec §2.1/§5.4): the candidate leaderboard
+      // renders through the canonical research.js renderer (FE-L2) — external
+      // OOS labelled audit-only, dedup disposition executed/duplicate/skipped —
+      // into the existing RD result area, never a bespoke second renderer. The
+      // pipeline card itself already shows the terminal leaderboard status, so
+      // this path does not also drive the workbench RD dot (pipeline B started
+      // via #rd-entry never set it 'running', so a bare 'done' would be a
+      // running-less writer — the legacy 运行一次 lane stays its sole owner).
+      renderResearch(result);
+      invalidateJobDependentPanels();
+      const rdSection = document.getElementById('workbench-rd');
+      if (rdSection && rdSection.scrollIntoView) rdSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      return;
+    }
+    render(result);
+    // parsedIdea keeps the formula for the editable-formula card; its
+    // factor_id is the DELETED working id post-completion, so follow-ups are
+    // seeded from published_factor_id (below), never from result.factor.
+    parsedIdea = { parser: result.parser, factor: result.factor, parameters: result.parameters };
+    applyPublishedFollowups(pipeline);
+    invalidateJobDependentPanels();
+  } catch (error) {
+    // Best-effort mirror of the legacy Factor Tape: the pipeline card itself
+    // already shows "completed" truthfully. Log instead of vanishing so a
+    // genuinely missing report is at least diagnosable.
+    console.warn('pipeline report mirror failed', error);
+  }
+}
+// P2 sidecar (agent_sidecar_frontend.md §5.5/§5.6): the narration/clarify
+// drawer attaches to whatever pipeline the pipeline module owns, via its
+// onPipeline hook (pipeline.js stays the single state owner, FE-L3). Readiness
+// is tri-state and refreshed on load + on token arrival; the pre-fetch default
+// stays `unknown` so a token-redacted boot never pre-judges (spec §5.6).
+initNarrationModule();
+// F2d: the editable-formula card's "run edited formula" action creates a NEW
+// immutable factor_study run branched from the current pipeline (edited_by
+// derived server-side). app.js owns the pipeline-card handoff + scroll; the
+// formula module stays a pure editor.
+initFormulaModule({
+  onRunEditedFormula: async (formula, parentPipelineId) => {
+    // F12: the run targets the pipeline the editor was OPENED on (captured by
+    // the formula module at open time), not whatever currentPipeline is now.
+    await createEditedFormulaRun(formula, { parentPipelineId });
+    const mount = document.getElementById('pipeline-card-mount');
+    if (mount && mount.scrollIntoView) mount.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+initPipelineModule({
+  onCompleted: onPipelineCompleted,
+  onPipeline: pipeline => { attachToPipeline(pipeline && pipeline.pipeline_id).catch(() => {}); }
+});
+refreshReadiness().catch(() => {});
 const multiModulePanel = document.getElementById('lab-module-panel-multi');
 function refreshSynthesisPanelIfDue() {
   if (!multiModulePanel || multiModulePanel.hidden) return;
@@ -464,14 +615,27 @@ initLabTabs({
     if (tabId === 'lab-tab-factor') refreshSynthesisPanelIfDue();
   }
 });
+// P1 rejoin (spec §2.3): mirrors refreshRuntimeStatus()'s own token guard --
+// skip silently (never prompt) until a token is already stored, so a fresh
+// page load with no rejoin candidate never surprises the user with an
+// unrelated auth prompt; onControlTokenStored below retries once one exists.
+async function maybeRejoinActivePipelines() {
+  if (controlTokenRequired) {
+    const token = window.sessionStorage.getItem('qf_control_token') || '';
+    if (!token) return;
+  }
+  await rejoinActivePipelines();
+}
 onControlTokenStored(() => {
   refreshRuntimeStatus().catch(() => {});
+  refreshReadiness().catch(() => {});
   historyPanel.refresh();
   benchPanel.refresh();
   dataPanel.refresh();
   registryPanel.refresh();
   docsPanel.refresh();
   extensionsPanel.refresh();
+  maybeRejoinActivePipelines().catch(() => {});
   // CP10 stays lazy even on token arrival: only fetch when the multi module
   // panel is not hidden; otherwise the next activation retries.
   refreshSynthesisPanelIfDue();
@@ -480,6 +644,7 @@ llmProviderSelect.addEventListener('change', syncLlmApiKeyControls);
 llmApiKeyMode.addEventListener('change', syncLlmApiKeyControls);
 syncLlmApiKeyControls();
 refreshRuntimeStatus().catch(() => {});
+maybeRejoinActivePipelines().catch(() => {});
 historyPanel.refresh();
 benchPanel.refresh();
 dataPanel.refresh();
@@ -493,32 +658,30 @@ button.addEventListener('click', async () => {
   activateTab('lab-tab-factor');
   activateModule('lab-module-single');
   setWorkbenchDot('idea', 'running');
-  setStep('parse', 'active');
-  setStep('validate', 'pending');
-  setStep('report', 'pending');
   clearGlobalError();
   resetIdeaResult('解析中', '因子解析完成后，公式和默认评测参数会在这里刷新。');
+  resetPipelineCard();
   statusEl.textContent = '解析中...';
   parsedIdea = null;
   validatedFactorId = null;
-  fillValidationInputs({});
-  setValidationInputsEnabled(false);
   setStaggeredEnabled(false);
+  revealReportFollowups(false);
   resetStaggeredResult();
   const parserMode = document.getElementById('parser').value;
   try {
     const payload = await submitParse(parserMode);
     parsedIdea = payload;
-    fillValidationInputs(payload.parameters);
-    setValidationInputsEnabled(true);
     renderParsed(payload);
-    setStep('parse', 'done');
+    // P1: wraps the just-completed parse job into a server-owned pipeline
+    // (awaiting_confirm) and renders the confirm card -- FE-L3, the
+    // pipeline reads its own parser/factor from this job id, never from
+    // `payload` itself (see createPipelineFromParseJob / apps/web/pipeline.py).
+    await createPipelineFromParseJob(payload.job_id);
     setWorkbenchDot('idea', 'done');
     invalidateJobDependentPanels();
     statusEl.innerHTML = '<span class="ok">解析完成，等待确认参数</span>';
   } catch (error) {
     if (error.message === '运行已中断') {
-      setStep('parse', 'pending');
       setWorkbenchDot('idea', 'clear');
       statusEl.innerHTML = '<span class="warn">运行已中断</span>';
       return;
@@ -529,17 +692,14 @@ button.addEventListener('click', async () => {
         try {
           const payload = await submitParse('rule');
           parsedIdea = payload;
-          fillValidationInputs(payload.parameters);
-          setValidationInputsEnabled(true);
           renderParsed(payload);
-          setStep('parse', 'done');
+          await createPipelineFromParseJob(payload.job_id);
           setWorkbenchDot('idea', 'done');
           invalidateJobDependentPanels();
           statusEl.innerHTML = '<span class="ok">已使用本地规则解析，等待确认参数</span>';
           return;
         } catch (fallbackError) {
           const reason = jobFailureReason(fallbackError);
-          setStep('parse', 'pending');
           setWorkbenchDot('idea', 'error');
           showJobFailureNotice('result', reason);
           errorEl.textContent = reason;
@@ -549,7 +709,6 @@ button.addEventListener('click', async () => {
       }
     }
     const reason = jobFailureReason(error);
-    setStep('parse', 'pending');
     setWorkbenchDot('idea', 'error');
     showJobFailureNotice('result', reason);
     errorEl.textContent = reason;
@@ -567,36 +726,32 @@ validateButton.addEventListener('click', async () => {
   activateTab('lab-tab-factor');
   activateModule('lab-module-single');
   setWorkbenchDot('idea', 'running');
-  setStep('validate', 'active');
   clearGlobalError();
   resetIdeaResult('验证与评测中', '评测完成后，IC、回测收益和 artifact 路径会在这里刷新。');
   statusEl.textContent = '验证与评测中...';
   try {
     const payload = await submitValidation();
     render(payload);
+    // parsedIdea keeps the formula for the editable-formula card only; its
+    // factor_id here is the pipeline WORKING id (…_PW…). Follow-up seeding
+    // (validatedFactorId / rd-seed / staggered / the follow-up bar) is owned
+    // SOLELY by onPipelineCompleted, which reads the reconciled record's
+    // published_factor_id — never this working id (F1).
     parsedIdea = {
       parser: payload.parser,
       factor: payload.factor,
       parameters: payload.parameters || validationParameters()
     };
-    validatedFactorId = payload.factor.factor_id;
-    fillValidationInputs(parsedIdea.parameters);
-    document.getElementById('rd-seed').value = payload.factor.factor_id;
-    setStaggeredEnabled(true);
-    setStep('validate', 'done');
-    setStep('report', 'done');
     setWorkbenchDot('idea', 'done');
     invalidateJobDependentPanels();
     statusEl.innerHTML = '<span class="ok">验证完成</span>';
   } catch (error) {
     if (error.message === '运行已中断') {
-      setStep('validate', 'pending');
       setWorkbenchDot('idea', 'clear');
       statusEl.innerHTML = '<span class="warn">运行已中断</span>';
       return;
     }
     const reason = jobFailureReason(error);
-    setStep('validate', 'pending');
     setWorkbenchDot('idea', 'error');
     showJobFailureNotice('result', reason);
     errorEl.textContent = reason;
@@ -605,7 +760,6 @@ validateButton.addEventListener('click', async () => {
     activeIdeaJobId = null;
     button.disabled = false;
     cancelButton.disabled = true;
-    setValidationInputsEnabled(Boolean(parsedIdea));
     setStaggeredEnabled(Boolean(validatedFactorId));
   }
 });
@@ -643,7 +797,6 @@ staggeredButton.addEventListener('click', async () => {
     activeIdeaJobId = null;
     button.disabled = false;
     cancelButton.disabled = true;
-    setValidationInputsEnabled(Boolean(parsedIdea));
     setStaggeredEnabled(Boolean(validatedFactorId));
   }
 });
@@ -669,7 +822,6 @@ rdRun.addEventListener('click', async () => {
   const rdSection = document.getElementById('workbench-rd');
   if (rdSection) rdSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
   setWorkbenchDot('rd', 'running');
-  setStep('rd', 'active');
   clearGlobalError();
   resetRdResult('RD 运行中', 'RD 候选、gate、report path 和分段证据会在本次运行完成后刷新。');
   rdStatusEl.textContent = 'RD 运行中...';
@@ -684,20 +836,17 @@ rdRun.addEventListener('click', async () => {
       jobId => activeRdJobId === jobId
     );
     renderResearch(payload);
-    setStep('rd', 'done');
     setWorkbenchDot('rd', 'done');
     invalidateJobDependentPanels();
     clearGlobalError();
     rdStatusEl.innerHTML = '<span class="ok">RD 完成</span>';
   } catch (error) {
     if (error.message === '运行已中断') {
-      setStep('rd', 'pending');
       setWorkbenchDot('rd', 'clear');
       resetRdResult('RD 已中断', '本次 RD 已取消，未产生新的候选结果。');
       rdStatusEl.textContent = 'RD 已中断';
     } else {
       const reason = jobFailureReason(error);
-      setStep('rd', 'pending');
       setWorkbenchDot('rd', 'error');
       showJobFailureNotice('rd-result', reason);
       rdStatusEl.innerHTML = `<span class="err">${esc(reason)}</span>`;
@@ -722,38 +871,73 @@ rdCancel.addEventListener('click', async () => {
     rdCancel.disabled = false;
   }
 });
-rdStart.addEventListener('click', async () => {
-  rdStart.disabled = true;
-  activateTab('lab-tab-factor');
-  activateModule('lab-module-single');
-  clearGlobalError();
-  resetRdResult('调度启动中', '调度开启后，最近一次 RD 结果会在这里刷新。');
-  rdStatusEl.textContent = '调度启动中...';
-  try {
-    const payload = rdPayload();
-    payload.action = 'start';
-    payload.interval_days = Number(document.getElementById('rd-interval').value);
-    const status = await postJson('/api/research/schedule', payload);
-    rdStatusEl.innerHTML = '<span class="ok">调度已开启</span>';
-    if (status.last_result) {
-      renderResearch(status.last_result);
-      setStep('rd', 'done');
+// P3 (spec §2.1): the ONLY A→B path. Clicking #rd-entry creates pipeline B
+// (rd_optimize) seeded from THIS report's factor and hands it to the pipeline
+// card, which opens on the RD confirm gate. There is NO automatic bridge —
+// nothing here fires unless the user clicks this report follow-up button.
+if (rdEntryButton) {
+  rdEntryButton.addEventListener('click', async () => {
+    // F1: seed pipeline B from the PUBLISHED canonical id only — never the
+    // deleted working id that result.factor would carry post-completion.
+    const seed = validatedFactorId;
+    if (!seed) return;
+    rdEntryButton.disabled = true;
+    activateTab('lab-tab-factor');
+    activateModule('lab-module-single');
+    clearGlobalError();
+    try {
+      await createRdPipeline(seed);
+      const mount = document.getElementById('pipeline-card-mount');
+      if (mount && mount.scrollIntoView) mount.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (error) {
+      errorEl.textContent = jobFailureReason(error);
+    } finally {
+      rdEntryButton.disabled = false;
     }
-  } catch (error) {
-    rdStatusEl.textContent = error.message;
-  } finally {
-    rdStart.disabled = false;
-  }
+  });
+}
+// P3 (spec §5.3): open the expert editable-formula card seeded with the
+// current factor's formula. The card runs read-only pre-validation
+// (/api/pipelines/pre-validate: no persist / eval / backtest).
+if (formulaEditButton) {
+  formulaEditButton.addEventListener('click', () => {
+    const formula = (parsedIdea && parsedIdea.factor && parsedIdea.factor.formula) || '';
+    // F12: capture the owning pipeline id NOW (open time) so a later run edits
+    // THIS pipeline even if currentPipeline changes before the user runs it.
+    openFormulaCard(formula, currentPipelineId());
+    const mount = document.getElementById('formula-card-mount');
+    if (mount && mount.scrollIntoView) mount.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+}
+modeSimpleBtn.addEventListener('click', () => setMode('simple'));
+modeExpertBtn.addEventListener('click', () => setMode('expert'));
+document.querySelectorAll('.simple-seed-btn').forEach(seedButton => {
+  seedButton.addEventListener('click', () => {
+    simpleIdeaEl.value = seedButton.dataset.seedText || '';
+    simpleIdeaEl.focus();
+  });
 });
-rdStop.addEventListener('click', async () => {
-  rdStop.disabled = true;
-  clearGlobalError();
-  try {
-    const status = await postJson('/api/research/schedule', {action: 'stop'});
-    rdStatusEl.textContent = status.run_count ? `调度已停止，累计运行 ${status.run_count} 次` : '调度已停止';
-  } catch (error) {
-    rdStatusEl.textContent = error.message;
-  } finally {
-    rdStop.disabled = false;
-  }
+// The simple-mode entry point delegates to the EXISTING #run handler
+// (button.click()) instead of duplicating its parse/activate/error/panel
+// wiring, so every pin on that handler's behavior stays intact. Switching
+// to expert mode first (FE-L1: no second canvas) reveals the real
+// renderers the delegated run writes into; a no-provider-ready runtime
+// forces the rule parser (no-LLM-key degradation, spec §10) instead of
+// attempting an LLM call the user never chose.
+// FE1 fix (phase review, binding): this handoff uses applyMode, NEVER
+// setMode — running the guided form once must not silently overwrite the
+// saved preference. Only an explicit toggle click is a real preference
+// choice (component contract 5.6); a first-time beginner who runs once
+// and reloads must still land back on the simple default.
+simpleRunButton.addEventListener('click', () => {
+  const anyProviderReady = llmProviderOptions.some(option => option.runtimeReady === 'true');
+  document.getElementById('parser').value = anyProviderReady ? 'llm' : 'rule';
+  applyMode('expert');
+  button.click();
 });
+// Mirrors the CP10 attribute-observer pattern above (MutationObserver on
+// #lab-module-panel-multi's `hidden`): the simple button tracks the
+// delegated #run button's disabled state instead of duplicating its
+// try/finally bookkeeping.
+new MutationObserver(() => { simpleRunButton.disabled = button.disabled; })
+  .observe(button, { attributes: true, attributeFilter: ['disabled'] });

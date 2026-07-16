@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import stat
+from typing import Iterable
 
 import pandas as pd
 
@@ -296,6 +297,85 @@ class FactorValueStore:
                 target,
                 index=False,
             )
+
+
+def remove_stored_values_for_factor_id(
+    root: Path | None, factor_id: str, *, other_known_factor_ids: Iterable[str] = ()
+) -> int:
+    """Remove every stored-value directory derivable from ``factor_id`` ALONE.
+
+    Cleanup counterpart to ``_resolve_factor_paths`` for pipeline working
+    rows (apps/web/pipeline.py): deletes the ID-derived candidate directory
+    names (canonical ``factor_id=...`` form, the raw id, and its
+    safe-dir-name form) under ``root`` itself and under each category
+    subdirectory. Deliberately NARROWER than ``_factor_dir_candidates``: the
+    name/formula-derived fallbacks are shared namespaces (two factors can
+    share a display name or a precomputed formula key), so a cleanup keyed
+    on them could destroy another factor's cache.
+
+    Ownership guard (rv2 round): ``_canonical_factor_dir_name`` is
+    non-injective (case folding, hyphen->underscore), so two DIFFERENT ids
+    can share a canonical directory. Any candidate directory that another
+    id in ``other_known_factor_ids`` also derives is SKIPPED (residue is
+    the lesser harm than deleting another factor's cache) and does not
+    count as removed. Callers pass the registry's other ids.
+
+    Observation errors are strict (rv2 round): a directory that cannot be
+    STATTED (permission, dead mount) raises instead of silently reading as
+    absent -- treating an unobservable path as cleaned would clear
+    ``cleanup_pending`` while residue remains. Absence (``ENOENT``) is the
+    only silent case. Returns the number of directories removed; a missing
+    root removes nothing.
+    """
+
+    import os as _os
+    import shutil
+    import stat as _stat
+
+    if root is None or not factor_id.strip():
+        return 0
+    base = Path(root).expanduser()
+    try:
+        base_mode = _os.stat(base).st_mode
+    except FileNotFoundError:
+        return 0
+    if not _stat.S_ISDIR(base_mode):
+        return 0
+    candidates = list(
+        dict.fromkeys(
+            name
+            for name in (_canonical_factor_dir_name(factor_id), factor_id, _safe_dir_name(factor_id))
+            if name
+        )
+    )
+    # Claims compare CASEFOLDED (re-verify RV3-F1): the default macOS/APFS
+    # volume is case-insensitive, so "/values/foo" and "/values/FOO" are the
+    # SAME directory -- an exact-case claim check would happily delete the
+    # other spelling's data through the alias.
+    foreign_claims: set[str] = set()
+    for other_id in other_known_factor_ids:
+        other = str(other_id)
+        if not other or other == factor_id:
+            continue
+        foreign_claims.update(
+            name.casefold() for name in (_canonical_factor_dir_name(other), other, _safe_dir_name(other)) if name
+        )
+    parents = [base, *(base / category_dir for category_dir in FACTOR_CATEGORY_DIRS.values())]
+    removed = 0
+    for parent in parents:
+        for candidate in candidates:
+            if candidate.casefold() in foreign_claims:
+                continue  # shared spelling (any case): never delete a contested dir
+            target = parent / candidate
+            try:
+                mode = _os.stat(target).st_mode
+            except FileNotFoundError:
+                continue
+            if not _stat.S_ISDIR(mode):
+                continue
+            shutil.rmtree(target)
+            removed += 1
+    return removed
 
 
 def _score_keys(panel: pd.DataFrame) -> pd.DataFrame:

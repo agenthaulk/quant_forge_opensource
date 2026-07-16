@@ -280,8 +280,8 @@ RD 结果会以中性 outcome 契约（`qf.research_outcome.v2`）写入本地�
 | --- | --- | --- | --- |
 | 解析并验证 | `运行中...` | `验证完成`，展示 factor/evaluation/backtest/artifacts | 显示 parser/provider/config/key/field/operator 错误 |
 | RD 运行一次/多轮递进 | `RD 运行中...` | `RD 完成`，展示 iteration chain、accepted candidates 和 report path | 显示 objective/gate/config/data/iterations 错误 |
-| 自动 RD 开启 | `调度启动中...` | `调度已开启`，展示 last result | 显示 interval/objective/config 错误 |
-| 自动 RD 停止 | 按钮 disabled | `调度已停止，累计运行 N 次` | 显示 scheduler 错误 |
+
+Web 已删除自动 RD 开启/停止控件；后端 `POST /api/research/schedule` 与 CLI 调度保留，仅在 API/CLI 联调中验证。
 
 ### 4.1 前端交互等级
 
@@ -400,7 +400,7 @@ API/HTTP 调用只允许核对后端 contract、artifact 路径、日期窗口�
    - `failed_round_index` 等于失败轮次。
    - `stopped_reason=iteration_failed`。
    - `chain_error` 展示可读错误摘要。
-8. Web 自动周期如果携带 `iterations`，每次调度触发都应执行同样的 N 轮链式 RD，而不是忽略该参数。
+8. 仅在后端 API/CLI 调度联调中：`POST /api/research/schedule` 携带 `iterations` 时，每次调度触发都应执行同样的 N 轮链式 RD；Web 不再提供自动周期控件。
 9. 点击 `中断本次RD` 时，链式 RD 应在轮间或安全检查点响应取消。
 
 ### 4.4 RD 长任务与性能诊断清单

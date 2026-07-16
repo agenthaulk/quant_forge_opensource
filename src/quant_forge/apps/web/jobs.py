@@ -46,6 +46,14 @@ class _WebJob:
     thread: threading.Thread | None = field(default=None, repr=False)
     started_monotonic: float = field(default_factory=time.monotonic, repr=False)
     finished_monotonic: float | None = None
+    # Optional caller-supplied echo of the job's OWN input (e.g. {"text":...,
+    # "parser_mode":...} for a parse_idea job). Never used for computation --
+    # only so a later reader (apps/web/pipeline.py::create_pipeline, for
+    # genuine per-field provenance derivation, phase-review F3) can see what
+    # the parser actually saw without re-deriving it from a client-supplied
+    # claim. Optional and additive: every existing caller of `start()` omits
+    # it and behaves exactly as before.
+    request: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -65,10 +73,25 @@ class _WebJobManager:
         self._lock = threading.Lock()
         self._jobs: dict[str, _WebJob] = {}
 
-    def start(self, kind: str, runner: Any) -> dict[str, Any]:
-        job_id = uuid4().hex[:12]
+    def reserve_id(self) -> str:
+        """Mint a job id without registering or starting anything.
+
+        Lets a caller (apps/web/pipeline.py's exactly-once launch ordering)
+        persist a durable record that NAMES the job it is about to start
+        BEFORE the job thread exists, so a crash between "decided to launch"
+        and "actually launched" leaves an honestly-reconcilable gap (the
+        named job never appears in ``get()``) instead of a running thread
+        with no durable record pointing at it.
+        """
+
+        return uuid4().hex[:12]
+
+    def start(
+        self, kind: str, runner: Any, *, job_id: str | None = None, request: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        job_id = job_id or uuid4().hex[:12]
         now = _utc_now()
-        job = _WebJob(job_id=job_id, kind=kind, status="running", started_at=now, updated_at=now)
+        job = _WebJob(job_id=job_id, kind=kind, status="running", started_at=now, updated_at=now, request=request)
 
         def run() -> None:
             from quant_forge.apps.web import server as _server
@@ -189,6 +212,7 @@ class _WebJobManager:
             "message": message,
             "error": job.error,
             "result": job.result,
+            "request": job.request,
         }
 
     def _prune_locked(self) -> None:

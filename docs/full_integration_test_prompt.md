@@ -160,17 +160,21 @@ provider 已识别、key env 已继承但真实 key 未打印、各数据/因子
 
 切到「单因子研究」模块。用三个 seed（**逐字**，见附录 C）各跑一遍。
 
-对每个 seed：在 `#idea` 输入自然语言 → 点「解析因子」（`#run`，真实 LLM 调用）→ 观察
-研究流程 stepper（`.lab-stepper`）依次点亮 **想法 → 解析 → 验证 → 因子报告 → RD 循环**
-（data-step：`idea` / `parse` / `validate` / `report` / `rd`）。解析阶段**只生成 factor
-草稿 + 待确认参数（draft + pending params），不得提前触发评价/回测**。
+对每个 seed：在 `#idea` 输入自然语言 → 点「解析因子」（`#run`，真实 LLM 调用）→ 服务端把
+这次解析包成一个**管线 A（factor_study）**，管线卡（`#pipeline-card-mount`）打开**假设确认
+闸门**，其四段阶段条 **解析 → 假设确认 → 计算 → 报告**（stage_id：`parse` / `confirm` /
+`compute` / `report`；旧的 `.lab-stepper` 五步条已在 P1 删除，由管线卡取代）依次推进。解析
+阶段**只生成 factor 草稿 + 待确认参数（draft + pending params），不得提前触发评价/回测**。
 
 - **诚实性检查（HONESTY）：** 在“本地规则解析”模式下输入乱码/无意义文本，报告顶部必须
   出现 fallback 警告卡（warn notice，`renderParseWarnings`）——fallback 解析不能伪装成
   自信解析。
-- **调整 11 个评测参数（`#validation-controls`）：** 持有期/天（`#param-holding-days`）、
+- **调整 11 个评测参数（在管线确认卡的**专家密度**网格 `#pipeline-expert-params` 内，输入项
+  `data-pipeline-param-field="…"`；旧的常驻 `#validation-controls` 网格已在 P1 删除并吸收进
+  确认卡）：** 持有期/天（`data-pipeline-param-field="holding_days"`）、
   Decay/天、Top Quantile、Delay/天、评测开始、评测结束、回测开始、回测结束、手续费 bps、
-  滑点 bps、融券成本 bps/年。
+  滑点 bps、融券成本 bps/年。切到「专家」密度后逐项修改，负面证据（`INSUFFICIENT_*` 等）
+  两档密度均可见。
 - 点「验证并评测」（`#validate-run`），因子报告应包含：
   - **诚实 MetricValue 状态：** 缺失/不足样本显示 `insufficient_sample` / `n/a` 等
     status 标签，**绝不是裸 0**（`metric.js` 单一渲染器纪律）。
@@ -185,8 +189,12 @@ provider 已识别、key env 已继承但真实 key 未打印、各数据/因子
     极端 t 值**。
   - turnover（initial build turnover、rebalance turnover、replacement rate）、成本后表现
     （net cumulative / net annualized）、artifact 路径（`#report-artifacts`）。
-- 点「首月逐日建仓稳健性回测」（`#staggered-run`），确认 `#report-staggered` 的 NAV 图与
-  cohort 明细。
+- **报告后续动作栏（`#report-followups`，P3 / R3.1）：** 报告是管线 A 的**终点**，报告下方
+  出现后续动作栏，只含入口按钮、**没有 A→B 自动桥**：
+  - 「首月逐日建仓稳健性回测」（`#staggered-run`）——R3.1 已从 01 Parse 控制栏**迁移**到这里；
+    点击后确认 `#report-staggered` 的 NAV 图与 cohort 明细。
+  - 「编辑并预验证公式」（`#formula-edit`）——打开专家可编辑公式卡（见 §4.2.1）。
+  - 「开始 RD 优化（管线 B）」（`#rd-entry`）——显式发起管线 B（见 §4.2.1）。
 
 **每个 seed 记录（carry over 老规范的完整字段清单）：**
 
@@ -206,7 +214,10 @@ provider 已识别、key env 已继承但真实 key 未打印、各数据/因子
 **RD 循环（`#workbench-rd`，右栏「02 Research」控制）：** 把上面 3 个因子作为 RD seed
 （`#rd-seed`）。设置目标优先级（`#rd-objective`）、候选数量（`#rd-max`，注意是每轮候选
 数，不是轮数）、RD 迭代次数（`#rd-iterations`，上限 `MAX_RD_ITERATIONS`=5）。点「运行
-一次」（`#rd-run`）。
+一次」（`#rd-run`）。**R3.1（owner 裁决）：rd-interval 自动周期 select 与 开启/停止
+定时循环控件已删除**——RD 周期/样本区间继承因子评测设置，无独立 interval 参数；页面上
+不应再出现 `#rd-interval` / `#rd-start` / `#rd-stop`（CLI `research run-once` 与调度端点
+保留，仅前端自动周期 UI 删除）。
 
 - **迭代档位：** `iterations=1` 是快速 smoke；`2` / `3` 是标准新用户递进联调；`5` 是重型
   回归模式，只在需验证长链 RD 时用，运行前把候选数量控制在较小值，并预期真实 DeepSeek +
@@ -234,6 +245,46 @@ seed）、`last_accepted_factor_id`、`last_explored_factor_id`、
 **非法公式路径：** LLM 生成非法公式时，把 validation error 回传 LLM 修复，连续 3 次失败
 才进 fallback；参数搜索只能作为独立 research lane，不得把非法公式当作参数搜索成功；若
 既没产生公式变体也没产生参数变体，必须输出 `no_optimization_performed`，不能算 RD 成功。
+
+### 4.2.1 可编辑公式预验证 + 管线 B（rd_optimize，P3）
+
+报告后续动作栏（§4.2 `#report-followups`）承载两条 P3 专家路径；两者都从**已完成的
+报告**（管线 A 终点）出发，**没有 A→B 自动桥**——只有点击这些入口按钮才会发生。
+
+**可编辑公式卡（`#formula-edit` → `#formula-card-mount`，spec §5.3）：**
+
+- 点「编辑并预验证公式」打开公式卡：一个 `<textarea>`（`#formula-input`，唯一事实源）+
+  一个 `aria-hidden` 高亮 overlay（`#formula-overlay`，复用 `views/dsl.js` 规范高亮器，
+  **不自绘公式**）。拒绝 `contenteditable`。
+- **IME 联调（必测）：** 用中文输入法在 textarea 里输入（组合态），确认 overlay 在
+  **组合期不重绘**（不打断候选窗/光标），组合结束后才刷新高亮。
+- 点「预验证公式」→ `POST /api/pipelines/pre-validate`（canonicalize + ValidationGate，
+  **不落盘、不评测、不回测**）。确认返回：
+  - 可解析公式 → `status=ready` + canonical `fingerprint`，且 `executed=false` /
+    `persisted=false`。
+  - 未知算子 → `status=review_required` + `review_packet.channel=operator_drafts` +
+    `hot_executed=false`——**只生成算子审阅包，绝不热执行、绝不落盘**（对照
+    `POST /api/jobs/validate-idea` 会跑完整评测链）。
+
+**管线 B（`#rd-entry`，rd_optimize，spec §2.1/§5.4）：**
+
+- 点「开始 RD 优化（管线 B）」→ `POST /api/pipelines`（`kind=rd_optimize`，
+  `seed_factor_id` 来自本报告因子）。管线卡（`#pipeline-card-mount`）打开 **RD 确认闸门**：
+  三段阶段条 **RD 确认 → RD 运行 → 排行榜**（`confirm`/`run`/`leaderboard`）。
+- **RD 确认卡：** 迭代轮数（`rounds`，1..`MAX_RD_ITERATIONS`=5，**服务端校验越界**）、
+  每轮候选数（`candidates_per_round`）、目标优先级（`objective`）+ 成本预告 +
+  **fixed_policy 披露**（周期/样本区间继承因子评测设置，R3.1：无独立 interval 参数）。
+  每个值带服务端派生的 provenance 徽章（经 `views/provenance.js` 唯一渲染器）。
+- 点「确认并运行 RD」→ 单个后台 research 任务跑 N 轮（**不拆每轮灯**），终态到达
+  `leaderboard`。管线卡显示「排行榜已生成」（终点，无闸门按钮）。
+- **排行榜（复用 `views/research.js` 渲染器，渲染进 `#rd-result`）：** external-OOS 列标注
+  **「审计」**（只审计、不参与 winner 选择）；**去重处置**按 executed / reused / skipped
+  披露（服务端权威计数：`candidates` / `deduplication.result_duplicates` /
+  `formula_skipped+diversity_skipped`）。状态词指标（`insufficient_sample` 等）走
+  `metric.js` 唯一渲染器 → `n/a`/status，**绝不被当作数字进入比较**。
+- **记录：** `pipeline_id`、`kind=rd_optimize`、三段 stages、`rounds`/`candidates_per_round`/
+  `objective` 及其徽章来源、`planning_influence_hash`（当前保留为空——SE 真实捕获在
+  CP-INT 接线，input_hash 稳定）、排行榜的审计列与去重处置。
 
 ### 4.3 多因子策略回测 / multi-factor strategy backtest（NEW）—— 合成
 
@@ -331,9 +382,20 @@ seed）、`last_accepted_factor_id`、`last_explored_factor_id`、
     `synthesis_provenance{coverage_by_role, factors[].formula 钉定公式}` 与 `validity`；
     契约违约（<2 因子 / 缺 holding_days / 未知方法 / 窗口过短 / 宇宙冲突）应是**同步的
     干净 4xx JSON**，不是失败的后台 job。
+- **P3 端点形状（管线 B + 预验证，routing.py，api.py 零改动）：**
+  - `POST /api/pipelines/pre-validate`（`{formula}`）→ 读-only：可解析公式 `status=ready`
+    + `fingerprint`；未知算子 `status=review_required` + `review_packet.channel=operator_drafts`
+    + `hot_executed=false`；全程 `executed=false` / `persisted=false`，**不评测不落盘**。
+  - `POST /api/pipelines`（`kind=rd_optimize`, `seed_factor_id`, `rounds`,
+    `candidates_per_round`, `objective`）→ 三段 `confirm`/`run`/`leaderboard`、
+    `planning_influence_hash=""`；**越界 `rounds` 同步 4xx**（服务端校验，不是失败 job）。
+    `/{id}/confirm` 启动单个 research 任务，终态 `leaderboard`；管线 A 跑完**不会**自动
+    创建任何 rd_optimize 管线（无 A→B 桥）。
 - **禁止用 API 替代点击：** 不得用 `/api/jobs/parse-idea` 替代「解析因子」、
   `/api/jobs/validate-idea` 替代「验证并评测」、`/api/jobs/research-run-once` 替代 RD
-  「运行一次」、`/api/jobs/multi-factor-backtest` 替代「合成并回测」。
+  「运行一次」、`/api/jobs/multi-factor-backtest` 替代「合成并回测」、
+  `/api/pipelines/pre-validate` 替代「编辑并预验证公式」、`POST /api/pipelines`
+  （`rd_optimize`）替代「开始 RD 优化（管线 B）」。
 
 **长任务诊断规则（carry over）：**
 

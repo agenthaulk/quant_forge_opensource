@@ -1068,21 +1068,35 @@ allowed_interval_days: [5]
     assert '<script type="module" src="/static/app.js"></script>' in html
     assert "/api/jobs/research-run-once" in bundle
     assert "/api/jobs/parse-idea" in bundle
-    assert "/api/jobs/validate-idea" in bundle
+    # P1 (agent_sidecar_frontend.md §2.3, WORKORDER P1 pin: idempotent
+    # confirm): #validate-run now posts to the pipeline aggregate's own
+    # confirm endpoint (/api/pipelines/<id>/confirm, pinned in
+    # tests/test_web_pipeline_view.py) instead of /api/jobs/validate-idea
+    # directly, so a double click carries a server-issued idempotency token
+    # instead of racing two bare job starts.
+    assert "/api/jobs/validate-idea" not in bundle
     assert "/api/jobs/staggered-entry" in bundle
     assert "/api/research/campaign" not in html
     assert "/api/research/campaign" not in bundle
-    assert "/api/research/schedule" in bundle
+    # R3.1 (owner-ruled, spec §8): the rd-interval auto-cycle 开启/停止 controls
+    # are DELETED, so the FRONTEND no longer drives the scheduler endpoint.
+    # /api/research/schedule stays a backend/CLI concern (routing.py keeps it),
+    # but no served module calls it any more; an explicit pipeline B replaces
+    # implicit timed RD. Absence is also pinned in tests/test_web_mode_shell.py.
+    assert "/api/research/schedule" not in bundle
     assert "解析因子" in html
     assert "验证并评测" in html
     assert "首月逐日建仓稳健性回测" in html
-    assert "param-holding-days" in html
-    assert "param-decay-days" in html
-    assert "param-top-quantile" in html
-    assert "param-evaluation-start" in html
-    assert "param-evaluation-end" in html
-    assert "param-backtest-start" in html
-    assert "param-backtest-end" in html
+    # P1 (WORKORDER P1 减法): the resident #validation-controls 11-parameter
+    # grid is DELETED from the served page -- absorbed into the pipeline
+    # confirm card's expert density (tests/test_web_pipeline_view.py pins
+    # the replacement markers there, both presence and absence). Matched by
+    # the full id="..." form: the CP10 synthesis module's OWN, unrelated
+    # #synth-backtest-params grid uses the same short suffixes (e.g.
+    # id="synth-param-holding-days"), which a bare substring check would
+    # false-positive on.
+    for param_id in ("param-holding-days", "param-decay-days", "param-top-quantile", "param-evaluation-start", "param-evaluation-end", "param-backtest-start", "param-backtest-end"):
+        assert f'id="{param_id}"' not in html, param_id
     assert "llm-api-key-mode" in html
     assert "llm-api-key" in html
     assert 'data-secret-policy="not-submitted"' in html
@@ -1122,11 +1136,15 @@ allowed_interval_days: [5]
     assert "RD Campaign" not in html
     assert "rd-campaign" not in bundle
     assert "RD Campaign" not in bundle
-    assert 'value="5"' in html
+    # R3.1 (owner-ruled, spec §8): the rd-interval 自动周期 select is DELETED,
+    # so its default option (value="5" from default_interval_days) no longer
+    # renders. The RD config's default_max_candidates (value="2") still fills
+    # the #rd-max input.
     assert 'value="2"' in html
     assert '<option value="rank_icir" selected>ICIR</option>' in html
     assert '<option value="balanced" selected>' not in html
-    assert '<option value="5" selected>5天</option>' in html
+    # R3.1: the rd-interval 自动周期 select (and its "5天" option) is DELETED.
+    assert '<option value="5" selected>5天</option>' not in html
     assert "LLM parser: deepseek / fake-deepseek" in html
     assert "RD optimizer: research local deterministic" in html
     assert '<option value="deepseek" selected>deepseek / fake-deepseek · env QF_TEST_DEEPSEEK_KEY</option>' in html
