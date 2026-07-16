@@ -1392,6 +1392,50 @@ def test_outcomes_ledger_lives_beside_the_other_memory_files(tmp_path: Path) -> 
     assert store.outcomes_ledger_path.parent == store.observations_path.parent
 
 
+def test_read_jsonl_survives_torn_multibyte_tail_and_repairs_on_append(tmp_path: Path) -> None:
+    # F17: a JSONL file ending in a TRUNCATED multibyte UTF-8 sequence (half of
+    # a CJK character, from a writer killed mid-character) crashed BOTH the
+    # read (whole-file read_text -> UnicodeDecodeError) and the write-side
+    # repair (_repair_torn_tail's json.loads(bytes) -> uncaught
+    # UnicodeDecodeError). The read must quarantine the torn tail, and the next
+    # append must move it to a .corrupt sidecar and continue on a clean line.
+    from quant_forge.research_loop.memory import (
+        _append_jsonl,
+        _quarantine_path_for,
+        _read_jsonl,
+    )
+
+    path = tmp_path / "ledger.jsonl"
+    good = {"outcome_id": "a" * 64, "value": 1}
+    torn_tail = "中".encode("utf-8")[:2]  # E4 B8 of E4 B8 AD -- invalid on its own
+    path.write_bytes(json.dumps(good).encode("utf-8") + b"\n" + torn_tail)
+
+    # Read path: no crash, valid row returned, torn tail dropped (quarantined).
+    assert _read_jsonl(path) == [good]
+
+    # Write path: the append repairs the torn tail and lands the new row.
+    nxt = {"outcome_id": "b" * 64, "value": 2}
+    _append_jsonl(path, nxt)
+    assert _read_jsonl(path) == [good, nxt]
+    sidecar = _quarantine_path_for(path)
+    assert sidecar.exists()
+    assert sidecar.read_bytes().startswith(torn_tail)
+
+
+def test_ledger_with_torn_multibyte_tail_still_ingests(tmp_path: Path) -> None:
+    # F17 through the real store: an outcomes ledger whose tail is a torn
+    # multibyte sequence still reads (known_outcome_ids) and still accepts a
+    # subsequent envelope append without raising.
+    store = ResearchMemoryStore(tmp_path / "artifact_root")
+    store.record_outcome_envelope(_envelope("a" * 64))
+    with store.outcomes_ledger_path.open("ab") as handle:
+        handle.write("中".encode("utf-8")[:2])  # torn multibyte tail, no newline
+
+    assert store.known_outcome_ids() == {"a" * 64}  # read survives the torn tail
+    assert store.record_outcome_envelope(_envelope("b" * 64)) is True  # append repairs + continues
+    assert store.known_outcome_ids() == {"a" * 64, "b" * 64}
+
+
 # ---------------------------------------------------------------------------
 # End-to-end memory wiring in the research loop (O2)
 # ---------------------------------------------------------------------------

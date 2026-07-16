@@ -1435,20 +1435,37 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     not the benign shape -- and still raises, mirroring SE-P3's local-
     producer trailing-corruption-quarantine pattern
     (docs/coordination/ENGINEERING_PROGRESS.md).
+
+    Byte-level decode (F17): the read splits on the newline byte and decodes
+    each line on its own rather than decoding the whole file up front. A
+    whole-file ``read_text(encoding="utf-8")`` raised ``UnicodeDecodeError``
+    on a torn multibyte tail (a writer that died mid-character, e.g. half a
+    CJK code point) BEFORE any quarantine could run, crashing every read.
+    Per-line strict decoding routes an undecodable tail through the SAME
+    trailing-line tolerance a malformed-JSON tail already gets (quarantine if
+    trailing, raise if interior).
     """
 
     if not path.exists():
         return []
-    lines = path.read_text(encoding="utf-8").splitlines()
-    last_line_number = len(lines)
+    raw = path.read_bytes()
+    if not raw:
+        return []
+    byte_lines = raw.split(b"\n")
+    # A trailing newline yields one empty final segment that ``splitlines()``
+    # would not have produced -- drop exactly that one so the trailing-line
+    # numbering matches the historical shape.
+    if byte_lines and byte_lines[-1] == b"":
+        byte_lines.pop()
+    last_line_number = len(byte_lines)
     rows: list[dict[str, Any]] = []
-    for line_number, line in enumerate(lines, start=1):
-        stripped = line.strip()
+    for line_number, byte_line in enumerate(byte_lines, start=1):
+        stripped = byte_line.strip()
         if not stripped:
             continue
         try:
-            rows.append(json.loads(stripped))
-        except json.JSONDecodeError:
+            rows.append(json.loads(stripped.decode("utf-8")))
+        except (UnicodeDecodeError, json.JSONDecodeError):
             if line_number == last_line_number:
                 logger.warning(
                     "quarantining malformed trailing line %d in %s (writer-died-mid-append shape)",
@@ -1522,7 +1539,11 @@ def _repair_torn_tail(path: Path) -> None:
         tail = data[last_newline + 1 :]
         try:
             json.loads(tail.strip())
-        except json.JSONDecodeError:
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            # F17: ``tail`` is raw bytes; a torn multibyte tail makes
+            # ``json.loads`` raise UnicodeDecodeError, which the old
+            # JSONDecodeError-only clause let escape uncaught. Both mean "not
+            # valid JSON" and route the fragment to the same quarantine below.
             pass
         else:
             # Valid JSON, merely missing its newline terminator: not the
