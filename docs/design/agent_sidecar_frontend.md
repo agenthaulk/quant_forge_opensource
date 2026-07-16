@@ -33,8 +33,8 @@ canonical renderers (`metric.js`, `views/charts.js`, `views/dsl.js`,
 **server-derived**; client and agent claims are never trusted.
 
 **Provenance.** Converged over three adversarial rounds: R1 (Codex, default
-xhigh) attacked the architecture thesis; an owner deep interview locked four
-product decisions; R2 (Codex, `gpt-5.6-sol`) attacked this frontend design
+xhigh) stress-tested the architecture thesis; an owner deep interview locked four
+product decisions; R2 (Codex, `gpt-5.6-sol`) adversarially reviewed this frontend design
 with 16 grounded findings (all adopted; verdicts: every component MODIFY,
 none DROP); R3/R3.1 are owner directives (dual pipeline split;
 anti-bloat governance; RD interval inheritance). Round summaries: Appendix A.
@@ -379,7 +379,7 @@ form/button operation is always first-class.
 - **Owner deep interview (4 locks):** simple mode default landing;
   hypothesis-level-only clarify (≤3, defaults); in-process typed adapter
   (MCP-ready signatures, no server); blueprint before code.
-- **R2 (Codex, `gpt-5.6-sol`, frontend round):** 16 attacks + 16 gaps;
+- **R2 (Codex, `gpt-5.6-sol`, frontend round):** 16 probes + 16 gaps;
   verdicts all-MODIFY. Net cost corrections adopted: pipeline aggregate is
   net-new (jobs are terminal-only); stage count must match execution
   truth; client-suppliable badges are forgeable; confirm needs idempotency;

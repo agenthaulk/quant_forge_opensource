@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
@@ -55,8 +56,10 @@ from quant_forge.research_loop.contracts import (
 )
 from quant_forge.research_loop.experiment_planner import ExperimentPlanner
 from quant_forge.research_loop.feedback_builder import build_feedback
+from quant_forge.research_loop.local_outcomes import experiment_result_to_outcome
 from quant_forge.research_loop.memory import ResearchMemoryStore
 from quant_forge.research_loop.operator_drafts import write_operator_draft_artifacts
+from quant_forge.research_loop.outcome_ingest import ingest_outcome
 from quant_forge.research_loop.strategy_selector import (
     StrategyContext,
     StrategyDecision,
@@ -65,6 +68,7 @@ from quant_forge.research_loop.strategy_selector import (
 from quant_forge.research_loop.trace_store import ResearchTraceStore, utc_timestamp
 from quant_forge.workbench.service import evaluation_data_window
 
+logger = logging.getLogger(__name__)
 
 DEFAULT_QUICK_HORIZON_DAYS = (5, 21)
 DEFAULT_QUICK_SAMPLE_SPLITS = (SampleSplitSpec(name="IS", fraction=1.0, score_weight=1.0),)
@@ -127,6 +131,25 @@ class ResearchGate:
         # is constructed directly instead of via the strict YAML loader.
         if not isinstance(self.missing_oos_evidence_blocks, bool):
             raise ValueError("missing_oos_evidence_blocks must be a boolean")
+        # SE-P2 re-verify RV2-F4: NaN slips through every `< 0` comparison
+        # below and +/-inf passes the minimum checks, then blows up LATE in
+        # the settings-token serialization after research artifacts were
+        # already written. A non-finite threshold is never meaningful; fail
+        # at construction.
+        for numeric_field in (
+            "min_ic_days",
+            "min_coverage",
+            "min_score",
+            "min_backtest_periods",
+            "min_oos_net_annualized_return",
+            "max_rebalance_rate",
+            "max_turnover_rate",
+            "min_net_return_retention",
+            "max_oos_net_return_decay",
+        ):
+            value = getattr(self, numeric_field)
+            if value is not None and not isfinite(value):
+                raise ValueError(f"{numeric_field} must be finite")
         if self.min_ic_days < 0:
             raise ValueError("min_ic_days must be non-negative")
         if not 0 <= self.min_coverage <= 1:
@@ -1034,53 +1057,66 @@ class ResearchLoopService:
             seed_assessment=seed_assessment,
             config_snapshot=config_snapshot,
         )
-        self._record_memory_observations(run_id, results)
+        self._record_memory_observations(run_id, results, candidate_gate)
         self._created_factor_ids.clear()
         self._promoted_factor_snapshots.clear()
         return result
 
-    def _record_memory_observations(self, run_id: str, results: list[ResearchCandidateResult]) -> None:
-        """Record this run's candidate outcomes as durable memory observations.
+    def _record_memory_observations(
+        self, run_id: str, results: list[ResearchCandidateResult], gate: ResearchGate
+    ) -> None:
+        """Record this run's candidate outcomes as durable memory (SE-P2).
 
-        Gate-blocked candidates become failure-class observations; accepted
-        candidates become finding-class observations. Statements are compact
-        redacted summaries (formula fingerprint family + gate reason
-        families) — no raw data, no paths, no free text. ``promote_pending``
-        runs once at completion so repeated signatures across runs can
-        promote deterministically.
+        Each candidate is mapped to one neutral ``ResearchOutcome``
+        (``local_outcomes.experiment_result_to_outcome``) and ingested through
+        the shared kernel sink (``outcome_ingest.ingest_outcome``): an
+        outcomes-ledger envelope (exact replay-drop by ``outcome_id``), its
+        derived ``MemoryObservation`` rows, and deterministic promotion. This
+        REPLACES the pre-SE-P2 ad-hoc ``rd_accepted:``/``rd_gate_blocked:``
+        raw-fingerprint signatures with the v2 four-axis identity (stage /
+        verdict / reason_codes / lifecycle_status): grouping now unifies by
+        reason-code family and scope rather than raw formula fingerprint,
+        which is the DESIGNED generalization behavior (SE-ii), not a
+        regression.
+
+        ``ingest_outcome`` calls ``promote_pending()`` once per outcome; that
+        is acceptable here (promotion is a pure, deterministic function of
+        the full observation set each time, so calling it once per candidate
+        in a small per-run loop costs some redundant re-reads but never
+        changes the outcome) rather than batching all of this run's envelopes
+        and observations first and promoting once at the end — the simpler,
+        per-outcome call keeps this loop a thin pass-through over the shared
+        sink instead of re-implementing its steps here.
+
+        ``gate`` is the effective ``ResearchGate`` this run's candidates were
+        judged under; the producer folds it into the derived
+        ``settings_profile`` scope token so evidence produced under
+        materially different thresholds can never share a signature
+        (SE-P2 review finding P2-F4).
+
+        A candidate result with no representable outcome in the neutral
+        vocabulary (``experiment_result_to_outcome`` returns None: an
+        unrepresentable factor identity, or a block carried ONLY by
+        administrative/unmapped reason families) is skipped and logged here,
+        at the caller, rather than inside the pure mapper.
         """
 
         if self.memory_store is None:
             return
         for result in results:
-            fingerprint = result.formula_fingerprint or factor_formula_fingerprint(result.factor)
-            window = _memory_data_window(result.evaluation)
-            if result.gate_passed:
-                self.memory_store.record_observation(
-                    signature=f"rd_accepted:{fingerprint}",
-                    statement=(
-                        f"accepted candidate formula family {fingerprint[:12]} passed the research gate"
-                    ),
-                    run_id=run_id,
-                    data_window=window,
+            outcome = experiment_result_to_outcome(result, run_id=run_id, gate=gate)
+            if outcome is None:
+                logger.info(
+                    "skipping memory observation for run %s candidate %s: no representable outcome "
+                    "(factor identity or reason families outside the neutral vocabulary)",
+                    run_id,
+                    result.factor.factor_id if result.factor is not None else "<unknown>",
                 )
-            else:
-                families = _gate_reason_families(result.gate_reasons)
-                # P2: the durable statement carries only the value-free reason
-                # families; full gate reasons stay in trace/report artifacts so
-                # provider-channel or repair-exception free text never reaches
-                # durable memory.
-                self.memory_store.record_observation(
-                    signature="rd_gate_blocked:" + fingerprint + ":" + ",".join(families),
-                    statement=(
-                        f"gate blocked candidate formula family {fingerprint[:12]}: "
-                        + ", ".join(families)
-                    ),
-                    run_id=run_id,
-                    data_window=window,
-                    failure_class="gate_blocked",
-                )
-        self.memory_store.promote_pending()
+                continue
+            # F1: the MAIN store is LOCAL-only (SE-i), and this producer only
+            # ever mints origin="local" outcomes -- assert that at the ingress
+            # boundary so a future non-local outcome can never be persisted here.
+            ingest_outcome(self.memory_store, outcome, expected_origin="local")
 
     def _raise_if_cancelled(self) -> None:
         if self.cancel_event is not None and self.cancel_event.is_set():
@@ -2857,31 +2893,6 @@ def _finite_float_or_none(value: Any) -> float | None:
         return None
     number = float(value)
     return number if isfinite(number) else None
-
-
-def _memory_data_window(evaluation: EvaluationResult) -> str:
-    """``start:end`` from the run's evaluation window, or "" when unknown (FP-4)."""
-
-    window = evaluation_data_window(evaluation)
-    if str(window.get("status")) != "available":
-        return ""
-    return f"{window.get('start_date')}:{window.get('end_date')}"
-
-
-def _gate_reason_families(reasons: tuple[str, ...]) -> tuple[str, ...]:
-    """Stable, value-free gate-reason families for memory signatures.
-
-    Gate reasons embed run-specific numbers ("score 0.0123 < 0.5"); the
-    signature must be identical when the SAME kind of failure recurs across
-    runs, so only the leading reason word (metric/clause name) is kept.
-    """
-
-    families: list[str] = []
-    for reason in reasons:
-        family = str(reason).split(":", 1)[0].split(" ", 1)[0].strip()
-        if family:
-            families.append(family)
-    return tuple(sorted(dict.fromkeys(families)))
 
 
 _RUN_ID_SUFFIX_RE = re.compile(r"\d{8}T\d{12}Z_[0-9a-f]{8}")

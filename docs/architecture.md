@@ -29,7 +29,7 @@ Local Data Provider
 | `quant_forge.factor_engine` | Safe formula execution, mounted daily factor-value reuse, and shared score preparation over local panels. |
 | `quant_forge.evaluation` | Deterministic single-factor metrics. |
 | `quant_forge.backtesting` | Lightweight next-day factor backtest. |
-| `quant_forge.research_loop` | Local RD loop: hypotheses, candidate scoring, smoke gates, Markdown reports, and in-process web scheduling. |
+| `quant_forge.research_loop` | Local RD loop: hypotheses, candidate scoring, smoke gates, Markdown reports, in-process web scheduling, and the local research-outcome memory (see "Self-Evolution Research Memory"). |
 | `quant_forge.workbench` | Use-case orchestration. |
 | `quant_forge.mcp` | Read-only catalogs for agents and LLM tooling. |
 | `quant_forge.agent_workspace` | Safe agent tool facade. Factor proposals are returned as data (not persisted) and promotion is refused; `evaluate_factor` writes a standard evaluation artifact under `artifact_root`, identical to the CLI/Web path. Artifact growth is bounded by the retention policy (`scripts/prune_artifacts.py`). |
@@ -242,6 +242,86 @@ OOS net return, rebalance rate, turnover rate, net/gross retention, and OOS
 decay. The public parameter search supports `full_grid` and
 `successive_halving`; successive halving is a two-stage budget strategy, not
 reinforcement learning.
+
+## Self-Evolution Research Memory
+
+The research loop carries a local, durable research-outcome memory so that
+repeated RD work accumulates evidence instead of re-discovering it. It is a
+research notebook with promotion rules, not an autonomous trading learner:
+nothing in this layer executes trades, changes gates by itself, or promotes
+factors to `active`.
+
+Contract (`research_loop/outcomes.py`, `qf.research_outcome.v2`):
+
+- Every producer emits a neutral `ResearchOutcome` built from closed
+  vocabularies only: stages (`evaluate`/`backtest`/`gate`/`prescreen`/
+  `simulate`/`submit`), verdicts (`passed`/`blocked`/`unknown`/
+  `not_applicable`), a neutral reason-code registry, a closed metric-key
+  registry with fixed units, and a sample-role axis. Registries are
+  read-only collections; extending a vocabulary is a reviewed contract
+  change.
+- Outcome identity is the logical evidence run:
+  `hash(factor_fingerprint × canonical window × stage)`. Re-measuring the
+  same evidence reuses the same `evidence_run_id`, so promotion's
+  ">= 2 distinct runs" threshold keeps meaning independent evidence rather
+  than retry count.
+- Evidence strength is derived from the declared stage and can never exceed
+  it. Submission lifecycle states are bookkeeping with a fixed
+  one-verdict-per-state coherence matrix; they never enter scientific
+  denominators.
+- Honesty rules: metric readings are status-carrying (`null` plus a status,
+  never a fabricated `0.0`); statements come from closed templates so free
+  text never reaches the ledger; identity fields are rejected, not
+  rewritten, when redaction would alter them.
+
+Dual-domain rule: the main store ingests `origin="local"` outcomes only.
+External-plugin producers write to their own store instance under a
+plugin-local root and steer only that plugin's work; plugin evidence never
+mixes into the local promotion pool.
+
+The data path is producer → ingress → store → read models:
+
+- `local_outcomes.experiment_result_to_outcome` maps one RD candidate
+  result to an outcome (pure, no I/O). The effective research gate
+  contributes only a derived `settings_profile` scope token. Results with
+  no representable outcome (foreign factor-id charset, administrative-only
+  block reasons) map to `None` — fail-closed — and the caller logs the skip.
+- `outcome_ingest.ingest_outcome` appends the envelope plus its derived
+  observations in one atomic store critical section; replayed envelopes are
+  idempotent.
+- `ResearchMemoryStore` persists append-only JSONL ledgers under
+  `artifact_root` behind an advisory file lock. Rule governance
+  (activate/deactivate/retire/unretire) is an append-only, row-bound event
+  log with a required reviewer identity.
+- Steering has exactly one owner: the pre-generation context builder reads
+  `effective_active_rules()` into a bounded, re-authenticated prompt
+  channel. Neither the priors view nor the review surfaces steer anything.
+
+Read models and surfaces:
+
+- `priors.py` computes pass/fail structure by generalization dimension from
+  the deduplicated outcome envelopes — computed on read, never persisted.
+  Rows are re-validated on read; invalid rows are excluded and surfaced as
+  `invalid_rows`, never silently zero-weighted. Only `passed`/`blocked`
+  enter rate denominators. CLI: `qf memory priors [--json]`.
+- CLI rule review: `qf memory rules
+  list|activate|deactivate|retire|unretire` (reviewer `--actor` required;
+  rationale is redacted before persistence).
+- Web review tab: `GET /api/memory/review` renders promoted
+  findings/failures from `promoted_review_snapshot` and rule states from
+  `rule_review_snapshot` — each a single-lock snapshot — and
+  `POST /api/memory/review/rule` / `/api/memory/review/promoted` append
+  exactly one validated review event.
+- `planning_influence.py` freezes the `planning_influence_snapshot`
+  contract: `capture_planning_influence` reads, in one lock hold, exactly
+  which learned steering could have influenced a run — including the
+  outcomes-ledger revision, the review-event revision, the ordered
+  authenticated active rules, and the prompt-policy constants. The
+  snapshot is designed to be captured at web-pipeline confirm time, its
+  hash filling a reserved `planning_influence_hash` slot in the pipeline
+  `input_hash`; that wiring belongs to the agent-sidecar track and is not
+  present on this branch. The contract is golden-vector pinned: any change
+  to its canonical form or hash is a reviewed contract change.
 
 ## Multi-Factor Synthesis Memory
 
