@@ -142,6 +142,19 @@ let resultEl = null;
 // F2d: app.js wires this to pipeline.js::createEditedFormulaRun so the module
 // stays a pure formula editor with no direct pipeline-lifecycle coupling.
 let onRunEditedFormula = null;
+// F12 (formula editor parent binding): the pipeline this editor was OPENED on,
+// captured at open time and forwarded verbatim when the user runs the edit --
+// so a run always targets the pipeline the expert was editing, never whatever
+// `currentPipeline` (which this module deliberately cannot see) has since
+// become. An opaque token to this module; app.js supplies and consumes it.
+let capturedParentPipelineId = null;
+// F14 (stale pre-validation verdict): a monotonic generation counter. Every
+// pre-validation captures the current generation; any later edit (or a fresh
+// open) bumps it, so an out-of-generation response is dropped instead of
+// overwriting a fresher verdict, and the displayed verdict is cleared the
+// moment the formula changes -- the run button is thereby gated on a FRESH
+// validation, never a stale "ready" from a formula the user has since edited.
+let validationGeneration = 0;
 
 /* Repaint the aria-hidden highlight overlay from the textarea's CURRENT value.
  * The IME guard (below) is the ONLY thing that gates this: it is a no-op while
@@ -149,6 +162,27 @@ let onRunEditedFormula = null;
 function syncOverlay() {
   if (!inputEl || !overlayEl) return;
   overlayEl.innerHTML = renderFormulaOverlay(inputEl.value);
+}
+
+/* F15 (IME preedit visibility): while a CJK composition is in flight the raw
+ * textarea text is what the user is actively editing, but `.formula-input` is
+ * `color: transparent` (the aria-hidden overlay draws the highlighted copy),
+ * so the preedit / candidate text would be INVISIBLE. Toggling `is-composing`
+ * restores the textarea's own text colour AND hides the overlay for the
+ * duration of the composition; compositionend/blur restore overlay mode and
+ * resync. Both target elements carry an id, so the toggle is observable. */
+function setComposingVisible(on) {
+  if (inputEl && inputEl.classList) inputEl.classList.toggle('is-composing', on);
+  if (overlayEl && overlayEl.classList) overlayEl.classList.toggle('is-composing', on);
+}
+
+/* F14: an edit after a verdict makes that verdict (and its run-edited button,
+ * if any) stale. Bump the generation so any in-flight validation response is
+ * dropped, and clear the displayed verdict so the run action is gated on a
+ * fresh pre-validation. */
+function invalidatePreValidation() {
+  validationGeneration += 1;
+  if (resultEl && resultEl.innerHTML !== '') resultEl.innerHTML = '';
 }
 
 /* Render the shell once and wire the persistent child elements. Idempotent:
@@ -166,9 +200,19 @@ function ensureRendered() {
   // disturb the candidate window / cursor. So compositionstart latches a flag
   // that makes `input` a no-op, and the overlay is repainted exactly ONCE on
   // compositionend (plus on ordinary, non-composed input).
-  inputEl.addEventListener('compositionstart', () => { composing = true; });
-  inputEl.addEventListener('compositionend', () => { composing = false; syncOverlay(); });
-  inputEl.addEventListener('input', () => { if (!composing) syncOverlay(); });
+  inputEl.addEventListener('compositionstart', () => { composing = true; setComposingVisible(true); });
+  inputEl.addEventListener('compositionend', () => { composing = false; setComposingVisible(false); syncOverlay(); });
+  // F14: any edit clears a now-stale verdict and drops an in-flight validation.
+  inputEl.addEventListener('input', () => { if (!composing) syncOverlay(); invalidatePreValidation(); });
+  // F15: some IMEs end a composition with a blur (tab/click away) rather than a
+  // compositionend; reset the composing state so the overlay is never left
+  // hidden with the textarea stuck in preedit-visible mode.
+  inputEl.addEventListener('blur', () => {
+    if (!composing) return;
+    composing = false;
+    setComposingVisible(false);
+    syncOverlay();
+  });
   // Keep the overlay scroll-aligned with the textarea so the highlight tracks
   // the visible text on long formulas.
   inputEl.addEventListener('scroll', () => {
@@ -195,7 +239,10 @@ async function runEditedFormula(btn) {
   if (!formula.trim()) return;
   if (btn) btn.disabled = true;
   try {
-    await onRunEditedFormula(formula);
+    // F12: run against the pipeline this editor was OPENED on (captured at
+    // open time), never whatever the pipeline module's current pipeline has
+    // since become.
+    await onRunEditedFormula(formula, capturedParentPipelineId);
     closeFormulaCard();
   } catch (error) {
     if (resultEl) {
@@ -218,6 +265,10 @@ async function runPreValidation(btn) {
     });
     return;
   }
+  // F14: capture this request's generation; a later edit (or another
+  // pre-validate) bumps the counter, so an out-of-generation response below is
+  // dropped rather than overwriting a fresher verdict.
+  const generation = ++validationGeneration;
   if (btn) btn.disabled = true;
   resultEl.innerHTML = '<p class="meta">预验证中...</p>';
   try {
@@ -225,8 +276,10 @@ async function runPreValidation(btn) {
     // and NEVER persists / evaluates / backtests (apps/web/pipeline.py::
     // pre_validate_formula). An unknown operator comes back as a review packet.
     const result = await postJson('/api/pipelines/pre-validate', { formula });
+    if (generation !== validationGeneration) return;  // F14: superseded -> drop
     resultEl.innerHTML = renderPreValidationResult(result);
   } catch (error) {
+    if (generation !== validationGeneration) return;  // F14: drop a stale error too
     resultEl.innerHTML = renderPreValidationResult({
       status: 'blocked', executed: false, persisted: false,
       blocking_reasons: [(error && error.message) || '预验证失败']
@@ -236,14 +289,18 @@ async function runPreValidation(btn) {
   }
 }
 
-/* Reveal the card seeded with `formula`, syncing the overlay once. Safe to
- * call repeatedly; the shell is rendered lazily on first open. */
-export function openFormulaCard(formula) {
+/* Reveal the card seeded with `formula`, binding it to `parentPipelineId` (the
+ * pipeline the expert is editing FROM, captured now so a later run targets it
+ * regardless of what the pipeline module's current pipeline becomes -- F12).
+ * Safe to call repeatedly; the shell is rendered lazily on first open. */
+export function openFormulaCard(formula, parentPipelineId) {
   if (!mount) return;
   ensureRendered();
+  capturedParentPipelineId = parentPipelineId || null;  // F12: bind to the owning pipeline NOW
   if (inputEl) inputEl.value = formula || '';
   syncOverlay();
   if (resultEl) resultEl.innerHTML = '';
+  validationGeneration += 1;  // F14: a fresh open starts a new verdict epoch
   mount.hidden = false;
   const heading = mount.querySelector && mount.querySelector('.formula-card-title');
   if (heading && typeof heading.focus === 'function') heading.focus();

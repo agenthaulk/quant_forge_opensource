@@ -38,6 +38,7 @@ import {
   createEditedFormulaRun,
   createPipelineFromParseJob,
   createRdPipeline,
+  currentPipelineId,
   currentPipelineParameters,
   hasActivePipeline,
   initPipelineModule,
@@ -536,8 +537,10 @@ initNarrationModule();
 // derived server-side). app.js owns the pipeline-card handoff + scroll; the
 // formula module stays a pure editor.
 initFormulaModule({
-  onRunEditedFormula: async formula => {
-    await createEditedFormulaRun(formula);
+  onRunEditedFormula: async (formula, parentPipelineId) => {
+    // F12: the run targets the pipeline the editor was OPENED on (captured by
+    // the formula module at open time), not whatever currentPipeline is now.
+    await createEditedFormulaRun(formula, { parentPipelineId });
     const mount = document.getElementById('pipeline-card-mount');
     if (mount && mount.scrollIntoView) mount.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
@@ -899,7 +902,9 @@ if (rdEntryButton) {
 if (formulaEditButton) {
   formulaEditButton.addEventListener('click', () => {
     const formula = (parsedIdea && parsedIdea.factor && parsedIdea.factor.formula) || '';
-    openFormulaCard(formula);
+    // F12: capture the owning pipeline id NOW (open time) so a later run edits
+    // THIS pipeline even if currentPipeline changes before the user runs it.
+    openFormulaCard(formula, currentPipelineId());
     const mount = document.getElementById('formula-card-mount');
     if (mount && mount.scrollIntoView) mount.scrollIntoView({ behavior: 'smooth', block: 'start' });
   });

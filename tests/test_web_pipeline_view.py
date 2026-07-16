@@ -959,6 +959,102 @@ def test_node_pipeline_render_smoke(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Node smoke: F7 durable report rejoin -- a persisted pipeline id that has
+# fallen OUT of the (bounded) active listing is re-attached to DIRECTLY, so a
+# reload never strands the user's own just-finished report.
+# ---------------------------------------------------------------------------
+
+
+_PIPELINE_REJOIN_SMOKE_HARNESS = r"""
+function makeElement(id) {
+  const attrs = new Map();
+  const listeners = new Map();
+  const el = {
+    id, value: '', innerHTML: '', textContent: '', dataset: {}, style: {},
+    addEventListener(type, fn) { if (!listeners.has(type)) listeners.set(type, []); listeners.get(type).push(fn); },
+    dispatchEvent(evt) { (listeners.get(evt.type) || []).slice().forEach(fn => fn.call(el, evt)); return true; },
+    setAttribute(n, v) { attrs.set(n, String(v)); }, getAttribute(n) { return attrs.has(n) ? attrs.get(n) : null; },
+    removeAttribute(n) { attrs.delete(n); }, hasAttribute(n) { return attrs.has(n); },
+    querySelector() { return null; }, querySelectorAll() { return []; }, closest() { return null; }, focus() {},
+    get hidden() { return attrs.has('hidden'); }, set hidden(v) { if (v) attrs.set('hidden', ''); else attrs.delete('hidden'); }
+  };
+  return el;
+}
+const registry = new Map();
+globalThis.document = {
+  getElementById(id) { if (!registry.has(id)) registry.set(id, makeElement(id)); return registry.get(id); },
+  querySelector() { return null; }, querySelectorAll() { return []; }, createElement() { return makeElement(''); }
+};
+const sessionStore = new Map([['qf_active_pipeline_id', 'PL_persisted_completed']]);
+globalThis.window = { sessionStorage: {
+  getItem: k => (sessionStore.has(k) ? sessionStore.get(k) : null),
+  setItem: (k, v) => sessionStore.set(k, String(v)), removeItem: k => sessionStore.delete(k)
+} };
+
+const stages = ['parse', 'confirm', 'compute', 'report'].map(s => ({ stage_id: s, status: 'completed', child_job_id: null }));
+const COMPLETED = {
+  pipeline_id: 'PL_persisted_completed', kind: 'factor_study', status: 'completed', stages,
+  confirm: { nonce: 'n', version: 1, confirmed_at: 't' },
+  factor: { factor_id: 'FTR_ABCDEFGH', name: 'x', formula: '-rank(market_cap)', description: '', horizon_days: 5, universe_filters: [] },
+  parameters: {}, confirmed_parameters: {}, provenance: [], warnings: [], failure: null, artifact_refs: [],
+  published_factor_id: 'FTR_ABCDEFGH', publish_state: 'published'
+};
+const calls = [];
+globalThis.fetch = async (url, options) => {
+  calls.push(((options && options.method) || 'GET') + ' ' + url);
+  const json = (obj, status = 200) => ({ ok: status < 400, status, json: async () => obj });
+  // The completed pipeline has fallen OUT of the bounded active listing ...
+  if (url === '/api/pipelines') return json({ pipelines: [] });
+  // ... so rejoin must re-attach to the PERSISTED id directly.
+  if (url === '/api/pipelines/PL_persisted_completed') return json(COMPLETED);
+  throw new Error('unexpected fetch: ' + url);
+};
+
+const mod = await import(process.env.QF_PIPELINE_URL);
+const { initPipelineModule, rejoinActivePipelines, currentPipelineId } = mod;
+
+let failed = 0;
+function check(name, cond, detail) { if (cond) console.log('PASS ' + name); else { failed++; console.log('FAIL ' + name + (detail ? ': ' + detail : '')); } }
+
+let completedArg = null;
+initPipelineModule({ onCompleted: p => { completedArg = p; } });
+const rejoined = await rejoinActivePipelines();
+await new Promise(r => setTimeout(r, 0));
+
+check('f7_rejoined_the_persisted_completed_pipeline', rejoined && rejoined.pipeline_id === 'PL_persisted_completed', JSON.stringify(rejoined));
+check('f7_fetched_report_bearing_record_directly', calls.includes('GET /api/pipelines/PL_persisted_completed'), JSON.stringify(calls));
+check('f7_current_pipeline_is_the_rejoined_one', currentPipelineId() === 'PL_persisted_completed');
+check('f7_completed_callback_fired_so_report_is_retrievable', completedArg && completedArg.pipeline_id === 'PL_persisted_completed');
+
+console.log('SMOKE RESULT: ' + failed + ' failed');
+if (failed) process.exit(1);
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runtime not available")
+def test_node_pipeline_rejoin_persisted_completed_smoke(tmp_path) -> None:
+    harness = tmp_path / "pipeline_rejoin_smoke.mjs"
+    harness.write_text(_PIPELINE_REJOIN_SMOKE_HARNESS, encoding="utf-8")
+    env = {"QF_PIPELINE_URL": PIPELINE_JS_PATH.resolve().as_uri()}
+    result = subprocess.run(
+        ["node", str(harness)],
+        capture_output=True,
+        text=True,
+        env={**dict(__import__("os").environ), **env},
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + "\n" + result.stderr
+    assert "SMOKE RESULT: 0 failed" in result.stdout
+    for marker in (
+        "PASS f7_rejoined_the_persisted_completed_pipeline",
+        "PASS f7_fetched_report_bearing_record_directly",
+        "PASS f7_current_pipeline_is_the_rejoined_one",
+        "PASS f7_completed_callback_fired_so_report_is_retrievable",
+    ):
+        assert marker in result.stdout, result.stdout
+
+
+# ---------------------------------------------------------------------------
 # Node smoke: the REAL app.js end to end against a scripted fake server
 # ---------------------------------------------------------------------------
 

@@ -240,6 +240,13 @@ function makeElement(id) {
   const el = {
     id, value: '', innerHTML: '', textContent: '', scrollTop: 0, scrollLeft: 0,
     dataset: {}, style: {},
+    classList: {
+      _set: new Set(),
+      add(...names) { names.forEach(n => this._set.add(n)); },
+      remove(...names) { names.forEach(n => this._set.delete(n)); },
+      contains(n) { return this._set.has(n); },
+      toggle(n, force) { const on = force === undefined ? !this._set.has(n) : !!force; if (on) this._set.add(n); else this._set.delete(n); return on; }
+    },
     addEventListener(type, fn) { if (!listeners.has(type)) listeners.set(type, []); listeners.get(type).push(fn); },
     dispatchEvent(evt) { (listeners.get(evt.type) || []).slice().forEach(fn => fn.call(el, evt)); return true; },
     setAttribute(name, value) { attrs.set(name, String(value)); },
@@ -303,6 +310,52 @@ check('review_shows_operator_drafts', review.includes('operator_drafts'));
 check('review_states_hot_executed_false', review.includes('hot_executed=false'));
 check('review_lists_unknown_operator', review.includes('ts_made_up'));
 
+// F15 (IME preedit visibility): during an active composition the textarea text
+// is made visible (is-composing) and the overlay hidden, restored on end.
+input.dispatchEvent({ type: 'compositionstart', target: input });
+check('f15_input_visible_during_composition', input.classList.contains('is-composing'));
+check('f15_overlay_hidden_during_composition', overlay.classList.contains('is-composing'));
+input.value = 'rank(close)运';                 // an in-flight IME candidate
+input.dispatchEvent({ type: 'input', target: input });
+check('f15_stays_visible_mid_composition', input.classList.contains('is-composing'));  // input must not reset it
+input.dispatchEvent({ type: 'compositionend', target: input });
+check('f15_input_restored_after_composition', !input.classList.contains('is-composing'));
+check('f15_overlay_restored_after_composition', !overlay.classList.contains('is-composing'));
+
+// F14 (stale verdict): a shown verdict is cleared by any edit, so the run
+// button is gated on a fresh validation and never a stale "ready".
+const resultSlot = document.getElementById('formula-prevalidate-result');
+resultSlot.innerHTML = renderPreValidationResult({ status: 'ready', fingerprint: 'zzz', executed: false, persisted: false });
+check('f14_verdict_present_before_edit', resultSlot.innerHTML.includes('zzz'));
+input.value = 'rank(volume)';
+input.dispatchEvent({ type: 'input', target: input });
+check('f14_edit_clears_stale_verdict', resultSlot.innerHTML === '', resultSlot.innerHTML);
+
+// F14 (generation drop): a validation response that arrives AFTER a later edit
+// is dropped, never overwriting the cleared verdict.
+let resolvePending = null;
+globalThis.fetch = (u, o) => new Promise(resolve => { resolvePending = body => resolve({ ok: true, status: 200, json: async () => body }); });
+const mount = document.getElementById('formula-card-mount');
+const prevalidateClick = { type: 'click', target: { closest: s => (s === '[data-formula-action]' ? { dataset: { formulaAction: 'pre-validate' }, disabled: false } : null) } };
+input.value = 'rank(close)';
+mount.dispatchEvent(prevalidateClick);           // runPreValidation now awaits fetch
+input.value = 'rank(open)';                       // the user edits meanwhile
+input.dispatchEvent({ type: 'input', target: input });
+resolvePending({ status: 'ready', fingerprint: 'STALE', executed: false, persisted: false });
+await new Promise(r => setTimeout(r, 0));
+check('f14_stale_response_dropped', !resultSlot.innerHTML.includes('STALE'), resultSlot.innerHTML);
+
+// F12 (parent binding): the editor captures the pipeline id at OPEN time and
+// forwards it verbatim when the user runs the edit -- never a later current id.
+let runArgs = null;
+initFormulaModule({ onRunEditedFormula: async (f, parentId) => { runArgs = { formula: f, parentId }; } });
+openFormulaCard('rank(close)', 'PL_PARENT_A');
+const runEditedClick = { type: 'click', target: { closest: s => (s === '[data-formula-action]' ? { dataset: { formulaAction: 'run-edited' }, disabled: false } : null) } };
+mount.dispatchEvent(runEditedClick);
+await new Promise(r => setTimeout(r, 0));
+check('f12_run_uses_captured_parent_id', runArgs && runArgs.parentId === 'PL_PARENT_A', JSON.stringify(runArgs));
+check('f12_run_forwards_the_edited_formula', runArgs && runArgs.formula === 'rank(close)', JSON.stringify(runArgs));
+
 console.log('SMOKE RESULT: ' + failed + ' failed');
 if (failed) process.exit(1);
 """
@@ -332,6 +385,16 @@ def test_node_formula_ime_and_prevalidation_smoke(tmp_path) -> None:
         "PASS ready_discloses_not_executed",
         "PASS review_shows_operator_drafts",
         "PASS review_states_hot_executed_false",
+        "PASS f15_input_visible_during_composition",
+        "PASS f15_overlay_hidden_during_composition",
+        "PASS f15_stays_visible_mid_composition",
+        "PASS f15_input_restored_after_composition",
+        "PASS f15_overlay_restored_after_composition",
+        "PASS f14_verdict_present_before_edit",
+        "PASS f14_edit_clears_stale_verdict",
+        "PASS f14_stale_response_dropped",
+        "PASS f12_run_uses_captured_parent_id",
+        "PASS f12_run_forwards_the_edited_formula",
     ):
         assert marker in result.stdout, result.stdout
 

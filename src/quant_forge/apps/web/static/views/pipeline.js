@@ -522,6 +522,29 @@ let lastRenderedHtml = null;
 // <body> once the heading's DOM node is replaced/removed.
 let preCardFocusElement = null;
 
+// F7 (durable report rejoin): persist the active pipeline id so a reload can
+// re-attach even to a completed report that has fallen out of the bounded
+// active listing. sessionStorage (not localStorage): scoped to this tab like
+// the control token; access is guarded so a Storage exception (privacy mode,
+// disabled storage) degrades to "no persistence" rather than breaking rejoin.
+const ACTIVE_PIPELINE_STORAGE_KEY = 'qf_active_pipeline_id';
+function persistActivePipelineId(id) {
+  try {
+    if (id) window.sessionStorage.setItem(ACTIVE_PIPELINE_STORAGE_KEY, id);
+    else window.sessionStorage.removeItem(ACTIVE_PIPELINE_STORAGE_KEY);
+  } catch (error) {
+    // Storage unavailable: the id still tracks in-memory for this page view,
+    // it just cannot survive a reload.
+  }
+}
+function readActivePipelineId() {
+  try {
+    return window.sessionStorage.getItem(ACTIVE_PIPELINE_STORAGE_KEY) || null;
+  } catch (error) {
+    return null;
+  }
+}
+
 function parametersFromExpertGrid() {
   if (!mount) return {};
   const values = {};
@@ -608,6 +631,12 @@ function setPipeline(pipeline) {
   const isNewPipeline = !currentPipeline || currentPipeline.pipeline_id !== pipeline.pipeline_id;
   const statusChanged = !currentPipeline || currentPipeline.status !== pipeline.status;
   currentPipeline = pipeline;
+  // F7: remember this pipeline so a reload can re-attach -- including a
+  // completed report that has fallen out of the bounded active listing. A
+  // reportless terminal (aborted/expired) has nothing to rejoin, so forget it.
+  persistActivePipelineId(
+    pipeline.status === 'aborted' || pipeline.status === 'expired' ? null : pipeline.pipeline_id
+  );
   currentProvenance = pipeline.provenance || [];
   if (isNewPipeline) draftOverrides = {};
   renderCurrent();
@@ -714,13 +743,20 @@ export async function createRdPipeline(seedFactorId, options) {
  * card is replaced with the new run's confirm gate, while the parent (a
  * completed report) stays intact server-side for side-by-side comparison. */
 export async function createEditedFormulaRun(formula, options) {
-  if (!currentPipeline) throw new Error('没有可编辑的管线');
   const opts = options || {};
+  // F12 (formula editor parent binding): branch from the pipeline the editor
+  // was OPENED on (its id captured at open time and passed here), NOT whatever
+  // `currentPipeline` has since become. Fall back to the current pipeline only
+  // when no captured id was supplied. The server validates the parent exists
+  // and returns a clear error if it is gone (surfaced by the caller), instead
+  // of this module silently rebinding to a different pipeline.
+  const parentId = opts.parentPipelineId || (currentPipeline && currentPipeline.pipeline_id);
+  if (!parentId) throw new Error('没有可编辑的管线');
   const body = { formula };
   if (opts.universe_filters !== undefined) body.universe_filters = opts.universe_filters;
   if (opts.horizon_days !== undefined) body.horizon_days = opts.horizon_days;
   const record = await postJson(
-    `/api/pipelines/${encodeURIComponent(currentPipeline.pipeline_id)}/edit-formula`,
+    `/api/pipelines/${encodeURIComponent(parentId)}/edit-formula`,
     body
   );
   currentDensity = 'beginner';
@@ -799,10 +835,32 @@ export async function rejoinActivePipelines() {
   } catch (error) {
     return null;
   }
-  if (!pipelines.length) return null;
-  const [mostRecent] = pipelines;
-  setPipeline(mostRecent);
-  return mostRecent;
+  const persistedId = readActivePipelineId();
+  if (pipelines.length) {
+    // F7: prefer the pipeline the user was actually working on when it is still
+    // in the listing (running OR recently-completed), else the most recent.
+    const persisted = persistedId && pipelines.find(record => record.pipeline_id === persistedId);
+    const target = persisted || pipelines[0];
+    setPipeline(target);
+    return target;
+  }
+  // F7: nothing in the active listing. If a pipeline id was persisted (e.g. a
+  // completed report that has since fallen out of the bounded listing window),
+  // re-attach to it DIRECTLY so a reload never strands the user's own
+  // just-finished run -- fetching the record renders its card and, via the
+  // completion callback, its /report. A genuinely-gone id (pruned/expired) is
+  // forgotten instead of retried every load.
+  if (persistedId) {
+    try {
+      const record = await getPipeline(persistedId);
+      setPipeline(record);
+      return record;
+    } catch (error) {
+      persistActivePipelineId(null);
+      return null;
+    }
+  }
+  return null;
 }
 
 export function currentPipelineParameters() {
@@ -827,6 +885,7 @@ export function resetPipelineCard() {
   currentPipeline = null;
   currentProvenance = [];
   draftOverrides = {};
+  persistActivePipelineId(null); // F7: an explicit reset forgets the rejoin target
   renderCurrent();
   if (onPipelineCallback) onPipelineCallback(null); // detach the narration drawer
   restoreFocusFromCard(); // F12: an explicit reset is also a "dismissal"

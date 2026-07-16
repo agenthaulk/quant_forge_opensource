@@ -932,6 +932,12 @@ def _index_html(
     .formula-input {{ position: relative; display: block; width: 100%; min-height: 96px; resize: vertical;
       background: transparent; color: transparent; caret-color: var(--ink); }}
     .formula-input:focus-visible {{ outline: 2px solid var(--accent-2); outline-offset: 2px; }}
+    /* F15 (IME preedit visibility): during an active CJK composition the raw
+       textarea text is what the user is editing, so make it visible and hide
+       the (now-stale, un-composed) highlight overlay for the composition's
+       duration; formula.js toggles `is-composing` on both and resyncs on end. */
+    .formula-input.is-composing {{ color: var(--ink); }}
+    .formula-overlay.is-composing {{ visibility: hidden; }}
     .formula-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }}
     .formula-actions button {{ width: auto; margin: 0; min-height: 44px; flex: 1 1 auto; }}
     .formula-prevalidate-result {{ margin-top: 10px; min-width: 0; }}
