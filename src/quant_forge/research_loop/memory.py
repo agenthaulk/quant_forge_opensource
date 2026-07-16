@@ -1002,7 +1002,11 @@ class ResearchMemoryStore:
         return tuple(results)
 
     def ingest_outcome_rows(
-        self, record: Mapping[str, Any], observations: Sequence[MemoryObservation]
+        self,
+        record: Mapping[str, Any],
+        observations: Sequence[MemoryObservation],
+        *,
+        expected_origin: str | None = None,
     ) -> tuple[bool, int]:
         """One critical section for the whole SE-P2 sink write (RV2-F3).
 
@@ -1032,6 +1036,19 @@ class ResearchMemoryStore:
         if not outcome_id:
             raise ValueError("outcome record is missing outcome_id")
         with advisory_file_lock(self._lock_path):
+            # F1: origin-bound ingress (defense-in-depth, SE-i dual domain).
+            # The caller declares which origin THIS store accepts; enforcing it
+            # here -- the single critical section, BEFORE the replay check and
+            # every append -- means a spoofed-origin outcome is rejected in BOTH
+            # directions (a "local" store refuses an external_plugin outcome and
+            # vice versa) and nothing (no observation, no envelope) is written.
+            if expected_origin is not None:
+                actual_origin = str((record.get("outcome") or {}).get("origin") or "")
+                if actual_origin != expected_origin:
+                    raise ValueError(
+                        f"outcome origin {actual_origin!r} does not match this store's expected origin "
+                        f"{expected_origin!r}; refusing to ingest (SE-i store-domain guard)"
+                    )
             if outcome_id in self._known_outcome_ids_unlocked():
                 return False, 0
             for observation in observations:

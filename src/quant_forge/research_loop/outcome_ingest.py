@@ -62,7 +62,9 @@ class IngestReceipt:
     as_of: int
 
 
-def ingest_outcome(store: ResearchMemoryStore, outcome: ResearchOutcome) -> IngestReceipt:
+def ingest_outcome(
+    store: ResearchMemoryStore, outcome: ResearchOutcome, *, expected_origin: str = "local"
+) -> IngestReceipt:
     """Ingest one outcome into ``store``: observations, envelope, promotion.
 
     ``recorded`` is False exactly when ``outcome.outcome_id()`` was already
@@ -76,15 +78,27 @@ def ingest_outcome(store: ResearchMemoryStore, outcome: ResearchOutcome) -> Inge
     ``as_of`` is the store's outcomes-ledger revision AFTER this call
     (SE-P5's snapshot input): stable across a replay, strictly higher after
     a genuinely new outcome.
+
+    ``expected_origin`` is a defense-in-depth store-domain guard (SE-i dual
+    domain): the CALLER declares which origin this store accepts, and the
+    outcome's own ``origin`` is checked against it INSIDE the store's single
+    critical section (see :meth:`~quant_forge.research_loop.memory.
+    ResearchMemoryStore.ingest_outcome_rows`). The MAIN store is LOCAL-only
+    (SE-i cancelled main-store external ingress), so this defaults to
+    ``"local"``; a mismatch raises ``ValueError`` before anything is
+    persisted -- neither the observations nor the envelope are written.
     """
 
     record = outcome.to_record()
     outcome_id = str(record["outcome_id"])
-    # ONE store-level critical section (RV2-F3): the replay check, the
-    # observation appends, and the envelope completion marker are a single
-    # lock hold inside the store, so two concurrent ingests of the same
-    # outcome cannot both pass the check and double-append.
-    recorded, observation_count = store.ingest_outcome_rows(record, outcome_to_observations(outcome))
+    # ONE store-level critical section (RV2-F3): the origin guard, the replay
+    # check, the observation appends, and the envelope completion marker are a
+    # single lock hold inside the store, so two concurrent ingests of the same
+    # outcome cannot both pass the check and double-append, and a spoofed
+    # origin can never leave a partial write behind.
+    recorded, observation_count = store.ingest_outcome_rows(
+        record, outcome_to_observations(outcome), expected_origin=expected_origin
+    )
     store.promote_pending()
     return IngestReceipt(
         outcome_id=outcome_id,

@@ -18,6 +18,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from quant_forge.research_loop.memory import ResearchMemoryStore
 from quant_forge.research_loop.outcome_ingest import ingest_outcome
 from quant_forge.research_loop.outcomes import (
@@ -366,3 +368,35 @@ def test_two_store_roots_keep_independent_ledgers(tmp_path: Path) -> None:
     assert main_store.known_outcome_ids() == {outcome.outcome_id()}
     assert plugin_store.known_outcome_ids() == frozenset()
     assert not plugin_store.outcomes_ledger_path.exists()
+
+
+def test_ingest_rejects_origin_mismatch_in_both_directions_and_writes_nothing(tmp_path: Path) -> None:
+    # F1: the origin-bound ingress guard (defense-in-depth, SE-i) rejects a
+    # spoofed origin in BOTH directions and persists NOTHING -- no envelope, no
+    # observations -- because the check runs inside the store's single critical
+    # section, before any append.
+    external_outcome = _outcome(origin="external_plugin")
+    local_outcome = _outcome(origin="local")
+
+    # Direction 1: a LOCAL store (expected_origin defaults to "local") refuses
+    # an external_plugin outcome.
+    local_store = _store(tmp_path, "local_root")
+    with pytest.raises(ValueError, match="does not match this store's expected origin"):
+        ingest_outcome(local_store, external_outcome)
+    assert _read_jsonl(local_store.outcomes_ledger_path) == []
+    assert _read_jsonl(local_store.observations_path) == []
+    assert local_store.known_outcome_ids() == frozenset()
+
+    # Direction 2: a plugin store (expected_origin="external_plugin") refuses a
+    # local outcome.
+    plugin_store = _store(tmp_path, "plugin_root")
+    with pytest.raises(ValueError, match="does not match this store's expected origin"):
+        ingest_outcome(plugin_store, local_outcome, expected_origin="external_plugin")
+    assert _read_jsonl(plugin_store.outcomes_ledger_path) == []
+    assert plugin_store.known_outcome_ids() == frozenset()
+
+    # The MATCHING direction still ingests: an external_plugin outcome into an
+    # external_plugin-expecting store is accepted and persisted.
+    receipt = ingest_outcome(plugin_store, external_outcome, expected_origin="external_plugin")
+    assert receipt.recorded is True
+    assert plugin_store.known_outcome_ids() == {external_outcome.outcome_id()}

@@ -1113,7 +1113,10 @@ class ResearchLoopService:
                     result.factor.factor_id if result.factor is not None else "<unknown>",
                 )
                 continue
-            ingest_outcome(self.memory_store, outcome)
+            # F1: the MAIN store is LOCAL-only (SE-i), and this producer only
+            # ever mints origin="local" outcomes -- assert that at the ingress
+            # boundary so a future non-local outcome can never be persisted here.
+            ingest_outcome(self.memory_store, outcome, expected_origin="local")
 
     def _raise_if_cancelled(self) -> None:
         if self.cancel_event is not None and self.cancel_event.is_set():
