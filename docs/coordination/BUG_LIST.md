@@ -99,3 +99,34 @@
 | U-3 | `constraints.txt` + README | py3.13/3.14 环境按 constraints 安装失败（numpy 1.26.4 / pyarrow 16.1.0 不可构建）；floor-only 安装后全套 1975 通过（pandas 3.0.3） | OPEN（README 注明 py3.12 基线 + floor-only 备选） |
 
 观察（非缺陷）：LLM 无 key 降级前的确认用原生 `window.confirm`——符合 §4.1 契约（先询问、命名 provider/env、不泄 key），体验上可换页内确认框，不列 OPEN。
+
+## 2026-07-16 — PR#20/#21 外部对抗复审裁决登记
+
+复审范围为两 PR 全量 diff;所有发现经独立核验后逐条裁决。已修复项(PR#20 六项:
+入口 origin 绑定、结构化指标快照、priors 科学行门槛、损坏行防护、审查页
+expected-entry 守卫、多字节撕尾自愈;PR#21 六项:取消竞态延迟清理、重启幂等
+发布恢复、报告重连、公式编辑父绑定、陈旧校验清除、IME 预编辑可见)已随分支
+提交,门禁全绿。以下为登记的 follow-up(合并后修,不阻塞):
+
+| # | 位置 | 症状/改进 | 状态 |
+| --- | --- | --- | --- |
+| R-20a | `research_loop/local_outcomes.py` | OOS 驱动的 gate 判决仍标 `in_sample`(现状:priors 只计 verdict,不泄 OOS 指标;标签精确化属改进) | OPEN(合并后修) |
+| R-20b | `research_loop/priors.py` 读侧 | 行级校验不重算 outcome 身份哈希(威胁模型=本地根被写;爆炸半径=展示) | OPEN(合并后修) |
+| R-20c | `research_loop/memory.py` reviewer actor | 自述文本身份,redaction 可改写;本地单人工具下为低危 | OPEN(合并后修) |
+| R-20d | `apps/web/memory_review.py` | 展示载荷四段锁拼装,极端并发下截面混排(只读,不驱动写) | OPEN(合并后修) |
+| R-20e | `research_loop/planning_influence.py` | 构造端类型校验宽于反序列化端(信任边界本身 fail-closed) | OPEN(合并后修) |
+| R-20f | `research_loop/memory.py` 审查事件 | 重试幂等应基于请求键而非服务端时间戳(追加型,重复事件不改有效态) | OPEN(合并后修) |
+| R-21a | `apps/web/pipeline.py`+`run_recording.py` | 发布后将血缘/RunIndex 重键到 canonical id(现状:临时 id 行悬挂;中大改动,贴 api 边界,单独批次) | OPEN(合并后修) |
+| R-21b | `apps/web/pipeline.py` factor_study confirm | 参数范围前置校验(现状:坏值走 paused_failure,可恢复) | OPEN(合并后修) |
+| R-21c | `apps/web/pipeline.py` RD input hash | 种子定义指纹纳入(现状:删种子=优雅失败;改种子=同 hash 下内容漂移) | OPEN(合并后修) |
+| R-21d | `apps/web/tools.py` | capability 主体存在性校验 + 非 pipeline_id 参数的范围硬化(现状:仅可信前端持有,回环即可信用户) | OPEN(合并后修) |
+| R-21e | `apps/web/static/views/research.js` | 多轮 dedup 面板计数口径标注"末轮";候选卡改用统一 formulaHtml 渲染 | OPEN(合并后修) |
+| R-21f | `apps/web/pipeline.py`/`routing.py` | pipeline 快照中的绝对 artifact 路径改逻辑引用(与结果面的 redaction 口径一致化) | OPEN(合并后修) |
+| R-21g | `apps/web/static/views/pipeline.js` | RD 字段编辑后徽标仍显示服务端来源(展示层;confirm 时服务端推导正确) | OPEN(合并后修) |
+| R-21h | 叙事层(接入 live LLM 生产者前) | 数值卫兵由全数字匹配收紧为含数字拒绝 + `resolve_ref` 生产接线与 kind-aware 校验 | OPEN(接线前修) |
+| R-M1 | `research_loop/service.py` + 候选卡(主干既有) | 外部 OOS 实际参与 gate 三个分支,而界面措辞称"不参与 winner 选择";候选卡对 OOS 回测无审计徽标——措辞与徽标诚实化(两 PR 均未引入,主干 follow-up) | OPEN(主干) |
+
+裁决为设计如此、不修的项:submit 生命周期行按证据强度加权入 priors(规范明文)、
+MetricReading 无独立 status 字段(unknown 以 None 表达,原因在 outcome 级)、
+评价窗为身份哈希的规范窗(防重跑刷分)、追加型知识层不做静默替代(supersede
+事件显式)。以上任何"修复"都会破坏金向量或规范语义,明确不做。
