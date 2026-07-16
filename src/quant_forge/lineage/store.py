@@ -86,13 +86,18 @@ def redact_free_text(text: str) -> str:
 
 
 @contextmanager
-def _advisory_file_lock(lock_path: Path) -> Iterator[None]:
+def advisory_file_lock(lock_path: Path) -> Iterator[None]:
     """Advisory ``fcntl.flock`` exclusive lock on a sidecar ``.lock`` file.
 
     Serializes the read-then-append critical sections of the lineage and run
     indexes against concurrent same-host writers. On platforms without
     ``fcntl`` (non-POSIX, e.g. Windows) this degrades to a no-op: appends stay
     append-only but the read+append dedup window is not serialized there.
+
+    Public (SE-P4a rework item 12): other stores under ``research_loop/``
+    (e.g. ``memory.py``) reuse this SAME primitive rather than forking a
+    second implementation, so it is promoted to a first-class export instead
+    of a cross-module private import.
     """
 
     if fcntl is None:
@@ -105,6 +110,11 @@ def _advisory_file_lock(lock_path: Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+#: Backward-compatible private alias for any existing same-module or
+#: cross-module callers written against the old private name.
+_advisory_file_lock = advisory_file_lock
 
 
 def canonical_fingerprint(payload: Mapping[str, Any]) -> str:

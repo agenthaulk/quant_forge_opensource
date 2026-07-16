@@ -40,8 +40,8 @@ JS_CONTENT_TYPE = "text/javascript; charset=utf-8"
 
 # The complete CP6-1 module set (+ CP6-2 Lab chrome + CP6-3 data/registry
 # views + CP6-4 docs/extensions views + CP10 synthesis module + P1 pipeline
-# aggregate views + P2 sidecar narration renderer + P3 editable-formula card).
-# A new module must be added here so the no-external-resources and
+# aggregate views + P2 sidecar narration renderer + P3 editable-formula card +
+# SE-P4b memory review). A new module must be added here so the no-external-resources and
 # single-renderer sweeps keep covering everything.
 EXPECTED_STATIC_MODULES = (
     "api.js",
@@ -57,6 +57,7 @@ EXPECTED_STATIC_MODULES = (
     "views/formula.js",
     "views/history.js",
     "views/lab.js",
+    "views/memory.js",
     "views/narration.js",
     "views/pipeline.js",
     "views/provenance.js",
@@ -257,9 +258,16 @@ def test_index_page_keeps_all_panel_sections_and_controls(web_app) -> None:
 def test_index_page_has_no_inline_application_script(web_app) -> None:
     html = _get_index_html(web_app)
     assert '<script type="module" src="/static/app.js"></script>' in html
+    # SE-P4b: memory.js gets its own module entry tag because html.py's
+    # additive-only budget for that surface could not extend app.js's
+    # central import/wiring chain (an FE-track-owned file outside this
+    # surface's scope) -- see apps/web/static/views/memory.js's module
+    # docstring. Still no inline application script: every module reaches
+    # the page through its own <script type="module" src="...">.
+    assert '<script type="module" src="/static/views/memory.js"></script>' in html
     assert '<script type="application/json" id="qf-page-config">' in html
-    # Exactly the JSON config block and the module entry tag; nothing else.
-    assert html.count("<script") == 2
+    # Exactly the JSON config block and the two module entry tags.
+    assert html.count("<script") == 3
     assert "addEventListener" not in html
     config_start = html.index('id="qf-page-config">') + len('id="qf-page-config">')
     config_text = html[config_start : html.index("</script>", config_start)]

@@ -59,6 +59,11 @@ class ResearchContext:
     unresolved_items: tuple[str, ...] = ()
     next_focus_hints: tuple[str, ...] = ()
     prompt_context: str = ""
+    # SE-iv: bounded, human-activated steering rules (cap 5, exact-scope
+    # before global, activation-recency desc; see context_builder._active_rules
+    # and llm.py's dedicated closed-template re-authentication). Additive,
+    # default-on, empty-by-default so zero activated rules is zero effect.
+    active_rules: tuple[dict[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         _set_tuple(self, "available_fields")
@@ -72,6 +77,7 @@ class ResearchContext:
         _set_tuple(self, "recent_failures", mapper=dict)
         _set_tuple(self, "unresolved_items")
         _set_tuple(self, "next_focus_hints")
+        _set_tuple(self, "active_rules", mapper=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonable(self)

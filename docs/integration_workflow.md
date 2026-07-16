@@ -33,6 +33,7 @@
 | 因子评价 | `eval-factor` 或 Web 评价 | 返回 Rank IC、ICIR、coverage、IC days、horizon matrix、IS/OOS split | OOS 是否衰减应显式展示 |
 | 回测 | `run-backtest` 或 Web 回测 | 返回持有期、调仓间隔、执行延迟、毛/净收益、回撤、Sharpe、换手口径、artifact path | 换手率必须说明口径 |
 | RD 单次运行 | `research run-once` 或 Web RD | 返回 seed factor、objective、候选列表、score、gate 结果、accepted candidates、report path | 不应只看全样本收益 |
+| 记忆先验复核 | `qf memory priors` 或 Web 记忆 review 页 | 返回 `as_of` revision、分维度 passed/blocked 计数与比率、`invalid_rows` | `unknown`/`not_applicable` 只计数、不进比率分母 |
 | 报告生成 | RD report 或最终报告 | 输出 Markdown/HTML/PDF 路径，报告内含配置、数据源、关键指标、风险说明 | 报告能复现本次联调路径 |
 | 结束复核 | 测试和安全扫描 | pytest/help/git diff check 通过，或明确说明未运行原因 | 无秘密、无绝对私有路径被提交 |
 
@@ -252,6 +253,27 @@ RD 运行反馈应包含：
 Gate warning: full-sample return is positive, but OOS return or OOS ICIR is weak.
 ```
 
+### 3.8 自我进化记忆反馈
+
+RD 结果会以中性 outcome 契约（`qf.research_outcome.v2`）写入本地研究记忆
+（`artifact_root` 下的 append-only ledger）。联调时应检查：
+
+- `qf memory priors [--json]` 输出应包含：`as_of`（outcomes ledger
+  revision）、每个泛化维度单元的 `passed`/`blocked` 计数与比率、
+  `unknown`/`not_applicable` 仅作为计数展示（不进入比率分母）、
+  `invalid_rows`（schema 校验失败被剔除的行数，必须显式展示，不得静默丢弃）。
+- ledger 不存在（尚未运行过 RD）时，priors 应返回空视图而不是报错。
+- `qf memory rules list [--active|--pending]` 展示已晋升规则及其状态；
+  `activate`/`deactivate`/`retire`/`unretire` 必须要求 `--actor`，rationale
+  经 redact 后落盘；事件只追加，不改写历史。
+- Web 记忆 review 页（`GET /api/memory/review`）应展示晋升的
+  findings/failures、retired 状态与规则状态，且来自同一次锁内快照；
+  `POST /api/memory/review/rule|promoted` 的字段必须是字符串，null/数字等
+  非字符串输入应返回 400，不得把 `"None"` 落成 reviewer 身份。
+- 外部插件产生的 outcome 只写入插件自己的 store（插件本地根目录），不进入
+  本地晋升池；本地主 store 只接受 `origin="local"`。
+- 所有指标读数遵循 null+status 原则：不可得的值不得显示为 `0.0`。
+
 ## 4. Web 联调时的推荐反馈状态
 
 | 页面动作 | 运行中状态 | 成功状态 | 失败状态 |
@@ -423,6 +445,8 @@ artifact_root: ...
 | OOS 失效 | 在评价、回测和 RD report 中明确 warning |
 | 换手口径过轻 | 标注为成分替换率，不作为真实交易换手 |
 | RD objective 未配置 | 指出缺失 `weight_profile` 或 objective 配置 |
+| 记忆 outcome 行损坏或 schema 不符 | 计入 priors 的 `invalid_rows` 并显式展示，不静默按 0 处理 |
+| 规则签名前缀不唯一或不存在 | 返回可读错误（HTTP 400 / CLI 错误），不做模糊匹配 |
 
 ## 6. 最小验收清单
 

@@ -148,17 +148,20 @@ def test_index_page_hosts_the_synthesis_module_skeleton(web_config) -> None:
     # A-priori discipline is stated on the form itself.
     assert "权重与方法为先验声明（非拟合）" in html
     # No inline script arrives with the skeleton (D8): still exactly the
-    # JSON config block plus the module entry tag.
-    assert html.count("<script") == 2
+    # JSON config block plus the module entry tags (app.js + SE-P4b's
+    # memory.js, which ships its own entry tag rather than extending app.js
+    # -- see apps/web/static/views/memory.js's module docstring).
+    assert html.count("<script") == 3
     assert "addEventListener" not in html
     # Skeleton lives inside the reserved multi module panel, before the
-    # history panel; tab semantics unchanged (6 + 2 tabs).
+    # history panel; tab semantics: 7 top-level (SE-P4b added 记忆治理) + 2
+    # workbench module tabs.
     assert html.index('id="lab-module-panel-multi"') < html.index('id="multi-result"')
     assert html.index('id="multi-result"') < html.index('id="synth-form"')
     assert html.index('id="synth-form"') < html.index('id="synth-report"')
     assert html.index('id="synth-report"') < html.index('id="lab-panel-history"')
-    assert html.count('role="tab"') == 8
-    assert html.count('role="tabpanel"') == 8
+    assert html.count('role="tab"') == 9
+    assert html.count('role="tabpanel"') == 9
 
 
 def test_index_page_ships_cp10_css_with_theme_tokens_only(web_config) -> None:

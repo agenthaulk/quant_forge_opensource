@@ -78,9 +78,11 @@ from quant_forge.apps.web.tools import (
     ToolRegistry,
 )
 from quant_forge.specs.narration import NarrationNode
+from quant_forge.apps.web.memory_review import memory_review_payload, review_promoted, review_rule
 from quant_forge.config import QuantForgeConfig
 from quant_forge.mcp.read_models import list_available_fields, list_available_operators
 from quant_forge.research_loop.config import ResearchLoopConfig, load_research_loop_config
+from quant_forge.research_loop.memory import ResearchMemoryStore
 from quant_forge.research_loop.scheduler import (
     ResearchLoopScheduler,
     ResearchScheduleRequest,
@@ -289,6 +291,31 @@ def _optional_universe_filters(value: Any) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _memory_review_str_field(payload: dict[str, Any], name: str) -> str:
+    """One field from a ``POST /api/memory/review/*`` body, type-checked at
+    the JSON boundary (review finding P4B-F1).
+
+    A JSON value that is not a string -- ``null``, a number, an object, an
+    array, a bool -- must never reach :func:`review_rule`/
+    :func:`review_promoted` through a blind ``str()`` coercion:
+    ``str(None) == "None"``, ``str(42) == "42"``, ``str({}) == "{}"`` are
+    all non-empty after ``.strip()``, so they would silently pass the
+    "actor is required" check downstream and fabricate a persisted actor
+    identity ("None" as a reviewer!), or corrupt a signature-prefix lookup.
+    An absent key reads as ``""`` (unchanged prior behavior for every
+    optional field on this surface); a present key must be a string
+    (``""`` included) or this raises ``ValueError``, which ``do_POST``'s
+    existing handler maps to a clean 400 -- the action is never called.
+    """
+
+    if name not in payload:
+        return ""
+    value = payload[name]
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string, got {type(value).__name__}")
+    return value
+
+
 def create_local_web_server(
     *, host: str, port: int, config: QuantForgeConfig, rd_config: ResearchLoopConfig | None = None
 ) -> ThreadingHTTPServer:
@@ -404,6 +431,18 @@ def create_local_web_server(
                 elif path == "/api/extensions":
                     self._require_control_token()
                     self._json(_server._extensions_payload(config))
+                elif path == "/api/memory/review":
+                    # SE-P4b: rule governance + findings/failures + priors +
+                    # optional read-only plugin pane (memory_review_payload's
+                    # plugin_store parameter). No config/env hook resolves a
+                    # plugin artifact root anywhere in this repo yet, so V1
+                    # never constructs one here and the plugin pane always
+                    # renders omitted (payload["plugin"] is None) until one
+                    # is added deliberately -- see memory_review.py's
+                    # docstring for the full plugin-pane contract.
+                    self._require_control_token()
+                    memory_store = ResearchMemoryStore(config.paths.artifact_root)
+                    self._json(memory_review_payload(memory_store))
                 elif path == "/api/status":
                     self._require_control_token()
                     active_llm = _active_llm(config)
@@ -913,6 +952,45 @@ def create_local_web_server(
                             objective=str(payload.get("objective", "")),
                             nav_target=_optional_str(payload.get("nav_target")),
                             supplied_capability=self.headers.get("X-Sidecar-Capability", ""),
+                        )
+                    )
+                    return
+                if path == "/api/memory/review/rule":
+                    # SE-P4b: review_rule validates actor/action and appends
+                    # exactly one event via the store's atomic
+                    # resolve_validate_append; ValueError (empty actor,
+                    # unknown action, ambiguous/absent signature prefix)
+                    # falls through to the generic ValueError -> 400 mapping
+                    # below. No plugin_store passed in V1, matching the GET
+                    # route above. P4B-F1: every field is extracted through
+                    # _memory_review_str_field, which rejects a non-string
+                    # JSON value (null/number/object/array/bool) with a 400
+                    # BEFORE review_rule is ever called -- a blind str()
+                    # here would let {"actor": null} persist "None" as the
+                    # reviewer identity.
+                    memory_store = ResearchMemoryStore(config.paths.artifact_root)
+                    self._json(
+                        review_rule(
+                            memory_store,
+                            signature_prefix=_memory_review_str_field(payload, "signature_prefix"),
+                            action=_memory_review_str_field(payload, "action"),
+                            actor=_memory_review_str_field(payload, "actor"),
+                            rationale=_memory_review_str_field(payload, "rationale"),
+                            expected_entry_id=_memory_review_str_field(payload, "expected_entry_id"),
+                        )
+                    )
+                    return
+                if path == "/api/memory/review/promoted":
+                    memory_store = ResearchMemoryStore(config.paths.artifact_root)
+                    self._json(
+                        review_promoted(
+                            memory_store,
+                            kind=_memory_review_str_field(payload, "kind"),
+                            signature_prefix=_memory_review_str_field(payload, "signature_prefix"),
+                            action=_memory_review_str_field(payload, "action"),
+                            actor=_memory_review_str_field(payload, "actor"),
+                            rationale=_memory_review_str_field(payload, "rationale"),
+                            expected_entry_id=_memory_review_str_field(payload, "expected_entry_id"),
                         )
                     )
                     return

@@ -68,6 +68,7 @@ from quant_forge.research_loop.goals import (
     ResearchGoalStore,
 )
 from quant_forge.research_loop.llm import LLMHypothesisGenerator, LLMResearchReviewGenerator
+from quant_forge.research_loop.memory import ResearchMemoryStore
 from quant_forge.research_loop.service import ResearchLoopService
 from quant_forge.utils import write_json, write_text
 from quant_forge.workbench.service import (
@@ -349,6 +350,87 @@ def build_parser() -> argparse.ArgumentParser:
     goal_complete.add_argument("--artifact-root", type=Path)
     goal_complete.set_defaults(handler=_cmd_goal_complete)
     # -------------------------- end Lane G ----------------------------
+
+    # ------------------------------------------------------------------
+    # Research memory review commands (SE-P4a): CLI parity for the SE-iii
+    # governance surface -- the Web review tab is the primary surface (P4b),
+    # this is the scriptable/offline equivalent. Prefix resolution is the
+    # anti-fat-finger confirmation R3 wants: no interactive prompts, an
+    # ambiguous or absent prefix simply fails with the candidate list.
+    # ------------------------------------------------------------------
+    memory = subcommands.add_parser("memory", help="research memory review commands")
+    memory_subcommands = memory.add_subparsers(dest="memory_command", required=True)
+    memory_rules = memory_subcommands.add_parser("rules", help="rule governance (activate/deactivate/retire)")
+    memory_rules_subcommands = memory_rules.add_subparsers(dest="memory_rules_command", required=True)
+
+    memory_rules_list = memory_rules_subcommands.add_parser("list", help="list promoted rule rows and their state")
+    memory_rules_state_filter = memory_rules_list.add_mutually_exclusive_group()
+    memory_rules_state_filter.add_argument(
+        "--pending", action="store_true", help="show only rules not currently active"
+    )
+    memory_rules_state_filter.add_argument("--active", action="store_true", help="show only currently active rules")
+    _add_config_options(memory_rules_list)
+    memory_rules_list.add_argument("--artifact-root", type=Path)
+    memory_rules_list.set_defaults(handler=_cmd_memory_rules_list)
+
+    memory_rules_activate = memory_rules_subcommands.add_parser(
+        "activate", help="activate a rule signature (or unambiguous prefix) for steering"
+    )
+    memory_rules_activate.add_argument("signature_prefix", metavar="signature-or-unambiguous-prefix")
+    memory_rules_activate.add_argument("--actor", required=True, help="reviewer identity (redacted, required)")
+    memory_rules_activate.add_argument("--rationale", default="", help="optional review rationale (redacted)")
+    _add_config_options(memory_rules_activate)
+    memory_rules_activate.add_argument("--artifact-root", type=Path)
+    memory_rules_activate.set_defaults(handler=_cmd_memory_rules_activate)
+
+    memory_rules_deactivate = memory_rules_subcommands.add_parser(
+        "deactivate", help="deactivate a rule signature (or unambiguous prefix)"
+    )
+    memory_rules_deactivate.add_argument("signature_prefix", metavar="signature-or-unambiguous-prefix")
+    memory_rules_deactivate.add_argument("--actor", required=True, help="reviewer identity (redacted, required)")
+    memory_rules_deactivate.add_argument("--rationale", default="", help="optional review rationale (redacted)")
+    _add_config_options(memory_rules_deactivate)
+    memory_rules_deactivate.add_argument("--artifact-root", type=Path)
+    memory_rules_deactivate.set_defaults(handler=_cmd_memory_rules_deactivate)
+
+    # SE-P5 (ruling SE-v): computed, never-persisted priors read surface.
+    memory_priors = memory_subcommands.add_parser(
+        "priors", help="quantitative priors view over the outcomes ledger (computed, read-only)"
+    )
+    memory_priors.add_argument(
+        "--dimension",
+        action="append",
+        dest="dimensions",
+        choices=("factor_family", "settings_profile", "asset_class", "universe"),
+        help="restrict to specific dimensions (repeatable; default: all)",
+    )
+    memory_priors.add_argument("--json", action="store_true", help="emit the full view as JSON")
+    _add_config_options(memory_priors)
+    memory_priors.add_argument("--artifact-root", type=Path)
+    memory_priors.set_defaults(handler=_cmd_memory_priors)
+
+    memory_rules_retire = memory_rules_subcommands.add_parser(
+        "retire", help="retire a finding or failure signature (or unambiguous prefix)"
+    )
+    memory_rules_retire.add_argument("target_kind", choices=["finding", "failure"])
+    memory_rules_retire.add_argument("signature_prefix", metavar="signature-prefix")
+    memory_rules_retire.add_argument("--actor", required=True, help="reviewer identity (redacted, required)")
+    memory_rules_retire.add_argument("--rationale", default="", help="optional review rationale (redacted)")
+    _add_config_options(memory_rules_retire)
+    memory_rules_retire.add_argument("--artifact-root", type=Path)
+    memory_rules_retire.set_defaults(handler=_cmd_memory_rules_retire)
+
+    memory_rules_unretire = memory_rules_subcommands.add_parser(
+        "unretire", help="reverse a retirement for a finding or failure signature (or unambiguous prefix)"
+    )
+    memory_rules_unretire.add_argument("target_kind", choices=["finding", "failure"])
+    memory_rules_unretire.add_argument("signature_prefix", metavar="signature-prefix")
+    memory_rules_unretire.add_argument("--actor", required=True, help="reviewer identity (redacted, required)")
+    memory_rules_unretire.add_argument("--rationale", default="", help="optional review rationale (redacted)")
+    _add_config_options(memory_rules_unretire)
+    memory_rules_unretire.add_argument("--artifact-root", type=Path)
+    memory_rules_unretire.set_defaults(handler=_cmd_memory_rules_unretire)
+    # ---------------------- end research memory review -----------------
 
     backends = subcommands.add_parser(
         "backends", help="external factor-backend status commands"
@@ -1257,6 +1339,153 @@ def _goal_evidence_refs(args: argparse.Namespace, artifact_root: Path) -> tuple[
 
 
 # ------------------------------ end Lane G ---------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Research memory review handlers (SE-P4a): CLI parity for the SE-iii
+# governance surface. Rows are never mutated; every command appends exactly
+# one review event under the store's advisory lock.
+# ---------------------------------------------------------------------------
+
+
+def _cmd_memory_rules_list(args: argparse.Namespace) -> int:
+    store = ResearchMemoryStore(_runtime_paths(args).artifact_root)
+    # Atomic (R2 rework items R2-1/R2-7): ONE snapshot read from the store,
+    # never a separately-locked row read layered on a separately-locked
+    # event read -- the split-snapshot race that fix closes applies to this
+    # listing path exactly as much as it applies to the active_rules
+    # steering channel (a promote_pending() landing between two separate
+    # reads could otherwise pair a stale activation label with new,
+    # unreviewed row content).
+    snapshot = store.rule_review_snapshot()
+    entries: list[tuple[dict[str, Any], str]] = []
+    for info in snapshot.values():
+        state = info["state"]
+        if args.active and state != "active":
+            continue
+        if args.pending and state == "active":
+            continue
+        entries.append((info["row"], state))
+    if not entries:
+        print("no rules recorded")
+        return 0
+    entries.sort(key=lambda pair: str(pair[0].get("last_seen") or ""), reverse=True)
+    _print_memory_rules_table(entries)
+    return 0
+
+
+def _cmd_memory_priors(args: argparse.Namespace) -> int:
+    from quant_forge.research_loop.priors import PRIOR_DIMENSIONS, PriorsQuery, compute_priors
+
+    store = ResearchMemoryStore(_runtime_paths(args).artifact_root)
+    dimensions = tuple(args.dimensions) if args.dimensions else PRIOR_DIMENSIONS
+    view = compute_priors(store, PriorsQuery(dimensions=dimensions))
+    if args.json:
+        print(json.dumps(view.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    print(
+        f"priors as_of={view.as_of} envelopes={view.total_envelopes} "
+        f"evidence_runs={view.total_evidence_runs} oos_excluded={view.oos_excluded} "
+        f"invalid_rows={view.invalid_rows}"
+    )
+    for table in view.tables:
+        print(f"\n[{table.dimension}] (unbucketed: {table.unbucketed})")
+        if not table.cells:
+            print("  no cells")
+            continue
+        for cell in table.cells:
+            rate = "n/a" if cell.pass_rate is None else f"{cell.pass_rate:.2f}"
+            weighted = "n/a" if cell.weighted_pass_rate is None else f"{cell.weighted_pass_rate:.2f}"
+            counts = cell.verdict_counts
+            reasons = ", ".join(f"{code}x{count}" for code, count in cell.top_blocked_reasons) or "-"
+            print(
+                f"  {cell.bucket}: runs={cell.evidence_runs} passed={counts.get('passed', 0)} "
+                f"blocked={counts.get('blocked', 0)} unknown={counts.get('unknown', 0)} "
+                f"not_applicable={counts.get('not_applicable', 0)} "
+                f"rate={rate} weighted={weighted}"
+                + (" (insufficient_sample)" if cell.insufficient_sample else "")
+                + f" | blocked_reasons: {reasons}"
+            )
+    return 0
+
+
+def _cmd_memory_rules_activate(args: argparse.Namespace) -> int:
+    return _cmd_memory_rule_review(args, target_kind="rule", action="activate")
+
+
+def _cmd_memory_rules_deactivate(args: argparse.Namespace) -> int:
+    return _cmd_memory_rule_review(args, target_kind="rule", action="deactivate")
+
+
+def _cmd_memory_rules_retire(args: argparse.Namespace) -> int:
+    return _cmd_memory_rule_review(args, target_kind=args.target_kind, action="retire")
+
+
+def _cmd_memory_rules_unretire(args: argparse.Namespace) -> int:
+    return _cmd_memory_rule_review(args, target_kind=args.target_kind, action="unretire")
+
+
+def _cmd_memory_rule_review(args: argparse.Namespace, *, target_kind: str, action: str) -> int:
+    store = ResearchMemoryStore(_runtime_paths(args).artifact_root)
+    try:
+        # Atomic (P4a rework item 8): prefix resolution, row binding, and
+        # event append all happen inside ONE lock hold, so two processes
+        # racing to review the same prefix cannot interleave between
+        # "resolve" and "append" -- see resolve_validate_append's docstring.
+        event = store.resolve_validate_append(
+            target_kind=target_kind,
+            prefix=args.signature_prefix,
+            action=action,
+            actor=args.actor,
+            rationale=args.rationale,
+            decided_at=datetime.now(timezone.utc).isoformat(),
+        )
+    except ValueError as exc:
+        print(f"memory rules {action} failed: {exc}")
+        return 2
+    _print_json({"event_id": event.event_id(), **event.to_dict()})
+    return 0
+
+
+_MEMORY_RULE_STATE_LABELS = {
+    "active": "active",
+    # P4a rework item 1 + R2-7: a signature that merely reached the rule
+    # tier -- in ANY non-active state -- already silences its lower tiers;
+    # every label below says so, and additionally names WHY it is not
+    # currently steering (never reviewed at all, explicitly deactivated, or
+    # reviewed once but the row's content has since changed and needs
+    # re-review -- three genuinely different reasons a reviewer would act
+    # on differently).
+    "never_reviewed": "pending -- lower tiers silenced",
+    "deactivated": "deactivated -- lower tiers silenced",
+    "lapsed_pending_re_review": "lapsed -- needs re-review (row content changed) -- lower tiers silenced",
+}
+
+
+def _memory_rule_state_label(state: str) -> str:
+    return _MEMORY_RULE_STATE_LABELS.get(state, state)
+
+
+def _print_memory_rules_table(entries: list[tuple[dict[str, Any], str]]) -> None:
+    headers = ["signature_prefix", "scope", "statement", "observation_count", "state"]
+    table = [
+        [
+            str(row.get("signature") or "")[:12],
+            str(row.get("scope") or "global"),
+            str(row.get("statement") or ""),
+            # ``.get(key, "")``, not ``... or ""``: observation_count is
+            # never legitimately 0 (PromotionDecision requires >= 2), but the
+            # `or` form would still misrender a genuine 0 as blank -- matches
+            # _print_runs_table's own null-not-falsy convention.
+            str(row.get("observation_count", "")),
+            _memory_rule_state_label(state),
+        ]
+        for row, state in entries
+    ]
+    _print_text_table(headers, table)
+
+
+# -------------------------- end research memory review ----------------------
 
 
 def _cmd_research_run_once(args: argparse.Namespace) -> int:

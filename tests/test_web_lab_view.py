@@ -73,7 +73,9 @@ def test_index_page_hosts_mounts_inside_lab_tab_panels(web_config) -> None:
     # Tablist wiring (CP9-2 IA consolidation): six top-level tabs — the
     # workbench tab (kept id lab-tab-factor, relabelled LLM 因子工作台)
     # absorbs the former RD 循环 / Benchmark tabs — plus the two workbench
-    # module tabs, so the page-wide role="tab" count stays 8.
+    # module tabs, so the page-wide role="tab" count was 8 pre-SE-P4b.
+    # SE-P4b appends a seventh top-level tab (记忆治理 / lab-tab-memory),
+    # bumping both page-wide counts to 9.
     assert 'role="tablist"' in html
     assert 'aria-label="工作台视图"' in html
     for tab, panel in (
@@ -86,14 +88,14 @@ def test_index_page_hosts_mounts_inside_lab_tab_panels(web_config) -> None:
     ):
         assert f'id="{tab}" aria-controls="{panel}"' in html
         assert f'id="{panel}" aria-labelledby="{tab}"' in html
-    # 6 top-level + 2 workbench module tabs; 6 lab-panel-* + 2
-    # lab-module-panel-* tabpanels.
-    assert html.count('role="tab"') == 8
-    assert html.count('role="tabpanel"') == 8
+    # 7 top-level (SE-P4b added 记忆治理) + 2 workbench module tabs; 7
+    # lab-panel-* + 2 lab-module-panel-* tabpanels.
+    assert html.count('role="tab"') == 9
+    assert html.count('role="tabpanel"') == 9
     top_tablist = html[html.index('aria-label="工作台视图"') : html.index('aria-label="工作台模块"')]
-    assert top_tablist.count('role="tab"') == 6
+    assert top_tablist.count('role="tab"') == 7
     assert top_tablist.count('aria-selected="true"') == 1
-    assert top_tablist.count('aria-selected="false"') == 5
+    assert top_tablist.count('aria-selected="false"') == 6
     module_nav = html[html.index('aria-label="工作台模块"') : html.index('id="lab-module-panel-single"')]
     assert module_nav.count('role="tab"') == 2
     assert module_nav.count('aria-selected="true"') == 1
