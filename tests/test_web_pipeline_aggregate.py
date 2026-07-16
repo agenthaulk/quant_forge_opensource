@@ -856,7 +856,12 @@ def test_pipeline_store_load_rejects_a_duplicate_provenance_field(tmp_path) -> N
 # ---------------------------------------------------------------------------
 
 
-def test_list_active_pipelines_includes_awaiting_confirm_and_excludes_terminal(tmp_path) -> None:
+def test_list_active_pipelines_includes_awaiting_confirm_and_recently_completed(tmp_path) -> None:
+    # F7 (durable report rejoin): a completed pipeline stays visible in the
+    # rejoin listing across REPEATED calls -- there is no one-shot consumption
+    # anymore -- so a reload and a second consumer both re-attach to the
+    # just-finished report. A non-completed terminal (aborted) carries no report
+    # to rejoin and is still excluded.
     config, store, job_manager = _new_env(tmp_path)
     parse_job = _parsed_job_with_request(config, job_manager)
     awaiting = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
@@ -869,17 +874,21 @@ def test_list_active_pipelines_includes_awaiting_confirm_and_excludes_terminal(t
         job_manager=job_manager, rd_config=_rd_config(), parameters={"holding_days": 9},
     )
     _wait_job(job_manager, confirmed.stage("compute").child_job_id)
+    # A non-completed terminal (aborted an awaiting_confirm draft) must NOT list.
+    aborted = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    assert cancel_pipeline(store, aborted.pipeline_id, job_manager=job_manager, config=config).status == "aborted"
 
-    # rv2 semantics: the FIRST list observes the running->completed
-    # transition (returned once, so the caller can fetch /report); every
-    # later list excludes the now-terminal record.
     first = {record.pipeline_id: record for record in list_active_pipelines(store, job_manager=job_manager, config=config)}
     assert awaiting.pipeline_id in first
     assert first[completed_pipeline.pipeline_id].status == "completed"
+    assert aborted.pipeline_id not in first
 
-    second = {record.pipeline_id for record in list_active_pipelines(store, job_manager=job_manager, config=config)}
+    # No one-shot: the completed pipeline is STILL listed on every later call
+    # (a second consumer / a reload both see it), the aborted one never is.
+    second = {record.pipeline_id: record for record in list_active_pipelines(store, job_manager=job_manager, config=config)}
     assert awaiting.pipeline_id in second
-    assert completed_pipeline.pipeline_id not in second
+    assert second[completed_pipeline.pipeline_id].status == "completed"
+    assert aborted.pipeline_id not in second
 
 
 def test_rejoin_after_a_simulated_server_restart_reconciles_to_paused_failure(tmp_path, monkeypatch) -> None:
@@ -1028,20 +1037,21 @@ def test_expired_draft_reconciles_to_expired_on_read(tmp_path) -> None:
     assert reconciled.status == "expired"
 
 
-def test_expired_pipelines_are_reported_once_then_excluded_from_list_active(tmp_path) -> None:
-    # rv2 semantics: a record that transitions to terminal INSIDE a list
-    # call's own reconcile pass is returned that once (so the client that
-    # triggered the discovery actually sees the transition -- the same rule
-    # that lets a restart-recovered completion surface its report), and is
-    # excluded from every later listing.
+def test_expired_pipelines_are_excluded_from_list_active_but_still_reconciled(tmp_path) -> None:
+    # F7 (durable report rejoin): the one-shot "surface a just-terminalized
+    # record exactly once" rule is gone. An expired pipeline carries no report
+    # to rejoin, so it is not listed at all -- but the listing pass still
+    # RECONCILES it, so its expiry transition persists and a direct GET sees it.
     config, store, job_manager = _new_env(tmp_path)
     parse_job = _parsed_job_with_request(config, job_manager)
     pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
     stale = pipeline.with_updates(expires_at="2000-01-01T00:00:00Z")
     store.save(stale, event="test_backdate")
 
-    first = {record.pipeline_id: record for record in list_active_pipelines(store, job_manager=job_manager, config=config)}
-    assert first[pipeline.pipeline_id].status == "expired"  # surfaced once, honestly terminal
+    first = {record.pipeline_id for record in list_active_pipelines(store, job_manager=job_manager, config=config)}
+    assert pipeline.pipeline_id not in first  # terminal, non-completed -> never listed
+    # The listing pass reconciled + persisted the expiry all the same.
+    assert get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config).status == "expired"
 
     second = {record.pipeline_id for record in list_active_pipelines(store, job_manager=job_manager, config=config)}
     assert pipeline.pipeline_id not in second
@@ -1064,12 +1074,16 @@ def test_cancel_awaiting_confirm_pipeline_is_terminal(tmp_path) -> None:
     assert again.status == "aborted"
 
 
-def test_cancel_while_running_synchronously_deletes_the_working_factor_row(tmp_path, monkeypatch) -> None:
-    # phase-review F6: an aborted pipeline must leave zero registry residue,
-    # and this must not depend on the background job's own eventual
-    # cooperation -- cancel_pipeline deletes the row itself, synchronously,
-    # before the still-blocked compute thread ever notices it was asked to
-    # stop.
+def test_cancel_while_running_defers_cleanup_and_abort_until_the_worker_stops(tmp_path, monkeypatch) -> None:
+    # F2 (cancellation is NON-terminal): while the compute worker is still
+    # running, cancel only REQUESTS the stop -- it must NOT delete the working
+    # factor row or terminalize the pipeline, because the job manager's
+    # completion-wins contract means the run may still finish. The working-
+    # artifact cleanup and the `aborted` transition are DEFERRED to
+    # reconciliation, which fires once the child job actually reaches
+    # `cancelled`. (The other ordering -- the worker COMPLETING despite the
+    # cancel -- is covered by
+    # test_f6_cancel_honors_a_completion_that_won_the_race_factor_study.)
     config, store, job_manager = _new_env(tmp_path)
     parse_job = _parsed_job_with_request(config, job_manager)
     pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
@@ -1093,13 +1107,19 @@ def test_cancel_while_running_synchronously_deletes_the_working_factor_row(tmp_p
     working_id = confirmed.working_factor_id
     assert repo.get(working_id) is not None  # registered while running
 
-    cancelled = cancel_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
-    assert cancelled.status == "aborted"
-    with pytest.raises(FileNotFoundError):
-        repo.get(working_id)
+    # Cancel while the worker is still blocked: DEFERRED, not terminal.
+    cancelling = cancel_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert cancelling.status == "running"  # non-terminal; cancel is only REQUESTED on the child job
+    assert repo.get(working_id) is not None  # working row NOT prematurely deleted
 
+    # Let the worker observe the cancel and stop -> the child job becomes
+    # `cancelled`; the DEFERRED cleanup + abort now fire on reconcile-on-read.
     release.set()
     _wait_job(job_manager, confirmed.stage("compute").child_job_id)
+    final = get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    assert final.status == "aborted"
+    with pytest.raises(FileNotFoundError):
+        repo.get(working_id)
     monkeypatch.undo()
 
 
@@ -1595,6 +1615,38 @@ def test_publish_cas_succeeds_when_canonical_row_unchanged(tmp_path) -> None:
     assert done.status == "completed"
     assert done.publish_state == "published"
     assert done.published_factor_id == pipeline.factor["factor_id"]
+
+
+def test_restart_republish_recovers_its_own_prior_publish_instead_of_a_false_conflict(tmp_path) -> None:
+    # F3 (restart-idempotent publish): a crash BETWEEN this pipeline's canonical
+    # repo.save and the completion store.save leaves the canonical row present
+    # while the on-disk snapshot still says "running". The restart's reconcile-
+    # republish then re-reads a row that was ABSENT at confirm (baseline ""), so
+    # the naive CAS check would call the pipeline's OWN prior publish a foreign
+    # conflict and record published_factor_id=None though the factor plainly
+    # exists. It must instead recognize its own output and record the id.
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    canonical_id = str(parse_job["result"]["factor"]["factor_id"])
+    pipeline = create_pipeline(store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config())
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    assert confirmed.canonical_baseline_fingerprint == ""  # canonical row absent at confirm
+    _wait_job(job_manager, confirmed.stage("compute").child_job_id)  # writes the completion artifact
+
+    # Model the partial first completion: the canonical publish LANDED ...
+    published_id, publish_state = pipeline_module._publish_canonical_factor(config, confirmed)
+    assert (published_id, publish_state) == (canonical_id, "published")
+    assert FactorRepository(config.paths.factor_root).get(canonical_id) is not None
+    # ... but the completion store.save never did (on-disk snapshot still "running").
+    assert store.load(pipeline.pipeline_id).status == "running"
+
+    # Restart: a fresh job manager (never heard of the job) reconciles from disk.
+    fresh_job_manager = _WebJobManager()
+    fresh_store = PipelineStore(config.paths.artifact_root)
+    rejoined = get_pipeline(fresh_store, pipeline.pipeline_id, job_manager=fresh_job_manager, config=config)
+    assert rejoined.status == "completed"
+    assert rejoined.published_factor_id == canonical_id  # recovered, NOT None
+    assert rejoined.publish_state == "published"
 
 
 def test_terminal_cleanup_removes_cached_working_values_from_both_roots(tmp_path) -> None:

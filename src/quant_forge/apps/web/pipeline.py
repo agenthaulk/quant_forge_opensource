@@ -605,6 +605,22 @@ class _CanonicalRowUnreadable(Exception):
     """A registry read failed for a reason OTHER than absence."""
 
 
+def _factor_content_fingerprint(factor: FactorDefinition) -> str:
+    """Content fingerprint of a factor definition.
+
+    The single fingerprint shape used for BOTH the canonical registry row
+    (loaded from disk) and an in-memory intended-publish output, so a
+    saved-then-reloaded row and the object it was built from fingerprint
+    identically -- the F3 recovery check in ``_publish_canonical_factor``
+    depends on that symmetry.
+    """
+
+    from dataclasses import asdict
+
+    payload = {key: str(value) for key, value in sorted(asdict(factor).items())}
+    return canonical_fingerprint(payload)
+
+
 def _canonical_row_fingerprint(config: QuantForgeConfig, canonical_id: str) -> str:
     """Content fingerprint of the canonical registry row; "" when absent.
 
@@ -628,10 +644,7 @@ def _canonical_row_fingerprint(config: QuantForgeConfig, canonical_id: str) -> s
         return ""
     except Exception as exc:
         raise _CanonicalRowUnreadable(canonical_id) from exc
-    from dataclasses import asdict
-
-    payload = {key: str(value) for key, value in sorted(asdict(existing).items())}
-    return canonical_fingerprint(payload)
+    return _factor_content_fingerprint(existing)
 
 
 def _publish_lock_path(config: QuantForgeConfig) -> Path:
@@ -684,6 +697,32 @@ def _publish_canonical_factor(config: QuantForgeConfig, record: PipelineRecord) 
             LOGGER.warning("declining to publish %s: canonical row unreadable (fail closed)", canonical_id)
             return None, "conflict"
         if current_fingerprint != record.canonical_baseline_fingerprint:
+            # F3 (restart-idempotent publish): recognize our OWN prior publish
+            # before calling a foreign conflict. A crash BETWEEN this pipeline's
+            # canonical repo.save and the completion store.save leaves the row
+            # present while the on-disk snapshot still says "running"; the
+            # restart's reconcile-republish then re-reads a row that was ABSENT
+            # at confirm (baseline ""), so the CAS baseline no longer matches --
+            # yet if the existing row is byte-identical to what THIS attempt
+            # would publish, the publish already landed and recording None would
+            # strand a factor that plainly exists. Treat that as idempotent
+            # success (recovered prior publish), NOT a conflict. A genuinely
+            # foreign concurrent edit still differs and still fails closed below.
+            intended = dataclass_replace(
+                _factor_from_request(dict(record.factor)), factor_id=canonical_id, status="draft"
+            )
+            try:
+                existing_row = FactorRepository(config.paths.factor_root).get(canonical_id)
+            except FileNotFoundError:
+                existing_row = None
+            if existing_row is not None and _factor_content_fingerprint(existing_row) == _factor_content_fingerprint(
+                intended
+            ):
+                LOGGER.info(
+                    "recovered prior publish for %s (canonical row already matches this attempt's output)",
+                    canonical_id,
+                )
+                return canonical_id, "published"
             LOGGER.info(
                 "declining to publish %s: canonical row changed since confirm (CAS mismatch)",
                 canonical_id,
@@ -1317,32 +1356,46 @@ def pipeline_report(
         raise PipelineNotFoundError(f"no durable report evidence for completed pipeline {pipeline_id}")
 
 
+# F7 (durable report rejoin): recently-completed pipelines stay visible in the
+# rejoin listing (bounded) instead of surfacing exactly once. A reload, Back, or
+# a second consumer must all still re-attach to a just-finished report -- the
+# old one-shot consumption made the completion invisible on the very next
+# listing. Bounded by COUNT (the N most recent by created_at) so the listing can
+# never grow without limit as completed pipelines accumulate.
+_MAX_RECENT_COMPLETED_IN_LISTING = 10
+
+
 def list_active_pipelines(store: PipelineStore, *, job_manager: _WebJobManager, config: QuantForgeConfig) -> list[PipelineRecord]:
-    """Every non-terminal pipeline, each independently reconciled.
+    """Every non-terminal pipeline plus the recently-completed ones, reconciled.
 
     Phase-review F9: rejoin must not reconcile only the pipeline the
     frontend happens to render -- every id under the store is loaded and
     reconciled here, unconditionally, before the (separate) decision of
     which one a caller's UI attaches to.
+
+    F7 (durable report rejoin): the listing carries non-terminal pipelines AND
+    the ``_MAX_RECENT_COMPLETED_IN_LISTING`` most-recent COMPLETED ones, with NO
+    one-shot consumption -- a completed report stays discoverable across a
+    reload and to a second consumer instead of being surfaced exactly once.
+    aborted/expired terminals carry no report to rejoin and are excluded (they
+    are still reconciled here, so their terminal transition still persists).
     """
 
     with store.lock:
-        records = []
+        active: list[PipelineRecord] = []
+        completed: list[PipelineRecord] = []
         for pipeline_id in store.list_ids():
             try:
                 record = store.load(pipeline_id)
             except PipelineNotFoundError:
                 continue
-            was_terminal = record.status in TERMINAL_PIPELINE_STATUSES
             record = _reconcile(record, store=store, job_manager=job_manager, config=config)
-            # A record that JUST transitioned to terminal inside THIS
-            # reconcile pass is returned once (rv2 round: filtering purely
-            # on the post-reconcile status made a restart-recovered
-            # completion invisible -- the startup listing was the only
-            # discovery path, so the client could never learn the pipeline
-            # id to fetch /report for).
-            if record.status not in TERMINAL_PIPELINE_STATUSES or not was_terminal:
-                records.append(record)
+            if record.status not in TERMINAL_PIPELINE_STATUSES:
+                active.append(record)
+            elif record.status == "completed":
+                completed.append(record)
+    completed.sort(key=lambda item: item.created_at, reverse=True)
+    records = active + completed[:_MAX_RECENT_COMPLETED_IN_LISTING]
     records.sort(key=lambda item: item.created_at, reverse=True)
     return records
 
@@ -1732,6 +1785,24 @@ def cancel_pipeline(store: PipelineStore, pipeline_id: str, *, job_manager: _Web
                 return record
             if record.status == "paused_failure":
                 return record
+            # F2 (cancellation is NON-terminal): the child job is still
+            # un-terminal here (``cancel_requested`` -- the worker has NOT yet
+            # observed the stop, or is inside the completion-wins window where
+            # jobs.py PF-F4 lets an already-returned result still land as
+            # ``completed``). Terminalizing and cleaning up NOW would (a) delete
+            # the working factor row / cached values out from under a run that
+            # may still finish and (b) orphan a completion the worker is about
+            # to durably record. So DEFER both the working-artifact cleanup and
+            # the ``aborted`` transition to reconciliation: the next read folds
+            # in the child job's real terminal status -- ``cancelled`` cleans +
+            # aborts, ``completed`` honors the completion (the cancel becomes a
+            # truthful no-op). The cancel is already requested on the child job;
+            # nothing on the record changed, so the still-running snapshot
+            # stands untouched.
+            return record
+        # Non-running (draft / awaiting_confirm / paused_failure): there is no
+        # live worker to wait for, so cancel is immediately terminal -- clean
+        # the working artifacts and abort in place, exactly as before.
         record = _with_cleanup(record, config)
         record = _transition(record, "aborted")
         return store.save(record, event="cancelled")
