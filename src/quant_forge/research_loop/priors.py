@@ -389,7 +389,12 @@ def _cell(dimension: str, bucket: str, records: list[dict[str, Any]], query: Pri
 
     evidence_runs = len(records)
     scientific = verdict_counts["passed"] + verdict_counts["blocked"]
-    insufficient = evidence_runs < query.min_cell_evidence_runs or scientific == 0
+    # F10: the min-cell-evidence floor gates on SCIENTIFIC rows only
+    # (passed + blocked). Counting unknown / not_applicable bookkeeping rows
+    # toward the floor let a thin cell (e.g. 1 passed + 1 unknown, floor 2)
+    # clear it and publish a pass_rate derived from a single scientific row.
+    # evidence_runs stays len(records) for the display/count fields.
+    insufficient = scientific < query.min_cell_evidence_runs or scientific == 0
     if insufficient:
         pass_rate = None
         weighted_pass_rate = None

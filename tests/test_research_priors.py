@@ -145,6 +145,31 @@ def test_view_thin_cells_are_null_plus_insufficient_sample(tmp_path: Path) -> No
     assert payload["pass_rate"] is None
 
 
+def test_view_thin_cell_floor_counts_scientific_rows_only_not_bookkeeping(tmp_path: Path) -> None:
+    # F10: a cell with 1 passed + 1 unknown (submit-stage lifecycle
+    # bookkeeping) holds only ONE scientific row. With the default floor of 2
+    # it must be reported insufficient -- the unknown envelope must not count
+    # toward the min-cell-evidence floor and let a single-scientific-row cell
+    # publish a pass_rate. The total evidence_runs count stays 2 for display.
+    store = _store(tmp_path)
+    ingest_outcome(store, _outcome(_fp(1), verdict="passed"))
+    ingest_outcome(
+        store,
+        _outcome(_fp(2), stage="submit", verdict="unknown", lifecycle_status="submitted", reason_codes=(REASON_NONE,)),
+    )
+
+    view = compute_priors(store)  # floor = 2 by default
+    cell = next(
+        item for item in next(t for t in view.tables if t.dimension == "factor_family").cells if item.bucket == "momentum"
+    )
+    assert cell.verdict_counts["passed"] == 1
+    assert cell.verdict_counts["unknown"] == 1
+    assert cell.evidence_runs == 2  # total count kept for display fields
+    assert cell.insufficient_sample is True  # only 1 scientific row < floor 2
+    assert cell.pass_rate is None
+    assert cell.weighted_pass_rate is None
+
+
 def test_view_weights_by_evidence_strength_tier(tmp_path: Path) -> None:
     store = _store(tmp_path)
     # gate stage -> local_backtest (0.5); submit accepted -> submitted_live (1.0).
