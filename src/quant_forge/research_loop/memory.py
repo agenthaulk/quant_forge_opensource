@@ -1081,9 +1081,23 @@ class ResearchMemoryStore:
             return len(_read_jsonl(self.outcomes_ledger_path))
 
     def _known_outcome_ids_unlocked(self) -> frozenset[str]:
-        return frozenset(
-            str(row["outcome_id"]) for row in _read_jsonl(self.outcomes_ledger_path) if row.get("outcome_id")
-        )
+        # F12: a JSON-valid but non-object ledger row (e.g. ``[]`` or a bare
+        # scalar) has no ``.get``, so a blind ``row.get`` crashed the replay
+        # check -- and every subsequent ingest -- on a single corrupt row.
+        # Guard ``isinstance(row, dict)`` and skip non-objects; the row stays on
+        # the append-only ledger (quarantined by exclusion), so later outcomes
+        # still ingest. Only a NON-EMPTY STRING outcome_id enters the replay
+        # set, so a corrupt row carrying a non-string id can no longer be
+        # ``str()``-coerced into a bogus membership entry that would silently
+        # drop a genuine future outcome as a "replay".
+        ids: set[str] = set()
+        for row in _read_jsonl(self.outcomes_ledger_path):
+            if not isinstance(row, dict):
+                continue
+            outcome_id = row.get("outcome_id")
+            if isinstance(outcome_id, str) and outcome_id:
+                ids.add(outcome_id)
+        return frozenset(ids)
 
     # ------------------------------------------------------------------
     # Unlocked internals: never self-lock (callers hold the lock already).
@@ -1306,6 +1320,8 @@ class ResearchMemoryStore:
     def _read_observations(self) -> tuple[MemoryObservation, ...]:
         observations: list[MemoryObservation] = []
         for row in _read_jsonl(self.observations_path):
+            if not isinstance(row, dict):
+                continue  # F12: skip a JSON-valid non-object row instead of crashing at row.get
             observations.append(
                 MemoryObservation(
                     signature=str(row.get("signature") or ""),

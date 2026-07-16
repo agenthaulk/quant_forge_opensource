@@ -400,3 +400,26 @@ def test_ingest_rejects_origin_mismatch_in_both_directions_and_writes_nothing(tm
     receipt = ingest_outcome(plugin_store, external_outcome, expected_origin="external_plugin")
     assert receipt.recorded is True
     assert plugin_store.known_outcome_ids() == {external_outcome.outcome_id()}
+
+
+def test_ingress_survives_non_object_rows_in_ledger_and_observations(tmp_path: Path) -> None:
+    # F12: a JSON-valid but non-object row (e.g. []) injected into the outcomes
+    # ledger OR the observations file must not crash the ingress replay check
+    # (_known_outcome_ids_unlocked) or the observation read (_read_observations).
+    # The corrupt row is quarantined by exclusion, and a subsequent genuine
+    # outcome still ingests.
+    store = _store(tmp_path)
+    first = ingest_outcome(store, _outcome(factor_id="FTR_A", factor_fingerprint=FP_A))
+    assert first.recorded is True
+
+    with store.outcomes_ledger_path.open("a", encoding="utf-8") as handle:
+        handle.write("[]\n")
+    with store.observations_path.open("a", encoding="utf-8") as handle:
+        handle.write('"not an object"\n')
+
+    # The next new outcome ingests without crashing on either corrupt row.
+    second = ingest_outcome(store, _outcome(factor_id="FTR_B", factor_fingerprint=FP_B))
+    assert second.recorded is True
+
+    # Both real ids remain; the [] row never entered the replay set.
+    assert store.known_outcome_ids() == {first.outcome_id, second.outcome_id}
