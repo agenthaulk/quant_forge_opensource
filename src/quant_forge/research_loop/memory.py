@@ -857,6 +857,7 @@ class ResearchMemoryStore:
         actor: str,
         rationale: str = "",
         decided_at: str | None = None,
+        expected_entry_id: str | None = None,
     ) -> MemoryReviewEvent:
         """Atomic CLI-facing operation (P4a rework item 8): prefix
         resolution, row binding, and event append all happen inside ONE
@@ -878,10 +879,22 @@ class ResearchMemoryStore:
 
         with advisory_file_lock(self._lock_path):
             row = self._resolve_signature_prefix_unlocked(target_kind, prefix)
+            live_entry_id = str(row.get("entry_id") or "")
+            # F14: stale review-tab guard. The client posts the entry id of the
+            # row it RENDERED; if the prefix now resolves to a different
+            # (superseded) live entry, the reviewer is acting on stale content
+            # -- refuse without appending any event. An empty/None
+            # expected_entry_id skips the check (CLI parity; backward compat).
+            if expected_entry_id and expected_entry_id != live_entry_id:
+                raise ValueError(
+                    f"stale review target: the {target_kind} row for this signature is now "
+                    f"entry {live_entry_id!r}, not the {expected_entry_id!r} you reviewed; "
+                    "reload the review tab and retry"
+                )
             return self._record_review_event_unlocked(
                 target_kind=target_kind,
                 target_signature=str(row.get("signature") or ""),
-                reviewed_entry_id=str(row.get("entry_id") or ""),
+                reviewed_entry_id=live_entry_id,
                 action=action,
                 actor=actor,
                 rationale=rationale,

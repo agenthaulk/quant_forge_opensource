@@ -522,6 +522,7 @@ def create_local_web_server(
                             action=_memory_review_str_field(payload, "action"),
                             actor=_memory_review_str_field(payload, "actor"),
                             rationale=_memory_review_str_field(payload, "rationale"),
+                            expected_entry_id=_memory_review_str_field(payload, "expected_entry_id"),
                         )
                     )
                     return
@@ -535,6 +536,7 @@ def create_local_web_server(
                             action=_memory_review_str_field(payload, "action"),
                             actor=_memory_review_str_field(payload, "actor"),
                             rationale=_memory_review_str_field(payload, "rationale"),
+                            expected_entry_id=_memory_review_str_field(payload, "expected_entry_id"),
                         )
                     )
                     return

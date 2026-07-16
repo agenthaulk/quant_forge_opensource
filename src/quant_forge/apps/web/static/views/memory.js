@@ -66,11 +66,14 @@ function signatureHtml(signature) {
   return `<code class="mem-sig" title="${esc(text)}">${esc(text)}</code>`;
 }
 
-function actionButtonHtml(action, kind, signature, label) {
+function actionButtonHtml(action, kind, signature, entryId, label) {
   const shortSig = String(signature || '').slice(0, 12);
+  // F14: carry the rendered row's entry id so the POST can bind the action to
+  // the exact row content the reviewer saw; the server refuses a stale target.
   return (
     `<button type="button" class="mem-action-btn secondary" data-mem-action="${esc(action)}" ` +
     `data-mem-kind="${esc(kind)}" data-mem-signature="${esc(signature)}" ` +
+    `data-mem-entry-id="${esc(entryId || '')}" ` +
     `aria-label="${esc(label)} ${esc(shortSig)}">${esc(label)}</button>`
   );
 }
@@ -82,8 +85,8 @@ function ruleRowHtml(row, includeActions) {
   let actionsCell = '';
   if (includeActions) {
     const actions = [];
-    if (row.can_activate) actions.push(actionButtonHtml('activate', 'rule', row.signature, '激活'));
-    if (row.can_deactivate) actions.push(actionButtonHtml('deactivate', 'rule', row.signature, '停用'));
+    if (row.can_activate) actions.push(actionButtonHtml('activate', 'rule', row.signature, row.entry_id, '激活'));
+    if (row.can_deactivate) actions.push(actionButtonHtml('deactivate', 'rule', row.signature, row.entry_id, '停用'));
     actionsCell = `<td class="mem-actions">${actions.join(' ') || '<span class="meta">无可用操作</span>'}</td>`;
   }
   return `
@@ -120,8 +123,8 @@ function promotedRowHtml(kind, row, includeActions) {
   let actionsCell = '';
   if (includeActions) {
     const actions = [];
-    if (row.can_retire) actions.push(actionButtonHtml('retire', kind, row.signature, '退休'));
-    if (row.can_unretire) actions.push(actionButtonHtml('unretire', kind, row.signature, '恢复'));
+    if (row.can_retire) actions.push(actionButtonHtml('retire', kind, row.signature, row.entry_id, '退休'));
+    if (row.can_unretire) actions.push(actionButtonHtml('unretire', kind, row.signature, row.entry_id, '恢复'));
     actionsCell = `<td class="mem-actions">${actions.join(' ') || '<span class="meta">无可用操作</span>'}</td>`;
   }
   return `
@@ -306,6 +309,7 @@ async function handleActionClick(button) {
   const action = button.dataset.memAction;
   const kind = button.dataset.memKind;
   const signature = button.dataset.memSignature;
+  const entryId = button.dataset.memEntryId || '';
   const actorInput = document.getElementById('mem-actor');
   const rationaleInput = document.getElementById('mem-rationale');
   const statusEl = document.getElementById('mem-action-status');
@@ -320,8 +324,8 @@ async function handleActionClick(button) {
   try {
     const url = kind === 'rule' ? '/api/memory/review/rule' : '/api/memory/review/promoted';
     const body = kind === 'rule'
-      ? { signature_prefix: signature, action, actor, rationale }
-      : { kind, signature_prefix: signature, action, actor, rationale };
+      ? { signature_prefix: signature, action, actor, rationale, expected_entry_id: entryId }
+      : { kind, signature_prefix: signature, action, actor, rationale, expected_entry_id: entryId };
     const payload = await postJson(url, body);
     if (statusEl) {
       statusEl.innerHTML = `<span class="ok">已记录 ${esc(action)} · ${esc(String(signature).slice(0, 12))}</span>`;

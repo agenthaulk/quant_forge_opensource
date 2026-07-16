@@ -194,6 +194,7 @@ def review_rule(
     action: str,
     actor: str,
     rationale: str = "",
+    expected_entry_id: str = "",
 ) -> dict[str, Any]:
     """Record one activate/deactivate review event for a rule signature and
     return the refreshed :func:`memory_review_payload`.
@@ -202,6 +203,11 @@ def review_rule(
     atomic lock hold via :meth:`ResearchMemoryStore.resolve_validate_append`:
     an ambiguous or absent prefix raises ``ValueError`` naming every
     candidate (the R3 anti-fat-finger check) before anything is written.
+
+    ``expected_entry_id`` is the entry id of the row the client RENDERED (F14
+    stale-tab guard): if the live row the prefix resolves to no longer matches
+    it, the store refuses with a ``ValueError`` and appends nothing. An empty
+    string (the default; e.g. a CLI caller) skips the check.
     """
 
     _require_actor(actor)
@@ -213,6 +219,7 @@ def review_rule(
         action=action,
         actor=actor,
         rationale=rationale,
+        expected_entry_id=expected_entry_id or None,
     )
     return memory_review_payload(store, plugin_store)
 
@@ -226,10 +233,12 @@ def review_promoted(
     action: str,
     actor: str,
     rationale: str = "",
+    expected_entry_id: str = "",
 ) -> dict[str, Any]:
     """Record one retire/unretire review event for a finding/failure
     signature and return the refreshed :func:`memory_review_payload`. Same
-    atomic resolve+append discipline as :func:`review_rule`.
+    atomic resolve+append discipline as :func:`review_rule`, including the F14
+    ``expected_entry_id`` stale-tab guard (empty skips the check).
     """
 
     _require_actor(actor)
@@ -243,5 +252,6 @@ def review_promoted(
         action=action,
         actor=actor,
         rationale=rationale,
+        expected_entry_id=expected_entry_id or None,
     )
     return memory_review_payload(store, plugin_store)

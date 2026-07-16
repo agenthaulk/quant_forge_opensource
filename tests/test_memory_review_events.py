@@ -1406,6 +1406,37 @@ def test_cli_memory_rules_unretire(tmp_path: Path, capsys: pytest.CaptureFixture
         cli_main.main(["memory", "rules", "unretire", "rule", "sig_unretire_me", "--actor", "erin", *root_arg])
 
 
+def test_resolve_validate_append_refuses_stale_expected_entry_id(tmp_path: Path) -> None:
+    # F14: the stale review-tab guard. resolve_validate_append refuses when the
+    # caller's expected_entry_id (the row it rendered) does not match the live
+    # row the prefix resolves to -- no event is appended -- while a matching id
+    # proceeds normally.
+    store = ResearchMemoryStore(tmp_path / "artifacts")
+    row = _promote_rule(store, signature="sig_stale")
+    live_entry_id = row["entry_id"]
+
+    with pytest.raises(ValueError, match="stale review target"):
+        store.resolve_validate_append(
+            target_kind="rule",
+            prefix="sig_stale",
+            action="activate",
+            actor="alice",
+            expected_entry_id="not-the-live-entry-id",
+        )
+    assert _read_jsonl(store.review_events_path) == []  # nothing appended
+
+    event = store.resolve_validate_append(
+        target_kind="rule",
+        prefix="sig_stale",
+        action="activate",
+        actor="alice",
+        expected_entry_id=live_entry_id,
+    )
+    assert event.reviewed_entry_id == live_entry_id
+    assert len(_read_jsonl(store.review_events_path)) == 1
+    assert store.rule_states() == {"sig_stale": "active"}
+
+
 def test_cli_atomic_race_two_threads_activating_the_same_prefix(tmp_path: Path) -> None:
     # P4a rework item 8: resolve_validate_append (which the CLI now uses)
     # closes the resolve-then-append TOCTOU window. Two THREADS (see

@@ -169,6 +169,40 @@ def test_rule_lapsed_pending_re_review_after_superseding_promotion(tmp_path: Pat
     assert entry["can_deactivate"] is True
 
 
+def test_review_rule_refuses_stale_expected_entry_id_after_supersede(tmp_path: Path) -> None:
+    # F14: a review action carrying the entry id of a row that has since been
+    # superseded (the reviewer's tab is stale) is refused -- no event appended
+    # -- while the current live entry id succeeds.
+    store = _store(tmp_path)
+    original = _promote_rule(store, signature="sig_stale")
+    stale_entry_id = original["entry_id"]
+
+    store.record_observation(
+        signature="sig_stale",
+        statement="rule statement for sig_stale",
+        run_id="sig_stale-4",
+        observed_at=T4,
+        data_window="2025-01-01:2025-06-30",
+    )
+    store.promote_pending()
+    live_entry_id = memory_review_payload(store)["rules"][0]["entry_id"]
+    assert live_entry_id != stale_entry_id
+
+    # The stale (rendered-then-superseded) entry id is refused; state unchanged
+    # (never reviewed -- the refusal appended no activation event).
+    with pytest.raises(ValueError, match="stale review target"):
+        review_rule(
+            store, signature_prefix="sig_stale", action="activate", actor="alice", expected_entry_id=stale_entry_id
+        )
+    assert memory_review_payload(store)["rules"][0]["state"] == "never_reviewed"
+
+    # The live entry id (a reloaded tab) succeeds.
+    payload = review_rule(
+        store, signature_prefix="sig_stale", action="activate", actor="alice", expected_entry_id=live_entry_id
+    )
+    assert next(item for item in payload["rules"] if item["signature"] == "sig_stale")["state"] == "active"
+
+
 def test_rules_sort_needs_review_first_then_active_then_deactivated(tmp_path: Path) -> None:
     store = _store(tmp_path)
     _promote_rule(store, signature="sig_active")
