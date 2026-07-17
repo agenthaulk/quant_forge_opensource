@@ -2509,6 +2509,18 @@ def apply_llm_settings_update(
       (used by RD optimization and the sidecar readiness probe; parse jobs
       already choose per request).
 
+    Security: this is the only route that could turn workbench-operate access
+    into standing-secret exfiltration, so it refuses to point an existing
+    provider whose key already lives in the environment at a NEW ``base_url``
+    without the caller re-supplying the key in the SAME request. Otherwise a
+    caller could redirect, say, deepseek to ``http://attacker/v1`` with no key
+    and the next LLM call would ship the host's durable ``DEEPSEEK_API_KEY``
+    (from ``configs/*.local.env``) as a bearer token to the attacker's URL —
+    a credential the web layer is never allowed to reveal. Legitimate
+    first-time setup (host + key together) is unaffected. No private-IP/SSRF
+    blocklist is applied on purpose: a local self-hosted model
+    (``http://127.0.0.1:11434`` etc.) is a first-class OpenAI-compatible use.
+
     Returns the replacement frozen config plus a response payload shaped like
     the ``llm`` section of ``/api/status`` so the frontend can re-hydrate from
     the response alone (loopback binds never re-fetch ``/api/status``).
@@ -2526,10 +2538,13 @@ def apply_llm_settings_update(
     model = str(payload.get("model", "") or "").strip()
     base_url = str(payload.get("base_url", "") or "").strip()
     activate = _bool_parameter(payload.get("activate", True), "activate")
+    api_key = payload.get("api_key")
+    api_key_supplied = api_key is not None and str(api_key) != ""
 
     presets = {preset["provider"]: preset for preset in builtin_provider_presets()}
     api_key_env = ""
-    if name not in config.llm.providers:
+    existing = config.llm.providers.get(name)
+    if existing is None:
         preset = presets.get(name)
         if preset is None:
             known = ", ".join(sorted(set(config.llm.providers) | set(presets)))
@@ -2551,16 +2566,35 @@ def apply_llm_settings_update(
     )
     selected = new_llm.select_provider(name)
 
+    # Standing-key exfiltration guard (see the security note above): a base_url
+    # that actually changes the entry's host, without a key re-supplied here,
+    # is refused when the target env var is already populated. `base_url` is
+    # only truthy when the caller sent one (presets fill it before this point,
+    # but a brand-new preset registration has no standing key + no `existing`).
+    target_env = str(selected.api_key_env).strip()
+    prior_base_url = existing.base_url if existing is not None else ""
+    if (
+        base_url
+        and base_url != prior_base_url
+        and not api_key_supplied
+        and target_env
+        and os.environ.get(target_env)
+    ):
+        raise ValueError(
+            "changing base_url requires re-supplying api_key so a standing "
+            "credential is never sent to a newly specified host"
+        )
+
     key_updated = False
-    api_key = payload.get("api_key")
-    if api_key is not None and str(api_key) != "":
+    if api_key_supplied:
         credential = str(api_key)
         _validate_api_key_shape(credential)
-        env_name = str(selected.api_key_env).strip()
+        env_name = target_env
         if not env_name:
             raise ValueError(
                 f"provider {name} does not declare api_key_env; cannot accept an API key"
             )
+        _validate_env_var_name(env_name)
         # In-process only, by design: the LLM client resolves the key from the
         # environment on every call, so this takes effect immediately and
         # vanishes on restart. Never logged, never in any response payload.
@@ -2580,6 +2614,22 @@ def apply_llm_settings_update(
         },
     }
     return new_config, response
+
+
+def _validate_env_var_name(env_name: str) -> None:
+    """Refuse to write anything but a plain env-var identifier.
+
+    Presets use fixed ``*_API_KEY`` names and YAML is owner-controlled, so this
+    is defense-in-depth: it stops a future/hand-edited ``api_key_env`` from
+    aiming the runtime key write at a process-influencing variable
+    (``PATH``/``LD_PRELOAD``/``PYTHONPATH``/the control-token env). Mirrors the
+    identifier rule the env-*file* parser already enforces (config.py).
+    """
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name):
+        raise ValueError("api_key_env must be a plain environment-variable name")
+    if env_name.endswith(("PATH", "PRELOAD")) or env_name in {"PATH", "LD_PRELOAD", "PYTHONPATH"}:
+        raise ValueError(f"refusing to write reserved environment variable: {env_name}")
 
 
 def _validate_api_key_shape(credential: str) -> None:

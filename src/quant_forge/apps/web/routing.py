@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import threading
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -357,16 +358,26 @@ def create_local_web_server(
     sidecar_sessions = SidecarSessionStore(config.paths.artifact_root)
     control_token = _control_token_for_bind(host, config)
     control_token_required = bool(control_token)
+    # Serializes the read-modify-write of the settings swap so two concurrent
+    # /api/settings/llm POSTs (ThreadingHTTPServer) can't both build off the
+    # same pre-swap snapshot and drop one registration.
+    settings_lock = threading.Lock()
 
-    def _swap_runtime_config(new_config: QuantForgeConfig) -> None:
-        # /api/settings/llm applies a runtime LLM update by atomically
-        # replacing the closure's frozen config snapshot (reference
-        # assignment; in-flight requests keep the snapshot they already
-        # read). The tool registry captured its own reference at
-        # construction, so it gets the replacement explicitly.
+    def _apply_llm_settings(payload: dict[str, Any]) -> dict[str, Any]:
+        # Runtime LLM settings write. The whole read-modify-write is held under
+        # settings_lock so the env-key injection and the config swap commit
+        # together. The swap reassigns the closure's `config` cell: subsequent
+        # NEW requests and deferred jobs/scheduler read the live value, while a
+        # synchronous request already mid-flight keeps the locals it read. The
+        # tool registry captured its own reference at construction, so it gets
+        # the replacement explicitly.
         nonlocal config
-        config = new_config
-        tool_registry.apply_runtime_config(new_config)
+        with settings_lock:
+            new_config, response = _server.apply_llm_settings_update(config, payload)
+            config = new_config
+            tool_registry.apply_runtime_config(new_config)
+            response["rd"] = _rd_status_payload(new_config, research_config)
+            return response
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -455,18 +466,21 @@ def create_local_web_server(
                     self._json(memory_review_payload(memory_store))
                 elif path == "/api/status":
                     self._require_control_token()
-                    active_llm = _active_llm(config)
+                    # Snapshot the closure config once: a settings swap landing
+                    # mid-response must not yield a JSON mixing pre/post state.
+                    cfg = config
+                    active_llm = _active_llm(cfg)
                     self._json(
                         {
                             "name": "Quant Forge",
-                            "paths": _paths_payload(config),
+                            "paths": _paths_payload(cfg),
                             "llm": {
                                 "provider": active_llm.provider,
                                 "model": active_llm.model,
                                 "api_key_env": active_llm.api_key_env,
-                                "providers": _llm_provider_options(config),
+                                "providers": _llm_provider_options(cfg),
                             },
-                            "rd": _rd_status_payload(config, research_config),
+                            "rd": _rd_status_payload(cfg, research_config),
                         }
                     )
                 elif path == "/api/research/status":
@@ -566,18 +580,14 @@ def create_local_web_server(
                 self._require_control_token()
                 payload = self._read_json()
                 if path == "/api/settings/llm":
-                    # Runtime LLM settings write: registers/updates a provider,
-                    # optionally injects the API key into this process's env
-                    # (never persisted, never echoed), then swaps the closure
-                    # config so every later request sees the new active
-                    # provider. ValueError -> 400 via the generic mapping.
-                    new_config, response = _server.apply_llm_settings_update(config, payload)
-                    _swap_runtime_config(new_config)
-                    # rd section rides along so the frontend can re-hydrate
-                    # the whole runtime strip from this response alone
-                    # (loopback binds never re-fetch /api/status).
-                    response["rd"] = _rd_status_payload(new_config, research_config)
-                    self._json(response)
+                    # Registers/updates a provider, optionally injects the API
+                    # key into this process's env (never persisted, echoed, or
+                    # logged), then swaps the closure config so every later
+                    # request sees the new active provider. The rd section
+                    # rides along so the frontend re-hydrates the whole runtime
+                    # strip from this response alone (loopback binds never
+                    # re-fetch /api/status). ValueError -> 400 below.
+                    self._json(_apply_llm_settings(payload))
                     return
                 if path == "/api/run-idea":
                     result = _server.run_idea_workflow(

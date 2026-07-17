@@ -55,10 +55,12 @@ def _config_with_deepseek(tmp_path: Path) -> QuantForgeConfig:
 
 @pytest.fixture()
 def llm_web_app(tmp_path, monkeypatch):
-    # The glm preset injects into the REAL preset env name; snapshot both so
-    # the test never leaks state into (or reads state from) the dev machine.
-    monkeypatch.delenv("GLM_API_KEY", raising=False)
-    monkeypatch.delenv(_DS_ENV, raising=False)
+    # Preset saves inject into the REAL preset env names; register every env
+    # var these tests touch with monkeypatch so a raw os.environ write inside
+    # the endpoint is reverted at teardown and never clobbers a developer's
+    # real key on the host.
+    for env_name in ("GLM_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_API_KEY", _DS_ENV):
+        monkeypatch.delenv(env_name, raising=False)
     create_demo_workspace(tmp_path / "demo")
     server = create_local_web_server(
         host="127.0.0.1", port=0, config=_config_with_deepseek(tmp_path)
@@ -142,17 +144,82 @@ def test_llm_settings_registers_preset_and_switches_active(llm_web_app) -> None:
 
 
 def test_llm_settings_accepts_provider_alias(llm_web_app) -> None:
+    # The fixture registers ANTHROPIC_API_KEY with monkeypatch, so the raw
+    # os.environ write inside the endpoint is reverted at teardown.
     status, body = _post(
         f"{llm_web_app}/api/settings/llm",
         {"provider": "anthropic", "model": "claude-test-model", "api_key": _DUMMY_KEY + "-c"},
     )
+    assert status == 200
+    response = json.loads(body.decode("utf-8"))
+    assert response["llm"]["provider"] == "claude"
+    assert os.environ.get("ANTHROPIC_API_KEY") == _DUMMY_KEY + "-c"
+
+
+def test_base_url_redirect_of_standing_key_provider_is_refused(llm_web_app) -> None:
+    # Standing-key exfiltration guard: deepseek's key is already in the env,
+    # so pointing it at a new host WITHOUT re-supplying the key must 400 and
+    # leave both the env key and the provider base_url untouched.
+    os.environ[_DS_ENV] = "qf-standing-victim-key"
+    status, body = _post(
+        f"{llm_web_app}/api/settings/llm",
+        {"provider": "deepseek", "base_url": "http://attacker.example/v1"},
+    )
+    assert status == 400
+    assert "re-supplying api_key" in json.loads(body.decode("utf-8"))["error"]
+    assert os.environ.get(_DS_ENV) == "qf-standing-victim-key"
+
+    status, body = _get(f"{llm_web_app}/api/status")
+    deepseek = next(
+        o for o in json.loads(body.decode("utf-8"))["llm"]["providers"] if o["provider"] == "deepseek"
+    )
+    assert deepseek["base_url"] == "http://localhost/v1"  # unchanged; redirect never applied
+    assert "attacker.example" not in body.decode("utf-8")
+
+    # Re-supplying the key in the SAME request is the legitimate move-host flow.
+    status, body = _post(
+        f"{llm_web_app}/api/settings/llm",
+        {"provider": "deepseek", "base_url": "http://my-proxy.local/v1", "api_key": "qf-new-owner-key"},
+    )
+    assert status == 200
+    assert "qf-new-owner-key" not in body.decode("utf-8")
+    assert os.environ.get(_DS_ENV) == "qf-new-owner-key"
+
+
+def test_llm_settings_refuses_reserved_env_var_write(tmp_path, monkeypatch) -> None:
+    # A provider whose api_key_env aims at a process-influencing variable must
+    # never become web-writable, even though presets/YAML normally prevent it.
+    monkeypatch.delenv("GLM_API_KEY", raising=False)
+    create_demo_workspace(tmp_path / "demo")
+    config = QuantForgeConfig(
+        llm=LLMSettings(
+            provider="deepseek",
+            providers={
+                "evil": LLMProviderSettings(
+                    provider="evil",
+                    model="m",
+                    base_url="http://localhost/v1",
+                    api_key_env="PATH",
+                ),
+            },
+        )
+    ).resolve(tmp_path / "demo")
+    original_path = os.environ.get("PATH")
+    server = create_local_web_server(host="127.0.0.1", port=0, config=config)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
     try:
-        assert status == 200
-        response = json.loads(body.decode("utf-8"))
-        assert response["llm"]["provider"] == "claude"
-        assert os.environ.get("ANTHROPIC_API_KEY") == _DUMMY_KEY + "-c"
+        status, body = _post(
+            f"http://127.0.0.1:{server.server_address[1]}/api/settings/llm",
+            {"provider": "evil", "api_key": "qf-x"},
+        )
+        assert status == 400
+        assert "environment variable" in json.loads(body.decode("utf-8"))["error"]
+        assert os.environ.get("PATH") == original_path
     finally:
-        os.environ.pop("ANTHROPIC_API_KEY", None)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
 
 
 def test_llm_settings_rejects_bad_inputs(llm_web_app) -> None:
@@ -222,6 +289,39 @@ def test_llm_settings_requires_control_token_on_docker_bind(tmp_path, monkeypatc
         server.shutdown()
         server.server_close()
         thread.join(timeout=2.0)
+
+
+def test_concurrent_settings_posts_do_not_drop_a_registration(llm_web_app) -> None:
+    # MINOR (review): the settings swap is a read-modify-write under
+    # ThreadingHTTPServer; without the lock two concurrent preset saves could
+    # both build off the pre-swap snapshot and the last swap would drop the
+    # other. Fire both at once and assert BOTH providers survive in the final
+    # config, and both env keys landed. GLM_API_KEY/ANTHROPIC_API_KEY are
+    # registered with monkeypatch by the fixture, so teardown reverts them.
+    results: dict[str, int] = {}
+
+    def _save(provider: str, model: str, key: str) -> None:
+        status, _ = _post(
+            f"{llm_web_app}/api/settings/llm",
+            {"provider": provider, "model": model, "api_key": key, "activate": False},
+        )
+        results[provider] = status
+
+    threads = [
+        threading.Thread(target=_save, args=("glm", "glm-m", _DUMMY_KEY + "-g")),
+        threading.Thread(target=_save, args=("anthropic", "claude-m", _DUMMY_KEY + "-c")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert results == {"glm": 200, "anthropic": 200}
+    status, body = _get(f"{llm_web_app}/api/status")
+    names = {o["provider"] for o in json.loads(body.decode("utf-8"))["llm"]["providers"]}
+    assert {"glm", "claude", "deepseek"} <= names  # neither concurrent save dropped
+    assert os.environ.get("GLM_API_KEY") == _DUMMY_KEY + "-g"
+    assert os.environ.get("ANTHROPIC_API_KEY") == _DUMMY_KEY + "-c"
 
 
 def test_builtin_presets_expose_metadata_only() -> None:
