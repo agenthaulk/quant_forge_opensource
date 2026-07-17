@@ -109,6 +109,19 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--data-root", type=Path)
     validate.set_defaults(handler=_cmd_data_validate)
 
+    build_fund = data_subcommands.add_parser(
+        "build-fundamentals",
+        help="materialize a point-in-time fundamentals overlay from a local source layer",
+    )
+    _add_config_options(build_fund)
+    build_fund.add_argument("--data-root", type=Path)
+    build_fund.add_argument(
+        "--output",
+        type=Path,
+        help="overlay parquet path (default: fundamentals.parquet next to the panel)",
+    )
+    build_fund.set_defaults(handler=_cmd_data_build_fundamentals)
+
     factor = subcommands.add_parser("factor", help="factor library commands")
     factor_subcommands = factor.add_subparsers(dest="factor_command", required=True)
     list_cmd = factor_subcommands.add_parser("list", help="list factors")
@@ -483,6 +496,57 @@ def _cmd_data_validate(args: argparse.Namespace) -> int:
     result = validate_data_root(_runtime_paths(args).data_root)
     _print_dataclass(result)
     return 0 if result.ok else 2
+
+
+def _cmd_data_build_fundamentals(args: argparse.Namespace) -> int:
+    """Materialize the PIT fundamentals overlay from a locally-materialized
+    source layer (its path comes from the local config only) and write the
+    daily [trade_date, instrument, <fields>] overlay next to the panel."""
+
+    import sys
+
+    import pandas as pd
+
+    from quant_forge.data.fundamentals import build_fundamentals_overlay
+    from quant_forge.data.local import FUNDAMENTALS_OVERLAY_FILE, resolve_panel_path
+
+    paths = _runtime_paths(args)
+    source_root = paths.fundamentals_source_root
+    if source_root is None:
+        print(
+            "fundamentals_source_root is not configured; set paths.fundamentals_source_root "
+            "in a local config that points at a locally-materialized source layer",
+            file=sys.stderr,
+        )
+        return 2
+    panel_path = resolve_panel_path(paths.data_root)
+    if not panel_path.exists():
+        print(f"panel not found under data_root (looked for {panel_path.name})", file=sys.stderr)
+        return 2
+
+    panel_keys = pd.read_parquet(panel_path, columns=["trade_date", "instrument"])
+    overlay = build_fundamentals_overlay(source_root, panel_keys)
+
+    if args.output is not None:
+        output = args.output
+    elif paths.fundamentals_overlay_root is not None:
+        output = paths.fundamentals_overlay_root / FUNDAMENTALS_OVERLAY_FILE
+    else:
+        output = panel_path.parent / FUNDAMENTALS_OVERLAY_FILE
+    output.parent.mkdir(parents=True, exist_ok=True)
+    overlay.to_parquet(output, index=False)
+
+    fields = [c for c in overlay.columns if c not in ("trade_date", "instrument")]
+    _print_json(
+        {
+            "output": output.name,
+            "rows": int(len(overlay)),
+            "instruments": int(overlay["instrument"].nunique()),
+            "fields": fields,
+            "non_null_counts": {c: int(overlay[c].notna().sum()) for c in fields},
+        }
+    )
+    return 0
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:

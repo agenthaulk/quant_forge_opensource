@@ -184,12 +184,10 @@ def test_data_status_reports_coverage_quality_and_availability(web_app) -> None:
     assert payload["quality"]["missing_columns"] == []
     assert payload["quality"]["problems"] == []
     assert payload["quality"]["synthesized_columns"] == []
-    assert sorted(payload["quality"]["optional_columns"]) == [
-        "return_1d",
-        "return_5d",
-        "volatility_5d",
-        "volume",
-    ]
+    # Every optional field is backed in the demo (price-volume derived columns
+    # plus the fundamental overlay), so all optional fields report available.
+    declared_optional = sorted(item.name for item in data_field_catalog() if item.role == "optional")
+    assert sorted(payload["quality"]["optional_columns"]) == declared_optional
     # Availability rows are labels only (FP-4), one per declared non-key field.
     declared_non_key = [item.name for item in data_field_catalog() if item.role != "key"]
     assert [row["name"] for row in payload["fields"]] == declared_non_key
@@ -265,8 +263,10 @@ def test_registry_factors_lists_catalog_with_description_source_and_tags(web_app
     assert content_type == JSON_CONTENT_TYPE
     payload = json.loads(body.decode("utf-8"))
     assert set(payload) == {"factors", "count"}
-    assert payload["count"] == len(payload["factors"]) == 2
+    # Demo workspace ships three factors: small-cap, momentum, earnings-growth.
+    assert payload["count"] == len(payload["factors"]) == 3
     by_id = {row["factor_id"]: row for row in payload["factors"]}
+    assert "FTR_DEMO_EARNINGS_GROWTH" in by_id
     row = by_id["FTR_DEMO_SMALL_CAP"]
     assert set(row) == {
         "factor_id",

@@ -39,6 +39,7 @@ import numpy as np
 import pandas as pd
 
 from quant_forge.core.contracts import DataValidationResult, FactorDefinition
+from quant_forge.data.fundamentals import FUNDAMENTAL_FIELDS, FundamentalField
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.factor_library.research_tags import ResearchTags
 
@@ -66,6 +67,7 @@ def _field_tags(
     *,
     themes: tuple[str, ...] = (),
     columns_required: tuple[str, ...] = (),
+    frequency: str = "daily",
     min_warmup_bars: int | None = None,
     notes: str | None = None,
 ) -> ResearchTags:
@@ -74,16 +76,17 @@ def _field_tags(
         subject_id=name,
         themes=themes,
         columns_required=columns_required,
-        frequency="daily",
+        frequency=frequency,
         min_warmup_bars=min_warmup_bars,
         notes=notes,
         provenance="catalog",
     )
 
 
-# The one authoritative panel field catalog (FP-5). Warmup bars are facts of
-# the loader derivations below (pct_change / rolling windows), not estimates.
-PANEL_FIELD_CATALOG: tuple[CatalogField, ...] = (
+# The price-volume core of the panel field catalog (FP-5). Warmup bars are
+# facts of the loader derivations below (pct_change / rolling windows), not
+# estimates. Fundamental fields are appended after this tuple.
+_PRICE_VOLUME_FIELD_CATALOG: tuple[CatalogField, ...] = (
     CatalogField(
         name="trade_date",
         description="Trading date key column.",
@@ -158,6 +161,42 @@ PANEL_FIELD_CATALOG: tuple[CatalogField, ...] = (
             min_warmup_bars=3,
         ),
     ),
+)
+
+
+def _fundamental_catalog_field(field: FundamentalField) -> CatalogField:
+    """Declare one fundamental field (all optional -- absent unless a PIT
+    overlay is built and merged). The PIT semantic is recorded in the tag notes;
+    statement fields are ``quarterly``, daily valuation ratios are ``daily``."""
+
+    if field.pit_class == "statement":
+        frequency = "quarterly"
+        notes = (
+            "As-of announcement date: value is visible only from the report's "
+            "ann_date, never the period end (point-in-time)."
+        )
+    else:
+        frequency = "daily"
+        notes = "Daily valuation ratio keyed by trade_date (already point-in-time)."
+    return CatalogField(
+        name=field.name,
+        description=field.description,
+        role="optional",
+        tags=_field_tags(
+            field.name,
+            themes=("fundamental", field.theme),
+            frequency=frequency,
+            min_warmup_bars=1,
+            notes=notes,
+        ),
+    )
+
+
+# The one authoritative panel field catalog (FP-5): price-volume core plus the
+# fundamental fields (from the single fundamentals spec table). Fundamental
+# fields are optional and report ``missing`` until a PIT overlay is built.
+PANEL_FIELD_CATALOG: tuple[CatalogField, ...] = _PRICE_VOLUME_FIELD_CATALOG + tuple(
+    _fundamental_catalog_field(field) for field in FUNDAMENTAL_FIELDS
 )
 
 
@@ -236,11 +275,25 @@ def undeclared_panel_columns(columns: Iterable[str]) -> tuple[str, ...]:
     return tuple(sorted(set(columns) - declared))
 
 
-class LocalPanelDataProvider:
-    """Read a local equity panel or a mounted source snapshot."""
+FUNDAMENTALS_OVERLAY_FILE = "fundamentals.parquet"
 
-    def __init__(self, data_root: Path) -> None:
+
+class LocalPanelDataProvider:
+    """Read a local equity panel or a mounted source snapshot.
+
+    When a fundamentals overlay parquet is present (a sibling
+    ``fundamentals.parquet`` next to the panel, or an explicit
+    ``fundamentals_overlay_root``), its point-in-time fundamental columns are
+    left-merged onto the panel on ``[trade_date, instrument]`` — the overlay is
+    already daily and PIT (built by ``qf data build-fundamentals``), so an
+    equality merge is correct. Absent overlay/columns stay absent (FP-4).
+    """
+
+    def __init__(self, data_root: Path, fundamentals_overlay_root: Path | None = None) -> None:
         self.data_root = data_root.expanduser()
+        self.fundamentals_overlay_root = (
+            fundamentals_overlay_root.expanduser() if fundamentals_overlay_root is not None else None
+        )
 
     @property
     def panel_path(self) -> Path:
@@ -274,8 +327,27 @@ class LocalPanelDataProvider:
             panel_path=self.panel_path,
             start_date=dates.min().date().isoformat() if dates is not None else "",
             end_date=dates.max().date().isoformat() if dates is not None else "",
-            optional_columns=tuple(column for column in _optional_column_names() if column in panel.columns),
+            optional_columns=self._optional_columns_present(panel.columns),
         )
+
+    def _optional_columns_present(self, panel_columns: Iterable[str]) -> tuple[str, ...]:
+        """Optional catalog fields backed by real data: panel columns plus any
+        fundamental fields present in the PIT overlay (so the data catalog
+        reports them ``available``, not ``missing`` — FP-7)."""
+
+        present = set(panel_columns) | set(self._overlay_column_names())
+        return tuple(column for column in _optional_column_names() if column in present)
+
+    def _overlay_column_names(self) -> tuple[str, ...]:
+        overlay_path = self._fundamentals_overlay_path()
+        if overlay_path is None:
+            return ()
+        try:
+            import pyarrow.parquet as pq
+
+            return tuple(pq.read_schema(overlay_path).names)
+        except Exception:  # pragma: no cover - defensive
+            return ()
 
     def load_panel(self) -> pd.DataFrame:
         if self.panel_path.exists():
@@ -287,6 +359,7 @@ class LocalPanelDataProvider:
             panel = panel.copy()
             panel["trade_date"] = pd.to_datetime(panel["trade_date"])
             panel["is_st"] = panel["is_st"].astype(bool)
+            panel = self._merge_fundamentals_overlay(panel)
             return panel.sort_values(["trade_date", "instrument"]).reset_index(drop=True)
         source_root = resolve_source_snapshot_root(self.data_root)
         if source_root is None:
@@ -294,6 +367,53 @@ class LocalPanelDataProvider:
             missing = ", ".join(validation.missing_columns) or "no rows"
             raise ValueError(f"invalid data_root {self.data_root}: missing {missing}")
         return _load_source_snapshot_panel(source_root)
+
+    def _fundamentals_overlay_path(self) -> Path | None:
+        """Resolve the PIT fundamentals overlay parquet, if any.
+
+        Precedence: an explicit ``fundamentals_overlay_root`` (a dir holding, or
+        a direct path to, ``fundamentals.parquet``), else a ``fundamentals.parquet``
+        sibling next to the resolved panel. Returns None when none exists, so a
+        pure price-volume workspace is unaffected.
+        """
+
+        root = self.fundamentals_overlay_root
+        if root is not None:
+            candidate = root if root.is_file() else root / FUNDAMENTALS_OVERLAY_FILE
+            if candidate.exists():
+                return candidate
+        sibling = self.panel_path.parent / FUNDAMENTALS_OVERLAY_FILE
+        return sibling if sibling.exists() else None
+
+    def _merge_fundamentals_overlay(self, panel: pd.DataFrame) -> pd.DataFrame:
+        """Left-merge the PIT fundamentals overlay onto the panel on
+        ``[trade_date, instrument]``. Only declared, not-already-present columns
+        are added; a bad/mismatched overlay is skipped rather than crashing the
+        load (FP-4: never fabricate values)."""
+
+        overlay_path = self._fundamentals_overlay_path()
+        if overlay_path is None:
+            return panel
+        try:
+            overlay = pd.read_parquet(overlay_path)
+        except Exception:  # pragma: no cover - defensive: unreadable overlay
+            return panel
+        if not {"trade_date", "instrument"}.issubset(overlay.columns):
+            return panel
+        declared = {item.name for item in data_field_catalog()}
+        value_columns = [
+            c
+            for c in overlay.columns
+            if c not in ("trade_date", "instrument") and c in declared and c not in panel.columns
+        ]
+        if not value_columns:
+            return panel
+        overlay = overlay[["trade_date", "instrument", *value_columns]].copy()
+        overlay["trade_date"] = pd.to_datetime(overlay["trade_date"])
+        overlay["instrument"] = overlay["instrument"].astype(str)
+        panel = panel.copy()
+        panel["instrument"] = panel["instrument"].astype(str)
+        return panel.merge(overlay, on=["trade_date", "instrument"], how="left")
 
 
 def _panel_quality_problems(panel: pd.DataFrame) -> tuple[str, ...]:
@@ -548,6 +668,13 @@ def create_demo_workspace(
 
     panel = _build_demo_panel()
     panel.to_parquet(data_root / PANEL_FILE, index=False)
+    # Synthetic point-in-time fundamentals overlay (sibling of the panel) so the
+    # demo exercises the real overlay-merge path and the earnings-growth demo
+    # factor is evaluable without the mounted drive. Values are deterministic
+    # demo numbers, NOT real financials.
+    _build_demo_fundamentals_overlay(panel).to_parquet(
+        data_root / FUNDAMENTALS_OVERLAY_FILE, index=False
+    )
 
     repo = FactorRepository(factor_root)
     repo.ensure_layout()
@@ -574,7 +701,41 @@ def create_demo_workspace(
             source="demo",
         )
     )
+    repo.save(
+        FactorDefinition(
+            factor_id="FTR_DEMO_EARNINGS_GROWTH",
+            name="demo_earnings_growth",
+            formula="rank(netprofit_yoy)",
+            status="candidate",
+            description="Higher net-profit YoY growth receives higher scores (fundamentals).",
+            horizon_days=21,
+            source="demo",
+        )
+    )
     return {"workspace": workspace, "data_root": data_root, "factor_root": factor_root, "artifact_root": artifact_root}
+
+
+def _build_demo_fundamentals_overlay(panel: pd.DataFrame) -> pd.DataFrame:
+    """Deterministic synthetic fundamentals overlay for the demo workspace.
+
+    Per-instrument stable levels give the cross-sectional spread rank() needs;
+    these are demo numbers, not real financials. Real overlays come from
+    ``qf data build-fundamentals`` over a mounted source layer.
+    """
+
+    instruments = panel[["instrument"]].drop_duplicates().reset_index(drop=True)
+    idx = np.arange(len(instruments), dtype=float)
+    # One deterministic per-instrument level per fundamental field, with enough
+    # cross-sectional spread that rank() is meaningful. Every declared field is
+    # covered so the demo exercises the full advertised surface.
+    levels: dict[str, object] = {"instrument": instruments["instrument"].to_numpy()}
+    for offset, field in enumerate(FUNDAMENTAL_FIELDS):
+        levels[field.name] = 10.0 * np.sin(0.3 * idx + 0.7 * offset) + 0.5 * idx + offset
+    levels_frame = pd.DataFrame(levels)
+    keys = panel[["trade_date", "instrument"]].drop_duplicates()
+    return keys.merge(levels_frame, on="instrument", how="left").sort_values(
+        ["trade_date", "instrument"]
+    ).reset_index(drop=True)
 
 
 def _build_demo_panel() -> pd.DataFrame:

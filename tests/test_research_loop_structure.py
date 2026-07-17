@@ -136,7 +136,7 @@ def test_experiment_planner_blocks_unknown_operator_field_and_st_numeric_feature
     bad_field = StructuredResearchHypothesis(
         hypothesis_id="bad_field",
         text="bad field",
-        formula_dsl="rank(pe_ttm)",
+        formula_dsl="rank(nonexistent_alpha_field)",
         expected_direction="positive",
         source="operator_mcp",
     )
