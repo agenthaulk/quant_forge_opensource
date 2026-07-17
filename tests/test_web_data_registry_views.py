@@ -2,7 +2,7 @@
 
 String-contract pins over the served page and static modules:
 
-- the served page hosts the 数据 / 注册表 tabs and panels (appended after the
+- the served page hosts the 数据 / 已注册因子 tabs and panels (appended after the
   CP6-2 tabs so existing indices stay stable) with server-rendered empty
   states, and the CP6-3 CSS additions reference theme tokens only (zero new
   color literals);

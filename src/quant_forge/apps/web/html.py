@@ -1234,7 +1234,7 @@ def _index_html(
       <button class="lab-tab" role="tab" id="lab-tab-factor" aria-controls="lab-panel-factor" aria-selected="true">LLM 因子工作台 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-history" aria-controls="lab-panel-history" aria-selected="false" tabindex="-1">研究历史 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-data" aria-controls="lab-panel-data" aria-selected="false" tabindex="-1">数据 <span class="lab-tab-dot" hidden></span></button>
-      <button class="lab-tab" role="tab" id="lab-tab-registry" aria-controls="lab-panel-registry" aria-selected="false" tabindex="-1">注册表 <span class="lab-tab-dot" hidden></span></button>
+      <button class="lab-tab" role="tab" id="lab-tab-registry" aria-controls="lab-panel-registry" aria-selected="false" tabindex="-1">已注册因子 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-docs" aria-controls="lab-panel-docs" aria-selected="false" tabindex="-1">文档 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-extensions" aria-controls="lab-panel-extensions" aria-selected="false" tabindex="-1">扩展 <span class="lab-tab-dot" hidden></span></button>
       <button class="lab-tab" role="tab" id="lab-tab-memory" aria-controls="lab-panel-memory" aria-selected="false" tabindex="-1">记忆治理 <span class="lab-tab-dot" hidden></span></button>
@@ -1338,7 +1338,7 @@ def _index_html(
             <div id="synth-factors">
               <div class="panel empty-state">
                 <h3>等待加载</h3>
-                <p class="meta">打开本模块后，注册表因子目录会加载到这里。</p>
+                <p class="meta">打开本模块后，已注册因子目录会加载到这里。</p>
               </div>
             </div>
             <label>合成方法与标准化</label>
@@ -1403,7 +1403,7 @@ def _index_html(
     </section>
     <section class="lab-tabpanel" role="tabpanel" id="lab-panel-registry" aria-labelledby="lab-tab-registry" tabindex="0" hidden>
       <div class="section-title">
-        <h2>注册表</h2>
+        <h2>已注册因子</h2>
         <p>因子定义与证据链</p>
       </div>
       <div id="registry-result">

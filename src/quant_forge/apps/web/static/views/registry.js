@@ -303,7 +303,7 @@ export async function refreshRegistryPanel() {
     }
     return true;
   } catch (error) {
-    registryResultEl.innerHTML = `<div class="panel"><h3>注册表</h3><p class="meta err">${esc(error.message)}</p></div>`;
+    registryResultEl.innerHTML = `<div class="panel"><h3>已注册因子</h3><p class="meta err">${esc(error.message)}</p></div>`;
     return false;
   }
 }
