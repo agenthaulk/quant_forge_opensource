@@ -683,3 +683,44 @@ def test_run_backtest_include_partial_final_period_flag(tmp_path: Path) -> None:
     assert opted["periods"] == 2
     assert "PARTIAL_FINAL_PERIOD" in opted["warning_codes"]
     assert "FINAL_PARTIAL_PERIOD_EXCLUDED" not in opted["warning_codes"]
+
+
+def test_cli_build_fundamentals_reads_config_source_root(tmp_path: Path) -> None:
+    # Regression: `qf data build-fundamentals` must read paths.fundamentals_source_root
+    # from the config (the CLI path-resolver once dropped it). End-to-end: a
+    # synthetic source + panel -> overlay parquet with the fundamental columns.
+    workspace = tmp_path / "demo"
+    create_demo_workspace(workspace)
+    data_root = workspace / "data"
+
+    source_root = tmp_path / "source"
+    (source_root / "financial").mkdir(parents=True)
+    panel = pd.read_parquet(data_root / "panel.parquet", columns=["instrument"])
+    inst = sorted(panel["instrument"].unique())[0]
+    pd.DataFrame(
+        {
+            "ts_code": [inst],
+            "ann_date": ["20240201"],
+            "end_date": ["20231231"],
+            "netprofit_yoy": [15.5],
+        }
+    ).to_parquet(source_root / "financial" / "f.parquet")
+
+    config_path = tmp_path / "local.yaml"
+    config_path.write_text(
+        "paths:\n"
+        f"  data_root: {data_root}\n"
+        f"  factor_root: {workspace / 'factor_root'}\n"
+        f"  artifact_root: {workspace / 'artifacts'}\n"
+        f"  output_root: {workspace / 'outputs'}\n"
+        f"  fundamentals_source_root: {source_root}\n",
+        encoding="utf-8",
+    )
+
+    payload = run_cli("data", "build-fundamentals", "--config", str(config_path))
+    assert payload["output"] == "fundamentals.parquet"
+    assert "netprofit_yoy" in payload["fields"]
+    assert payload["non_null_counts"]["netprofit_yoy"] > 0
+
+    overlay = pd.read_parquet(data_root / "fundamentals.parquet")
+    assert {"trade_date", "instrument", "netprofit_yoy"}.issubset(overlay.columns)

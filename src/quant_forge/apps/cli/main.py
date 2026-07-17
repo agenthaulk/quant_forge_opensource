@@ -1635,6 +1635,8 @@ def _runtime_paths_from_config(args: argparse.Namespace, config: QuantForgeConfi
         or paths.factor_values_overlay_root,
         factor_values_manifest_root=getattr(args, "factor_values_manifest_root", None)
         or paths.factor_values_manifest_root,
+        fundamentals_source_root=paths.fundamentals_source_root,
+        fundamentals_overlay_root=paths.fundamentals_overlay_root,
         artifact_root=getattr(args, "artifact_root", None) or paths.artifact_root,
         output_root=paths.output_root,
     )
