@@ -1,7 +1,7 @@
 """Point-in-time (PIT) fundamental data processing — public, path-free.
 
-Reads locally-materialized financial-statement parquet in the **Tushare-Pro
-public schema** (a widely documented open data specification) and expands each
+Reads locally-materialized financial-statement parquet in a documented
+open financial-statement schema (ts_code / ann_date / end_date / …) and expands each
 report to a daily point-in-time value: for every ``(instrument, trade_date)``
 the value is the latest report whose **announcement date** ``ann_date`` is
 on-or-before ``trade_date``. There is no look-ahead — the report period
@@ -24,7 +24,8 @@ from pathlib import Path
 
 import pandas as pd
 
-# Tushare-Pro public schema key columns (documented open spec, not a secret).
+# documented open financial-statement schema key columns (ts_code / ann_date /
+# end_date / trade_date), not a secret.
 SOURCE_INSTRUMENT_COL = "ts_code"
 ANN_DATE_COL = "ann_date"
 END_DATE_COL = "end_date"
@@ -55,8 +56,8 @@ class FundamentalField:
 
 
 # The exposed fundamental field set (per-instrument, PIT-reliable). Names are
-# the Tushare-Pro source column names verbatim so the contract is transparent
-# and additional columns from the same tables extend this list unchanged.
+# the documented open source-schema column names verbatim so the contract is
+# transparent and additional columns from the same tables extend this unchanged.
 FUNDAMENTAL_FIELDS: tuple[FundamentalField, ...] = (
     # -- growth (financial indicators, YoY %) --
     FundamentalField("netprofit_yoy", "financial", "statement", "growth", "净利润同比增速（%）。", "high"),
@@ -116,10 +117,31 @@ def read_statement(source_root: Path, dataset: str, columns: list[str] | None = 
     return _read_parquet_dir(Path(source_root) / dataset, columns=columns)
 
 
-def _parse_ymd(series: pd.Series) -> pd.Series:
-    """Parse a Tushare ``YYYYMMDD`` string/int date column to datetime."""
+def _to_ns(series: pd.Series) -> pd.Series:
+    """Normalize a datetime series to ``datetime64[ns]``.
 
-    return pd.to_datetime(series.astype("string"), format="%Y%m%d", errors="coerce")
+    parquet often yields ``datetime64[us]`` while ``pd.to_datetime`` yields
+    ``ns``; pandas >= 2.2 raises on a us/ns mismatch in ``merge_asof``, so all
+    join keys are forced to a single precision here. Unparseable values coerce
+    to NaT rather than raising (the caller drops them).
+    """
+
+    return pd.to_datetime(series, errors="coerce").astype("datetime64[ns]")
+
+
+def _parse_ymd(series: pd.Series) -> pd.Series:
+    """Parse a ``YYYYMMDD`` date column (string, int, or NaN-bearing) to
+    datetime[ns].
+
+    A NaN in an int column makes pandas upcast to float, so a naive
+    ``astype(str)`` would yield ``"20250420.0"`` and fail the ``%Y%m%d`` parse
+    (silently NaT-ing every row). Coerce through nullable ``Int64`` first so
+    real dates survive and only genuinely-missing/invalid values become NaT.
+    """
+
+    numeric = pd.to_numeric(series, errors="coerce").astype("Int64")
+    parsed = pd.to_datetime(numeric.astype("string"), format="%Y%m%d", errors="coerce")
+    return parsed.astype("datetime64[ns]")
 
 
 def dedup_announcements(reports: pd.DataFrame) -> pd.DataFrame:
@@ -142,12 +164,26 @@ def as_of_expand(reports: pd.DataFrame, keys: pd.DataFrame, value_columns: list[
     figure is only visible from its announcement date onward — never from the
     report period end. Instruments/dates with no prior announcement stay NaN
     (FP-4: absence is NaN, never a silent 0).
+
+    Modeling choice (no look-ahead either way): the value is the *most recently
+    announced* figure. If an old period is restated AFTER a newer period was
+    already announced, the later announcement wins even though it is for an
+    earlier fiscal period — "newest information" rather than "newest period".
     """
 
-    reports = reports.dropna(subset=[ANN_DATE_COL, "instrument"])
+    reports = reports.dropna(subset=[ANN_DATE_COL, "instrument"]).copy()
+    reports[ANN_DATE_COL] = _to_ns(reports[ANN_DATE_COL])
+    reports = reports.dropna(subset=[ANN_DATE_COL])
+    left = keys[[TRADE_DATE_COL, "instrument"]].copy()
+    left[TRADE_DATE_COL] = _to_ns(left[TRADE_DATE_COL])
+    if reports.empty:
+        # No usable announcements: every value is unknown (NaN), never fabricated.
+        for column in value_columns:
+            left[column] = pd.NA
+        return left
     reports = dedup_announcements(reports)[["instrument", ANN_DATE_COL, *value_columns]]
     reports = reports.sort_values(ANN_DATE_COL, kind="mergesort")
-    left = keys.sort_values(TRADE_DATE_COL, kind="mergesort")
+    left = left.sort_values(TRADE_DATE_COL, kind="mergesort")
     merged = pd.merge_asof(
         left,
         reports,
@@ -174,7 +210,7 @@ def build_fundamentals_overlay(
     """
 
     keys = panel_keys[[TRADE_DATE_COL, "instrument"]].drop_duplicates().copy()
-    keys[TRADE_DATE_COL] = pd.to_datetime(keys[TRADE_DATE_COL])
+    keys[TRADE_DATE_COL] = _to_ns(keys[TRADE_DATE_COL])
     keys["instrument"] = keys["instrument"].astype("string")
     overlay = keys.copy()
 

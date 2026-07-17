@@ -409,6 +409,9 @@ class LocalPanelDataProvider:
         if not value_columns:
             return panel
         overlay = overlay[["trade_date", "instrument", *value_columns]].copy()
+        # Guard against a malformed overlay fanning out the panel: keep one row
+        # per (trade_date, instrument). Sanctioned builds are already unique.
+        overlay = overlay.drop_duplicates(["trade_date", "instrument"], keep="last")
         overlay["trade_date"] = pd.to_datetime(overlay["trade_date"])
         overlay["instrument"] = overlay["instrument"].astype(str)
         panel = panel.copy()

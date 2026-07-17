@@ -174,3 +174,48 @@ def test_overlay_absent_field_stays_absent_not_zero(tmp_path) -> None:
 def test_field_names_are_unique_and_nonempty() -> None:
     assert len(FUNDAMENTAL_FIELD_NAMES) == len(set(FUNDAMENTAL_FIELD_NAMES))
     assert all(FUNDAMENTAL_FIELD_NAMES)
+
+
+def test_as_of_parses_nan_bearing_int_date_column() -> None:
+    # A NaN in an int ann_date column upcasts the whole column to float; a naive
+    # astype(str) would give "20250420.0" and NaT every row. The parser must
+    # still recover the real dates (only the genuinely-missing row is dropped).
+    reports = pd.DataFrame(
+        {
+            "instrument": ["000001.SZ", "000001.SZ"],
+            "ann_date": [20250420, None],  # -> float64 [20250420.0, nan]
+            "end_date": ["20241231", "20250331"],
+            "netprofit_yoy": [12.5, 99.0],
+        }
+    )
+    keys = _keys(["2025-05-01"])
+    out = as_of_expand(reports, keys, ["netprofit_yoy"])
+    assert out["netprofit_yoy"].iloc[0] == 12.5  # the NaT-ann_date row is excluded
+
+
+def test_as_of_empty_reports_returns_all_nan_not_crash() -> None:
+    reports = pd.DataFrame(
+        {"instrument": ["000001.SZ"], "ann_date": ["notadate"], "end_date": ["20241231"], "roe": [8.0]}
+    )
+    out = as_of_expand(reports, _keys(["2025-05-01"]), ["roe"])
+    assert len(out) == 1
+    assert pd.isna(out["roe"].iloc[0])
+
+
+def test_overlay_duplicate_keys_do_not_fan_out_panel(tmp_path) -> None:
+    from quant_forge.data.local import create_demo_workspace, LocalPanelDataProvider, resolve_panel_path
+
+    workspace = tmp_path / "demo"
+    create_demo_workspace(workspace)
+    panel_path = resolve_panel_path(workspace / "data")
+    base = pd.read_parquet(panel_path)
+    inst = base["instrument"].iloc[0]
+    dt = pd.to_datetime(base["trade_date"]).iloc[0]
+    # a duplicated (trade_date, instrument) overlay key
+    dup = pd.DataFrame(
+        {"trade_date": [dt, dt], "instrument": [inst, inst], "netprofit_yoy": [1.0, 2.0]}
+    )
+    dup.to_parquet(panel_path.parent / "fundamentals.parquet")
+    loaded = LocalPanelDataProvider(workspace / "data").load_panel()
+    # panel row count is preserved (no fan-out); one row per (date, instrument)
+    assert not loaded.duplicated(["trade_date", "instrument"]).any()

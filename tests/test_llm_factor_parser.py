@@ -488,13 +488,15 @@ def test_fundamentals_idea_no_longer_flagged_out_of_scope(monkeypatch: pytest.Mo
 def test_out_of_scope_detector_flags_only_alt_data() -> None:
     from quant_forge.specs.nl_flow import out_of_scope_data_warnings
 
-    # Genuinely-unavailable alternative data still warns.
+    # Genuinely-unavailable alternative data + unexposed line items still warn.
     for idea in (
         "根据舆情和研报情绪选股",
         "北向资金持续流入的股票",
         "龙虎榜机构净买入的股票",
+        "商誉占比低、存货周转快的公司",  # no exposed goodwill/inventory field
         "high analyst sentiment names",
         "stocks with strong northbound flow",
+        "low goodwill and lean inventory names",
     ):
         assert out_of_scope_data_warnings(idea), idea
 

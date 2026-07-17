@@ -43,8 +43,12 @@ _OUT_OF_SCOPE_DATA_TERMS: tuple[str, ...] = (
     # alternative data (Chinese) — genuinely unavailable per-stock
     "舆情", "研报", "分析师", "北向", "龙虎榜", "机构持仓", "增减持", "股东户数",
     "股吧", "新闻",
-    # alternative data (English)
-    "sentiment", "analyst", "news flow", "northbound",
+    # balance-sheet line items with no exposed catalog field (the exposed set is
+    # growth / profitability / valuation / leverage / cashflow, not raw items).
+    "商誉", "存货", "应收", "应付",
+    # alternative data / unexposed items (English)
+    "sentiment", "analyst", "news flow", "northbound", "goodwill", "inventory",
+    "receivable",
 )
 _OUT_OF_SCOPE_DATA_WARNING = (
     "本数据集有量价 + 基本面字段，但没有该想法涉及的另类数据（舆情/研报/资金流/"

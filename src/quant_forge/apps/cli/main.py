@@ -527,12 +527,9 @@ def _cmd_data_build_fundamentals(args: argparse.Namespace) -> int:
     panel_keys = pd.read_parquet(panel_path, columns=["trade_date", "instrument"])
     overlay = build_fundamentals_overlay(source_root, panel_keys)
 
-    if args.output is not None:
-        output = args.output
-    elif paths.fundamentals_overlay_root is not None:
-        output = paths.fundamentals_overlay_root / FUNDAMENTALS_OVERLAY_FILE
-    else:
-        output = panel_path.parent / FUNDAMENTALS_OVERLAY_FILE
+    # Default output is the fundamentals.parquet sibling of the panel (what the
+    # loader auto-discovers); --output overrides for a custom location.
+    output = args.output if args.output is not None else panel_path.parent / FUNDAMENTALS_OVERLAY_FILE
     output.parent.mkdir(parents=True, exist_ok=True)
     overlay.to_parquet(output, index=False)
 
@@ -1636,7 +1633,6 @@ def _runtime_paths_from_config(args: argparse.Namespace, config: QuantForgeConfi
         factor_values_manifest_root=getattr(args, "factor_values_manifest_root", None)
         or paths.factor_values_manifest_root,
         fundamentals_source_root=paths.fundamentals_source_root,
-        fundamentals_overlay_root=paths.fundamentals_overlay_root,
         artifact_root=getattr(args, "artifact_root", None) or paths.artifact_root,
         output_root=paths.output_root,
     )
