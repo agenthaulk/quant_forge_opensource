@@ -21,16 +21,20 @@ SUPPORTED_OPERATORS = {
     "delay",
     "delta",
     "log",
+    "ntile",
     "rank",
     "scale",
     "sign",
     "signedpower",
     "stddev",
+    "ts_argmax",
+    "ts_argmin",
     "ts_max",
     "ts_mean",
     "ts_min",
     "ts_rank",
     "ts_sum",
+    "winsorize",
     "wq_max",
     "wq_min",
     "zscore",
@@ -224,7 +228,8 @@ def _node_lookback_rows(node: ast.AST) -> int:
         if operator in {"delay", "delta"} and len(args) >= 2:
             return child_lookbacks[0] + _positive_int_arg(args[1])
         if (
-            operator in {"ts_sum", "ts_mean", "ts_min", "ts_max", "stddev", "ts_rank", "decay_linear"}
+            operator
+            in {"ts_sum", "ts_mean", "ts_min", "ts_max", "stddev", "ts_rank", "decay_linear", "ts_argmax", "ts_argmin"}
             and len(args) >= 2
         ):
             return child_lookbacks[0] + max(_positive_int_arg(args[1]) - 1, 0)
@@ -261,8 +266,36 @@ def _validate_operator_signature(
         return True
     if operator in {"rank", "zscore", "abs", "log", "sign"}:
         return _expect_arity(operator, args, 1, errors)
-    if operator in {"delay", "delta", "ts_sum", "ts_mean", "ts_min", "ts_max", "stddev", "ts_rank", "decay_linear"}:
+    if operator in {
+        "delay",
+        "delta",
+        "ts_sum",
+        "ts_mean",
+        "ts_min",
+        "ts_max",
+        "stddev",
+        "ts_rank",
+        "decay_linear",
+        "ts_argmax",
+        "ts_argmin",
+    }:
         return _expect_arity(operator, args, 2, errors) and _expect_window_arg(operator, args, 1, errors)
+    if operator == "winsorize":
+        if not _expect_arity(operator, args, 2, errors):
+            return False
+        fraction = numeric_constant(args[1])
+        if fraction is None or not (0.0 <= fraction < 0.5):
+            errors.append("winsorize argument 2 must be a quantile fraction in [0, 0.5)")
+            return False
+        return True
+    if operator == "ntile":
+        if not _expect_arity(operator, args, 2, errors):
+            return False
+        buckets = numeric_constant(args[1])
+        if buckets is None or math.floor(buckets) < 2:
+            errors.append("ntile argument 2 must be an integer bucket count >= 2")
+            return False
+        return True
     if operator in {"correlation", "covariance"}:
         return _expect_arity(operator, args, 3, errors) and _expect_window_arg(operator, args, 2, errors)
     if operator == "scale":
