@@ -1954,12 +1954,22 @@ def prescan_rebalance_coverage(
 
 
 def count_non_overlapping_periods(date_count: int, *, delay: int, holding: int) -> int:
-    """RB-2 realized non-overlapping period count.
+    """RB-2 realized non-overlapping period count (D3-complete grid periods).
 
-    ``N = floor((len(in_window_dates) - delay - 1) / holding) + 1`` — the
-    design §3 expression, computed verbatim. This is a precondition gate over
-    the window, not the engine's realized ledger count (which additionally
-    drops the excluded final partial period).
+    ``N = max(0, floor((len(in_window_dates) - 1 - delay - holding) / holding)
+    + 1)`` — the number of grid signal indices ``s`` in
+    ``range(0, len(dates) - delay - 1, holding)`` whose forward window closes
+    **inside** the panel (``s + delay + holding < len(dates)``), i.e. the
+    complete periods the engine actually realizes under owner decision D3 (the
+    final partial period whose exit falls beyond the window is dropped).
+
+    This corrects a spec-level off-by-one (audit S1): the earlier design §3
+    expression ``floor((dates - delay - 1) / holding) + 1`` counted the
+    D3-excluded final-partial signal, and exceeded even the grid signal count
+    by 1 whenever ``holding`` divided ``dates - delay - 1``. A window of 7
+    dates / delay=1 / holding=5 realizes **one** complete traded period, so the
+    "≥ 2 non-overlapping periods" precondition (``require_backtest_window``)
+    now correctly rejects it instead of admitting a phantom second period.
     """
 
     if isinstance(date_count, bool) or not isinstance(date_count, int) or date_count < 0:
@@ -1968,7 +1978,7 @@ def count_non_overlapping_periods(date_count: int, *, delay: int, holding: int) 
         raise ValueError("delay must be an integer >= 1")
     if isinstance(holding, bool) or not isinstance(holding, int) or holding < 1:
         raise ValueError("holding must be an integer >= 1")
-    return (date_count - delay - 1) // holding + 1
+    return max(0, (date_count - 1 - delay - holding) // holding + 1)
 
 
 def require_backtest_window(date_count: int, *, delay: int, holding: int) -> int:

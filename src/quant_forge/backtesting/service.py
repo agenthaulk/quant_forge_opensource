@@ -47,6 +47,15 @@ SEGMENT_BOUNDARY_PURGED = "SEGMENT_BOUNDARY_PURGED"
 POSITIONS_LOST_BEFORE_EXIT = "POSITIONS_LOST_BEFORE_EXIT"
 REBALANCE_SKIPPED_NO_COVERAGE = "REBALANCE_SKIPPED_NO_COVERAGE"
 REBALANCE_SKIPPED_THIN = "REBALANCE_SKIPPED_THIN"
+# F2 (Phase-1/2 audit): a schedule with skipped rebalances leaves the book flat
+# across gap days that the in-market exposure-day basis excludes, so the
+# exposure-day annualization over-states gappy schedules. When any rebalance is
+# skipped the headline annualized return switches to a calendar trading-day
+# basis (first traded entry to last traded exit, INCLUDING the skipped-window
+# gap days); this code discloses the switch so it is never silent.
+ANNUALIZATION_BASIS_CALENDAR_TIME = "ANNUALIZATION_BASIS_CALENDAR_TIME"
+ANNUALIZATION_BASIS_EXPOSURE_DAYS = "exposure_days"
+ANNUALIZATION_BASIS_CALENDAR_TRADING_DAYS = "calendar_trading_days"
 
 
 def rebalance_indices(
@@ -167,6 +176,11 @@ def run_factor_backtest(
     partial_periods = 0
     excluded_final_partial_period = False
     lost_positions_total = 0
+    # F2: trading-day indices of the first traded entry and last traded exit,
+    # used to derive the calendar-time span (which includes skipped-window gap
+    # days) for the annualization denominator.
+    first_entry_index: int | None = None
+    last_exit_index: int | None = None
     for signal_index in rebalance_indices(
         dates, delay=delay, holding=holding, start_signal_index=start_signal_index
     ):
@@ -309,6 +323,12 @@ def run_factor_backtest(
             completed_periods += 1
         else:
             partial_periods += 1
+        # F2: this period actually traded; extend the calendar-time span. Only
+        # traded periods bound the span, so leading/trailing skips do not inflate
+        # it — only interior skipped windows (between traded periods) do.
+        if first_entry_index is None:
+            first_entry_index = signal_index + delay
+        last_exit_index = actual_exit_index
         rows.append(
             {
                 "period_id": len(rows),
@@ -358,11 +378,26 @@ def run_factor_backtest(
         [float(row["net_period_return"]) for row in rows if row["is_complete_period"]], dtype=float
     )
     exposure_days = int(sum(int(row.get("trading_days_held", holding)) for row in rows))
+    # F2: calendar-time trading-day span of the live book (first traded entry →
+    # last traded exit), INCLUDING skipped-rebalance gap days. Equals
+    # exposure_days exactly when no rebalance was skipped; strictly larger when
+    # interior rebalances were skipped. When any rebalance is skipped the
+    # headline annualization switches to this basis so a gappy schedule is not
+    # over-annualized on in-market days alone.
+    calendar_exposure_days = (
+        int(last_exit_index - first_entry_index)
+        if first_entry_index is not None and last_exit_index is not None
+        else 0
+    )
+    use_calendar_basis = skipped_rebalances > 0
+    annualization_days = calendar_exposure_days if use_calendar_basis else exposure_days
     gross_summary = _return_summary(
         gross_returns,
         holding,
         daily_nav=daily_nav,
         exposure_days=exposure_days,
+        calendar_exposure_days=calendar_exposure_days,
+        use_calendar_basis=use_calendar_basis,
         sample_role=sample_role,
         volatility_returns=complete_gross_returns,
     )
@@ -371,6 +406,8 @@ def run_factor_backtest(
         holding,
         daily_nav=daily_nav,
         exposure_days=exposure_days,
+        calendar_exposure_days=calendar_exposure_days,
+        use_calendar_basis=use_calendar_basis,
         nav_key="net_nav",
         sample_role=sample_role,
         volatility_returns=complete_net_returns,
@@ -382,7 +419,7 @@ def run_factor_backtest(
     warnings = _backtest_warnings(
         periods=len(rows),
         holding_days=holding,
-        exposure_days=exposure_days,
+        annualization_days=annualization_days,
         rebalance_rate=rebalance_rate,
         turnover_rate=turnover_rate,
         gross_annualized_return=gross_summary["annualized_return"],
@@ -432,10 +469,29 @@ def run_factor_backtest(
                 )
             )
         )
+    if use_calendar_basis:
+        # F2: never silent — disclose the headline basis switch and keep the
+        # in-market exposure-day figure available as annualized_return_exposure.
+        warnings = tuple(
+            dict.fromkeys(
+                (
+                    *warnings,
+                    "headline annualized return uses a calendar trading-day basis "
+                    "(first traded entry to last traded exit, including "
+                    "skipped-rebalance gap days) because rebalances were skipped; "
+                    "the in-market exposure-day basis is reported separately as "
+                    "annualized_return_exposure (audit item F2)",
+                )
+            )
+        )
     warning_codes = tuple(dict.fromkeys(warning_code_items))
     metrics = {
         "annualized_return": gross_summary["metrics"]["annualized_return"],
         "net_annualized_return": net_summary["metrics"]["annualized_return"],
+        "annualized_return_exposure": gross_summary["annualized_return_exposure"],
+        "annualized_return_calendar": gross_summary["annualized_return_calendar"],
+        "net_annualized_return_exposure": net_summary["annualized_return_exposure"],
+        "net_annualized_return_calendar": net_summary["annualized_return_calendar"],
         "annualized_volatility": gross_summary["metrics"]["annualized_volatility"],
         "net_annualized_volatility": net_summary["metrics"]["annualized_volatility"],
         "long_short_sharpe": gross_summary["metrics"]["long_short_sharpe"],
@@ -561,6 +617,8 @@ def run_factor_backtest(
             ],
             "lost_positions": lost_positions_total,
             "exposure_days": exposure_days,
+            "calendar_exposure_days": calendar_exposure_days,
+            "headline_annualization_basis": gross_summary["headline_annualization_basis"],
             "calendar_days": _calendar_days(rows),
             "cumulative_return": gross_summary["cumulative_return"],
             "annualized_return": gross_summary["annualized_return"],
@@ -577,6 +635,13 @@ def run_factor_backtest(
             "net_annualized_volatility": net_summary["annualized_volatility"],
             "net_long_short_sharpe": net_summary["long_short_sharpe"],
             "net_max_drawdown": net_summary["max_drawdown"],
+            # F2: both annualization bases as flat scalars (headline above points
+            # at whichever basis headline_annualization_basis names). The full
+            # provenance for each lives under metrics[...]/metric_provenance[...].
+            "annualized_return_exposure": gross_summary["annualized_return_exposure"].value,
+            "annualized_return_calendar": gross_summary["annualized_return_calendar"].value,
+            "net_annualized_return_exposure": net_summary["annualized_return_exposure"].value,
+            "net_annualized_return_calendar": net_summary["annualized_return_calendar"].value,
             "rebalance_rate": rebalance_rate,
             "turnover_rate": turnover_rate,
             "reportable_annualization": asdict(gross_summary["reportable_annualization"]),
@@ -1098,12 +1163,53 @@ def _daily_nav_for_period(
     return rows
 
 
+def _annualization_metric(
+    cumulative_return: float,
+    exposure_days: int,
+    terminal_equity: float,
+    *,
+    method: str,
+    source_series: str,
+    sample_role: str,
+) -> MetricValue:
+    """Geometric annualization over a stated day basis, with the reportable gate.
+
+    ``exposure_days`` is the denominator (252/exposure_days exponent). The value
+    is suppressed to ``None`` (status ``insufficient_sample``) unless the basis
+    clears ``MIN_ANNUALIZATION_EXPOSURE_DAYS`` or the book blew up
+    (``terminal_equity <= 0`` always reports ``-1.0``). Every basis carries its
+    own ``method``/``source_series`` provenance so a reader can tell which day
+    count produced the number (qf.metrics.v2).
+    """
+
+    extrapolated = _annualized_return(cumulative_return, exposure_days)
+    reportable = (
+        extrapolated
+        if terminal_equity <= 0.0 or exposure_days >= MIN_ANNUALIZATION_EXPOSURE_DAYS
+        else None
+    )
+    warnings = () if exposure_days >= MIN_ANNUALIZATION_EXPOSURE_DAYS else (INSUFFICIENT_ANNUALIZATION_HISTORY,)
+    return MetricValue(
+        value=reportable,
+        unit="return",
+        status="available" if reportable is not None else "insufficient_sample",
+        observation_count=int(exposure_days),
+        minimum_required=MIN_ANNUALIZATION_EXPOSURE_DAYS,
+        method=method,
+        source_series=source_series,
+        sample_role=sample_role,
+        warning_codes=warnings,
+    )
+
+
 def _return_summary(
     returns: np.ndarray,
     holding_days: int,
     *,
     daily_nav: list[dict[str, object]] | None = None,
     exposure_days: int | None = None,
+    calendar_exposure_days: int | None = None,
+    use_calendar_basis: bool = False,
     nav_key: str = "gross_nav",
     sample_role: str = EXTERNAL_OOS_ROLE,
     volatility_returns: np.ndarray | None = None,
@@ -1120,10 +1226,44 @@ def _return_summary(
         cumulative_return = float(equity[-1] - 1.0) if len(equity) else 0.0
     terminal_equity = 1.0 + cumulative_return
     exposure = exposure_days if exposure_days is not None else periods * holding_days
-    extrapolated = _annualized_return(cumulative_return, exposure)
-    annualized_return = extrapolated if terminal_equity <= 0.0 or exposure >= MIN_ANNUALIZATION_EXPOSURE_DAYS else None
+    # F2: the calendar trading-day span (first traded entry → last traded exit,
+    # INCLUDING skipped-rebalance gap days). Equal to `exposure` when nothing was
+    # skipped; strictly larger under interior skips — exactly the gappy case the
+    # exposure-day basis over-annualizes. Both bases are always emitted; the
+    # headline points at the calendar basis when the caller flags skips.
+    calendar_exposure = calendar_exposure_days if calendar_exposure_days is not None else exposure
+    exposure_annualization = _annualization_metric(
+        cumulative_return,
+        exposure,
+        terminal_equity,
+        method="geometric_annualization_exposure_days",
+        source_series="non_overlapping_period_returns",
+        sample_role=sample_role,
+    )
+    calendar_annualization = _annualization_metric(
+        cumulative_return,
+        calendar_exposure,
+        terminal_equity,
+        method="geometric_annualization_calendar_time",
+        source_series="calendar_trading_days_span",
+        sample_role=sample_role,
+    )
+    headline_exposure = calendar_exposure if use_calendar_basis else exposure
+    headline_basis = (
+        ANNUALIZATION_BASIS_CALENDAR_TRADING_DAYS if use_calendar_basis else ANNUALIZATION_BASIS_EXPOSURE_DAYS
+    )
+    basis_warnings = (ANNUALIZATION_BASIS_CALENDAR_TIME,) if use_calendar_basis else ()
+    extrapolated = _annualized_return(cumulative_return, headline_exposure)
+    annualized_return = calendar_annualization.value if use_calendar_basis else exposure_annualization.value
     annualized_status = "available" if annualized_return is not None else "insufficient_sample"
-    annualized_warnings = () if exposure >= MIN_ANNUALIZATION_EXPOSURE_DAYS else (INSUFFICIENT_ANNUALIZATION_HISTORY,)
+    annualized_warnings = tuple(
+        dict.fromkeys(
+            (
+                *(() if headline_exposure >= MIN_ANNUALIZATION_EXPOSURE_DAYS else (INSUFFICIENT_ANNUALIZATION_HISTORY,)),
+                *basis_warnings,
+            )
+        )
+    )
     annualized_volatility = (
         float(np.std(vol_returns, ddof=1) * np.sqrt(252 / holding_days)) if len(vol_returns) > 1 else None
     )
@@ -1138,12 +1278,18 @@ def _return_summary(
     )
     return {
         "cumulative_return": cumulative_return,
+        # Headline: calendar-time basis under skips (F2), exposure-day otherwise.
         "annualized_return": annualized_return,
+        "headline_annualization_basis": headline_basis,
+        # Both bases always emitted with their own provenance (qf.metrics.v2);
+        # the exposure-day figure is preserved verbatim so nothing is lost.
+        "annualized_return_exposure": exposure_annualization,
+        "annualized_return_calendar": calendar_annualization,
         "reportable_annualization": MetricValue(
             value=annualized_return,
             unit="return",
             status=annualized_status,
-            observation_count=exposure,
+            observation_count=int(headline_exposure),
             minimum_required=MIN_ANNUALIZATION_EXPOSURE_DAYS,
             method="geometric_annualization",
             source_series="non_overlapping_period_returns",
@@ -1154,7 +1300,7 @@ def _return_summary(
             value=extrapolated,
             unit="return",
             status="available" if extrapolated is not None else "invalid",
-            observation_count=exposure,
+            observation_count=int(headline_exposure),
             method="geometric_annualization_extrapolated",
             source_series="non_overlapping_period_returns",
             sample_role=sample_role,
@@ -1169,7 +1315,7 @@ def _return_summary(
                 value=annualized_return,
                 unit="return",
                 status=annualized_status,
-                observation_count=exposure,
+                observation_count=int(headline_exposure),
                 minimum_required=MIN_ANNUALIZATION_EXPOSURE_DAYS,
                 method="geometric_annualization",
                 source_series="non_overlapping_period_returns",
@@ -1468,7 +1614,7 @@ def _backtest_warnings(
     *,
     periods: int,
     holding_days: int,
-    exposure_days: int,
+    annualization_days: int,
     rebalance_rate: float | None,
     turnover_rate: float | None,
     gross_annualized_return: float | None,
@@ -1478,7 +1624,9 @@ def _backtest_warnings(
     warnings: list[str] = []
     if periods < 2:
         warnings.append("too few backtest periods for stable Sharpe or drawdown estimates")
-    if 0 < exposure_days < MIN_ANNUALIZATION_EXPOSURE_DAYS:
+    # F2: the short-window warning tracks the HEADLINE annualization basis
+    # (calendar-time when rebalances were skipped, exposure-day otherwise).
+    if 0 < annualization_days < MIN_ANNUALIZATION_EXPOSURE_DAYS:
         warnings.append(
             "short annualization window: annualized return and volatility are highly extrapolated"
         )
