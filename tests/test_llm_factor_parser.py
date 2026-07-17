@@ -434,6 +434,87 @@ def test_llm_mode_generic_formula_carries_identical_fallback_warning(monkeypatch
     assert parsed.warnings == (GENERIC_FALLBACK_WARNING,)
 
 
+class FakeMomentumHandler(BaseHTTPRequestHandler):
+    """Mimics the real degradation: an unmappable fundamentals idea comes back
+    as a confident-looking momentum formula (the workbench prompt only allows a
+    handful of price-volume formulas, so the model picks the nearest one)."""
+
+    def do_POST(self) -> None:
+        length = int(self.headers["Content-Length"])
+        json.loads(self.rfile.read(length).decode("utf-8"))
+        content = {
+            "name": "profit_growth_momentum",
+            "formula": "rank(return_5d)",
+            "description": "年报、季报利润同比增加高的公司，在未来21天的表现会更好",
+            "horizon_days": 21,
+            "universe_filters": [],
+        }
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"choices": [{"message": {"content": json.dumps(content)}}]}).encode("utf-8"))
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+def test_out_of_scope_data_warns_on_fundamentals(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The exact reported case: a fundamentals idea the price-volume panel cannot
+    # express degrades to rank(return_5d) but must NOT look confident -- the
+    # parse carries an out-of-scope review warning even though the formula is a
+    # valid non-fallback (rank(return_5d), not rank(close)).
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeMomentumHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("QF_TEST_DEEPSEEK_KEY", "test-key")
+    try:
+        parsed = parse_factor_idea(
+            "年报、季报利润同比增加高的公司，在未来21天的表现会更好",
+            LLMSettings(
+                provider="deepseek",
+                model="fake-deepseek",
+                base_url=f"http://127.0.0.1:{server.server_port}",
+                api_key_env="QF_TEST_DEEPSEEK_KEY",
+            ),
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+    assert parsed.factor.formula == "rank(return_5d)"
+    assert parsed.warnings, "fundamentals idea must carry a review warning"
+    assert any("基本面" in w or "price-volume" in w for w in parsed.warnings)
+    # rank(return_5d) is NOT the rank(close) catch-all, so the generic-fallback
+    # warning must not be what fired here.
+    assert GENERIC_FALLBACK_WARNING not in parsed.warnings
+
+
+def test_out_of_scope_detector_recall_and_no_false_positives() -> None:
+    from quant_forge.specs.nl_flow import out_of_scope_data_warnings
+
+    # Out-of-scope data domains warn.
+    for idea in (
+        "年报、季报利润同比增加高的公司未来更好",
+        "现金流充裕、负债率低的公司",
+        "市盈率低、股息率高的股票",
+        "stocks with rising earnings and revenue",
+        "high analyst sentiment names",
+    ):
+        assert out_of_scope_data_warnings(idea), idea
+
+    # In-scope price-volume ideas and the built-in demo seeds do NOT warn, and
+    # short English terms never match inside unrelated words (approach/broad).
+    for idea in (
+        "非ST的小市值股票未来表现更好",
+        "过去5天涨幅较大的股票，短期动量继续",
+        "低波动率的股票更稳",
+        "成交量放大的股票",
+        "估值越低的股票，长期收益越好",  # bare 估值 demo seed: keeps rank(close) path
+        "approach the broad market with high volume",
+    ):
+        assert not out_of_scope_data_warnings(idea), idea
+
+
 def test_llm_mode_specific_formula_carries_no_fallback_warning(monkeypatch: pytest.MonkeyPatch) -> None:
     server = ThreadingHTTPServer(("127.0.0.1", 0), FakeLLMHandler)
     thread = Thread(target=server.serve_forever, daemon=True)
