@@ -214,7 +214,7 @@ def test_index_page_keeps_all_panel_sections_and_controls(web_app) -> None:
         'id="data-result"',
         'id="registry-result"',
         '数据控制台',
-        '注册表',
+        '已注册因子',
         '等待加载',
     ):
         assert marker in html, marker

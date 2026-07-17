@@ -463,7 +463,7 @@ function revealReportFollowups(hasFactor) {
 // refused with a visible reason and `validatedFactorId` stays null.
 const PUBLISH_UNAVAILABLE_REASONS = {
   conflict: '因子未发布：规范因子在本次运行期间被并发修改（发布冲突）。RD 优化 / 稳健性回测暂不可用；可重新运行本因子。',
-  declined_promoted: '因子未覆盖：同名规范因子已被人工提升（promoted）。RD 优化 / 稳健性回测请从「注册表」中的该因子发起。'
+  declined_promoted: '因子未覆盖：同名规范因子已被人工提升（promoted）。RD 优化 / 稳健性回测请从「已注册因子」中的该因子发起。'
 };
 function applyPublishedFollowups(pipeline) {
   const publishedId = pipeline && pipeline.published_factor_id;
