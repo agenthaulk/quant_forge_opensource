@@ -152,8 +152,10 @@ provider 已识别、key env 已继承但真实 key 未打印、各数据/因子
 - LLM API Key 控件（`#llm-api-key-mode`）：
   - “配置文件 / 环境变量加载”模式 → 输入框 `#llm-api-key` 置灰（disabled），**不显示
     真实 key**；
-  - “手动输入（仅前端联调）”模式 → 输入框才可编辑；手动输入内容**仅前端使用、不持久化**，
-    绝不写入配置、日志、artifact 或报告（`data-secret-policy="not-submitted"`）。
+  - “前端输入（注入本次运行）”模式 → 输入框才可编辑；点「保存并启用」（`#llm-settings-save`）
+    经 `POST /api/settings/llm` 注入服务进程环境变量，**仅存内存、不落盘、任何响应不回显**，
+    重启后失效（`data-secret-policy="runtime-memory-only"`）；内置预设（openai/glm/claude/
+    minimax/openai_compatible）可在此注册启用，缺省 model 的预设需补填模型名。
 - 控制令牌门控 UX（token-gating）：需要令牌时页面提示明确，粘贴/预置后功能解锁。
 
 ### 4.2 单因子研究 / single-factor module（真实 DeepSeek）

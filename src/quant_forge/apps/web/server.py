@@ -81,6 +81,7 @@ from quant_forge.apps.web.api import (
     RESEARCH_HISTORY_DEFAULT_LIMIT as RESEARCH_HISTORY_DEFAULT_LIMIT,
     RESEARCH_HISTORY_MAX_LIMIT as RESEARCH_HISTORY_MAX_LIMIT,
     WebControlTokenError as WebControlTokenError,
+    apply_llm_settings_update as apply_llm_settings_update,
     _EVALUATION_DISPLAY_METRIC_KEYS as _EVALUATION_DISPLAY_METRIC_KEYS,
     _WEB_PATH_KEYS as _WEB_PATH_KEYS,
     _active_llm as _active_llm,

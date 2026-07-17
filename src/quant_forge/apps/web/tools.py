@@ -487,6 +487,17 @@ class ToolRegistry:
         self._grants: dict[str, ToolGrant] = {}
         self._lock = threading.Lock()
 
+    def apply_runtime_config(self, config: Any) -> None:
+        """Swap the registry's config snapshot after a runtime settings update.
+
+        ``POST /api/settings/llm`` atomically replaces the routing closure's
+        frozen config; the registry captured its own reference at construction,
+        so the route hands the replacement here too — otherwise sidecar tools
+        would keep parsing with the pre-switch LLM provider.
+        """
+
+        self._config = config
+
     # -- authorization -----------------------------------------------------
 
     def authorize(self, pipeline_id: str) -> ToolGrant:

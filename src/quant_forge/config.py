@@ -315,6 +315,58 @@ def llm_settings_from_mapping(raw: Any) -> LLMSettings:
     return settings
 
 
+def llm_settings_with_provider_update(
+    llm: LLMSettings,
+    *,
+    provider: str,
+    model: str = "",
+    base_url: str = "",
+    api_key_env: str = "",
+    activate: bool = True,
+) -> LLMSettings:
+    """Return a new ``LLMSettings`` with one provider added or updated at runtime.
+
+    Web runtime-settings path (``/api/settings/llm``): merges the given fields
+    over the existing provider entry (or a blank one for a new registration),
+    validates the merged entry with the same rules as YAML-loaded providers,
+    and never touches key material — only the environment-variable NAME
+    travels through config, matching the file-based contract.
+    """
+
+    name = _normalize_provider_name(provider)
+    if not name:
+        raise ValueError("provider is required")
+    if name in {"rule", "deterministic"}:
+        raise ValueError("provider 'rule' is built in and cannot be edited")
+    base = llm.providers.get(name) or LLMProviderSettings(
+        provider=name,
+        model="",
+        base_url="",
+        api_key_env="",
+        timeout_seconds=llm.timeout_seconds,
+    )
+    merged = LLMProviderSettings(
+        provider=name,
+        model=model.strip() or base.model,
+        base_url=base_url.strip() or base.base_url,
+        api_key_env=api_key_env.strip() or base.api_key_env,
+        timeout_seconds=base.timeout_seconds,
+        api_key_required=base.api_key_required,
+    )
+    _validate_llm_provider_settings(merged)
+    providers = dict(llm.providers)
+    providers[name] = merged
+    return LLMSettings(
+        provider=name if activate else llm.provider,
+        model=llm.model,
+        base_url=llm.base_url,
+        api_key_env=llm.api_key_env,
+        timeout_seconds=llm.timeout_seconds,
+        api_key_required=llm.api_key_required,
+        providers=providers,
+    )
+
+
 def simulation_profile_from_mapping(raw: Any, base: SimulationProfile | None = None) -> SimulationProfile:
     profile = base or SimulationProfile()
     if raw is None:

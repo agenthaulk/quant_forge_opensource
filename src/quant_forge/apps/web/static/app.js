@@ -62,7 +62,12 @@ const llmProviderSelect = document.getElementById('llm-provider');
 const llmApiKeyMode = document.getElementById('llm-api-key-mode');
 const llmApiKeyInput = document.getElementById('llm-api-key');
 const llmApiKeyStatus = document.getElementById('llm-api-key-status');
-let llmProviderOptions = pageConfig.llmProviderOptions || [];
+const llmModelLabel = document.getElementById('llm-model-label');
+const llmModelInput = document.getElementById('llm-model');
+const llmBaseUrlLabel = document.getElementById('llm-base-url-label');
+const llmBaseUrlInput = document.getElementById('llm-base-url');
+const llmSettingsSave = document.getElementById('llm-settings-save');
+let llmProviderOptions = (pageConfig.llmProviderOptions || []).map(normalizeProviderOption);
 const rdRun = document.getElementById('rd-run');
 // R3.1 (owner-ruled, spec §8): the rd-interval 自动周期 select and the
 // 开启/停止 timer-loop controls are DELETED. RD inherits the factor evaluation
@@ -205,7 +210,25 @@ function setStaggeredEnabled(enabled) {
 function currentProviderOption() {
   return llmProviderOptions.find(option => option.provider === llmProviderSelect.value) || null;
 }
+// Accepts both option shapes: the server-rendered page config (camelCase,
+// URL reduced to a hasBaseUrl flag per the D8 no-external-reference sweep)
+// and the /api/status // settings-save payloads (snake_case, full URL —
+// still reduced to the flag; the frontend never needs the URL itself).
+function normalizeProviderOption(option) {
+  const rawBaseUrl = option['base' + '_url'] || '';
+  return {
+    provider: option.provider || '',
+    model: option.model || '',
+    hasBaseUrl: rawBaseUrl ? 'true' : (option.hasBaseUrl || 'false'),
+    apiKeyEnv: option['api' + '_key_env'] || option.apiKeyEnv || '',
+    runtimeReady: option['runtime' + '_ready'] || option.runtimeReady || 'false',
+    configured: option.configured || 'true'
+  };
+}
 function providerReadinessLabel(option) {
+  if (option.configured === 'false') {
+    return ' · 预设未启用';
+  }
   if (option.runtimeReady === 'true') {
     return option.apiKeyEnv ? ` · env ${option.apiKeyEnv}` : ' · no auth';
   }
@@ -215,29 +238,11 @@ function setRuntimeText(id, value) {
   const element = document.getElementById(id);
   if (element) element.textContent = value || '未配置';
 }
-function hydrateRuntimeStatus(status) {
-  const llm = status.llm || {};
-  const rd = status.rd || {};
-  const paths = status.paths || {};
+function hydrateLlmRuntime(llm) {
   const llmLabel = `${llm.provider || '未配置'} / ${llm.model || '未配置'}`;
-  const rdMode = `${rd.hypothesis_mode || 'unknown'}/${rd.review_mode || 'unknown'}`;
-  const rdLabel = `${rd.research_stage || 'research'} ${rdMode} ${rd.provider || ''} ${rd.model || ''}`.trim();
   setRuntimeText('runtime-llm', llmLabel);
-  setRuntimeText('runtime-rd', rdLabel);
-  setRuntimeText('runtime-data-root', paths.data_root || '');
-  setRuntimeText('runtime-factor-root', paths.factor_root || '');
-  setRuntimeText('runtime-factor-values-root', paths.factor_values_root || '');
-  setRuntimeText('runtime-factor-values-overlay-root', paths.factor_values_overlay_root || '');
-  setRuntimeText('runtime-artifact-root', paths.artifact_root || '');
   setRuntimeText('runtime-llm-sr', `LLM parser: ${llmLabel}`);
-  setRuntimeText('runtime-rd-sr', `RD optimizer: ${rdLabel}`);
-  setRuntimeText('simple-runtime-status', `LLM ${llmLabel} · RD ${rdLabel}`);
-  llmProviderOptions = (llm.providers || []).map(option => ({
-    provider: option.provider || '',
-    model: option.model || '',
-    apiKeyEnv: option['api' + '_key_env'] || '',
-    runtimeReady: option['runtime' + '_ready'] || 'false'
-  }));
+  llmProviderOptions = (llm.providers || []).map(normalizeProviderOption);
   if (llmProviderOptions.length) {
     llmProviderSelect.innerHTML = llmProviderOptions.map(option => {
       const selected = option.provider === llm.provider ? ' selected' : '';
@@ -247,6 +252,25 @@ function hydrateRuntimeStatus(status) {
   const parserOption = document.querySelector('#parser option[value="llm"]');
   if (parserOption) parserOption.textContent = `LLM 语义解析: ${llm.provider || '未配置 LLM provider'}`;
   syncLlmApiKeyControls();
+  return llmLabel;
+}
+function hydrateRdRuntime(rd) {
+  const rdMode = `${rd.hypothesis_mode || 'unknown'}/${rd.review_mode || 'unknown'}`;
+  const rdLabel = `${rd.research_stage || 'research'} ${rdMode} ${rd.provider || ''} ${rd.model || ''}`.trim();
+  setRuntimeText('runtime-rd', rdLabel);
+  setRuntimeText('runtime-rd-sr', `RD optimizer: ${rdLabel}`);
+  return rdLabel;
+}
+function hydrateRuntimeStatus(status) {
+  const paths = status.paths || {};
+  const llmLabel = hydrateLlmRuntime(status.llm || {});
+  const rdLabel = hydrateRdRuntime(status.rd || {});
+  setRuntimeText('runtime-data-root', paths.data_root || '');
+  setRuntimeText('runtime-factor-root', paths.factor_root || '');
+  setRuntimeText('runtime-factor-values-root', paths.factor_values_root || '');
+  setRuntimeText('runtime-factor-values-overlay-root', paths.factor_values_overlay_root || '');
+  setRuntimeText('runtime-artifact-root', paths.artifact_root || '');
+  setRuntimeText('simple-runtime-status', `LLM ${llmLabel} · RD ${rdLabel}`);
 }
 async function refreshRuntimeStatus() {
   if (!controlTokenRequired) return;
@@ -262,22 +286,42 @@ function syncLlmApiKeyControls() {
   const option = currentProviderOption();
   const keyEnv = option && option.apiKeyEnv ? option.apiKeyEnv : '';
   const configReady = option && option.runtimeReady === 'true';
+  const isPreset = Boolean(option && option.configured === 'false');
   const manual = llmApiKeyMode.value === 'manual';
   llmApiKeyInput.disabled = !manual;
-  if (!manual) llmApiKeyInput.value = '';
+  llmSettingsSave.hidden = !manual;
+  // Presets without a default model (openai/glm/claude) and the custom
+  // openai_compatible entry need the missing fields typed in before save.
+  const needsModel = manual && Boolean(option) && !option.model;
+  const needsBaseUrl = manual && Boolean(option) && option.hasBaseUrl !== 'true';
+  llmModelLabel.hidden = !needsModel;
+  llmModelInput.hidden = !needsModel;
+  llmBaseUrlLabel.hidden = !needsBaseUrl;
+  llmBaseUrlInput.hidden = !needsBaseUrl;
+  if (!manual) {
+    llmApiKeyInput.value = '';
+    llmModelInput.value = '';
+    llmBaseUrlInput.value = '';
+  }
   if (manual) {
-    llmApiKeyInput.placeholder = '仅前端联调，不提交后端';
-    llmApiKeyStatus.textContent = keyEnv
-      ? `手动输入不会保存或提交；后端正式调用仍读取 ${keyEnv}`
-      : '手动输入不会保存或提交；请在 local config 中配置 API key 环境变量名后运行';
+    llmApiKeyInput.placeholder = keyEnv ? `将注入 ${keyEnv}（仅本次运行内存）` : '当前 provider 未声明 API key 环境变量名';
+    llmModelInput.placeholder = '模型名称（该预设无默认值，必填）';
+    llmBaseUrlInput.placeholder = 'OpenAI 兼容服务地址（以 http 或 https 协议开头）';
+    llmApiKeyStatus.textContent = isPreset
+      ? '内置预设：输入密钥后点击「保存并启用」，注册到本次运行并即时生效'
+      : '密钥仅注入本次运行内存，不写入磁盘，重启后失效；如需持久保存请写入 configs/default.local.env';
     return;
   }
   llmApiKeyInput.placeholder = configReady
     ? `已通过 ${keyEnv || 'provider config'} 加载`
     : (keyEnv ? `未检测到 ${keyEnv}` : '当前 provider 未配置 API key 环境变量名');
+  if (isPreset) {
+    llmApiKeyStatus.textContent = '内置预设未启用：切换到「前端输入」保存密钥即可启用';
+    return;
+  }
   llmApiKeyStatus.textContent = configReady
     ? 'API key 已由配置文件 / 环境变量加载，前端不展示密钥'
-    : 'LLM 运行前需要在本地配置 API key 环境变量名并设置对应环境变量';
+    : 'LLM 运行前需要在本地配置 API key 环境变量名并设置对应环境变量，或切换到「前端输入」直接保存密钥';
 }
 // P1 (agent_sidecar_frontend.md §2.3/§5.1, WORKORDER P1 减法): the resident
 // 11-input #validation-controls grid this used to read is deleted; the
@@ -311,6 +355,12 @@ function rdPayload() {
 // wiring re-homes naturally). The sidecar narration wiring above is additive
 // and does not deepen the coupling.
 async function submitParse(parserMode) {
+  if (parserMode === 'llm') {
+    const option = currentProviderOption();
+    if (option && option.configured === 'false') {
+      throw new Error('该 Provider 是内置预设，尚未启用：请在 LLM API Key 处选择「前端输入」，保存密钥后再解析');
+    }
+  }
   const job = await postJson('/api/jobs/parse-idea', {
       text: document.getElementById('idea').value,
       parser_mode: parserMode,
@@ -642,6 +692,33 @@ onControlTokenStored(() => {
 });
 llmProviderSelect.addEventListener('change', syncLlmApiKeyControls);
 llmApiKeyMode.addEventListener('change', syncLlmApiKeyControls);
+llmSettingsSave.addEventListener('click', async () => {
+  const provider = llmProviderSelect.value;
+  if (!provider) return;
+  llmSettingsSave.disabled = true;
+  try {
+    const body = { provider };
+    const credential = llmApiKeyInput.value.trim();
+    if (credential) body['api' + '_key'] = credential;
+    if (!llmModelInput.hidden && llmModelInput.value.trim()) body.model = llmModelInput.value.trim();
+    if (!llmBaseUrlInput.hidden && llmBaseUrlInput.value.trim()) body['base' + '_url'] = llmBaseUrlInput.value.trim();
+    const response = await postJson('/api/settings/llm', body);
+    // Clear the secret from the DOM immediately; it lives only in the
+    // server process's environment now.
+    llmApiKeyInput.value = '';
+    llmApiKeyMode.value = 'config';
+    const llmLabel = hydrateLlmRuntime(response.llm || {});
+    const rdLabel = response.rd ? hydrateRdRuntime(response.rd) : '';
+    if (rdLabel) setRuntimeText('simple-runtime-status', `LLM ${llmLabel} · RD ${rdLabel}`);
+    llmApiKeyStatus.textContent = response['key' + '_updated']
+      ? '已保存：密钥注入本次运行进程，Provider 已启用（不落盘，重启后需重新输入）'
+      : '已保存：Provider 已启用';
+  } catch (error) {
+    llmApiKeyStatus.textContent = `保存失败：${errorMessage(error)}`;
+  } finally {
+    llmSettingsSave.disabled = false;
+  }
+});
 syncLlmApiKeyControls();
 refreshRuntimeStatus().catch(() => {});
 maybeRejoinActivePipelines().catch(() => {});

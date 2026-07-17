@@ -358,6 +358,16 @@ def create_local_web_server(
     control_token = _control_token_for_bind(host, config)
     control_token_required = bool(control_token)
 
+    def _swap_runtime_config(new_config: QuantForgeConfig) -> None:
+        # /api/settings/llm applies a runtime LLM update by atomically
+        # replacing the closure's frozen config snapshot (reference
+        # assignment; in-flight requests keep the snapshot they already
+        # read). The tool registry captured its own reference at
+        # construction, so it gets the replacement explicitly.
+        nonlocal config
+        config = new_config
+        tool_registry.apply_runtime_config(new_config)
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             parsed_url = urlparse(self.path)
@@ -555,6 +565,20 @@ def create_local_web_server(
                 path = urlparse(self.path).path
                 self._require_control_token()
                 payload = self._read_json()
+                if path == "/api/settings/llm":
+                    # Runtime LLM settings write: registers/updates a provider,
+                    # optionally injects the API key into this process's env
+                    # (never persisted, never echoed), then swaps the closure
+                    # config so every later request sees the new active
+                    # provider. ValueError -> 400 via the generic mapping.
+                    new_config, response = _server.apply_llm_settings_update(config, payload)
+                    _swap_runtime_config(new_config)
+                    # rd section rides along so the frontend can re-hydrate
+                    # the whole runtime strip from this response alone
+                    # (loopback binds never re-fetch /api/status).
+                    response["rd"] = _rd_status_payload(new_config, research_config)
+                    self._json(response)
+                    return
                 if path == "/api/run-idea":
                     result = _server.run_idea_workflow(
                         config,
