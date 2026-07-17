@@ -100,6 +100,20 @@ operators:
     audit_status: core_reviewed
     pit_safety: {uses_future_data: false, alignment: t}
     llm: {preferred_name: log, allow_generation: true, forbid_alias_generation: true}
+  - name: ntile
+    signature: ntile(x, buckets)
+    description: Cross-sectional quantile bucketing by trade date; labels 1 to n from low to high.
+    category: cross_sectional
+    family: bucketing
+    args:
+      - {name: x, type: series, role: input}
+      - {name: buckets, type: positive_integer, role: bucket_count, constraints: {minimum: 2}}
+    examples: [ntile(rank(return_5d), 5)]
+    execution_status: implemented
+    audit_status: core_reviewed
+    numeric_behavior: {scope: by_trade_date}
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: ntile, allow_generation: true, forbid_alias_generation: true}
   - name: rank
     signature: rank(x)
     description: Cross-sectional percentile rank by trade date.
@@ -164,6 +178,36 @@ operators:
     numeric_behavior: {scope: by_instrument_rolling, min_periods: window}
     pit_safety: {uses_future_data: false, alignment: t}
     llm: {preferred_name: stddev, allow_generation: true, forbid_alias_generation: true}
+  - name: ts_argmax
+    signature: ts_argmax(x, window)
+    description: Days since the most recent rolling maximum by instrument; 0 at the current bar.
+    category: time_series
+    family: rolling_arg
+    args:
+      - {name: x, type: series, role: input}
+      - {name: window, type: positive_integer, role: lookback_window}
+    examples: [ts_argmax(close, 20)]
+    lookback_rule: {type: window_minus_one, window_arg: window}
+    execution_status: implemented
+    audit_status: core_reviewed
+    numeric_behavior: {scope: by_instrument_rolling, min_periods: window, tie_break: most_recent}
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: ts_argmax, allow_generation: true, forbid_alias_generation: true}
+  - name: ts_argmin
+    signature: ts_argmin(x, window)
+    description: Days since the most recent rolling minimum by instrument; 0 at the current bar.
+    category: time_series
+    family: rolling_arg
+    args:
+      - {name: x, type: series, role: input}
+      - {name: window, type: positive_integer, role: lookback_window}
+    examples: [ts_argmin(close, 20)]
+    lookback_rule: {type: window_minus_one, window_arg: window}
+    execution_status: implemented
+    audit_status: core_reviewed
+    numeric_behavior: {scope: by_instrument_rolling, min_periods: window, tie_break: most_recent}
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: ts_argmin, allow_generation: true, forbid_alias_generation: true}
   - name: ts_max
     signature: ts_max(x, window)
     description: Rolling time-series maximum by instrument.
@@ -234,6 +278,20 @@ operators:
     audit_status: core_reviewed
     pit_safety: {uses_future_data: false, alignment: t}
     llm: {preferred_name: ts_sum, allow_generation: true, forbid_alias_generation: true}
+  - name: winsorize
+    signature: winsorize(x, quantile)
+    description: Cross-sectional quantile winsorization by trade date; clips to the [q, 1-q] bounds.
+    category: cross_sectional
+    family: robust_transform
+    args:
+      - {name: x, type: series, role: input}
+      - {name: quantile, type: number, role: tail_fraction, constraints: {minimum: 0.0, maximum: 0.5, maximum_exclusive: true}}
+    examples: [winsorize(return_5d, 0.02)]
+    execution_status: implemented
+    audit_status: core_reviewed
+    numeric_behavior: {scope: by_trade_date}
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: winsorize, allow_generation: true, forbid_alias_generation: true}
   - name: wq_max
     signature: wq_max(x, y_or_window)
     description: WorldQuant-style max; scalar second arg maps to ts_max, otherwise pairwise max.

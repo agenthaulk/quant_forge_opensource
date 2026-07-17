@@ -101,6 +101,26 @@ def _eval_node(panel: pd.DataFrame, node: ast.AST) -> pd.Series:
             mean = grouped.transform("mean")
             std = grouped.transform("std").replace(0, pd.NA)
             return (values - mean) / std
+        if operator == "winsorize":
+            if len(args) != 2:
+                raise ValueError("winsorize expects 2 arguments")
+            values = _eval_node(panel, args[0])
+            fraction = _number_arg(args[1], "winsorize quantile")
+            if not 0.0 <= fraction < 0.5:
+                raise ValueError("winsorize quantile must be in [0, 0.5)")
+            grouped = values.groupby(panel["trade_date"])
+            lower = grouped.transform(lambda group: group.quantile(fraction))
+            upper = grouped.transform(lambda group: group.quantile(1.0 - fraction))
+            return values.clip(lower=lower, upper=upper)
+        if operator == "ntile":
+            if len(args) != 2:
+                raise ValueError("ntile expects 2 arguments")
+            values = _eval_node(panel, args[0])
+            buckets = int(math.floor(_number_arg(args[1], "ntile bucket count")))
+            if buckets < 2:
+                raise ValueError("ntile bucket count must be >= 2")
+            percentile = values.groupby(panel["trade_date"]).rank(pct=True)
+            return np.ceil(percentile * buckets).clip(lower=1, upper=buckets)
         if operator == "abs":
             return _one_series_arg(panel, operator, args).abs()
         if operator == "log":
@@ -114,7 +134,7 @@ def _eval_node(panel: pd.DataFrame, node: ast.AST) -> pd.Series:
         if operator == "delta":
             values = _one_series_arg(panel, operator, args[:1])
             return values - _by_instrument(panel, values, lambda series: series.shift(_window(args, 1)))
-        if operator in {"ts_sum", "ts_mean", "ts_min", "ts_max", "stddev", "ts_rank", "decay_linear"}:
+        if operator in {"ts_sum", "ts_mean", "ts_min", "ts_max", "stddev", "ts_rank", "decay_linear", "ts_argmax", "ts_argmin"}:
             return _rolling_operator(panel, operator, args)
         if operator in {"correlation", "covariance"}:
             if len(args) != 3:
@@ -177,6 +197,8 @@ def _rolling_operator(panel: pd.DataFrame, operator: str, args: list[ast.AST]) -
         weights = np.arange(1, window + 1, dtype=float)
         weights = weights / weights.sum()
         return _rolling_weighted_sum(panel, values, weights=weights)
+    if operator in {"ts_argmax", "ts_argmin"}:
+        return _rolling_days_since_extreme(panel, values, window=window, operator=operator)
     raise ValueError(f"unsupported rolling operator: {operator}")
 
 
@@ -222,6 +244,41 @@ def _rolling_last_rank_pct(panel: pd.DataFrame, values: pd.Series, *, window: in
         ranks[(valid_count == 0) | ~valid_last] = np.nan
         group_result = np.full(group_values.size, np.nan, dtype=float)
         group_result[window - 1 :] = ranks
+        result.loc[positions] = group_result
+    return result
+
+
+def _rolling_days_since_extreme(
+    panel: pd.DataFrame,
+    values: pd.Series,
+    *,
+    window: int,
+    operator: str,
+) -> pd.Series:
+    """Days since the most recent rolling max/min per instrument (0 at bar t).
+
+    For the trailing window ending at ``t`` (inclusive) the result is the number
+    of bars between ``t`` and the extreme value's position: 0 when the current
+    bar holds the extreme, ``window - 1`` when the oldest bar does. Ties resolve
+    to the most recent occurrence. Only rows up to ``t`` enter the window
+    (PIT-safe), and any window containing a NaN yields NaN, matching the
+    ``min_periods=window`` contract shared by the other ``ts_*`` operators.
+    """
+
+    take_argextreme = np.argmax if operator == "ts_argmax" else np.argmin
+    result = pd.Series(np.nan, index=panel.index, dtype="float64")
+    for _, positions in panel.groupby("instrument", sort=False).groups.items():
+        group_values = values.loc[positions].to_numpy(dtype=float)
+        if group_values.size < window:
+            continue
+        windows = np.lib.stride_tricks.sliding_window_view(group_values, window)
+        # Scan each window from the current bar backwards: the index of the
+        # extreme in the reversed window is exactly the days-since count, and the
+        # first hit wins so ties collapse to the most recent bar.
+        days_since = take_argextreme(windows[:, ::-1], axis=1).astype(float)
+        days_since[~np.isfinite(windows).all(axis=1)] = np.nan
+        group_result = np.full(group_values.size, np.nan, dtype=float)
+        group_result[window - 1 :] = days_since
         result.loc[positions] = group_result
     return result
 
