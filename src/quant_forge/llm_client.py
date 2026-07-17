@@ -68,6 +68,33 @@ _PROVIDER_ALIASES = {
     "bigmodel": "glm",
 }
 
+
+def canonical_provider_name(provider: str) -> str:
+    """Public alias-aware normalization (``anthropic`` -> ``claude``)."""
+
+    return _canonical_provider(provider)
+
+
+def builtin_provider_presets() -> tuple[dict[str, str], ...]:
+    """Public metadata for the built-in provider presets — never key material.
+
+    The web settings surface offers these so a user can enable a provider
+    without editing YAML. Each entry carries only defaults from
+    ``_PROVIDER_DEFAULTS``: the canonical name, default ``base_url``/``model``
+    ("" when the preset has no default and the user must supply one), and the
+    default environment-variable NAME the credential is read from.
+    """
+
+    return tuple(
+        {
+            "provider": name,
+            "model": str(defaults.get("default_model", "")),
+            "base_url": str(defaults.get("base_url", "")),
+            "api_key_env": str(defaults["api_key_envs"][0]),
+        }
+        for name, defaults in _PROVIDER_DEFAULTS.items()
+    )
+
 _TRANSIENT_HTTP_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 _MAX_HTTP_ATTEMPTS = 3
 _HTTP_RETRY_BACKOFF_SECONDS = (0.25, 1.0)

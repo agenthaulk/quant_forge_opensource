@@ -18,7 +18,7 @@ from pathlib import Path, PurePosixPath
 import re
 import threading
 from typing import Any
-from urllib.parse import parse_qs, unquote
+from urllib.parse import parse_qs, unquote, urlparse
 
 from quant_forge.apps.web.jobs import _IdeaValidationSettings, _WebJobCancelled, _client_error_message
 from quant_forge.apps.web.markdown import extract_markdown_title, render_markdown_html
@@ -29,7 +29,12 @@ from quant_forge.apps.web.run_recording import (
     _staggered_warnings_count,
 )
 from quant_forge.backtesting.service import EXTERNAL_OOS_ROLE
-from quant_forge.config import QuantForgeConfig, simulation_profile_from_mapping, validate_llm_runtime
+from quant_forge.config import (
+    QuantForgeConfig,
+    llm_settings_with_provider_update,
+    simulation_profile_from_mapping,
+    validate_llm_runtime,
+)
 from quant_forge.core.contracts import (
     BacktestResult,
     EvaluationResult,
@@ -2435,13 +2440,37 @@ def _paths_payload(config: QuantForgeConfig) -> dict[str, str]:
 
 
 def _llm_provider_options(config: QuantForgeConfig) -> tuple[dict[str, str], ...]:
+    from quant_forge.llm_client import builtin_provider_presets
+
     options: list[dict[str, str]] = []
+    configured_names: set[str] = set()
     for option in config.llm.public_provider_options():
+        configured_names.add(option["provider"])
         runtime_ready, runtime_error = _llm_runtime_status(config, option["provider"])
         enriched = dict(option)
+        enriched["configured"] = "true"
         enriched["runtime_ready"] = "true" if runtime_ready else "false"
         enriched["runtime_error"] = runtime_error
         options.append(enriched)
+    # Built-in presets not declared in YAML: offered so the frontend can
+    # register them at runtime via /api/settings/llm without a config edit.
+    # Only metadata travels here — the env var NAME, never key material.
+    for preset in builtin_provider_presets():
+        if preset["provider"] in configured_names:
+            continue
+        key_present = bool(os.environ.get(preset["api_key_env"], ""))
+        options.append(
+            {
+                **preset,
+                "configured": "false",
+                "runtime_ready": "false",
+                "runtime_error": (
+                    "preset is not enabled yet; save LLM settings to enable it"
+                    if key_present
+                    else "preset is not enabled yet; save LLM settings with an API key to enable it"
+                ),
+            }
+        )
     return tuple(options)
 
 
@@ -2455,6 +2484,176 @@ def _llm_runtime_status(config: QuantForgeConfig, provider: str) -> tuple[bool, 
 
 def _active_llm(config: QuantForgeConfig) -> Any:
     return config.llm.select_provider()
+
+
+_LLM_API_KEY_MAX_CHARS = 512
+
+
+def apply_llm_settings_update(
+    config: QuantForgeConfig, payload: dict[str, Any]
+) -> tuple[QuantForgeConfig, dict[str, Any]]:
+    """Apply a runtime LLM settings update from ``POST /api/settings/llm``.
+
+    Semantics (all in-process, nothing is written to disk):
+
+    * ``provider`` (required) — a YAML-configured provider or a built-in
+      preset; presets are registered into the runtime config on first save.
+    * ``model`` / ``base_url`` (optional) — override or complete the entry;
+      the merged entry passes the same validation as YAML-loaded providers.
+    * ``api_key`` (optional) — injected into ``os.environ[api_key_env]`` so
+      the very next LLM call picks it up (the client reads the key from the
+      environment per call). The key value is never echoed, logged, or
+      persisted; a restart clears it. For a durable key, users keep the
+      documented path: a git-ignored ``configs/*.local.env``.
+    * ``activate`` (default true) — make this provider the active default
+      (used by RD optimization and the sidecar readiness probe; parse jobs
+      already choose per request).
+
+    Security: this is the only route that could turn workbench-operate access
+    into standing-secret exfiltration, so it refuses to point an existing
+    provider whose key already lives in the environment at a NEW ``base_url``
+    without the caller re-supplying the key in the SAME request. Otherwise a
+    caller could redirect, say, deepseek to ``http://attacker/v1`` with no key
+    and the next LLM call would ship the host's durable ``DEEPSEEK_API_KEY``
+    (from ``configs/*.local.env``) as a bearer token to the attacker's URL —
+    a credential the web layer is never allowed to reveal. Legitimate
+    first-time setup (host + key together) is unaffected. No private-IP/SSRF
+    blocklist is applied on purpose: a local self-hosted model
+    (``http://127.0.0.1:11434`` etc.) is a first-class OpenAI-compatible use.
+
+    Returns the replacement frozen config plus a response payload shaped like
+    the ``llm`` section of ``/api/status`` so the frontend can re-hydrate from
+    the response alone (loopback binds never re-fetch ``/api/status``).
+    """
+
+    from quant_forge.llm_client import builtin_provider_presets, canonical_provider_name
+
+    provider_raw = str(payload.get("provider", "") or "").strip()
+    if not provider_raw:
+        raise ValueError("provider is required")
+    name = canonical_provider_name(provider_raw)
+    if name in {"rule", "deterministic"}:
+        raise ValueError("provider 'rule' is built in and cannot be edited")
+
+    model = str(payload.get("model", "") or "").strip()
+    base_url = str(payload.get("base_url", "") or "").strip()
+    activate = _bool_parameter(payload.get("activate", True), "activate")
+    api_key = payload.get("api_key")
+    api_key_supplied = api_key is not None and str(api_key) != ""
+
+    presets = {preset["provider"]: preset for preset in builtin_provider_presets()}
+    api_key_env = ""
+    existing = config.llm.providers.get(name)
+    if existing is None:
+        preset = presets.get(name)
+        if preset is None:
+            known = ", ".join(sorted(set(config.llm.providers) | set(presets)))
+            raise ValueError(f"unknown LLM provider: {provider_raw}. Known providers: {known}.")
+        model = model or preset["model"]
+        base_url = base_url or preset["base_url"]
+        api_key_env = preset["api_key_env"]
+
+    if base_url:
+        _require_http_base_url(base_url)
+
+    new_llm = llm_settings_with_provider_update(
+        config.llm,
+        provider=name,
+        model=model,
+        base_url=base_url,
+        api_key_env=api_key_env,
+        activate=activate,
+    )
+    selected = new_llm.select_provider(name)
+
+    # Standing-key exfiltration guard (see the security note above): a base_url
+    # that actually changes the entry's host, without a key re-supplied here,
+    # is refused when the target env var is already populated. `base_url` is
+    # only truthy when the caller sent one (presets fill it before this point,
+    # but a brand-new preset registration has no standing key + no `existing`).
+    target_env = str(selected.api_key_env).strip()
+    prior_base_url = existing.base_url if existing is not None else ""
+    if (
+        base_url
+        and base_url != prior_base_url
+        and not api_key_supplied
+        and target_env
+        and os.environ.get(target_env)
+    ):
+        raise ValueError(
+            "changing base_url requires re-supplying api_key so a standing "
+            "credential is never sent to a newly specified host"
+        )
+
+    key_updated = False
+    if api_key_supplied:
+        credential = str(api_key)
+        _validate_api_key_shape(credential)
+        env_name = target_env
+        if not env_name:
+            raise ValueError(
+                f"provider {name} does not declare api_key_env; cannot accept an API key"
+            )
+        _validate_env_var_name(env_name)
+        # In-process only, by design: the LLM client resolves the key from the
+        # environment on every call, so this takes effect immediately and
+        # vanishes on restart. Never logged, never in any response payload.
+        os.environ[env_name] = credential
+        key_updated = True
+
+    new_config = replace(config, llm=new_llm)
+    active = new_config.llm.select_provider()
+    response = {
+        "ok": True,
+        "key_updated": key_updated,
+        "llm": {
+            "provider": active.provider,
+            "model": active.model,
+            "api_key_env": active.api_key_env,
+            "providers": _llm_provider_options(new_config),
+        },
+    }
+    return new_config, response
+
+
+def _validate_env_var_name(env_name: str) -> None:
+    """Refuse to write anything but a plain env-var identifier.
+
+    Presets use fixed ``*_API_KEY`` names and YAML is owner-controlled, so this
+    is defense-in-depth: it stops a future/hand-edited ``api_key_env`` from
+    aiming the runtime key write at a process-influencing variable
+    (``PATH``/``LD_PRELOAD``/``PYTHONPATH``/the control-token env). Mirrors the
+    identifier rule the env-*file* parser already enforces (config.py).
+    """
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name):
+        raise ValueError("api_key_env must be a plain environment-variable name")
+    if env_name.endswith(("PATH", "PRELOAD")) or env_name in {"PATH", "LD_PRELOAD", "PYTHONPATH"}:
+        raise ValueError(f"refusing to write reserved environment variable: {env_name}")
+
+
+def _validate_api_key_shape(credential: str) -> None:
+    """Shape-only checks; error text never includes the submitted value."""
+
+    if len(credential) > _LLM_API_KEY_MAX_CHARS:
+        raise ValueError(f"api_key is too long (max {_LLM_API_KEY_MAX_CHARS} characters)")
+    if any(character.isspace() for character in credential):
+        raise ValueError("api_key must not contain whitespace")
+    if any(not character.isprintable() for character in credential):
+        raise ValueError("api_key must not contain non-printable characters")
+
+
+def _require_http_base_url(base_url: str) -> None:
+    """The web write path only accepts http(s) endpoints.
+
+    ``urllib.request.urlopen`` would happily open other schemes (``file://``
+    included), so a runtime-writable base_url must be scheme-restricted here
+    even though YAML-configured values are the host owner's own business.
+    """
+
+    scheme = urlparse(base_url).scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError("base_url must start with http:// or https://")
 
 
 def _rd_status_payload(config: QuantForgeConfig, rd_config: ResearchLoopConfig) -> dict[str, str]:

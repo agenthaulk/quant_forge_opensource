@@ -44,8 +44,14 @@ def _provider_options_script_payload(options: tuple[dict[str, str], ...]) -> tup
     return tuple(
         {
             "provider": option.get("provider", ""),
+            "model": option.get("model", ""),
+            # boolean flag only: a real URL literal would break the D8
+            # no-external-reference sweep on the served page, and the
+            # frontend only needs to know whether base_url must be typed in.
+            "hasBaseUrl": "true" if option.get("base_url", "") else "false",
             "apiKeyEnv": option.get("api_key_env", ""),
             "runtimeReady": option.get("runtime_ready", "false"),
+            "configured": option.get("configured", "true"),
         }
         for option in options
     )
@@ -65,6 +71,8 @@ def _page_config_json(
 
 
 def _provider_readiness_label(option: dict[str, str]) -> str:
+    if option.get("configured") == "false":
+        return " · 预设未启用"
     if option.get("runtime_ready") == "true":
         return " · env " + option["api_key_env"] if option["api_key_env"] else " · no auth"
     api_key_env = option.get("api_key_env", "")
@@ -469,6 +477,9 @@ def _index_html(
       background: #fff6f6;
     }}
     button:disabled {{ opacity: .55; cursor: wait; }}
+    /* label{{display:block}} / button width rules above would defeat the
+       [hidden] UA default on the runtime LLM settings controls. */
+    label[hidden], input[hidden], button[hidden] {{ display: none; }}
     code {{
       background: #eef5ef;
       border: 1px solid var(--line);
@@ -1165,9 +1176,14 @@ def _index_html(
       <label for="llm-api-key-mode">LLM API Key</label>
       <select id="llm-api-key-mode">
         <option value="config">配置文件 / 环境变量加载</option>
-        <option value="manual">手动输入（仅前端联调）</option>
+        <option value="manual">前端输入（注入本次运行）</option>
       </select>
-      <input id="llm-api-key" type="password" autocomplete="off" data-secret-policy="not-submitted" disabled>
+      <input id="llm-api-key" type="password" autocomplete="off" data-secret-policy="runtime-memory-only" disabled>
+      <label for="llm-model" id="llm-model-label" hidden>模型名称</label>
+      <input id="llm-model" autocomplete="off" hidden>
+      <label for="llm-base-url" id="llm-base-url-label" hidden>Base URL</label>
+      <input id="llm-base-url" autocomplete="off" hidden>
+      <button id="llm-settings-save" class="secondary" hidden>保存并启用</button>
       <p id="llm-api-key-status" class="meta"></p>
       <!-- P1 (agent_sidecar_frontend.md §5.1/§8): the resident 11-parameter
            grid (formerly #validation-controls, wrapped in #advanced-params)

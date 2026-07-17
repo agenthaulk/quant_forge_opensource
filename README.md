@@ -352,6 +352,35 @@ features. RD does not have a second API-key setting.
 
 LLM 语义解析和 RD LLM 功能共用同一个当前 provider；RD 不再单独配置第二套 API key。
 
+### Switching providers from the Web UI / 在网页端切换大模型
+
+The workbench can also register a provider and take an API key at runtime, so
+you can try a model without editing YAML or restarting the server. In the
+expert-mode control rail, the **LLM Provider** menu lists the configured
+providers plus the built-in presets (`deepseek`, `openai`, `openai_compatible`,
+`glm`, `claude`, `minimax`). Switch **LLM API Key** to *前端输入 / manual*, enter
+the key (and, for a preset with no default, the model / base URL), and click
+**保存并启用 / Save & enable**.
+
+The key is injected into the **running server process environment only**. It is
+never written to disk, never echoed in any response, and never logged; a restart
+clears it. For a durable key, keep using the ignored `configs/*.local.env` path
+above. Like every mutating Web action, the settings write requires the browser
+control token on a Docker/`0.0.0.0` bind. Pointing an existing provider at a new
+`base_url` requires re-supplying the key in the same request, so a standing key
+is never sent to a newly specified host.
+
+网页端也可以在运行时注册 provider 并接收 API key，无需改 YAML 或重启即可试用某个
+模型。在专家模式左侧控制栏，**LLM Provider** 下拉会列出已配置 provider 以及内置预设
+（`deepseek`、`openai`、`openai_compatible`、`glm`、`claude`、`minimax`）。把
+**LLM API Key** 切到「前端输入」，填入密钥（预设无默认值时再补填模型名 / base URL），
+点击「保存并启用」。
+
+密钥只注入**运行中的服务进程环境变量**：不写磁盘、不在任何响应中回显、不进日志，重启即
+失效；如需持久保存，仍走上文被忽略的 `configs/*.local.env`。与所有会改状态的 Web 操作
+一样，在 Docker / `0.0.0.0` 绑定下该写入需要浏览器控制令牌。把已有 provider 指向新的
+`base_url` 时必须在同一请求内重新提交密钥，以确保常驻密钥不会被发往新指定的地址。
+
 ## Configuration Files / 配置文件
 
 | File | Purpose |

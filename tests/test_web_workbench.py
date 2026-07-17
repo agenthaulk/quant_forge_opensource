@@ -1099,8 +1099,18 @@ allowed_interval_days: [5]
         assert f'id="{param_id}"' not in html, param_id
     assert "llm-api-key-mode" in html
     assert "llm-api-key" in html
-    assert 'data-secret-policy="not-submitted"' in html
-    assert "手动输入不会保存或提交" in bundle
+    # Runtime LLM settings (POST /api/settings/llm): the manual key path now
+    # submits over the token-gated local POST and injects the key into the
+    # server process env only — never disk, never echoed. The old
+    # "not-submitted" stance is deliberately replaced.
+    assert 'data-secret-policy="runtime-memory-only"' in html
+    assert 'id="llm-settings-save"' in html
+    assert 'id="llm-model"' in html
+    assert 'id="llm-base-url"' in html
+    assert "/api/settings/llm" in bundle
+    assert "密钥仅注入本次运行内存" in bundle
+    assert "手动输入不会保存或提交" not in bundle
+    assert 'data-secret-policy="not-submitted"' not in html
     assert "中断本次运行" in html
     assert "中断本次RD" in html
     assert "function clearGlobalError" in bundle
