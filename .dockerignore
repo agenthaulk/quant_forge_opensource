@@ -27,7 +27,6 @@ docs/*_repair_ledger_*.md
 docs/first_principles_review_*.md
 
 # Untracked local drafts living under COPY'd dirs
-docs/getting_started_zh.md
 docs/research_platform_optimization_from_vibe_quantgpt.md
 
 # Local machine setup material at the context root
