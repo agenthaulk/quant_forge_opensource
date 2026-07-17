@@ -133,7 +133,7 @@ provider 已识别、key env 已继承但真实 key 未打印、各数据/因子
 摘要（screenshots / page-state）作为真实前端操作证据。
 
 **当前 IA：7 个顶层页签（tabs）** —— 「LLM 因子工作台」（内含两个模块：单因子研究 /
-多因子策略回测）·「研究历史」·「数据」·「注册表」·「文档」·「扩展」·「记忆治理」。
+多因子策略回测）·「研究历史」·「数据」·「已注册因子」·「文档」·「扩展」·「记忆治理」。
 顶层 tab id 依次为 `lab-tab-factor` / `lab-tab-history` / `lab-tab-data` /
 `lab-tab-registry` / `lab-tab-docs` / `lab-tab-extensions` / `lab-tab-memory`；
 工作台内两个模块 id 为 `lab-module-single`（单因子研究）与
@@ -157,6 +157,28 @@ provider 已识别、key env 已继承但真实 key 未打印、各数据/因子
     重启后失效（`data-secret-policy="runtime-memory-only"`）；内置预设（openai/glm/claude/
     minimax/openai_compatible）可在此注册启用，缺省 model 的预设需补填模型名。
 - 控制令牌门控 UX（token-gating）：需要令牌时页面提示明确，粘贴/预置后功能解锁。
+
+#### 4.1.1 运行时切换大模型 / runtime LLM switch（NEW，`POST /api/settings/llm`）
+
+网页端可在**不改 YAML、不重启**的前提下注册/切换 provider 并输入密钥。作为验收步骤逐项验证：
+
+- **预设可见性：** `#llm-provider` 下拉除已配置 provider 外，还应列出 6 个内置预设
+  （`deepseek` / `openai` / `openai_compatible` / `glm` / `claude` / `minimax`）；未在 YAML
+  配过的预设标注**「预设未启用」**（`configured=false`）。
+- **注册预设 + 注入密钥：** 选一个未启用预设 → `#llm-api-key-mode` 切「前端输入（注入本次
+  运行）」→ 填一个 **dummy 密钥**（缺省 model 的预设如 openai/glm/claude 会多出模型名输入框
+  `#llm-model`；`openai_compatible` 还多出 `#llm-base-url`，可填本地 `http://127.0.0.1:11434/v1`）
+  → 点「保存并启用」（`#llm-settings-save`）。**期望：** 状态提示「已保存…」、`#llm-api-key`
+  立即清空、运行时状态条切成该 provider、该预设的 `runtime_ready` 翻成 `true`。
+- **密钥保密（HONESTY / P4）：** dummy 密钥值**绝不**出现在任何响应体、`/api/status`、页面
+  DOM、日志或工作区磁盘；`#llm-api-key` 属性为 `data-secret-policy="runtime-memory-only"`；
+  保存后重启容器则失效（进程内存语义）。
+- **base_url 重定向护栏（SECURITY）：** 对一个 **env 里已有常驻密钥**的 provider（如 deepseek）
+  只改 `base_url`、不重填密钥 → 期望 **400**（错误含「re-supplying api_key」），且原 base_url
+  未被改写。带上密钥再改则允许。此举防止把宿主常驻密钥发往新指定地址。
+- **切回不回归：** 切回原配置 provider（`{"provider":"deepseek"}`，不带密钥）应成功、
+  `key_updated=false`、真实 DeepSeek 链路 readiness 仍为 `ready`。
+- **令牌门控一致：** Docker/`0.0.0.0` 绑定下，无令牌 `POST /api/settings/llm` 返回 `401`。
 
 ### 4.2 单因子研究 / single-factor module（真实 DeepSeek）
 
@@ -329,7 +351,9 @@ seed）、`last_accepted_factor_id`、`last_explored_factor_id`、
 
 - 「数据」（`#lab-panel-data`）：字段目录（catalog）、覆盖范围（coverage）、质量门
   （quality gate）。
-- 「注册表」（`#lab-panel-registry`）：因子列表 + 详情 + 证据链（evidence chain）。
+- 「已注册因子」（`#lab-panel-registry`）：因子列表 + 详情 + 证据链（evidence chain）。
+  标签文案是**「已注册因子」**（不再是旧的「注册表」）；内部 id 仍是 `lab-tab-registry` /
+  `lab-panel-registry`（深链与路由不变）。
 - 「文档」（`#lab-panel-docs`）：docs 目录 + 渲染后的 markdown（应能看到本文件与
   `frontend_contributing.md`）。
 - 「扩展」（`#lab-panel-extensions`）：扩展 manifest 清单 + 校验状态（validation status）。
@@ -374,6 +398,15 @@ seed）、`last_accepted_factor_id`、`last_explored_factor_id`、
   `/api` 路径 → 返回 index shell（深链与拼写错误都落到首页外壳）。
 - **payload 卫生（hygiene）：** 任何 payload 都**不得含绝对路径**；尤其
   `GET /api/data/status` 不得泄漏 `data_root` / `panel_path`（artifact 字段应为 basename）。
+- **LLM 运行时设置端点（NEW，`POST /api/settings/llm`）：**
+  - `GET /api/status` 的 `llm.providers[]` 除已配置项外还带内置预设，每项含
+    `configured` / `runtime_ready` / `api_key_env`（**只有环境变量名，无 key 值**）。
+  - `POST` 一个预设 + dummy `api_key` → `200`，响应含 `key_updated:true`，但**响应体、
+    `/api/status`、任何日志/磁盘都不含 key 值**；该预设 `runtime_ready` 翻 `true`。
+  - **护栏 400：** 对已有常驻密钥的 provider 只改 `base_url`、不带 `api_key` → `400`
+    （错误含 `re-supplying api_key`），base_url 不变。
+  - **门控：** 无令牌 `POST /api/settings/llm` → `401`。非法输入（未知 provider / 含空白的
+    key / 非 http(s) 的 base_url / 预设缺 model / `provider:"rule"`）→ 同步 `400`。
 - **合成端点形状：**
   - `GET /api/synthesis/methods` 返回 `{methods, standardizations}`：4 个方法
     （`equal_weight` / `weighted` 先验 + `ic_weighted` / `icir_weighted` 拟合，P6 终态全部
@@ -524,7 +557,7 @@ doctor 必须 DeepSeek runtime-ready；llm-smoke 必须完成一次真实解析�
 
 阶段 3 真实前端联调（按能力阶梯取最高级：L1 真实桌面 Chrome，L2 真实 Chrome 程序化，
 L3 API 仅补充非验收）：走 4.0–4.5——6-tab + 两模块 IA；provider 与 key 控件；单因子
-三个 seed（附录 C，逐字）解析→评测→RD；多因子模块合成→回测；只读面（数据/注册表/文档/
+三个 seed（附录 C，逐字）解析→评测→RD；多因子模块合成→回测；只读面（数据/已注册因子/文档/
 扩展）；横切（深链 reload、console 零错误、暗色 + 375px via CDP device metrics）。保留截图/
 页面状态证据。禁止用 /api/jobs/* 替代点击。
 
@@ -576,7 +609,7 @@ L3 API 仅补充非验收）：走 4.0–4.5——6-tab + 两模块 IA；provide
 
 **一个多因子合成配方 / a multi-factor recipe（用于 4.3）：**
 
-- 从注册表/已产出的因子里挑 2–3 个（例如上面三个 seed 验证后注册的因子）。
+- 从「已注册因子」/已产出的因子里挑 2–3 个（例如上面三个 seed 验证后注册的因子）。
 - 方法选 `weighted`，为每个因子填一个权重，例如 `0.5 / 0.3 / 0.2`（方向按定义 `+1`，
   除非要显式反向 `-1`）；标准化选 `zscore`。
 - `holding_days = 5`（必填）；其余留空由后端 profile 默认值决定。

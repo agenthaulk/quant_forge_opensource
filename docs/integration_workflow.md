@@ -329,7 +329,9 @@ API/HTTP 调用只允许核对后端 contract、artifact 路径、日期窗口�
 
 1. 打开桌面 Chrome，访问本地 Web URL。
 2. 检查左侧 runtime strip 是否展示当前 `LLM`、`data`、`factors`、`values`、`overlay`、`artifacts`。
-3. 在 `LLM Provider` 中选择 DeepSeek 或当前配置的云端 provider。
+3. 在 `LLM Provider` 中选择 DeepSeek 或当前配置的云端 provider。下拉除已配置 provider 外，
+   还应列出内置预设（deepseek/openai/openai_compatible/glm/claude/minimax），未在 YAML 配过的
+   标注“预设未启用”。
 4. 检查 `LLM API Key` 控件：
    - 默认模式应为“配置文件 / 环境变量加载”。
    - 如果 provider key 已通过配置和环境变量加载，password 输入框必须置灰。
@@ -339,6 +341,14 @@ API/HTTP 调用只允许核对后端 contract、artifact 路径、日期窗口�
    - 密钥仅存在于运行中进程的内存，不写入磁盘、配置、日志、artifact 或报告，任何响应
      （含 `/api/status`）都不得回显密钥值；重启后失效，持久化仍走 `configs/*.local.env`。
    - 手动输入的密钥不得进入 parse/validate 请求体；正式调用仍从后端环境变量读取。
+4b. 运行时切换大模型（NEW）联调：
+   - 选一个“预设未启用”的 provider → 切“前端输入” → 填 dummy 密钥（缺省 model 的预设会多出
+     模型名输入框；openai_compatible 还多出 base_url 框，可填本地 `http://127.0.0.1:11434/v1`）
+     → 点“保存并启用”。期望：状态提示“已保存…”、密钥框清空、runtime strip 切成该 provider、
+     该预设 `runtime_ready` 翻 true。全程 dummy 密钥不得出现在任何响应/DOM/日志/磁盘。
+   - base_url 护栏：对一个 env 已有常驻密钥的 provider 只改 base_url、不重填密钥 → 期望 400
+     （错误含 “re-supplying api_key”），原 base_url 不变；带密钥再改则允许。
+   - 切回原配置 provider（不带密钥）应成功、`key_updated=false`、真实链路 readiness 仍 ready。
 5. 输入自然语言因子观点，点击“解析因子”。
 6. 解析完成后应只展示 factor 草稿和待确认参数，不应立即执行评价/回测。
 7. 检查评测参数区是否自动填入默认值：
