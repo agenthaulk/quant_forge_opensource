@@ -346,8 +346,17 @@ Optional fields used by built-in formulas:
 内置公式使用的可选字段：
 
 ```text
-volume, return_1d, return_5d, volatility_5d
+open, high, low, volume, amount, return_1d, return_5d, volatility_5d
 ```
+
+`open` / `high` / `low` share the same adjusted price basis as `close`; `amount`
+is daily traded turnover (a VWAP proxy is `amount / volume`). A panel that omits
+any optional column reports it as `missing` and formulas that reference it fail
+with the standard missing-field error.
+
+`open` / `high` / `low` 与 `close` 同为复权基准；`amount` 为当日成交额（VWAP 代理
+为 `amount / volume`）。面板缺某可选列时会标记为 `missing`，引用该列的公式按缺失字段
+报错。
 
 Validate before research:
 

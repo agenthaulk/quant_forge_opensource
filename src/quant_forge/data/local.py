@@ -103,6 +103,39 @@ PANEL_FIELD_CATALOG: tuple[CatalogField, ...] = (
         tags=_field_tags("close", themes=("price",), min_warmup_bars=1),
     ),
     CatalogField(
+        name="open",
+        description="Adjusted opening price on the same price basis as close.",
+        role="optional",
+        tags=_field_tags(
+            "open",
+            themes=("price",),
+            min_warmup_bars=1,
+            notes="Same adjusted price basis as close; do not mix with a raw-price close.",
+        ),
+    ),
+    CatalogField(
+        name="high",
+        description="Adjusted intraday high on the same price basis as close.",
+        role="optional",
+        tags=_field_tags(
+            "high",
+            themes=("price",),
+            min_warmup_bars=1,
+            notes="Same adjusted price basis as close; do not mix with a raw-price close.",
+        ),
+    ),
+    CatalogField(
+        name="low",
+        description="Adjusted intraday low on the same price basis as close.",
+        role="optional",
+        tags=_field_tags(
+            "low",
+            themes=("price",),
+            min_warmup_bars=1,
+            notes="Same adjusted price basis as close; do not mix with a raw-price close.",
+        ),
+    ),
+    CatalogField(
         name="market_cap",
         description="Point-in-time market capitalization supplied by local data.",
         role="required",
@@ -124,6 +157,17 @@ PANEL_FIELD_CATALOG: tuple[CatalogField, ...] = (
         description="Local demo trading volume.",
         role="optional",
         tags=_field_tags("volume", themes=("liquidity",), min_warmup_bars=1),
+    ),
+    CatalogField(
+        name="amount",
+        description="Daily traded turnover (value); a VWAP proxy is amount / volume.",
+        role="optional",
+        tags=_field_tags(
+            "amount",
+            themes=("liquidity",),
+            min_warmup_bars=1,
+            notes="Turnover value in the same currency basis as price*volume.",
+        ),
     ),
     CatalogField(
         name="return_1d",
@@ -589,14 +633,28 @@ def _build_demo_panel() -> pd.DataFrame:
             seasonal = np.sin((day_index + instrument_index) / 4.0) * 0.015
             small_cap_tilt = (len(instruments) - instrument_index) * 0.0008 * day_index
             close = base_close * (1.0 + drift + seasonal + small_cap_tilt)
+            volume = float(1_000_000 + instrument_index * 50_000 + day_index * 2_000)
+            # Intraday range and turnover on the SAME adjusted basis as close
+            # (deterministic demo values, not estimates): high/low bracket close
+            # and open sits inside [low, high]; amount is a price*volume turnover.
+            high_gap = 0.012 + 0.006 * abs(float(np.sin((day_index + instrument_index) / 5.0)))
+            low_gap = 0.012 + 0.006 * abs(float(np.cos((day_index - instrument_index) / 7.0)))
+            high = close * (1.0 + high_gap)
+            low = close * (1.0 - low_gap)
+            open_fraction = 0.5 + 0.35 * float(np.sin((day_index * 2 + instrument_index) / 6.0))
+            open_price = low + open_fraction * (high - low)
             rows.append(
                 {
                     "trade_date": trade_date.date().isoformat(),
                     "instrument": instrument,
+                    "open": round(float(open_price), 6),
+                    "high": round(float(high), 6),
+                    "low": round(float(low), 6),
                     "close": round(float(close), 6),
                     "market_cap": float(base_cap * (1.0 + seasonal)),
                     "is_st": bool(instrument_index in {1, 8} and day_index >= 10),
-                    "volume": float(1_000_000 + instrument_index * 50_000 + day_index * 2_000),
+                    "volume": volume,
+                    "amount": round(float(close) * volume, 2),
                 }
             )
     panel = pd.DataFrame(rows)
