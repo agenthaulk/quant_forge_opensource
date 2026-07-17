@@ -405,6 +405,7 @@ Read the full bilingual guide:
 
 阅读完整双语手册：
 
+- [新手入门指南 / Beginner's Guide (中文, 图文并茂)](docs/getting_started_zh.md)
 - [User Manual / 使用手册](docs/USER_MANUAL.md)
 - [Architecture / 架构说明](docs/architecture.md)
 - [Configuration Reference / 配置参考](docs/configuration.md)
