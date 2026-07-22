@@ -89,6 +89,20 @@ operators:
     audit_status: core_reviewed
     pit_safety: {uses_future_data: false, alignment: t}
     llm: {preferred_name: delta, allow_generation: true, forbid_alias_generation: true}
+  - name: group_neutralize
+    signature: group_neutralize(factor, group)
+    description: Cross-sectional within-group demean by trade date; subtracts each day's group mean so the factor is neutral inside every group. A single-member group yields 0 and a row with a missing group label yields null.
+    category: cross_sectional
+    family: neutralization
+    args:
+      - {name: factor, type: series, role: input}
+      - {name: group, type: field, role: group_key}
+    examples: [group_neutralize(rank(return_1d), industry)]
+    execution_status: implemented
+    audit_status: core_reviewed
+    numeric_behavior: {scope: by_trade_date, partition: group_key, singleton_group: zero, missing_group: nan}
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: group_neutralize, allow_generation: true, forbid_alias_generation: true}
   - name: log
     signature: log(x)
     description: Elementwise natural log for positive values.
@@ -126,6 +140,20 @@ operators:
     numeric_behavior: {scope: by_trade_date}
     pit_safety: {uses_future_data: false, alignment: t}
     llm: {preferred_name: rank, allow_generation: true, forbid_alias_generation: true}
+  - name: residualize
+    signature: residualize(y, x)
+    description: Cross-sectional OLS residual of y on x with an intercept, by trade date; returns y minus its per-day least-squares fit on x. Degenerate cross-sections (fewer than two finite pairs, or an x with zero variance) yield null, as do rows with a missing y or x.
+    category: cross_sectional
+    family: neutralization
+    args:
+      - {name: y, type: series, role: response}
+      - {name: x, type: series, role: regressor}
+    examples: [residualize(return_5d, return_1d)]
+    execution_status: implemented
+    audit_status: core_reviewed
+    numeric_behavior: {scope: by_trade_date, fit: ols_with_intercept, degenerate_sample: nan}
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: residualize, allow_generation: true, forbid_alias_generation: true}
   - name: scale
     signature: scale(x, target)
     description: Cross-sectional scaling so sum(abs(score)) equals target.

@@ -121,6 +121,18 @@ def _eval_node(panel: pd.DataFrame, node: ast.AST) -> pd.Series:
                 raise ValueError("ntile bucket count must be >= 2")
             percentile = values.groupby(panel["trade_date"]).rank(pct=True)
             return np.ceil(percentile * buckets).clip(lower=1, upper=buckets)
+        if operator == "group_neutralize":
+            if len(args) != 2:
+                raise ValueError("group_neutralize expects 2 arguments")
+            values = _eval_node(panel, args[0])
+            group = _group_key(panel, args[1])
+            return _group_demean(panel, values, group)
+        if operator == "residualize":
+            if len(args) != 2:
+                raise ValueError("residualize expects 2 arguments")
+            response = _eval_node(panel, args[0])
+            regressor = _eval_node(panel, args[1])
+            return _cross_sectional_residualize(panel, response, regressor)
         if operator == "abs":
             return _one_series_arg(panel, operator, args).abs()
         if operator == "log":
@@ -316,6 +328,79 @@ def _field(panel: pd.DataFrame, name: str) -> pd.Series:
     if not pd.api.types.is_numeric_dtype(panel[column]):
         raise ValueError(f"factor field must be numeric: {column}")
     return panel[column].astype(float)
+
+
+def _group_key(panel: pd.DataFrame, node: ast.AST) -> pd.Series:
+    """Resolve a categorical grouping column referenced by name (e.g. industry).
+
+    Unlike a numeric factor argument, the group key only partitions the
+    cross-section, so it is taken straight from the panel without numeric
+    coercion (industry codes are strings). It must be a bare field reference.
+    """
+
+    if not isinstance(node, (ast.Name, ast.Attribute)):
+        raise ValueError("group argument must be a field name")
+    column = field_name(node).split(".")[-1]
+    if column not in panel.columns:
+        raise ValueError(f"unsupported or missing group field: {column}")
+    return panel[column]
+
+
+def _group_demean(panel: pd.DataFrame, values: pd.Series, group: pd.Series) -> pd.Series:
+    """Cross-sectional within-group demean by (trade_date, group) each day.
+
+    Subtracts the group's daily mean from each member, so the factor is neutral
+    within every group on every date. A single-member group demeans to 0 (the
+    member is its own group mean). A row whose group label is missing has no peer
+    set to neutralize against and stays null rather than passing the raw value
+    through. NaN factor values stay NaN, and the group mean is taken over the
+    finite members. Each date is independent (PIT-safe by construction).
+    """
+
+    frame = pd.DataFrame(
+        {
+            "value": values.to_numpy(dtype=float),
+            "trade_date": panel["trade_date"].to_numpy(),
+            "group": group.to_numpy(),
+        },
+        index=panel.index,
+    )
+    group_mean = frame.groupby(["trade_date", "group"])["value"].transform("mean")
+    demeaned = frame["value"] - group_mean
+    demeaned[frame["group"].isna().to_numpy()] = np.nan
+    return demeaned
+
+
+def _cross_sectional_residualize(panel: pd.DataFrame, response: pd.Series, regressor: pd.Series) -> pd.Series:
+    """Per-trade-date OLS residual of ``response`` on ``regressor`` (with intercept).
+
+    For each trade date the residual is y - (a + b*x) from that day's
+    least-squares fit. Degenerate cross-sections yield null: fewer than two finite
+    (x, y) pairs, or a regressor with zero variance, leaves the slope
+    unidentified, so those rows stay NaN rather than emitting a fabricated
+    residual. Rows with a missing y or x drop out of the fit and are reported
+    null. Each date is independent (PIT-safe by construction).
+    """
+
+    result = pd.Series(np.nan, index=panel.index, dtype="float64")
+    for _, positions in panel.groupby("trade_date", sort=False).groups.items():
+        y_values = response.loc[positions].to_numpy(dtype=float)
+        x_values = regressor.loc[positions].to_numpy(dtype=float)
+        finite = np.isfinite(y_values) & np.isfinite(x_values)
+        if int(finite.sum()) < 2:
+            continue
+        x_fit = x_values[finite]
+        y_fit = y_values[finite]
+        x_centered = x_fit - x_fit.mean()
+        denominator = float((x_centered * x_centered).sum())
+        if denominator == 0.0:
+            continue
+        slope = float((x_centered * (y_fit - y_fit.mean())).sum()) / denominator
+        intercept = float(y_fit.mean()) - slope * float(x_fit.mean())
+        residual = np.full(y_values.shape, np.nan, dtype=float)
+        residual[finite] = y_fit - (intercept + slope * x_fit)
+        result.loc[positions] = residual
+    return result
 
 
 def _eval_filter(panel: pd.DataFrame, expression: str) -> pd.Series:

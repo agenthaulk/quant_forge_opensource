@@ -20,9 +20,11 @@ SUPPORTED_OPERATORS = {
     "decay_linear",
     "delay",
     "delta",
+    "group_neutralize",
     "log",
     "ntile",
     "rank",
+    "residualize",
     "scale",
     "sign",
     "signedpower",
@@ -296,6 +298,17 @@ def _validate_operator_signature(
             errors.append("ntile argument 2 must be an integer bucket count >= 2")
             return False
         return True
+    if operator == "group_neutralize":
+        if not _expect_arity(operator, args, 2, errors):
+            return False
+        # The second argument is a categorical grouping key, so it must be a bare
+        # field reference (e.g. industry), never a numeric literal or expression.
+        if not isinstance(args[1], (ast.Name, ast.Attribute)):
+            errors.append("group_neutralize argument 2 must be a group field name")
+            return False
+        return True
+    if operator == "residualize":
+        return _expect_arity(operator, args, 2, errors)
     if operator in {"correlation", "covariance"}:
         return _expect_arity(operator, args, 3, errors) and _expect_window_arg(operator, args, 2, errors)
     if operator == "scale":
