@@ -136,7 +136,7 @@ def test_experiment_planner_blocks_unknown_operator_field_and_st_numeric_feature
     bad_field = StructuredResearchHypothesis(
         hypothesis_id="bad_field",
         text="bad field",
-        formula_dsl="rank(pe_ttm)",
+        formula_dsl="rank(nonexistent_alpha_field)",
         expected_direction="positive",
         source="operator_mcp",
     )
@@ -736,6 +736,20 @@ def test_context_builder_includes_effective_ideas_and_operator_context(tmp_path:
     assert "parameter_search fallback" not in prompt
     assert "Always set parameter_search_fallback=false" in prompt
     assert "Never include precomputed:" in prompt
+
+
+def test_context_builder_excludes_unavailable_fundamental_fields(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    (paths["data_root"] / "fundamentals.parquet").unlink()
+
+    context = ResearchContextBuilder(
+        factor_root=paths["factor_root"],
+        data_root=paths["data_root"],
+    ).build(seed_factor_ids=("FTR_DEMO_SMALL_CAP",))
+
+    assert "market_cap" in context.available_fields
+    assert "netprofit_yoy" not in context.available_fields
+    assert "netprofit_yoy" not in {field["name"] for field in context.field_catalog}
 
 
 def test_llm_repair_prompt_includes_validation_error(tmp_path: Path) -> None:

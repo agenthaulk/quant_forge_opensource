@@ -25,6 +25,7 @@ from quant_forge.factor_engine.signal_processing import (
     require_minimum_display_trading_days,
     simulation_profile_suffix,
 )
+from quant_forge.factor_engine.formula_parser import formula_input_fields
 from quant_forge.factor_library.catalog import FactorCatalog
 from quant_forge.utils import write_json
 
@@ -243,7 +244,9 @@ def _prepare_ic_inputs(
     horizon = horizon_days or factor.horizon_days
     if horizon < 1:
         raise ValueError("horizon_days must be positive")
-    panel = LocalPanelDataProvider(data_root).load_panel()
+    panel = LocalPanelDataProvider(data_root).load_panel(
+        required_fields=formula_input_fields(factor.formula)
+    )
     working_panel = apply_test_period(panel, profile)
     require_minimum_display_trading_days(working_panel)
     score_result = prepare_factor_scores_result(

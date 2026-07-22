@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from quant_forge.factor_library.catalog import FactorCatalog, is_precomputed_formula
-from quant_forge.mcp.read_models import list_available_fields, list_available_operators
+from quant_forge.mcp.read_models import list_available_operators, list_runtime_available_fields
 from quant_forge.research_loop.contracts import ResearchContext
 from quant_forge.research_loop.feedback_builder import NEXT_HYPOTHESIS_HINT_TEMPLATES
 from quant_forge.research_loop.memory import ResearchMemoryStore
@@ -87,7 +87,7 @@ class ResearchContextBuilder:
         )
         memory_failures = self._memory_items("failure", exclude_signatures=rule_tier_signatures)
         memory_findings = self._memory_items("finding", exclude_signatures=rule_tier_signatures)
-        field_catalog = tuple(dict(field) for field in list_available_fields())
+        field_catalog = tuple(dict(field) for field in list_runtime_available_fields(self.data_root))
         operator_catalog = tuple(dict(operator) for operator in list_available_operators())
         return ResearchContext(
             market=self.market,

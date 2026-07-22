@@ -22,6 +22,12 @@ class PathSettings:
     factor_values_root: Path | None = None
     factor_values_overlay_root: Path | None = None
     factor_values_manifest_root: Path | None = None
+    # Fundamental data plane (optional; None -> price-volume-only panel).
+    # ``fundamentals_source_root`` points at a locally-materialized source layer
+    # (its real path lives only in an ignored local config); the CLI
+    # ``qf data build-fundamentals`` reads it and writes the PIT overlay as a
+    # ``fundamentals.parquet`` sibling of the panel, which the loader merges.
+    fundamentals_source_root: Path | None = None
     artifact_root: Path = Path("artifacts")
     output_root: Path = Path("outputs")
 
@@ -139,6 +145,7 @@ class QuantForgeConfig:
                 factor_values_root=_optional_under(root, self.paths.factor_values_root),
                 factor_values_overlay_root=_optional_under(root, self.paths.factor_values_overlay_root),
                 factor_values_manifest_root=_optional_under(root, self.paths.factor_values_manifest_root),
+                fundamentals_source_root=_optional_under(root, self.paths.fundamentals_source_root),
                 artifact_root=_under(root, self.paths.artifact_root),
                 output_root=_under(root, self.paths.output_root),
             ),
@@ -175,6 +182,7 @@ def load_config(config_path: Path | None = None, workspace: Path | None = None) 
             factor_values_root=_optional_path_setting(raw, "factor_values_root"),
             factor_values_overlay_root=_optional_path_setting(raw, "factor_values_overlay_root"),
             factor_values_manifest_root=_optional_path_setting(raw, "factor_values_manifest_root"),
+            fundamentals_source_root=_optional_path_setting(raw, "fundamentals_source_root"),
             artifact_root=_path_setting(raw, "artifact_root", default="artifacts"),
             output_root=_path_setting(raw, "output_root", default="outputs"),
         ),
@@ -554,6 +562,7 @@ _KNOWN_PATHS_KEYS = (
     "factor_values_root",
     "factor_values_overlay_root",
     "factor_values_manifest_root",
+    "fundamentals_source_root",
     "artifact_root",
     "output_root",
 )

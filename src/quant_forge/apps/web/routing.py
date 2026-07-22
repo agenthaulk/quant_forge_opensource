@@ -81,7 +81,8 @@ from quant_forge.apps.web.tools import (
 from quant_forge.specs.narration import NarrationNode
 from quant_forge.apps.web.memory_review import memory_review_payload, review_promoted, review_rule
 from quant_forge.config import QuantForgeConfig
-from quant_forge.mcp.read_models import list_available_fields, list_available_operators
+from quant_forge.data.local import LocalPanelDataProvider
+from quant_forge.mcp.read_models import list_available_operators, list_runtime_available_fields
 from quant_forge.research_loop.config import ResearchLoopConfig, load_research_loop_config
 from quant_forge.research_loop.memory import ResearchMemoryStore
 from quant_forge.research_loop.scheduler import (
@@ -388,7 +389,12 @@ def create_local_web_server(
                     self._json({"ok": True})
                 elif path == "/catalog":
                     self._require_control_token()
-                    self._json({"fields": list_available_fields(), "operators": list_available_operators()})
+                    self._json(
+                        {
+                            "fields": list_runtime_available_fields(config.paths.data_root),
+                            "operators": list_available_operators(),
+                        }
+                    )
                 elif path == "/api/research/history":
                     self._require_control_token()
                     # ValueError (limit validation) is reflected for the new
@@ -786,6 +792,9 @@ def create_local_web_server(
                             name=payload.get("name", ""),
                             horizon_days=payload.get("horizon_days", 5),
                             universe_filters=_optional_universe_filters(payload.get("universe_filters")),
+                            available_fields=LocalPanelDataProvider(
+                                config.paths.data_root
+                            ).available_field_names(),
                         )
                     )
                     return

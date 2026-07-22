@@ -9,7 +9,11 @@ from quant_forge.agent_workspace.tools import AgentWorkspaceTools
 from quant_forge.core.contracts import SimulationProfile
 from quant_forge.data.local import create_demo_workspace
 from quant_forge.factor_library.repository import FactorRepository
-from quant_forge.mcp.read_models import list_available_fields, list_available_operators
+from quant_forge.mcp.read_models import (
+    list_available_fields,
+    list_available_operators,
+    list_runtime_available_fields,
+)
 
 
 def test_mcp_catalogs_are_read_only_shapes() -> None:
@@ -25,6 +29,22 @@ def test_mcp_catalogs_are_read_only_shapes() -> None:
     assert "args" in rank
     stddev = next(operator for operator in operators if operator["name"] == "stddev")
     assert "ts_stddev" in stddev["aliases_for_recognition_only"]
+
+
+def test_runtime_catalog_separates_capability_from_current_data(tmp_path: Path) -> None:
+    paths = create_demo_workspace(tmp_path / "demo")
+    assert "netprofit_yoy" in {
+        field["name"] for field in list_runtime_available_fields(paths["data_root"])
+    }
+
+    (paths["data_root"] / "fundamentals.parquet").unlink()
+    runtime_names = {
+        field["name"] for field in list_runtime_available_fields(paths["data_root"])
+    }
+    capability_names = {field["name"] for field in list_available_fields()}
+    assert "netprofit_yoy" in capability_names
+    assert "netprofit_yoy" not in runtime_names
+    assert "market_cap" in runtime_names
 
 
 def test_desktop_chrome_contract_is_prompt_only() -> None:

@@ -8,7 +8,12 @@ import pytest
 
 from quant_forge.config import LLMSettings
 from quant_forge.factor_library.repository import parse_idea_to_definition
-from quant_forge.llm_factor_parser import GENERIC_FALLBACK_WARNING, _factor_from_llm_json, parse_factor_idea
+from quant_forge.llm_factor_parser import (
+    GENERIC_FALLBACK_WARNING,
+    _factor_from_llm_json,
+    _prompt_parts,
+    parse_factor_idea,
+)
 from quant_forge.specs import nl_flow
 
 
@@ -147,6 +152,30 @@ def test_llm_factor_json_canonicalizes_safe_alias() -> None:
     )
 
     assert factor.formula == "rank(-stddev(return_1d, 20))"
+
+
+def test_runtime_fields_constrain_prompt_and_reject_unavailable_formula() -> None:
+    system, _ = _prompt_parts(
+        "profit growth",
+        available_fields=("close", "return_5d"),
+    )
+    available_segment = system.split("Available fields: ", 1)[1].split(". operator_catalog:", 1)[0]
+    assert "close" in available_segment
+    assert "netprofit_yoy" not in available_segment
+    assert "rank(netprofit_yoy)" not in system
+
+    with pytest.raises(RuntimeError, match="not available in the current data: netprofit_yoy"):
+        _factor_from_llm_json(
+            {
+                "name": "profit_growth",
+                "formula": "rank(netprofit_yoy)",
+                "description": "profit growth",
+                "horizon_days": 5,
+                "universe_filters": [],
+            },
+            "profit growth",
+            available_fields=("close", "return_5d"),
+        )
 
 
 def test_llm_factor_json_rejects_likely_alias_and_draft_operator() -> None:
@@ -458,11 +487,12 @@ class FakeMomentumHandler(BaseHTTPRequestHandler):
         return
 
 
-def test_out_of_scope_data_warns_on_fundamentals(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The exact reported case: a fundamentals idea the price-volume panel cannot
-    # express degrades to rank(return_5d) but must NOT look confident -- the
-    # parse carries an out-of-scope review warning even though the formula is a
-    # valid non-fallback (rank(return_5d), not rank(close)).
+def test_fundamentals_idea_no_longer_flagged_out_of_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Since fundamentals are now supported (netprofit_yoy et al.), the earlier
+    # reported profit-growth idea must NOT carry the out-of-scope warning any
+    # more -- the domain is expressible. (Real DeepSeek would return
+    # rank(netprofit_yoy); the fake here still returns rank(return_5d), but the
+    # point of this regression guard is only that no out-of-scope warning fires.)
     server = ThreadingHTTPServer(("127.0.0.1", 0), FakeMomentumHandler)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -481,35 +511,36 @@ def test_out_of_scope_data_warns_on_fundamentals(monkeypatch: pytest.MonkeyPatch
         server.shutdown()
         thread.join(timeout=5)
 
-    assert parsed.factor.formula == "rank(return_5d)"
-    assert parsed.warnings, "fundamentals idea must carry a review warning"
-    assert any("基本面" in w or "price-volume" in w for w in parsed.warnings)
-    # rank(return_5d) is NOT the rank(close) catch-all, so the generic-fallback
-    # warning must not be what fired here.
-    assert GENERIC_FALLBACK_WARNING not in parsed.warnings
+    assert parsed.warnings == (), "fundamentals are supported -> no out-of-scope warning"
 
 
-def test_out_of_scope_detector_recall_and_no_false_positives() -> None:
+def test_out_of_scope_detector_flags_only_alt_data() -> None:
     from quant_forge.specs.nl_flow import out_of_scope_data_warnings
 
-    # Out-of-scope data domains warn.
+    # Genuinely-unavailable alternative data + unexposed line items still warn.
     for idea in (
-        "年报、季报利润同比增加高的公司未来更好",
-        "现金流充裕、负债率低的公司",
-        "市盈率低、股息率高的股票",
-        "stocks with rising earnings and revenue",
+        "根据舆情和研报情绪选股",
+        "北向资金持续流入的股票",
+        "龙虎榜机构净买入的股票",
+        "商誉占比低、存货周转快的公司",  # no exposed goodwill/inventory field
         "high analyst sentiment names",
+        "stocks with strong northbound flow",
+        "low goodwill and lean inventory names",
     ):
         assert out_of_scope_data_warnings(idea), idea
 
-    # In-scope price-volume ideas and the built-in demo seeds do NOT warn, and
-    # short English terms never match inside unrelated words (approach/broad).
+    # Now-supported fundamentals/valuation ideas, in-scope price-volume ideas,
+    # and the demo seeds do NOT warn; short English terms never match inside
+    # unrelated words (approach/broad).
     for idea in (
+        "年报、季报利润同比增加高的公司未来更好",  # now supported (netprofit_yoy)
+        "现金流充裕、负债率低的公司",              # now supported (n_cashflow_act/debt_to_assets)
+        "市盈率低、ROE 高的股票",                   # now supported (pe_ttm/roe)
+        "stocks with rising earnings and revenue",  # now supported
         "非ST的小市值股票未来表现更好",
         "过去5天涨幅较大的股票，短期动量继续",
         "低波动率的股票更稳",
-        "成交量放大的股票",
-        "估值越低的股票，长期收益越好",  # bare 估值 demo seed: keeps rank(close) path
+        "估值越低的股票，长期收益越好",
         "approach the broad market with high volume",
     ):
         assert not out_of_scope_data_warnings(idea), idea

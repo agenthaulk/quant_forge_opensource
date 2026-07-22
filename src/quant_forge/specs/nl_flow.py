@@ -25,40 +25,37 @@ _FALLBACK_WARNING = (
     "not have understood the idea - review before running"
 )
 
-# No-silent-fallback, extended past the rank(close) catch-all. The public
-# workbench panel has only price-volume fields (close / is_st / market_cap /
-# return_* / volatility_* / volume). When an idea references a data domain the
-# panel cannot express -- financial statements, valuation multiples, alt-data --
-# the parser (LLM or rule) can only degrade to a price-volume formula, so it may
-# silently return e.g. rank(return_5d) for a fundamentals idea and look
-# confident. Detect the domain mismatch from the idea text and attach a review
-# warning so an approximation is never presented as a faithful implementation.
+# No-silent-fallback, extended past the rank(close) catch-all. The workbench
+# now carries price-volume AND point-in-time fundamentals (growth / profitability
+# / valuation / leverage / cashflow, e.g. netprofit_yoy / roe / pe_ttm — see
+# data/fundamentals.py). Those domains are expressible, so they are NOT flagged.
+# What remains genuinely unavailable is per-stock ALTERNATIVE data — sentiment /
+# analyst-report / northbound-flow (hsgt is market-level, not per-stock) /
+# dragon-tiger / institutional-holding / shareholder-count. An idea about those
+# can only degrade to a price-volume/fundamental formula, so it must carry a
+# review warning. (Any unexposed single line-item — goodwill, inventory — is
+# caught honestly instead by the missing-field validation gate.)
 #
-# This is a curated, deliberately conservative heuristic (recall over a fixed
-# set, not exhaustive): terms are chosen to avoid colliding with in-scope
-# price-volume vocabulary (收益/回报/动量/波动/成交量/市值/价格) and with the
-# built-in demo seeds (notably the bare word 估值 is intentionally NOT listed,
-# so the "低估值" seed keeps its existing rank(close) catch-all behavior).
+# Curated, conservative recall over a fixed alt-data set; terms avoid colliding
+# with in-scope vocabulary. English terms stay multi-char to avoid matching
+# inside unrelated words (e.g. "analyst" not "anal").
 _OUT_OF_SCOPE_DATA_TERMS: tuple[str, ...] = (
-    # fundamentals / financial statements (Chinese)
-    "基本面", "利润", "净利", "毛利", "营收", "营业收入", "财报", "年报", "季报",
-    "中报", "业绩", "每股收益", "净资产", "资产负债", "现金流", "负债", "商誉",
-    "分红", "股息", "派息", "应收", "存货", "扣非",
-    # valuation multiples that need fundamentals (the bare 估值/价值 is excluded)
-    "市盈", "市净", "市销", "股息率",
-    # alternative data (Chinese)
+    # alternative data (Chinese) — genuinely unavailable per-stock
     "舆情", "研报", "分析师", "北向", "龙虎榜", "机构持仓", "增减持", "股东户数",
-    # fundamentals / valuation / alt-data (English, multi-char to avoid matches
-    # inside unrelated words like "approach" / "broad")
-    "earnings", "revenue", "profit", "dividend", "cash flow", "cashflow",
-    "book value", "ebitda", "fundamental", "p/e", "p/b", "sentiment", "analyst",
+    "股吧", "新闻",
+    # balance-sheet line items with no exposed catalog field (the exposed set is
+    # growth / profitability / valuation / leverage / cashflow, not raw items).
+    "商誉", "存货", "应收", "应付",
+    # alternative data / unexposed items (English)
+    "sentiment", "analyst", "news flow", "northbound", "goodwill", "inventory",
+    "receivable",
 )
 _OUT_OF_SCOPE_DATA_WARNING = (
-    "本数据集只有量价字段（close/market_cap/return/volatility/volume 等），"
-    "无法表达该想法涉及的基本面/估值/另类数据，公式只是最接近的量价近似，"
-    "并非该想法的真实实现，请复核 / this idea references data not in the "
-    "price-volume dataset; the formula is only a nearest price-volume "
-    "approximation, not a faithful implementation - review before running"
+    "本数据集有量价 + 基本面字段，但没有该想法涉及的另类数据（舆情/研报/资金流/"
+    "龙虎榜/机构持仓 等），公式只是最接近的近似，并非真实实现，请复核 / this idea "
+    "references alternative data (sentiment / analyst / flow) not in the dataset; "
+    "the formula is only a nearest approximation, not a faithful implementation - "
+    "review before running"
 )
 
 

@@ -697,7 +697,14 @@ class ToolRegistry:
         except ValueError as exc:
             return {"status": "blocked", "blocking_reasons": [str(exc)], "unresolved_operators": [],
                     "unresolved_fields": []}, []
-        result = validate_factor_spec(spec)
+        from quant_forge.data.local import LocalPanelDataProvider
+
+        result = validate_factor_spec(
+            spec,
+            available_fields=LocalPanelDataProvider(
+                self._config.paths.data_root
+            ).available_field_names(),
+        )
         payload = {
             "status": result.status,
             "unresolved_operators": list(result.unresolved_operators),

@@ -40,13 +40,14 @@ class AgentWorkspaceTools:
             horizon_days_matrix=horizon_days_matrix,
         )
         self.factor_root = factor_root
+        self.data_root = data_root
         self.factor_values_root = factor_values_root
         self.factor_values_manifest_root = factor_values_manifest_root
         self.artifact_root = artifact_root
 
     def read_catalog(self) -> dict[str, object]:
         return {
-            "fields": read_models.list_available_fields(),
+            "fields": read_models.list_runtime_available_fields(self.data_root),
             "operators": read_models.list_available_operators(),
             "factors": read_models.list_factors(
                 self.factor_root,

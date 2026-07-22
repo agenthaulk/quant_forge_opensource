@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from quant_forge.data.local import data_field_catalog
+from quant_forge.data.local import LocalPanelDataProvider, data_field_catalog
 from quant_forge.factor_engine.formula_parser import SUPPORTED_OPERATORS, inspect_formula
 from quant_forge.factor_library.catalog import FactorCatalog, is_precomputed_formula
 from quant_forge.factor_library.research_tags import (
@@ -33,7 +33,16 @@ def _advertised_fields():
 
 
 def list_available_fields() -> list[dict[str, str]]:
+    """Fields supported by the Quant Forge execution capability catalog."""
+
     return [{"name": item.name, "description": item.description} for item in _advertised_fields()]
+
+
+def list_runtime_available_fields(data_root: Path) -> list[dict[str, str]]:
+    """Capability-catalog fields actually backed by the configured data root."""
+
+    available = set(LocalPanelDataProvider(data_root).available_field_names())
+    return [field for field in list_available_fields() if field["name"] in available]
 
 
 def list_available_operators() -> list[dict[str, object]]:

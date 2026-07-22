@@ -454,6 +454,20 @@ def test_pre_validate_formula_is_read_only_and_never_executes(tmp_path) -> None:
     assert blocked["executed"] is False
 
 
+def test_pre_validate_formula_blocks_fields_missing_from_current_data() -> None:
+    result = pre_validate_formula(
+        "rank(netprofit_yoy)",
+        available_fields=("close", "return_5d"),
+    )
+
+    assert result["status"] == "blocked"
+    assert result["blocking_reasons"] == [
+        "field not available in current data: netprofit_yoy"
+    ]
+    assert result["executed"] is False
+    assert result["persisted"] is False
+
+
 def test_pre_validate_unknown_operator_returns_a_review_packet_and_never_executes(tmp_path) -> None:
     # WORKORDER pin: unknown operator -> operator_drafts review-packet ref,
     # NEVER hot-executed and NEVER persisted.
