@@ -117,6 +117,7 @@ unscoped registry side effects.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 from datetime import UTC, datetime, timedelta
@@ -147,6 +148,7 @@ from quant_forge.apps.web.provenance import (
 )
 from quant_forge.config import QuantForgeConfig
 from quant_forge.core.contracts import FactorDefinition
+from quant_forge.data.local import LocalPanelDataProvider
 from quant_forge.factor_engine.value_store import remove_stored_values_for_factor_id
 from quant_forge.factor_library.repository import FactorRepository
 from quant_forge.operator_registry import canonical_formula_fingerprint
@@ -2207,6 +2209,7 @@ def create_pipeline_from_edited_formula(
             name=str(parent.factor.get("name", "")),
             horizon_days=effective_horizon,
             universe_filters=new_filters,
+            available_fields=LocalPanelDataProvider(config.paths.data_root).available_field_names(),
         )
         if pre.get("status") != "ready":
             raise PipelineConflictError(
@@ -2291,9 +2294,14 @@ def pre_validate_formula(
     name: Any = "",
     horizon_days: Any = 5,
     universe_filters: tuple[str, ...] = (),
+    available_fields: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Canonicalize + ValidationGate a formula WITHOUT persisting, evaluating,
     or backtesting (spec §5.3).
+
+    When ``available_fields`` is provided by a runtime surface, capability and
+    current-data availability are checked separately before the formula can be
+    confirmed.
 
     Returns a CANONICAL fingerprint of the (canonical-formula, sorted-filters,
     validated-horizon) spec -- via the operator_registry's own
@@ -2348,7 +2356,7 @@ def pre_validate_formula(
             horizon_days=horizon,
             universe_filters=filters,
         )
-        result = validate_factor_spec(spec)
+        result = validate_factor_spec(spec, available_fields=available_fields)
     except Exception:
         # A malformed formula (parse error) is an honest "blocked", never a
         # 500 and never an execution. The message is generic and leak-free

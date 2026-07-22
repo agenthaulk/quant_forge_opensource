@@ -83,3 +83,21 @@ def test_validation_gate_consults_the_real_catalog(monkeypatch) -> None:
     ready = validate_factor_spec(spec)
     assert ready.status == "ready"
     assert ready.unresolved_fields == ()
+
+
+def test_validation_gate_distinguishes_supported_from_runtime_available_fields() -> None:
+    spec = FactorSpec(
+        factor_id="FTR_RUNTIME_FIELD_GATE",
+        name="runtime field gate",
+        formula_dsl="rank(netprofit_yoy)",
+    )
+
+    supported = validate_factor_spec(spec)
+    assert supported.status == "ready"
+
+    unavailable = validate_factor_spec(spec, available_fields={"close", "return_5d"})
+    assert unavailable.status == "blocked"
+    assert unavailable.unresolved_fields == ()
+    assert unavailable.blocking_reasons == (
+        "field not available in current data: netprofit_yoy",
+    )

@@ -544,9 +544,10 @@ def test_validate_idea_route_invokes_patched_evaluate_and_backtest_seams(monkeyp
 def test_parse_idea_route_invokes_patched_parse_factor_idea_seam(monkeypatch, web_app) -> None:
     captured: dict[str, object] = {}
 
-    def fake_parse_factor_idea(text, llm, *, mode):
+    def fake_parse_factor_idea(text, llm, *, mode, available_fields=None):
         captured["text"] = text
         captured["mode"] = mode
+        captured["available_fields"] = tuple(available_fields or ())
         return ParsedFactor(
             factor=FactorDefinition(
                 factor_id="FTR_PARSE_SEAM",
@@ -568,13 +569,16 @@ def test_parse_idea_route_invokes_patched_parse_factor_idea_seam(monkeypatch, we
     assert status == 200
     assert content_type == JSON_CONTENT_TYPE
     payload = json.loads(body.decode("utf-8"))
+    assert "market_cap" in captured["available_fields"]
+    assert "netprofit_yoy" in captured["available_fields"]
     assert payload["parser"] == {
         "source": "patched-seam",
         "provider": "patched-provider",
         "model": "patched-model",
     }
     assert payload["factor"]["factor_id"] == "FTR_PARSE_SEAM"
-    assert captured == {"text": "小市值", "mode": "rule"}
+    assert captured["text"] == "小市值"
+    assert captured["mode"] == "rule"
 
 
 def test_research_run_once_route_invokes_patched_run_research_once_seam(

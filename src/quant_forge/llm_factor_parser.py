@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -87,11 +88,18 @@ def generic_fallback_warnings(formula: str) -> tuple[str, ...]:
     return ()
 
 
-def parse_factor_idea(text: str, llm: LLMSettings, *, mode: str = "llm") -> ParsedFactor:
+def parse_factor_idea(
+    text: str,
+    llm: LLMSettings,
+    *,
+    mode: str = "llm",
+    available_fields: Iterable[str] | None = None,
+) -> ParsedFactor:
     """Parse user text into a validated factor definition."""
 
     if mode == "rule":
         factor = parse_idea_to_definition(text)
+        _require_runtime_fields(factor.formula, available_fields)
         return ParsedFactor(
             factor=factor,
             source="rule",
@@ -104,12 +112,27 @@ def parse_factor_idea(text: str, llm: LLMSettings, *, mode: str = "llm") -> Pars
     selected_llm = llm.select_provider()
     if selected_llm.provider.lower() in {"rule", "deterministic"}:
         raise RuntimeError("LLM parser was requested, but the selected provider is the local rule parser.")
-    return _parse_with_configured_llm(text, selected_llm)
+    return _parse_with_configured_llm(text, selected_llm, available_fields=available_fields)
 
 
-def _parse_with_configured_llm(text: str, llm: LLMSettings) -> ParsedFactor:
-    result = generate_chat_text(llm, _messages(text), temperature=0, max_tokens=1000)
-    factor = _factor_from_llm_json(extract_json_object(result.content), text)
+def _parse_with_configured_llm(
+    text: str,
+    llm: LLMSettings,
+    *,
+    available_fields: Iterable[str] | None,
+) -> ParsedFactor:
+    runtime_fields = _normalize_available_fields(available_fields)
+    result = generate_chat_text(
+        llm,
+        _messages(text, available_fields=runtime_fields),
+        temperature=0,
+        max_tokens=1000,
+    )
+    factor = _factor_from_llm_json(
+        extract_json_object(result.content),
+        text,
+        available_fields=runtime_fields,
+    )
     return ParsedFactor(
         factor=factor,
         source="llm",
@@ -120,13 +143,45 @@ def _parse_with_configured_llm(text: str, llm: LLMSettings) -> ParsedFactor:
     )
 
 
-def _messages(text: str) -> list[dict[str, str]]:
-    system, user = _prompt_parts(text)
+def _messages(
+    text: str,
+    *,
+    available_fields: Iterable[str] | None = None,
+) -> list[dict[str, str]]:
+    system, user = _prompt_parts(text, available_fields=available_fields)
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def _prompt_parts(text: str) -> tuple[str, str]:
-    fields = ", ".join(field["name"] for field in list_available_fields())
+def _prompt_parts(
+    text: str,
+    *,
+    available_fields: Iterable[str] | None = None,
+) -> tuple[str, str]:
+    runtime_fields = _normalize_available_fields(available_fields)
+    catalog_fields = list_available_fields()
+    if runtime_fields is not None:
+        catalog_fields = [field for field in catalog_fields if field["name"] in runtime_fields]
+    fields = ", ".join(field["name"] for field in catalog_fields)
+    field_names = {field["name"] for field in catalog_fields}
+    examples = [
+        text
+        for required, text in (
+            (("market_cap",), "-rank(market_cap) for small-cap ideas"),
+            (("return_5d",), "rank(return_5d) for recent momentum"),
+            (("volatility_5d",), "-rank(volatility_5d) for low-volatility ideas"),
+            (("volume",), "rank(volume) for trading-volume strength"),
+            (("close",), "rank(close) for close-price strength"),
+            (("netprofit_yoy",), "rank(netprofit_yoy) for earnings-growth ideas"),
+            (("or_yoy",), "rank(or_yoy) for revenue-growth ideas"),
+            (("roe",), "rank(roe) for profitability ideas"),
+            (("pe_ttm",), "-rank(pe_ttm) for cheap-valuation ideas"),
+            (("pb",), "-rank(pb) for cheap book-value ideas"),
+            (("dv_ttm",), "rank(dv_ttm) for dividend-yield ideas"),
+            (("debt_to_assets",), "-rank(debt_to_assets) for low-leverage ideas"),
+        )
+        if set(required).issubset(field_names)
+    ]
+    example_text = ", ".join(examples)
     operators = json.dumps(list_available_operators(), ensure_ascii=False)
     system = (
         "You convert Chinese or English factor ideas into Quant Forge factor JSON. "
@@ -135,13 +190,8 @@ def _prompt_parts(text: str) -> tuple[str, str]:
         "Aliases may appear in aliases_for_recognition_only, but you must never generate aliases. "
         "Do not invent operators or fields. "
         "Prefer simple rank-based formulas over the available fields; put a leading "
-        "minus when a LOWER value is the stronger signal. Examples: "
-        "-rank(market_cap) for small-cap ideas, rank(return_5d) for recent momentum, "
-        "-rank(volatility_5d) for low-volatility ideas, rank(volume) for trading-volume strength, "
-        "rank(close) for close-price strength, "
-        "rank(netprofit_yoy) or rank(or_yoy) for earnings- or revenue-growth ideas, "
-        "rank(roe) for profitability ideas, -rank(pe_ttm) or -rank(pb) for cheap-valuation ideas, "
-        "rank(dv_ttm) for dividend-yield ideas, and -rank(debt_to_assets) for low-leverage ideas. "
+        "minus when a LOWER value is the stronger signal. "
+        f"Examples limited to the current data: {example_text}. "
         "Use universe_filters [\"is_st == false\"] only when the idea excludes ST stocks. "
         "Treat one month or next month as 21 trading days unless the user gives an explicit day count. "
         f"Available fields: {fields}. operator_catalog: {operators}."
@@ -155,7 +205,12 @@ def _prompt_parts(text: str) -> tuple[str, str]:
     return system, user
 
 
-def _factor_from_llm_json(payload: dict[str, Any], text: str) -> FactorDefinition:
+def _factor_from_llm_json(
+    payload: dict[str, Any],
+    text: str,
+    *,
+    available_fields: Iterable[str] | None = None,
+) -> FactorDefinition:
     name = _slug(str(payload.get("name", "llm_factor")))
     raw_formula = str(payload["formula"]).strip()
     resolution = resolve_formula_operators(raw_formula)
@@ -163,6 +218,7 @@ def _factor_from_llm_json(payload: dict[str, Any], text: str) -> FactorDefinitio
         details = json.dumps(resolution.to_dict(), ensure_ascii=False, sort_keys=True)
         raise RuntimeError(f"LLM formula failed operator registry gate: {details}")
     formula = resolution.canonical_formula
+    _require_runtime_fields(formula, available_fields)
     description = sanitize_factor_text(str(payload.get("description", "")), FACTOR_DESCRIPTION_MAX_CHARS)
     horizon_days = _normalize_horizon_days(int(payload.get("horizon_days", 5)), text)
     filters_raw = payload.get("universe_filters", [])
@@ -180,6 +236,33 @@ def _factor_from_llm_json(payload: dict[str, Any], text: str) -> FactorDefinitio
         universe_filters=filters,
         source="llm",
     )
+
+
+def _normalize_available_fields(
+    available_fields: Iterable[str] | None,
+) -> frozenset[str] | None:
+    if available_fields is None:
+        return None
+    return frozenset(str(name).split(".")[-1] for name in available_fields)
+
+
+def _require_runtime_fields(
+    formula: str,
+    available_fields: Iterable[str] | None,
+) -> None:
+    runtime_fields = _normalize_available_fields(available_fields)
+    if runtime_fields is None:
+        return
+    resolution = resolve_formula_operators(formula)
+    missing = tuple(
+        raw_name.split(".")[-1]
+        for raw_name in resolution.used_fields
+        if raw_name.split(".")[-1] not in runtime_fields
+    )
+    if missing:
+        raise RuntimeError(
+            "factor fields are not available in the current data: " + ", ".join(missing)
+        )
 
 def _normalize_horizon_days(horizon_days: int, text: str) -> int:
     if horizon_days < 1:

@@ -103,8 +103,13 @@ def _read_parquet_dir(directory: Path, columns: list[str] | None = None) -> pd.D
     files = sorted(p for p in directory.rglob("*.parquet") if not p.name.startswith("._"))
     frames: list[pd.DataFrame] = []
     for path in files:
-        available = pd.read_parquet(path).columns if columns else None
-        use = [c for c in columns if c in available] if columns is not None else None
+        if columns is None:
+            use = None
+        else:
+            import pyarrow.parquet as pq
+
+            available = set(pq.read_schema(path).names)
+            use = [column for column in columns if column in available]
         frames.append(pd.read_parquet(path, columns=use))
     if not frames:
         return pd.DataFrame()

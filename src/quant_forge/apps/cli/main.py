@@ -16,7 +16,7 @@ from quant_forge.config import (
     load_config,
     validate_llm_runtime,
 )
-from quant_forge.data.local import create_demo_workspace, validate_data_root
+from quant_forge.data.local import LocalPanelDataProvider, create_demo_workspace, validate_data_root
 from quant_forge.factor_library.catalog import (
     FactorCatalog,
     discover_factor_value_roots,
@@ -643,7 +643,13 @@ def _cmd_llm_smoke(args: argparse.Namespace) -> int:
     config = _config(args)
     selected = config.llm.select_provider(args.provider)
     validate_llm_runtime(config.llm, args.provider)
-    parsed = parse_factor_idea(args.text, selected, mode="llm")
+    available_fields = LocalPanelDataProvider(config.paths.data_root).available_field_names()
+    parsed = parse_factor_idea(
+        args.text,
+        selected,
+        mode="llm",
+        available_fields=available_fields,
+    )
     _print_json(
         {
             "ok": True,

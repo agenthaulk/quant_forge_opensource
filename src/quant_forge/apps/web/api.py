@@ -54,6 +54,7 @@ from quant_forge.factor_engine.signal_processing import (
     apply_test_period,
     prepare_factor_scores_result,
 )
+from quant_forge.factor_engine.formula_parser import formula_input_fields
 from quant_forge.factor_engine.value_store import FactorValueStore
 from quant_forge.factor_library.catalog import FactorCatalog, is_precomputed_formula
 from quant_forge.factor_library.repository import FactorRepository
@@ -234,7 +235,13 @@ def _parse_idea(
     if parser_mode == "llm":
         validate_llm_runtime(config.llm, llm_provider)
     _raise_if_cancelled(cancel_event)
-    parsed = _server.parse_factor_idea(text, llm_settings, mode=parser_mode)
+    available_fields = LocalPanelDataProvider(config.paths.data_root).available_field_names()
+    parsed = _server.parse_factor_idea(
+        text,
+        llm_settings,
+        mode=parser_mode,
+        available_fields=available_fields,
+    )
     _raise_if_cancelled(cancel_event)
     return parsed
 
@@ -799,7 +806,16 @@ def _prepare_multi_factor_backtest(
         members, directions=directions, universe_filters=universe_filters
     )
 
-    panel = LocalPanelDataProvider(config.paths.data_root).load_panel()
+    required_fields = tuple(
+        dict.fromkeys(
+            field
+            for member in members
+            for field in formula_input_fields(member.formula)
+        )
+    )
+    panel = LocalPanelDataProvider(config.paths.data_root).load_panel(
+        required_fields=required_fields
+    )
     working_panel = apply_test_period(panel, settings.profile)
     dates = tuple(sorted(working_panel["trade_date"].drop_duplicates()))
     period_count = require_backtest_window(

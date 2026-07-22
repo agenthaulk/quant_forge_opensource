@@ -527,7 +527,7 @@ def test_web_run_idea_workflow_preserves_distinct_default_profiles(monkeypatch, 
     config = QuantForgeConfig().resolve(tmp_path / "demo")
     captured: dict[str, object] = {}
 
-    def fake_parse_factor_idea(text, llm, *, mode):
+    def fake_parse_factor_idea(text, llm, *, mode, available_fields=None):
         factor = FactorDefinition(
             factor_id="FTR_COMPAT_PROFILE",
             name="compat_profile",
@@ -1962,7 +1962,7 @@ def test_web_workbench_uses_llm_factor_horizon(monkeypatch, tmp_path) -> None:
     config = QuantForgeConfig().resolve(tmp_path / "demo")
     captured: dict[str, object] = {}
 
-    def fake_parse_factor_idea(text, llm, *, mode):
+    def fake_parse_factor_idea(text, llm, *, mode, available_fields=None):
         factor = FactorDefinition(
             factor_id="FTR_LLM_HORIZON",
             name="llm_horizon",
@@ -2355,7 +2355,7 @@ def test_web_workbench_uses_selected_llm_provider(monkeypatch, tmp_path) -> None
     ).resolve(tmp_path / "demo")
     captured: dict[str, str] = {}
 
-    def fake_parse_factor_idea(text, llm, *, mode):
+    def fake_parse_factor_idea(text, llm, *, mode, available_fields=None):
         captured["provider"] = llm.provider
         captured["model"] = llm.model
         factor = FactorDefinition(
@@ -2380,7 +2380,7 @@ def test_run_idea_workflow_cleans_new_factor_on_cancel(monkeypatch, tmp_path) ->
     config = QuantForgeConfig().resolve(tmp_path / "demo")
     cancel_event = threading.Event()
 
-    def fake_parse_factor_idea(text, llm, *, mode):
+    def fake_parse_factor_idea(text, llm, *, mode, available_fields=None):
         factor = FactorDefinition(
             factor_id="FTR_CANCELLED_PARSE",
             name="cancelled_parse",
@@ -2430,7 +2430,7 @@ def test_run_idea_workflow_restores_existing_factor_on_cancel(monkeypatch, tmp_p
     original_path = repo.save(original)
     cancel_event = threading.Event()
 
-    def fake_parse_factor_idea(text, llm, *, mode):
+    def fake_parse_factor_idea(text, llm, *, mode, available_fields=None):
         factor = FactorDefinition(
             factor_id=original.factor_id,
             name="cancelled_reparse",

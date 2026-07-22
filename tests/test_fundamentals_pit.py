@@ -9,9 +9,11 @@ report tables so they run without the mounted drive.
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from quant_forge.data.fundamentals import (
     FUNDAMENTAL_FIELD_NAMES,
+    _read_parquet_dir,
     as_of_expand,
     build_fundamentals_overlay,
     dedup_announcements,
@@ -216,6 +218,156 @@ def test_overlay_duplicate_keys_do_not_fan_out_panel(tmp_path) -> None:
         {"trade_date": [dt, dt], "instrument": [inst, inst], "netprofit_yoy": [1.0, 2.0]}
     )
     dup.to_parquet(panel_path.parent / "fundamentals.parquet")
-    loaded = LocalPanelDataProvider(workspace / "data").load_panel()
-    # panel row count is preserved (no fan-out); one row per (date, instrument)
+    provider = LocalPanelDataProvider(workspace / "data")
+    loaded = provider.load_panel(required_fields=("return_5d",))
+    # A price-volume factor does not depend on the invalid optional overlay.
     assert not loaded.duplicated(["trade_date", "instrument"]).any()
+    assert "netprofit_yoy" not in loaded.columns
+    with pytest.raises(ValueError, match="duplicate keys"):
+        provider.load_panel(required_fields=("netprofit_yoy",))
+
+
+def test_missing_overlay_blocks_only_fundamental_dependencies(tmp_path) -> None:
+    from quant_forge.data.local import create_demo_workspace, LocalPanelDataProvider
+
+    workspace = tmp_path / "demo"
+    create_demo_workspace(workspace)
+    (workspace / "data" / "fundamentals.parquet").unlink()
+    provider = LocalPanelDataProvider(workspace / "data")
+
+    assert "netprofit_yoy" not in provider.available_field_names()
+    assert "return_5d" in provider.available_field_names()
+    assert "return_5d" in provider.load_panel(required_fields=("return_5d",)).columns
+    with pytest.raises(ValueError, match="not present in the current data"):
+        provider.load_panel(required_fields=("netprofit_yoy",))
+
+
+def test_evaluation_and_backtest_gate_missing_runtime_fields_before_execution(tmp_path) -> None:
+    from quant_forge.backtesting.service import run_factor_backtest
+    from quant_forge.data.local import create_demo_workspace
+    from quant_forge.evaluation.service import evaluate_factor
+
+    paths = create_demo_workspace(tmp_path / "demo")
+    (paths["data_root"] / "fundamentals.parquet").unlink()
+    kwargs = {
+        "factor_id": "FTR_DEMO_EARNINGS_GROWTH",
+        "factor_root": paths["factor_root"],
+        "data_root": paths["data_root"],
+        "artifact_root": paths["artifact_root"],
+    }
+
+    with pytest.raises(ValueError, match="not present in the current data"):
+        evaluate_factor(**kwargs)
+    with pytest.raises(ValueError, match="not present in the current data"):
+        run_factor_backtest(**kwargs)
+
+
+def test_invalid_optional_overlay_is_reported_without_breaking_price_volume(tmp_path) -> None:
+    from quant_forge.data.local import create_demo_workspace, LocalPanelDataProvider
+
+    workspace = tmp_path / "demo"
+    create_demo_workspace(workspace)
+    pd.DataFrame(
+        {
+            "trade_date": ["not-a-date"],
+            "instrument": ["STK001"],
+            "netprofit_yoy": [1.0],
+        }
+    ).to_parquet(workspace / "data" / "fundamentals.parquet", index=False)
+    provider = LocalPanelDataProvider(workspace / "data")
+
+    validation = provider.validate()
+    assert validation.ok is True
+    assert "netprofit_yoy" not in validation.optional_columns
+    assert "optional:fundamentals:invalid_trade_date" in validation.missing_columns
+    assert "return_5d" in provider.load_panel(required_fields=("return_5d",)).columns
+    with pytest.raises(ValueError, match="invalid trade_date"):
+        provider.load_panel(required_fields=("netprofit_yoy",))
+
+
+def test_overlay_without_join_keys_is_not_advertised(tmp_path) -> None:
+    from quant_forge.data.local import create_demo_workspace, LocalPanelDataProvider
+
+    workspace = tmp_path / "demo"
+    create_demo_workspace(workspace)
+    pd.DataFrame({"netprofit_yoy": [1.0]}).to_parquet(
+        workspace / "data" / "fundamentals.parquet", index=False
+    )
+    provider = LocalPanelDataProvider(workspace / "data")
+
+    validation = provider.validate()
+    assert "netprofit_yoy" not in validation.optional_columns
+    assert "optional:fundamentals:missing_join_keys" in validation.missing_columns
+    with pytest.raises(ValueError, match="missing join keys"):
+        provider.load_panel(required_fields=("netprofit_yoy",))
+
+
+def test_overlay_without_matching_panel_keys_is_not_advertised(tmp_path) -> None:
+    from quant_forge.data.local import create_demo_workspace, LocalPanelDataProvider
+
+    workspace = tmp_path / "demo"
+    create_demo_workspace(workspace)
+    pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(["1999-01-04"]),
+            "instrument": ["NOT_IN_PANEL"],
+            "netprofit_yoy": [12.5],
+        }
+    ).to_parquet(workspace / "data" / "fundamentals.parquet", index=False)
+    provider = LocalPanelDataProvider(workspace / "data")
+
+    validation = provider.validate()
+    assert validation.ok is True
+    assert "netprofit_yoy" not in validation.optional_columns
+    assert "optional:fundamentals:no_matching_data" in validation.missing_columns
+    assert "netprofit_yoy" not in provider.available_field_names()
+    with pytest.raises(ValueError, match="no usable values"):
+        provider.load_panel(required_fields=("netprofit_yoy",))
+
+
+def test_all_null_panel_field_is_not_runtime_available(tmp_path) -> None:
+    from quant_forge.data.local import create_demo_workspace, LocalPanelDataProvider, resolve_panel_path
+
+    workspace = tmp_path / "demo"
+    create_demo_workspace(workspace)
+    panel_path = resolve_panel_path(workspace / "data")
+    panel = pd.read_parquet(panel_path)
+    panel["roe"] = pd.NA
+    panel.to_parquet(panel_path, index=False)
+    (workspace / "data" / "fundamentals.parquet").unlink()
+
+    provider = LocalPanelDataProvider(workspace / "data")
+    assert "roe" not in provider.available_field_names()
+    with pytest.raises(ValueError, match="no usable values"):
+        provider.load_panel(required_fields=("roe",))
+
+
+def test_parquet_projection_reads_each_file_once(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "source"
+    _write_source(
+        source,
+        "financial",
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "ann_date": ["20250420"],
+                "end_date": ["20241231"],
+                "netprofit_yoy": [12.5],
+            }
+        ),
+    )
+    real_read_parquet = pd.read_parquet
+    calls: list[tuple[str, ...] | None] = []
+
+    def counted_read_parquet(path, *, columns=None, **kwargs):
+        calls.append(tuple(columns) if columns is not None else None)
+        return real_read_parquet(path, columns=columns, **kwargs)
+
+    monkeypatch.setattr(pd, "read_parquet", counted_read_parquet)
+    result = _read_parquet_dir(
+        source / "financial",
+        columns=["ts_code", "ann_date", "end_date", "netprofit_yoy"],
+    )
+
+    assert len(result) == 1
+    assert calls == [("ts_code", "ann_date", "end_date", "netprofit_yoy")]

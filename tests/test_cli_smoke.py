@@ -325,7 +325,7 @@ llm:
     )
     monkeypatch.delenv("QF_LLM_SMOKE_KEY", raising=False)
 
-    def fake_parse_factor_idea(text, llm, *, mode):
+    def fake_parse_factor_idea(text, llm, *, mode, available_fields=None):
         assert mode == "llm"
         assert text == "小市值低波动"
         assert llm.provider == "deepseek"

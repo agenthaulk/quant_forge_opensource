@@ -8,7 +8,12 @@ import pytest
 
 from quant_forge.config import LLMSettings
 from quant_forge.factor_library.repository import parse_idea_to_definition
-from quant_forge.llm_factor_parser import GENERIC_FALLBACK_WARNING, _factor_from_llm_json, parse_factor_idea
+from quant_forge.llm_factor_parser import (
+    GENERIC_FALLBACK_WARNING,
+    _factor_from_llm_json,
+    _prompt_parts,
+    parse_factor_idea,
+)
 from quant_forge.specs import nl_flow
 
 
@@ -147,6 +152,30 @@ def test_llm_factor_json_canonicalizes_safe_alias() -> None:
     )
 
     assert factor.formula == "rank(-stddev(return_1d, 20))"
+
+
+def test_runtime_fields_constrain_prompt_and_reject_unavailable_formula() -> None:
+    system, _ = _prompt_parts(
+        "profit growth",
+        available_fields=("close", "return_5d"),
+    )
+    available_segment = system.split("Available fields: ", 1)[1].split(". operator_catalog:", 1)[0]
+    assert "close" in available_segment
+    assert "netprofit_yoy" not in available_segment
+    assert "rank(netprofit_yoy)" not in system
+
+    with pytest.raises(RuntimeError, match="not available in the current data: netprofit_yoy"):
+        _factor_from_llm_json(
+            {
+                "name": "profit_growth",
+                "formula": "rank(netprofit_yoy)",
+                "description": "profit growth",
+                "horizon_days": 5,
+                "universe_filters": [],
+            },
+            "profit growth",
+            available_fields=("close", "return_5d"),
+        )
 
 
 def test_llm_factor_json_rejects_likely_alias_and_draft_operator() -> None:

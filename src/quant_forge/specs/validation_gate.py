@@ -22,6 +22,7 @@ pass. Any surface the gate cannot verify at all is disclosed in
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections.abc import Iterable
 from typing import Literal
 
 from quant_forge.mcp.read_models import list_available_fields
@@ -57,7 +58,19 @@ class SpecValidationResult:
     unchecked: tuple[str, ...] = ()
 
 
-def validate_factor_spec(spec: FactorSpec, registry: OperatorRegistry | None = None) -> SpecValidationResult:
+def validate_factor_spec(
+    spec: FactorSpec,
+    registry: OperatorRegistry | None = None,
+    *,
+    available_fields: Iterable[str] | None = None,
+) -> SpecValidationResult:
+    """Validate formula capability and, when supplied, current-data availability.
+
+    The canonical field catalog answers whether Quant Forge understands a field.
+    ``available_fields`` answers the separate runtime question of whether the
+    configured data root can provide it for this run.
+    """
+
     registry = registry or load_default_operator_registry()
     resolution = resolve_formula_operators(spec.formula_dsl, registry)
 
@@ -72,6 +85,13 @@ def validate_factor_spec(spec: FactorSpec, registry: OperatorRegistry | None = N
     )
     for name in unresolved_fields:
         blocking.append(f"unknown field: {name}")
+
+    if available_fields is not None:
+        runtime_fields = {str(name).split(".")[-1] for name in available_fields}
+        for raw_name in resolution.used_fields:
+            name = raw_name.split(".")[-1]
+            if name in known_fields and name not in runtime_fields:
+                blocking.append(f"field not available in current data: {name}")
 
     # Fail loud on reserved capabilities until adapters register them.
     for capability in spec.unsupported_capabilities(tuple(KNOWN_CAPABILITIES)):

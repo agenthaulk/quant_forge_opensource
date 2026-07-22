@@ -105,6 +105,13 @@ def inspect_formula(
     )
 
 
+def formula_input_fields(formula: str) -> tuple[str, ...]:
+    """Return canonical data-field dependencies without executing a formula."""
+
+    inspection = inspect_formula(formula, known_operators=set(SUPPORTED_OPERATORS))
+    return inspection.fields
+
+
 def formula_lookback_rows(formula: str) -> int:
     """Return the prior per-instrument rows needed to evaluate a formula."""
 

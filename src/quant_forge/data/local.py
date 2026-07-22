@@ -276,17 +276,33 @@ def undeclared_panel_columns(columns: Iterable[str]) -> tuple[str, ...]:
 
 
 FUNDAMENTALS_OVERLAY_FILE = "fundamentals.parquet"
+_FUNDAMENTAL_FIELD_NAME_SET = frozenset(field.name for field in FUNDAMENTAL_FIELDS)
+
+
+@dataclass(frozen=True)
+class _FundamentalsOverlayState:
+    frame: pd.DataFrame | None = None
+    available_fields: tuple[str, ...] = ()
+    problem_code: str = ""
+    problem_message: str = ""
+
+    @property
+    def valid(self) -> bool:
+        return self.frame is not None and not self.problem_code
 
 
 class LocalPanelDataProvider:
     """Read a local equity panel or a mounted source snapshot.
 
-    When a fundamentals overlay parquet is present (a sibling
+    When a validated fundamentals overlay parquet is present (a sibling
     ``fundamentals.parquet`` next to the panel, or an explicit
     ``fundamentals_overlay_root``), its point-in-time fundamental columns are
     left-merged onto the panel on ``[trade_date, instrument]`` — the overlay is
     already daily and PIT (built by ``qf data build-fundamentals``), so an
-    equality merge is correct. Absent overlay/columns stay absent (FP-4).
+    equality merge is correct. Runtime callers declare their required fields:
+    an invalid optional overlay cannot block a price-volume-only formula, while
+    a formula that depends on fundamentals fails before execution with the
+    overlay's concrete validation error.
     """
 
     def __init__(self, data_root: Path, fundamentals_overlay_root: Path | None = None) -> None:
@@ -294,6 +310,7 @@ class LocalPanelDataProvider:
         self.fundamentals_overlay_root = (
             fundamentals_overlay_root.expanduser() if fundamentals_overlay_root is not None else None
         )
+        self._overlay_state_cache: _FundamentalsOverlayState | None = None
 
     @property
     def panel_path(self) -> Path:
@@ -317,39 +334,77 @@ class LocalPanelDataProvider:
         missing = tuple(column for column in _required_column_names() if column not in panel.columns)
         dates = pd.to_datetime(panel["trade_date"]) if "trade_date" in panel.columns and not panel.empty else None
         problems = _panel_quality_problems(panel) if not missing and not panel.empty else ()
+        overlay = self._fundamentals_overlay_state()
+        overlay_fields = self._matching_overlay_fields(panel, overlay)
+        overlay_problem_code = overlay.problem_code
+        overlay_candidates = set(overlay.available_fields) - set(panel.columns)
+        if overlay.valid and overlay_candidates and not overlay_fields:
+            overlay_problem_code = "no_matching_data"
+        overlay_problems = (
+            (f"optional:fundamentals:{overlay_problem_code}",)
+            if overlay_problem_code
+            else ()
+        )
         return DataValidationResult(
             data_root=self.data_root,
             ok=not missing and not panel.empty and not problems,
             rows=len(panel),
             instruments=int(panel["instrument"].nunique()) if "instrument" in panel.columns else 0,
             date_count=int(panel["trade_date"].nunique()) if "trade_date" in panel.columns else 0,
-            missing_columns=missing + problems,
+            missing_columns=missing + problems + overlay_problems,
             panel_path=self.panel_path,
             start_date=dates.min().date().isoformat() if dates is not None else "",
             end_date=dates.max().date().isoformat() if dates is not None else "",
-            optional_columns=self._optional_columns_present(panel.columns),
+            optional_columns=self._optional_columns_present(panel, overlay_fields),
         )
 
-    def _optional_columns_present(self, panel_columns: Iterable[str]) -> tuple[str, ...]:
+    def _optional_columns_present(
+        self,
+        panel: pd.DataFrame,
+        overlay_fields: Iterable[str],
+    ) -> tuple[str, ...]:
         """Optional catalog fields backed by real data: panel columns plus any
         fundamental fields present in the PIT overlay (so the data catalog
         reports them ``available``, not ``missing`` — FP-7)."""
 
-        present = set(panel_columns) | set(self._overlay_column_names())
+        present = {column for column in panel.columns if panel[column].notna().any()}
+        present.update(overlay_fields)
         return tuple(column for column in _optional_column_names() if column in present)
 
-    def _overlay_column_names(self) -> tuple[str, ...]:
-        overlay_path = self._fundamentals_overlay_path()
-        if overlay_path is None:
-            return ()
-        try:
-            import pyarrow.parquet as pq
+    def available_field_names(self) -> tuple[str, ...]:
+        """Factor-input fields actually provided by the configured data root."""
 
-            return tuple(pq.read_schema(overlay_path).names)
-        except Exception:  # pragma: no cover - defensive
-            return ()
+        if self.panel_path.exists():
+            try:
+                import pyarrow.parquet as pq
 
-    def load_panel(self) -> pd.DataFrame:
+                parquet = pq.ParquetFile(self.panel_path)
+                schema_names = set(parquet.schema_arrow.names)
+                if parquet.metadata.num_rows == 0 or not set(_required_column_names()).issubset(schema_names):
+                    return ()
+                projected = [
+                    item.name
+                    for item in data_field_catalog()
+                    if item.name in schema_names
+                ]
+                panel = pd.read_parquet(self.panel_path, columns=projected)
+            except Exception:
+                return ()
+            present = {column for column in panel.columns if panel[column].notna().any()}
+            present.update(
+                self._matching_overlay_fields(panel, self._fundamentals_overlay_state())
+            )
+        else:
+            validation = self.validate()
+            if not validation.ok or validation.rows == 0:
+                return ()
+            present = set(_required_column_names())
+            present.update(validation.optional_columns)
+            present.update(validation.synthesized_columns)
+        return tuple(item.name for item in data_field_catalog() if item.name in present and item.role != "key")
+
+    def load_panel(self, *, required_fields: Iterable[str] = ()) -> pd.DataFrame:
+        required = tuple(dict.fromkeys(str(name).split(".")[-1] for name in required_fields))
         if self.panel_path.exists():
             validation = self.validate()
             if not validation.ok:
@@ -359,14 +414,19 @@ class LocalPanelDataProvider:
             panel = panel.copy()
             panel["trade_date"] = pd.to_datetime(panel["trade_date"])
             panel["is_st"] = panel["is_st"].astype(bool)
-            panel = self._merge_fundamentals_overlay(panel)
-            return panel.sort_values(["trade_date", "instrument"]).reset_index(drop=True)
+            panel = self._merge_fundamentals_overlay(panel, required_fields=required)
+            panel = panel.sort_values(["trade_date", "instrument"]).reset_index(drop=True)
+            self._require_fields(panel, required)
+            return panel
         source_root = resolve_source_snapshot_root(self.data_root)
         if source_root is None:
             validation = self.validate()
             missing = ", ".join(validation.missing_columns) or "no rows"
             raise ValueError(f"invalid data_root {self.data_root}: missing {missing}")
-        return _load_source_snapshot_panel(source_root)
+        panel = _load_source_snapshot_panel(source_root)
+        panel = self._merge_fundamentals_overlay(panel, required_fields=required)
+        self._require_fields(panel, required)
+        return panel
 
     def _fundamentals_overlay_path(self) -> Path | None:
         """Resolve the PIT fundamentals overlay parquet, if any.
@@ -385,21 +445,141 @@ class LocalPanelDataProvider:
         sibling = self.panel_path.parent / FUNDAMENTALS_OVERLAY_FILE
         return sibling if sibling.exists() else None
 
-    def _merge_fundamentals_overlay(self, panel: pd.DataFrame) -> pd.DataFrame:
-        """Left-merge the PIT fundamentals overlay onto the panel on
-        ``[trade_date, instrument]``. Only declared, not-already-present columns
-        are added; a bad/mismatched overlay is skipped rather than crashing the
-        load (FP-4: never fabricate values)."""
+    def _fundamentals_overlay_state(self) -> _FundamentalsOverlayState:
+        if self._overlay_state_cache is not None:
+            return self._overlay_state_cache
+        state = self._read_fundamentals_overlay_state()
+        self._overlay_state_cache = state
+        return state
 
+    def _read_fundamentals_overlay_state(self) -> _FundamentalsOverlayState:
         overlay_path = self._fundamentals_overlay_path()
         if overlay_path is None:
-            return panel
+            return _FundamentalsOverlayState()
         try:
-            overlay = pd.read_parquet(overlay_path)
-        except Exception:  # pragma: no cover - defensive: unreadable overlay
+            import pyarrow.parquet as pq
+
+            schema_names = set(pq.read_schema(overlay_path).names)
+        except Exception as exc:
+            return _FundamentalsOverlayState(
+                problem_code="unreadable",
+                problem_message=f"fundamentals overlay is unreadable: {exc}",
+            )
+        if not {"trade_date", "instrument"}.issubset(schema_names):
+            return _FundamentalsOverlayState(
+                problem_code="missing_join_keys",
+                problem_message="fundamentals overlay is missing join keys trade_date/instrument",
+            )
+        value_columns = [
+            field.name for field in FUNDAMENTAL_FIELDS if field.name in schema_names
+        ]
+        try:
+            overlay = pd.read_parquet(
+                overlay_path,
+                columns=["trade_date", "instrument", *value_columns],
+            )
+        except Exception as exc:
+            return _FundamentalsOverlayState(
+                problem_code="unreadable",
+                problem_message=f"fundamentals overlay is unreadable: {exc}",
+            )
+        if overlay.empty:
+            return _FundamentalsOverlayState(
+                problem_code="empty",
+                problem_message="fundamentals overlay is empty",
+            )
+        parsed_dates = pd.to_datetime(
+            overlay["trade_date"].astype("string").str.replace(r"\.0$", "", regex=True),
+            errors="coerce",
+        )
+        if parsed_dates.isna().any():
+            return _FundamentalsOverlayState(
+                problem_code="invalid_trade_date",
+                problem_message="fundamentals overlay has invalid trade_date values",
+            )
+        instruments = overlay["instrument"].astype("string")
+        if instruments.isna().any() or instruments.str.strip().eq("").any():
+            return _FundamentalsOverlayState(
+                problem_code="invalid_instrument",
+                problem_message="fundamentals overlay has invalid instrument values",
+            )
+        overlay = overlay.copy()
+        overlay["trade_date"] = parsed_dates
+        overlay["instrument"] = instruments
+        if overlay.duplicated(["trade_date", "instrument"]).any():
+            return _FundamentalsOverlayState(
+                problem_code="duplicate_keys",
+                problem_message="fundamentals overlay has duplicate keys",
+            )
+        available = tuple(column for column in value_columns if overlay[column].notna().any())
+        if not available:
+            return _FundamentalsOverlayState(
+                problem_code="no_available_fields",
+                problem_message="fundamentals overlay has no populated declared fields",
+            )
+        return _FundamentalsOverlayState(
+            frame=overlay[["trade_date", "instrument", *available]],
+            available_fields=available,
+        )
+
+    @staticmethod
+    def _matching_overlay_fields(
+        panel: pd.DataFrame,
+        state: _FundamentalsOverlayState,
+    ) -> tuple[str, ...]:
+        """Return overlay fields with at least one usable panel-key match."""
+
+        if not state.valid or not {"trade_date", "instrument"}.issubset(panel.columns):
+            return ()
+        overlay = state.frame
+        assert overlay is not None
+        candidate_fields = tuple(
+            field for field in state.available_fields if field not in panel.columns
+        )
+        if not candidate_fields:
+            return ()
+        keys = panel[["trade_date", "instrument"]].copy()
+        keys["trade_date"] = pd.to_datetime(
+            keys["trade_date"].astype("string").str.replace(r"\.0$", "", regex=True),
+            errors="coerce",
+        )
+        keys["instrument"] = keys["instrument"].astype("string")
+        keys = keys.dropna().drop_duplicates()
+        matched = overlay[["trade_date", "instrument", *candidate_fields]].merge(
+            keys,
+            on=["trade_date", "instrument"],
+            how="inner",
+        )
+        return tuple(field for field in candidate_fields if matched[field].notna().any())
+
+    def _merge_fundamentals_overlay(
+        self,
+        panel: pd.DataFrame,
+        *,
+        required_fields: Iterable[str],
+    ) -> pd.DataFrame:
+        """Merge a validated PIT overlay when its data plane is usable.
+
+        Invalid optional data is isolated from formulas that do not depend on
+        it. A declared fundamental dependency makes the same validation error
+        blocking, so no formula silently runs on a substitute field.
+        """
+
+        required_fundamentals = (
+            _FUNDAMENTAL_FIELD_NAME_SET.intersection(required_fields) - set(panel.columns)
+        )
+        state = self._fundamentals_overlay_state()
+        if not state.valid:
+            if required_fundamentals:
+                if state.problem_message:
+                    raise ValueError(state.problem_message)
+                missing = ", ".join(sorted(required_fundamentals))
+                raise ValueError(
+                    f"required fundamental fields are not present in the current data: {missing}"
+                )
             return panel
-        if not {"trade_date", "instrument"}.issubset(overlay.columns):
-            return panel
+        overlay = state.frame
+        assert overlay is not None
         declared = {item.name for item in data_field_catalog()}
         value_columns = [
             c
@@ -409,14 +589,23 @@ class LocalPanelDataProvider:
         if not value_columns:
             return panel
         overlay = overlay[["trade_date", "instrument", *value_columns]].copy()
-        # Guard against a malformed overlay fanning out the panel: keep one row
-        # per (trade_date, instrument). Sanctioned builds are already unique.
-        overlay = overlay.drop_duplicates(["trade_date", "instrument"], keep="last")
-        overlay["trade_date"] = pd.to_datetime(overlay["trade_date"])
-        overlay["instrument"] = overlay["instrument"].astype(str)
         panel = panel.copy()
-        panel["instrument"] = panel["instrument"].astype(str)
+        panel["instrument"] = panel["instrument"].astype("string")
         return panel.merge(overlay, on=["trade_date", "instrument"], how="left")
+
+    @staticmethod
+    def _require_fields(panel: pd.DataFrame, required_fields: Iterable[str]) -> None:
+        missing = tuple(name for name in required_fields if name not in panel.columns)
+        if missing:
+            raise ValueError(
+                "factor fields are not present in the current data: " + ", ".join(missing)
+            )
+        unusable = tuple(name for name in required_fields if not panel[name].notna().any())
+        if unusable:
+            raise ValueError(
+                "factor fields have no usable values in the current data: "
+                + ", ".join(unusable)
+            )
 
 
 def _panel_quality_problems(panel: pd.DataFrame) -> tuple[str, ...]:
