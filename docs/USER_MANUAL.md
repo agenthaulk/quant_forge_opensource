@@ -346,7 +346,7 @@ Optional fields used by built-in formulas:
 内置公式使用的可选字段：
 
 ```text
-open, high, low, volume, amount, return_1d, return_5d, volatility_5d
+open, high, low, volume, amount, industry, return_1d, return_5d, volatility_5d
 ```
 
 `open` / `high` / `low` share the same adjusted price basis as `close`; `amount`
@@ -357,6 +357,14 @@ with the standard missing-field error.
 `open` / `high` / `low` 与 `close` 同为复权基准；`amount` 为当日成交额（VWAP 代理
 为 `amount / volume`）。面板缺某可选列时会标记为 `missing`，引用该列的公式按缺失字段
 报错。
+
+`industry` is a Shenwan (SW) level-1 industry classification code — a categorical
+string grouping label (not a numeric factor input) consumed by industry-aware
+operators. The demo panel carries a static deterministic code per instrument;
+point-in-time (as-of) industry history is deferred to a later extension.
+
+`industry` 为申万一级行业分类代码 —— 类别字符串分组标签（非数值因子输入），供行业类
+算子使用。演示面板为每只标的钉一个静态确定性代码;时点(as-of)行业历史留后续展期备注。
 
 Validate before research:
 

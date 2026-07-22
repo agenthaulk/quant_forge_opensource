@@ -187,6 +187,7 @@ def test_data_status_reports_coverage_quality_and_availability(web_app) -> None:
     assert sorted(payload["quality"]["optional_columns"]) == [
         "amount",
         "high",
+        "industry",
         "low",
         "open",
         "return_1d",

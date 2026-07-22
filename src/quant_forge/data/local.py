@@ -153,6 +153,22 @@ PANEL_FIELD_CATALOG: tuple[CatalogField, ...] = (
         ),
     ),
     CatalogField(
+        name="industry",
+        description="Shenwan (SW) level-1 industry classification code; a categorical grouping label, not a numeric factor input.",
+        role="optional",
+        tags=_field_tags(
+            "industry",
+            themes=("classification",),
+            min_warmup_bars=1,
+            notes=(
+                "Shenwan (SW) level-1 industry code; categorical grouping key for "
+                "industry-aware operators. Point-in-time (as-of) history is deferred "
+                "to a later extension. / 申万一级行业码;行业类算子的分组键。"
+                "时点(as-of)语义留后续展期备注。"
+            ),
+        ),
+    ),
+    CatalogField(
         name="volume",
         description="Local demo trading volume.",
         role="optional",
@@ -621,6 +637,18 @@ def create_demo_workspace(
     return {"workspace": workspace, "data_root": data_root, "factor_root": factor_root, "artifact_root": artifact_root}
 
 
+# Shenwan (SW) level-1 industry codes used to label the deterministic demo
+# panel. Static demo labels only (no as-of history): the 12 demo instruments
+# split evenly across four SW level-1 sectors (three instruments each) so
+# industry-aware operators have multi-member groups to neutralize within.
+_DEMO_SW_L1_INDUSTRY_CODES: tuple[str, ...] = (
+    "801080",  # 电子 / Electronics
+    "801120",  # 食品饮料 / Food & Beverage
+    "801150",  # 医药生物 / Pharmaceuticals & Biotech
+    "801780",  # 银行 / Banking
+)
+
+
 def _build_demo_panel() -> pd.DataFrame:
     instruments = [f"STK{i:03d}" for i in range(1, 13)]
     dates = pd.bdate_range("2024-01-02", periods=160)
@@ -628,6 +656,9 @@ def _build_demo_panel() -> pd.DataFrame:
     for instrument_index, instrument in enumerate(instruments):
         base_close = 10.0 + instrument_index
         base_cap = 5_000_000_000 + instrument_index * 750_000_000
+        # Deterministic SW level-1 label; instruments interleave across sectors
+        # so industry does not line up with the size/cap ordering above.
+        industry = _DEMO_SW_L1_INDUSTRY_CODES[instrument_index % len(_DEMO_SW_L1_INDUSTRY_CODES)]
         for day_index, trade_date in enumerate(dates):
             drift = 0.002 * day_index
             seasonal = np.sin((day_index + instrument_index) / 4.0) * 0.015
@@ -653,6 +684,7 @@ def _build_demo_panel() -> pd.DataFrame:
                     "close": round(float(close), 6),
                     "market_cap": float(base_cap * (1.0 + seasonal)),
                     "is_st": bool(instrument_index in {1, 8} and day_index >= 10),
+                    "industry": industry,
                     "volume": volume,
                     "amount": round(float(close) * volume, 2),
                 }
