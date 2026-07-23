@@ -20,6 +20,7 @@ from quant_forge.operator_registry.resolver import resolve_formula_operators
 # Reuse it here instead of defining a parallel copy so the web parse path and
 # the spec flow can never drift apart.
 from quant_forge.specs.nl_flow import (  # noqa: E402  (grouped with the contract note above)
+    out_of_scope_data_warnings as out_of_scope_data_warnings,
     _FALLBACK_WARNING as GENERIC_FALLBACK_WARNING,
     _GENERIC_FALLBACK_FORMULA as GENERIC_FALLBACK_FORMULA,
 )
@@ -60,6 +61,18 @@ class ParsedFactor:
     warnings: tuple[str, ...] = ()
 
 
+def parse_warnings(formula: str, text: str) -> tuple[str, ...]:
+    """Every honest-parse warning for a result: the generic-fallback flag plus
+    the out-of-scope-data flag, deduplicated and order-preserving. Both parse
+    modes assemble their ``warnings`` through this single helper."""
+
+    combined: list[str] = []
+    for warning in (*generic_fallback_warnings(formula), *out_of_scope_data_warnings(text)):
+        if warning not in combined:
+            combined.append(warning)
+    return tuple(combined)
+
+
 def generic_fallback_warnings(formula: str) -> tuple[str, ...]:
     """Warnings a parse result must carry when it landed on the generic formula.
 
@@ -84,7 +97,7 @@ def parse_factor_idea(text: str, llm: LLMSettings, *, mode: str = "llm") -> Pars
             source="rule",
             provider="rule",
             model="deterministic",
-            warnings=generic_fallback_warnings(factor.formula),
+            warnings=parse_warnings(factor.formula, text),
         )
     if mode != "llm":
         raise ValueError(f"unsupported parser mode: {mode}")
@@ -103,7 +116,7 @@ def _parse_with_configured_llm(text: str, llm: LLMSettings) -> ParsedFactor:
         provider=result.provider,
         model=result.model,
         raw_response=result.content,
-        warnings=generic_fallback_warnings(factor.formula),
+        warnings=parse_warnings(factor.formula, text),
     )
 
 
