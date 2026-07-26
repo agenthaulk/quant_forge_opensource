@@ -92,17 +92,33 @@ Capital exhaustion (compounding terminates)
 -------------------------------------------
 A NAV step that lands at or below zero FREEZES that channel's NAV at exactly
 ``0.0``: the book has no capital left, so compounding terminates there. The
-recurrence ``nav[j+1] = nav[j] * (1 + return[j])`` still holds verbatim (``0.0``
-multiplies to ``0.0``), and the period-return rows AFTER the exhaustion bar are
-truncated in meaning -- they report the book's arithmetic return but no longer
-move any capital, and the exhaustion bar is named in
-``diagnostics["gross_capital_exhausted_period"]`` /
-``["net_capital_exhausted_period"]`` with the ``CAPITAL_EXHAUSTED`` warning code.
-Without the freeze a levered wipe-out carries a NEGATIVE NAV forward and a
+arithmetic recurrence ``nav[j+1] = nav[j] * (1 + return[j])`` therefore
+describes every step STRICTLY BEFORE the exhaustion bar; the exhaustion bar
+and everything after it follow FROZEN semantics instead -- the breach step
+realizes exactly ``-100%`` of the capital that was left (whatever larger
+arithmetic loss the book printed), and every later step moves nothing.
+
+Both series are reported, and neither is dressed as the other:
+
+* ``period_rows`` keep the RAW arithmetic period return, so the book's own
+  ``-1.20`` bar stays legible, and the whole raw series is disclosed in
+  ``diagnostics["raw_arithmetic_returns"]``;
+* the series the SUMMARY METRICS consume is reconciled with the frozen NAV
+  (``-1.0`` at the breach step, ``0.0`` after it), so a Sharpe is never
+  computed off a loss the capital never took.
+
+The exhaustion bar is named in ``diagnostics["gross_capital_exhausted_period"]``
+/ ``["net_capital_exhausted_period"]`` with the ``CAPITAL_EXHAUSTED`` warning
+code. Without the freeze a levered wipe-out carries a NEGATIVE NAV forward and a
 subsequent LOSS raises it (``-0.20 * (1 - 0.20) = -0.16``), reporting a recovery
 no book can make and a drawdown past ``-1.0``. With it, ``max_drawdown`` is
 bounded below by ``-1.0`` structurally -- by the NAV series it reads, not by a
 clamp on a second copy of the drawdown formula.
+
+A NAV that is NOT FINITE is never read as a wipe-out. ``-inf <= 0.0`` is
+``True``, so the freeze branch would otherwise report an equity nobody can know
+as a clean bankruptcy and name an exhaustion period for it; a non-finite NAV is
+propagated unchanged instead and reported by the metric tri-state below.
 
 Fail-closed input gate
 ----------------------
@@ -126,16 +142,35 @@ the cost math intact and turn every downstream return, NAV and metric into NaN.
 Honest metrics
 --------------
 Summary metrics are :class:`~quant_forge.core.contracts.MetricValue` with the
-kernel's tri-state vocabulary. Annualized return is suppressed to ``None`` /
-``insufficient_sample`` below the same half-year basis the engine uses
+kernel's tri-state vocabulary.
+
+Their basis is ELAPSED TIME, not the row count. ``len(period_rows)`` counts the
+terminal-settlement row too, and that row is a zero-length execution event
+(``entry_date == exit_date``) that adds a cost step to the NAV without adding a
+bar of exposure -- so ``holding_periods`` (``bar_count - 1``, also in
+``diagnostics``) is what annualization exponentiates by AND what its
+reportability gate compares, and the Sharpe sample is the holding rows alone.
+Counting rows instead would let ``125`` held bars plus one settlement row clear
+a ``126``-bar half-year gate the sample has not reached, and would mix a
+zero-length cost row into a dispersion estimate of per-bar returns.
+
+Annualized return is suppressed to ``None`` / ``insufficient_sample`` below the
+same half-year basis the engine uses
 (:data:`~quant_forge.backtesting.service.MIN_ANNUALIZATION_EXPOSURE_DAYS`,
 rescaled to the configured ``periods_per_year`` and rounded UP, so a frequency
 that lands mid-bar cannot report an annualization off a basis short of the half
-year); Sharpe is suppressed below two periods or at zero dispersion. A source
-series carrying a non-finite value suppresses every metric derived from it to
-``None`` / ``unavailable_source_series`` + ``NON_FINITE_RETURN_SERIES`` -- the
-same rule ``service.py``'s ``max_drawdown`` block applies. No metric is ever
-faked as ``0.0``.
+year); Sharpe is suppressed below two holding periods or at zero dispersion. A
+source series carrying a non-finite value suppresses every metric derived from
+it to ``None`` / ``unavailable_source_series`` + ``NON_FINITE_RETURN_SERIES`` --
+the same rule ``service.py``'s ``max_drawdown`` block applies -- and the FLAT
+compatibility restatements of that same channel (``gross_cumulative_return`` /
+``net_cumulative_return`` and the ``cost_reconciliation`` terminal equities) are
+suppressed to ``None`` with it, so the summary surface can never hand back a
+bare ``inf``/``NaN`` next to a metric that already declared the number unknown.
+The raw evidence stays: the affected channel is named in
+``diagnostics["non_finite_metric_source_series"]``, and ``period_rows`` /
+``nav_series`` / ``diagnostics["raw_arithmetic_returns"]`` keep the series that
+overflowed. No metric is ever faked as ``0.0``.
 """
 
 from __future__ import annotations
@@ -282,9 +317,16 @@ class PositionSeriesPeriod:
     ``is_terminal_settlement`` marks the ZERO-LENGTH row that executes the last
     bar's target book (``entry_date == exit_date``, gross return / price
     relatives / borrow all exactly zero, trade cost only); see the module
-    docstring. Rows after a capital-exhaustion bar still report the book's
-    arithmetic return, but the NAV they carry is frozen at ``0.0``, so those
-    returns move nothing.
+    docstring. It is a cost event, not a bar of exposure, so it is excluded from
+    the Sharpe sample and from the annualization basis while staying in this
+    series and in ``nav_series``.
+
+    ``gross_period_return`` / ``net_period_return`` are always the RAW
+    arithmetic returns. At and after a capital-exhaustion bar they are no longer
+    the return the capital took -- the NAV they carry is frozen at ``0.0``, so
+    those returns move nothing -- and the summary metrics read a reconciled
+    series instead (``-1.0`` at the breach bar, ``0.0`` after it; module
+    docstring, "Capital exhaustion").
     """
 
     period_id: int
@@ -324,6 +366,14 @@ class PositionSeriesBacktestResult:
     zero-length row is the final entry of both, so the last two ``nav_series``
     rows share the terminal ``trade_date``: the pre-trade mark and the
     post-trade mark of the same bar.
+
+    ``gross_cumulative_return`` / ``net_cumulative_return`` and the
+    ``cost_reconciliation`` terminal equities are the FLAT restatement of the
+    two NAV channels, and they carry the same tri-state as the metrics computed
+    off those channels: ``None`` when that channel's source series is
+    non-finite (module docstring, "Honest metrics"), a real number otherwise.
+    ``cost_reconciliation["period_transaction_cost_sum"]`` is never suppressed
+    -- it is a sum of gated, finite cost terms.
     """
 
     periods: int
@@ -335,8 +385,8 @@ class PositionSeriesBacktestResult:
     end_date: str
     period_rows: tuple[PositionSeriesPeriod, ...]
     nav_series: tuple[dict[str, object], ...]
-    gross_cumulative_return: float
-    net_cumulative_return: float
+    gross_cumulative_return: float | None
+    net_cumulative_return: float | None
     traded_notional_total: float
     turnover_total: float
     turnover_mean: float
@@ -346,7 +396,7 @@ class PositionSeriesBacktestResult:
     transaction_costs: TransactionCostModel
     metrics: dict[str, MetricValue]
     metric_provenance: dict[str, dict[str, object]] = field(default_factory=dict)
-    cost_reconciliation: dict[str, float] = field(default_factory=dict)
+    cost_reconciliation: dict[str, float | None] = field(default_factory=dict)
     diagnostics: dict[str, object] = field(default_factory=dict)
     warning_codes: tuple[str, ...] = field(default_factory=tuple)
     warnings: tuple[str, ...] = field(default_factory=tuple)
@@ -415,6 +465,23 @@ def _is_finite_non_negative(value: object) -> bool:
     return bool(np.isfinite(number)) and number >= 0.0
 
 
+def _cost_model_field_names(costs: object) -> tuple[str, ...]:
+    """Every field the GIVEN cost model carries, base contract included.
+
+    Read off the object actually handed in, not off a hand-written list, so the
+    gate covers a rate added to :class:`TransactionCostModel` upstream the day
+    it appears AND a rate carried by a caller's extended model. The base
+    contract's names are unioned in first so a duck-typed (non-dataclass) input
+    is still checked against everything this module reads.
+    """
+
+    try:
+        own = tuple(item.name for item in dataclass_fields(costs))  # type: ignore[arg-type]
+    except TypeError:
+        own = ()
+    return tuple(dict.fromkeys(_COST_MODEL_FIELDS + own))
+
+
 def _validated_cost_model(costs: TransactionCostModel) -> TransactionCostModel:
     """Total input gate over EVERY numeric field of the cost model.
 
@@ -427,7 +494,7 @@ def _validated_cost_model(costs: TransactionCostModel) -> TransactionCostModel:
 
     offenders = [
         {"field": name, "value": repr(getattr(costs, name, None))}
-        for name in _COST_MODEL_FIELDS
+        for name in _cost_model_field_names(costs)
         if not _is_finite_non_negative(getattr(costs, name, None))
     ]
     if offenders:
@@ -664,21 +731,63 @@ def _compounded(nav: float, period_return: float) -> float:
     """One NAV compounding step, with compounding TERMINATED at zero equity.
 
     An equity that reaches zero or below has no capital left to compound: the
-    NAV is frozen at exactly ``0.0`` and every later step multiplies ``0.0``, so
-    the recurrence ``nav[j+1] = nav[j] * (1 + return[j])`` still holds verbatim
-    while the series can never go negative and a later LOSS can never raise it
-    (``-0.20 * (1 - 0.20) = -0.16`` is a recovery no book can make). A
-    non-finite step is propagated untouched rather than floored to ``0.0`` --
-    faking it as a wipe-out would hide the fault the metric tri-state exists to
-    report.
+    NAV is frozen at exactly ``0.0`` and every later step returns ``0.0``, so
+    the series can never go negative and a later LOSS can never raise it
+    (``-0.20 * (1 - 0.20) = -0.16`` is a recovery no book can make).
+
+    A non-finite value is propagated untouched at BOTH ends of the step, never
+    floored -- faking it as a wipe-out would hide the fault the metric tri-state
+    exists to report:
+
+    * a non-finite STEP (``nav`` finite, the product overflows) returns the
+      overflowed product;
+    * a non-finite INCOMING NAV short-circuits ahead of the freeze branch and is
+      returned unchanged. This ordering is load-bearing: ``-inf <= 0.0`` is
+      ``True``, so the freeze branch would otherwise convert an equity nobody
+      can know into an exact ``0.0`` -- reporting a clean bankruptcy, naming an
+      exhaustion period for it, and erasing the very non-finiteness the metric
+      gate keys off. It would also let the sign of the next return decide
+      whether the unknown reappears as ``+inf`` or ``-inf``.
     """
 
+    if not np.isfinite(nav):
+        return float(nav)
     if nav <= 0.0:
         return 0.0
     stepped = nav * (1.0 + period_return)
     if not np.isfinite(stepped):
         return float(stepped)
     return float(stepped) if stepped > 0.0 else 0.0
+
+
+def _frozen_adjusted_returns(raw_returns: np.ndarray, *, exhausted_period: int | None) -> np.ndarray:
+    """The raw arithmetic return series RECONCILED with the frozen NAV.
+
+    ``_compounded`` freezes an exhausted channel at ``0.0``, so from the
+    exhaustion bar on the arithmetic return the book printed is no longer the
+    return the CAPITAL took: a ``-1.20`` bar cannot take more than the ``100%``
+    that was there, and a ``-0.20`` bar after it takes nothing at all. Feeding
+    the raw series to a dispersion statistic therefore measures a book that the
+    NAV series says stopped existing.
+
+    The reconciled series is what the summary metrics consume: unchanged before
+    the exhaustion bar, exactly ``-1.0`` at it, and ``0.0`` after it -- so
+    ``nav[j+1] == nav[j] * (1 + reconciled[j])`` holds across the WHOLE series,
+    including the frozen tail. The raw series is preserved verbatim on the
+    period rows and in ``diagnostics["raw_arithmetic_returns"]``.
+
+    ``exhausted_period`` is a ``period_id``, which indexes ``period_rows``
+    directly: the holding rows occupy ``0 .. bar_count - 2`` under their own bar
+    index, and the terminal settlement occupies ``bar_count - 1`` under the
+    terminal bar's. ``test_every_period_id_is_its_own_row_index`` pins that.
+    """
+
+    if exhausted_period is None:
+        return raw_returns
+    adjusted = raw_returns.copy()
+    adjusted[exhausted_period] = -1.0
+    adjusted[exhausted_period + 1 :] = 0.0
+    return adjusted
 
 
 # ---------------------------------------------------------------------------
@@ -976,48 +1085,81 @@ def run_position_series_backtest(
         )
 
     periods = len(period_rows)
+    # ELAPSED TIME, not row count. ``periods`` counts the terminal-settlement
+    # row, which is a zero-length execution event on the last bar: it adds a
+    # cost step to the NAV but not one bar of exposure. Annualization
+    # exponentiates by, and gates on, the holding basis instead -- 125 held bars
+    # plus one settlement row is 126 ROWS but only 125 bars of elapsed time, and
+    # counting rows would clear a 126-bar half-year gate the sample never
+    # reached.
     holding_periods = bar_count - 1
-    gross_returns = np.array([row.gross_period_return for row in period_rows], dtype=float)
-    net_returns = np.array([row.net_period_return for row in period_rows], dtype=float)
-    gross_cumulative_return = float(gross_nav - 1.0)
-    net_cumulative_return = float(net_nav - 1.0)
+    # ... and the Sharpe sample is the holding rows alone, for the same reason:
+    # a zero-length row carries a pure cost, not a per-bar return, so mixing it
+    # into a dispersion estimate measures an interval that does not exist.
+    holding_rows_mask = np.array([not row.is_terminal_settlement for row in period_rows], dtype=bool)
+    raw_returns_by_channel: dict[str, np.ndarray] = {
+        "gross_nav": np.array([row.gross_period_return for row in period_rows], dtype=float),
+        "net_nav": np.array([row.net_period_return for row in period_rows], dtype=float),
+    }
+    terminal_equity_by_channel: dict[str, float] = {"gross_nav": gross_nav, "net_nav": net_nav}
+    exhausted_by_channel: dict[str, int | None] = {
+        "gross_nav": gross_exhausted_period,
+        "net_nav": net_exhausted_period,
+    }
     minimum_periods = _minimum_annualization_periods(periods_per_year)
 
     metrics: dict[str, MetricValue] = {}
     non_finite_channels: list[str] = []
-    for prefix, returns, cumulative, nav_key in (
-        ("", gross_returns, gross_cumulative_return, "gross_nav"),
-        ("net_", net_returns, net_cumulative_return, "net_nav"),
-    ):
+    # Flat compatibility restatements of each channel's terminal equity. They
+    # are populated per channel BELOW rather than computed up front, because a
+    # channel whose source series is non-finite must report them as ``None``
+    # exactly like the metrics derived from the same series (a bare inf/NaN
+    # cumulative return alongside a metric that already said "unknown" would be
+    # the one place the tri-state leaks).
+    cumulative_by_channel: dict[str, float | None] = {}
+    for prefix, nav_key in (("", "gross_nav"), ("net_", "net_nav")):
+        raw_returns = raw_returns_by_channel[nav_key]
         # The NAV base (1.0 at the first execution bar) is excluded here because
         # ``service._max_drawdown`` prepends its own 1.0 start; passing both
         # would double the base point without changing the result.
         drawdown_navs = np.array([float(row[nav_key]) for row in nav_series[1:]], dtype=float)
+        cumulative = float(terminal_equity_by_channel[nav_key] - 1.0)
+        # Reconciled with the frozen NAV before any statistic reads it: past an
+        # exhaustion bar the arithmetic return is no longer the return the
+        # capital took (see ``_frozen_adjusted_returns``).
+        adjusted_returns = _frozen_adjusted_returns(
+            raw_returns, exhausted_period=exhausted_by_channel[nav_key]
+        )
+        sharpe_sample = adjusted_returns[holding_rows_mask]
+        sharpe_observations = int(sharpe_sample.size)
         # Tri-state gate on the SOURCE SERIES, ahead of every statistic derived
         # from it (annualized return, Sharpe, drawdown, terminal equity). A
         # non-finite return or NAV -- an overflow on an extreme book, say --
         # makes each of them unknowable, and the honest report is null + the
         # kernel's ``unavailable_source_series`` status, never a 0.0 standing in
-        # for a number nobody has.
+        # for a number nobody has. The RAW returns are what is checked: they are
+        # the series that actually entered the NAV.
         series_is_finite = bool(
-            np.isfinite(returns).all()
+            np.isfinite(raw_returns).all()
             and np.isfinite(drawdown_navs).all()
             and np.isfinite(cumulative)
         )
+        cumulative_by_channel[nav_key] = cumulative if series_is_finite else None
         if not series_is_finite:
             non_finite_channels.append(nav_key)
-            for suffix, unit, minimum, method, source in (
-                ("annualized_return", "return", minimum_periods, "geometric_annualization_period_basis",
-                 "position_series_period_returns"),
-                ("sharpe", "ratio", 2, "period_return_mean_over_std_scaled",
-                 "position_series_period_returns"),
-                ("max_drawdown", "return", 1, "peak_to_trough_nav", f"position_series_{nav_key}"),
+            for suffix, unit, observations, minimum, method, source in (
+                ("annualized_return", "return", holding_periods, minimum_periods,
+                 "geometric_annualization_period_basis", "position_series_period_returns"),
+                ("sharpe", "ratio", sharpe_observations, 2,
+                 "period_return_mean_over_std_scaled", "position_series_period_returns"),
+                ("max_drawdown", "return", periods, 1, "peak_to_trough_nav",
+                 f"position_series_{nav_key}"),
             ):
                 metrics[f"{prefix}{suffix}"] = MetricValue(
                     value=None,
                     unit=unit,
                     status="unavailable_source_series",
-                    observation_count=periods,
+                    observation_count=observations,
                     minimum_required=minimum,
                     method=method,
                     source_series=source,
@@ -1029,28 +1171,32 @@ def run_position_series_backtest(
         # value is suppressed below the half-year basis UNLESS the book was
         # wiped out, which is -100% annualized over any horizon. The
         # insufficient-history disclosure still fires on the short basis.
-        reportable = periods >= minimum_periods or (1.0 + cumulative) <= 0.0
+        reportable = holding_periods >= minimum_periods or (1.0 + cumulative) <= 0.0
         annualized = (
-            _annualized_return_periodic(cumulative, periods, periods_per_year) if reportable else None
+            _annualized_return_periodic(cumulative, holding_periods, periods_per_year)
+            if reportable
+            else None
         )
-        annualized_warnings = () if periods >= minimum_periods else (INSUFFICIENT_ANNUALIZATION_HISTORY,)
+        annualized_warnings = (
+            () if holding_periods >= minimum_periods else (INSUFFICIENT_ANNUALIZATION_HISTORY,)
+        )
         metrics[f"{prefix}annualized_return"] = MetricValue(
             value=annualized,
             unit="return",
             status="available" if annualized is not None else "insufficient_sample",
-            observation_count=periods,
+            observation_count=holding_periods,
             minimum_required=minimum_periods,
             method="geometric_annualization_period_basis",
             source_series="position_series_period_returns",
             sample_role=sample_role,
             warning_codes=annualized_warnings,
         )
-        sharpe = _sharpe_periodic(returns, periods_per_year)
+        sharpe = _sharpe_periodic(sharpe_sample, periods_per_year)
         metrics[f"{prefix}sharpe"] = MetricValue(
             value=sharpe,
             unit="ratio",
             status="available" if sharpe is not None else "insufficient_sample",
-            observation_count=periods,
+            observation_count=sharpe_observations,
             minimum_required=2,
             method="period_return_mean_over_std_scaled",
             source_series="position_series_period_returns",
@@ -1114,8 +1260,10 @@ def run_position_series_backtest(
         warning_items.append(
             "a non-finite value entered the "
             + ", ".join(sorted(non_finite_channels))
-            + " series, so every statistic derived from it is reported as null + "
-            "unavailable_source_series rather than a fabricated number"
+            + " series, so every statistic derived from it -- including the flat cumulative-return and "
+            "terminal-equity restatements -- is reported as null + unavailable_source_series rather than "
+            "a fabricated number; the series itself is preserved in period_rows / nav_series / "
+            "diagnostics['raw_arithmetic_returns'] as the evidence of what overflowed"
         )
     # A signal on one of the last `delay` bars has no execution bar on this
     # calendar at all, so it can move nothing. Disclosed rather than silently
@@ -1176,8 +1324,8 @@ def run_position_series_backtest(
         end_date=timeline[-1].date().isoformat(),
         period_rows=tuple(period_rows),
         nav_series=tuple(nav_series),
-        gross_cumulative_return=gross_cumulative_return,
-        net_cumulative_return=net_cumulative_return,
+        gross_cumulative_return=cumulative_by_channel["gross_nav"],
+        net_cumulative_return=cumulative_by_channel["net_nav"],
         traded_notional_total=traded_notional_total,
         turnover_total=traded_notional_total / 2.0,
         # periods >= 1 is guaranteed by the CALENDAR_TOO_SHORT gate above.
@@ -1189,9 +1337,17 @@ def run_position_series_backtest(
         metrics=metrics,
         metric_provenance=metric_provenance,
         cost_reconciliation={
+            # The cost sum is always a real number (every rate passed the finite
+            # gate and every weight is finite), so it is never suppressed. The
+            # two terminal equities restate the NAV channels, so they follow
+            # exactly the suppression their own channel's metrics took.
             "period_transaction_cost_sum": float(trade_cost_total + borrow_cost_total),
-            "gross_terminal_equity": float(gross_nav),
-            "net_terminal_equity": float(net_nav),
+            "gross_terminal_equity": (
+                float(gross_nav) if cumulative_by_channel["gross_nav"] is not None else None
+            ),
+            "net_terminal_equity": (
+                float(net_nav) if cumulative_by_channel["net_nav"] is not None else None
+            ),
         },
         diagnostics={
             "bar_count": bar_count,
@@ -1213,6 +1369,16 @@ def run_position_series_backtest(
             "terminal_settlement_traded_notional": terminal_traded_notional,
             "gross_capital_exhausted_period": gross_exhausted_period,
             "net_capital_exhausted_period": net_exhausted_period,
+            # The UNRECONCILED arithmetic period returns, whole, per channel --
+            # the same numbers the rows carry, gathered as a series so the
+            # frozen-NAV reconciliation the summary metrics consume can be
+            # compared against what the book actually printed (see
+            # ``_frozen_adjusted_returns``). Past an exhaustion bar the two
+            # differ by construction; everywhere else they are identical.
+            "raw_arithmetic_returns": {
+                "gross": tuple(float(value) for value in raw_returns_by_channel["gross_nav"]),
+                "net": tuple(float(value) for value in raw_returns_by_channel["net_nav"]),
+            },
             "non_finite_metric_source_series": tuple(non_finite_channels),
             "minimum_annualization_periods": minimum_periods,
         },
@@ -1236,6 +1402,9 @@ def _assumptions(*, execution_price: str, delay: int) -> tuple[str, ...]:
         "interval follows it",
         "a signal whose execution bar falls beyond the calendar establishes nothing; its complete target "
         "book is disclosed in diagnostics rather than charged or held",
-        "equity at or below zero terminates compounding: NAV is frozen at 0.0 from that period on",
-        "annualization spans every evaluated bar, including bars the book is flat",
+        "equity at or below zero terminates compounding: NAV is frozen at 0.0 from that period on, and "
+        "the return series the summary metrics consume is reconciled with it (-1.0 at the breach period, "
+        "0.0 after it) while the rows keep the raw arithmetic return",
+        "annualization and the Sharpe sample span the HOLDING bars -- every evaluated bar including the "
+        "bars the book is flat, but not the zero-length terminal settlement, which is a cost event",
     )

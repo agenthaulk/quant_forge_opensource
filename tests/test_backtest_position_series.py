@@ -410,6 +410,218 @@ def test_vector_c_multi_instrument_fractional_weights() -> None:
     assert set(result.period_rows[2].price_relatives) == {"BBB"}
 
 
+def test_vector_c_metrics_read_the_holding_basis_not_the_row_count() -> None:
+    """C is the only vector carrying a terminal settlement, so it is the one
+    vector whose metric BASIS moves once the zero-length row stops counting as
+    a bar of exposure.
+
+    Hand chain (settlement row excluded from the sample, kept in the NAV):
+
+    * holding sample, gross: ``[0.0, -0.10, +0.10]`` -- mean exactly ``0``, so
+      the Sharpe is a true ``0.0`` (the settlement's ``0.0`` gross return would
+      not have moved the mean, but it WOULD have shrunk the dispersion, so the
+      row count still has to be the holding count);
+    * holding sample, net: ``[0.0, -0.1015, +0.0980]``. mean
+      ``-0.0035 / 3 = -0.0011666...``; deviations
+      ``[+0.0011666..., -0.1003333..., +0.0991666...]``; sum of squares
+      ``0.00000136... + 0.01006677... + 0.00983402... = 0.01990216...``;
+      sample variance ``/2 = 0.00995108...``; std ``0.09975511...``;
+      Sharpe ``-0.0011666... / 0.09975511... * sqrt(252) = -0.18565723...``;
+    * annualization basis: ``3`` holding bars, not ``4`` rows -- still far under
+      the 126-bar gate, so the value stays suppressed and the disclosure fires;
+    * ``max_drawdown`` keeps the FULL row count (``4``): it reads ``nav_series``,
+      which the settlement's cost step really does move.
+    """
+
+    prices = _prices(DATES_4, close={"AAA": C_CLOSES_A, "BBB": C_CLOSES_B})
+    positions = _positions(
+        [
+            (DATES_4[0], "AAA", 0.5),
+            (DATES_4[0], "BBB", -0.5),
+            (DATES_4[1], "AAA", 0.0),
+            (DATES_4[1], "BBB", -1.0),
+            (DATES_4[2], "AAA", 1.0),
+            (DATES_4[2], "BBB", 0.0),
+        ]
+    )
+    result = run_position_series_backtest(positions, prices, transaction_costs=C_COSTS)
+
+    assert result.periods == 4
+    assert result.diagnostics["holding_periods"] == 3
+
+    holding_gross = np.array([0.0, -0.10, 0.10])
+    holding_net = np.array([0.0, -0.1015, 0.0980])
+    assert result.metrics["sharpe"].value == pytest.approx(0.0, abs=1e-12)
+    assert result.metrics["sharpe"].observation_count == 3
+    assert result.metrics["net_sharpe"].value == pytest.approx(
+        float(np.mean(holding_net) / np.std(holding_net, ddof=1) * math.sqrt(252.0)), rel=1e-9
+    )
+    assert result.metrics["net_sharpe"].value == pytest.approx(-0.18565723510, rel=1e-9)
+    assert result.metrics["net_sharpe"].observation_count == 3
+    # The 4-row sample is a DIFFERENT number, so the assertion above pins which
+    # sample was consumed rather than merely agreeing with it.
+    four_row_net = np.array([0.0, -0.1015, 0.0980, -0.0020])
+    assert result.metrics["net_sharpe"].value != pytest.approx(
+        float(np.mean(four_row_net) / np.std(four_row_net, ddof=1) * math.sqrt(252.0)), rel=1e-6
+    )
+    # Gross is untouched by the settlement either way (its gross return is 0.0),
+    # but its OBSERVATION COUNT still has to be the holding count.
+    assert _sharpe_periodic(holding_gross, TRADING_PERIODS_PER_YEAR) == pytest.approx(0.0, abs=1e-12)
+
+    annualized = result.metrics["annualized_return"]
+    assert annualized.value is None
+    assert annualized.status == "insufficient_sample"
+    assert annualized.observation_count == 3
+    assert annualized.minimum_required == MIN_ANNUALIZATION_EXPOSURE_DAYS
+    assert INSUFFICIENT_ANNUALIZATION_HISTORY in annualized.warning_codes
+    # The drawdown reads nav_series, which the settlement's cost step moves.
+    assert result.metrics["max_drawdown"].observation_count == 4
+
+
+def test_a_settlement_row_cannot_push_a_short_sample_over_the_annualization_gate() -> None:
+    """125 held bars + 1 zero-length settlement row is 126 ROWS and 125 bars.
+
+    Counting rows cleared the 126-bar half-year gate at 252 bars a year off a
+    sample that never reached the horizon it annualizes from. The basis is
+    elapsed time, so this sample is refused -- and the SAME panel with one more
+    real bar (a genuine 126 holding periods) is reported.
+    """
+
+    bar_count = 126
+    dates = pd.bdate_range("2026-01-05", periods=bar_count)
+    closes = [100.0 * (1.001**index) for index in range(bar_count)]
+    prices = _prices(dates, close={"CU": closes})
+    # A book established on bar 1 and closed on the LAST bar: the closing trade
+    # is a terminal settlement row, so period_rows is one longer than the
+    # holding series.
+    positions = _positions([(dates[0], "CU", 1.0), (dates[bar_count - 2], "CU", 0.0)])
+    result = run_position_series_backtest(positions, prices)
+
+    assert result.periods == 126
+    assert result.diagnostics["holding_periods"] == 125
+    assert result.period_rows[-1].is_terminal_settlement is True
+    assert result.diagnostics["minimum_annualization_periods"] == MIN_ANNUALIZATION_EXPOSURE_DAYS
+
+    annualized = result.metrics["annualized_return"]
+    assert annualized.value is None, "125 bars of exposure cannot annualize off a 126-bar gate"
+    assert annualized.status == "insufficient_sample"
+    assert annualized.observation_count == 125
+    assert INSUFFICIENT_ANNUALIZATION_HISTORY in annualized.warning_codes
+    # The Sharpe sample is the 125 holding rows, not the 126 emitted rows.
+    assert result.metrics["sharpe"].observation_count == 125
+    assert result.metrics["net_sharpe"].observation_count == 125
+    # ... while max_drawdown still reads all 126 NAV marks.
+    assert result.metrics["max_drawdown"].observation_count == 126
+
+    # One more real bar is a genuine 126 holding periods, and it reports.
+    longer_dates = pd.bdate_range("2026-01-05", periods=bar_count + 1)
+    longer = run_position_series_backtest(
+        _positions([(longer_dates[0], "CU", 1.0)]),
+        _prices(longer_dates, close={"CU": [100.0 * (1.001**index) for index in range(bar_count + 1)]}),
+    )
+    assert longer.diagnostics["holding_periods"] == 126
+    assert longer.metrics["annualized_return"].status == "available"
+
+
+def test_every_period_id_is_its_own_row_index() -> None:
+    """``period_id`` indexes ``period_rows`` directly, settlement row included.
+
+    The frozen-NAV reconciliation and the ``*_capital_exhausted_period``
+    diagnostics both carry a ``period_id`` and both are applied positionally, so
+    the identity is load-bearing rather than incidental: holding rows take their
+    own bar index (``0 .. bar_count - 2``) and the terminal settlement takes the
+    terminal bar's (``bar_count - 1``).
+    """
+
+    positions, prices = _vector_a_inputs()
+    cases = [
+        run_position_series_backtest(positions, prices, transaction_costs=A_COSTS),
+        # with a terminal settlement row
+        run_position_series_backtest(
+            _positions(
+                [
+                    (DATES_6[0], "CU", 1.0),
+                    (DATES_6[1], "CU", 1.0),
+                    (DATES_6[2], "CU", -1.0),
+                    (DATES_6[3], "CU", 0.0),
+                    (DATES_6[4], "CU", -1.0),
+                ]
+            ),
+            prices,
+            transaction_costs=A_COSTS,
+        ),
+        # with a capital exhaustion (the reconciliation's own consumer)
+        run_position_series_backtest(
+            _positions([(DATES_4[0], "CU", 2.0)]),
+            _prices(DATES_4, close={"CU": [100.0, 100.0, 40.0, 36.0]}),
+        ),
+    ]
+    for result in cases:
+        assert [row.period_id for row in result.period_rows] == list(range(result.periods))
+        exhausted = result.diagnostics["gross_capital_exhausted_period"]
+        if exhausted is not None:
+            assert result.period_rows[exhausted].period_id == exhausted
+            assert result.nav_series[exhausted + 1]["gross_nav"] == 0.0
+
+
+def test_a_terminal_settlement_moves_the_nav_but_not_the_holding_sample() -> None:
+    """The settlement row is a COST event on a zero-length interval.
+
+    It belongs in ``period_rows`` and in the NAV (the cost is real and compounds
+    as its own step), and it must stay out of the per-bar return sample and out
+    of the elapsed-time basis -- vectors A/B/D have no settlement row at all, so
+    they must be byte-identical to their pre-change selves either way.
+    """
+
+    positions, prices = _vector_a_inputs()
+    baseline = run_position_series_backtest(positions, prices, transaction_costs=A_COSTS)
+    terminal_target = _positions(
+        [
+            (DATES_6[0], "CU", 1.0),
+            (DATES_6[1], "CU", 1.0),
+            (DATES_6[2], "CU", -1.0),
+            (DATES_6[3], "CU", 0.0),
+            (DATES_6[4], "CU", -1.0),  # establishes on bar 5, the last bar
+        ]
+    )
+    with_terminal = run_position_series_backtest(terminal_target, prices, transaction_costs=A_COSTS)
+
+    assert baseline.periods == baseline.diagnostics["holding_periods"] == 5
+    assert with_terminal.periods == 6
+    assert with_terminal.diagnostics["holding_periods"] == 5
+    # The holding rows are identical, so the holding-sample statistics are too --
+    # a closing trade on the last bar cannot move the dispersion of the bars
+    # that came before it.
+    assert with_terminal.period_rows[:5] == baseline.period_rows
+    for key in ("sharpe", "net_sharpe"):
+        assert with_terminal.metrics[key].value == pytest.approx(baseline.metrics[key].value, rel=REL)
+        assert with_terminal.metrics[key].observation_count == 5
+    # ... while the NAV, its cumulative return and the drawdown sample DO move,
+    # because the settlement's cost is a real step on the equity curve.
+    assert with_terminal.net_cumulative_return < baseline.net_cumulative_return
+    assert with_terminal.metrics["net_max_drawdown"].observation_count == 6
+    assert baseline.metrics["net_max_drawdown"].observation_count == 5
+
+    # B and D carry no settlement row: every metric basis is the row count and
+    # the holding count at once, so nothing about them moves.
+    b_positions, b_prices = _vector_b_inputs()
+    vector_b = run_position_series_backtest(b_positions, b_prices, execution_price="open")
+    assert all(row.is_terminal_settlement is False for row in vector_b.period_rows)
+    assert vector_b.periods == vector_b.diagnostics["holding_periods"] == 4
+    assert vector_b.metrics["sharpe"].observation_count == 4
+    assert vector_b.metrics["annualized_return"].observation_count == 4
+
+    d_dates = pd.bdate_range("2026-01-05", periods=127)
+    vector_d = run_position_series_backtest(
+        _positions([(d_dates[0], "CU", 1.0)]),
+        _prices(d_dates, close={"CU": [100.0 * (1.001**index) for index in range(127)]}),
+    )
+    assert all(row.is_terminal_settlement is False for row in vector_d.period_rows)
+    assert vector_d.periods == vector_d.diagnostics["holding_periods"] == 126
+    assert vector_d.metrics["annualized_return"].value == pytest.approx(1.001**250 - 1.0, rel=1e-9)
+    assert vector_d.metrics["annualized_return"].observation_count == 126
+
+
 # ---------------------------------------------------------------------------
 # Vector D: the only vector long enough to clear the annualization gate.
 # ---------------------------------------------------------------------------
@@ -757,6 +969,139 @@ def test_the_compounding_step_floors_at_zero_but_never_fakes_a_non_finite_one() 
     assert _compounded(0.0, 5.0) == 0.0  # frozen: no later gain revives it
     assert math.isnan(_compounded(1.0, float("nan")))
     assert math.isinf(_compounded(1.0, float("inf")))
+    assert _compounded(1.0, float("-inf")) == float("-inf")
+
+
+@pytest.mark.parametrize("period_return", [0.10, 0.0, -0.20, -1.0, -5.0])
+def test_a_non_finite_incoming_nav_is_propagated_not_read_as_a_wipe_out(period_return: float) -> None:
+    """The INCOMING nav is checked for finiteness ahead of the zero floor.
+
+    ``-inf <= 0.0`` is True, so the freeze branch would otherwise hand back an
+    exact ``0.0`` for an equity nobody can know -- reporting a clean bankruptcy,
+    and erasing the very non-finiteness the metric gate keys off. It would also
+    let the SIGN of the next return decide whether the unknown resurfaced as
+    ``+inf`` or ``-inf``, which is why the value is passed through untouched
+    rather than recomputed.
+    """
+
+    assert _compounded(float("-inf"), period_return) == float("-inf")
+    assert _compounded(float("inf"), period_return) == float("inf")
+    assert math.isnan(_compounded(float("nan"), period_return))
+
+
+def test_a_non_finite_nav_is_never_reported_as_a_capital_exhaustion() -> None:
+    """The reported scenario: a step that overflows to -inf.
+
+    Before the incoming-NAV check the FIRST step propagated ``-inf`` correctly,
+    and then the NEXT step read ``-inf <= 0.0`` and froze the channel at ``0.0``
+    -- so an unknown equity was reported as a wipe-out, complete with a named
+    ``exhausted_period`` and the CAPITAL_EXHAUSTED code, on a book whose value
+    is simply not known. An unknown must stay unknown.
+    """
+
+    # Finite, strictly positive quotes (so the mark gate passes) whose relative
+    # times a finite SHORT weight overflows the float range.
+    prices = _prices(DATES_4, close={"CU": [1.0, 1e308, 1e308, 1e308]})
+    positions = _positions([(DATES_4[0], "CU", -1e10)])
+    with np.errstate(over="ignore", invalid="ignore"):
+        result = run_position_series_backtest(positions, prices, execution_delay_periods=0)
+
+    # The overflow itself is real and is reported as such ...
+    assert result.diagnostics["raw_arithmetic_returns"]["gross"][0] == float("-inf")
+    assert [row["gross_nav"] for row in result.nav_series] == [1.0, float("-inf"), float("-inf"), float("-inf")]
+    assert result.diagnostics["non_finite_metric_source_series"] == ("gross_nav", "net_nav")
+    assert NON_FINITE_RETURN_SERIES in result.warning_codes
+    # ... and it is NOT a bankruptcy: no frozen 0.0 NAV, no exhausted period,
+    # no CAPITAL_EXHAUSTED disclosure, no "compounding terminates" narrative.
+    assert result.diagnostics["gross_capital_exhausted_period"] is None
+    assert result.diagnostics["net_capital_exhausted_period"] is None
+    assert CAPITAL_EXHAUSTED not in result.warning_codes
+    assert not any("compounding terminates" in item for item in result.warnings)
+    assert all(row["gross_nav"] != 0.0 for row in result.nav_series)
+
+
+def test_the_flat_compat_fields_are_suppressed_with_their_channels_metrics() -> None:
+    """A non-finite channel suppresses its FLAT restatements too.
+
+    ``gross/net_cumulative_return`` and the ``cost_reconciliation`` terminal
+    equities are the same terminal equity the metrics were computed from. When
+    the metrics report null + ``unavailable_source_series``, these must not hand
+    the caller a bare ``inf``/``NaN`` for the same quantity.
+    """
+
+    prices = _prices(DATES_4, close={"CU": [1.0, 1e308, 1e308, 1e308]})
+    positions = _positions([(DATES_4[0], "CU", 1e10)])
+    with np.errstate(over="ignore", invalid="ignore"):
+        result = run_position_series_backtest(positions, prices, execution_delay_periods=0)
+
+    assert result.gross_cumulative_return is None
+    assert result.net_cumulative_return is None
+    assert result.cost_reconciliation["gross_terminal_equity"] is None
+    assert result.cost_reconciliation["net_terminal_equity"] is None
+    # The cost sum is a sum of GATED, finite rates: it is knowable, so it is
+    # reported rather than suppressed along with the rest.
+    assert result.cost_reconciliation["period_transaction_cost_sum"] == 0.0
+    # Nothing on the flat summary surface is a bare non-finite number.
+    flat_values = [
+        result.gross_cumulative_return,
+        result.net_cumulative_return,
+        result.traded_notional_total,
+        result.turnover_total,
+        result.turnover_mean,
+        result.trade_cost_total,
+        result.borrow_cost_total,
+        result.transaction_cost_total,
+        *result.cost_reconciliation.values(),
+    ]
+    assert all(value is None or math.isfinite(value) for value in flat_values)
+    # The evidence is NOT suppressed: the raw series that overflowed is still
+    # readable, so the fault stays diagnosable.
+    assert any(not math.isfinite(value) for value in result.diagnostics["raw_arithmetic_returns"]["gross"])
+
+    # A finite run reports both flat fields as real numbers (the suppression is
+    # scoped to the non-finite case, not a blanket None).
+    finite = run_position_series_backtest(*_vector_a_inputs(), transaction_costs=A_COSTS)
+    assert finite.gross_cumulative_return == pytest.approx(0.20, rel=REL)
+    assert finite.cost_reconciliation["gross_terminal_equity"] == pytest.approx(1.20, rel=REL)
+
+
+def test_the_metric_return_series_is_reconciled_with_the_frozen_nav() -> None:
+    """The reported scenario: closes [100, 100, 40, 36] at weight 2.0.
+
+    The NAV freezes at ``0.0`` on the ``-1.20`` bar, so from there the book's
+    ARITHMETIC returns stop being the returns the capital took: it cannot lose
+    120% of what it had, and the following ``-0.20`` bar moves nothing at all.
+    Feeding the raw series to Sharpe measures a book the NAV says stopped
+    existing, so the metric-side series is reconciled -- ``-1.0`` at the breach
+    bar, ``0.0`` after it -- while the rows keep the raw numbers.
+    """
+
+    prices = _prices(DATES_4, close={"CU": [100.0, 100.0, 40.0, 36.0]})
+    positions = _positions([(DATES_4[0], "CU", 2.0)])
+    result = run_position_series_backtest(positions, prices)
+
+    # The rows and the diagnostics disclosure keep the RAW arithmetic series.
+    raw = [0.0, -1.20, -0.20]
+    assert [row.gross_period_return for row in result.period_rows] == pytest.approx(raw, rel=1e-9)
+    assert result.diagnostics["raw_arithmetic_returns"]["gross"] == pytest.approx(raw, rel=1e-9)
+    assert result.diagnostics["raw_arithmetic_returns"]["net"] == pytest.approx(raw, rel=1e-9)
+    assert result.diagnostics["gross_capital_exhausted_period"] == 1
+
+    # Sharpe consumes [0.0, -1.0, 0.0]: mean -1/3, sample std 1/sqrt(3), so
+    # (-1/3) / (1/sqrt(3)) * sqrt(252) = -sqrt(756)/3.
+    reconciled_sharpe = -math.sqrt(756.0) / 3.0
+    assert result.metrics["sharpe"].value == pytest.approx(reconciled_sharpe, rel=1e-12)
+    assert result.metrics["net_sharpe"].value == pytest.approx(reconciled_sharpe, rel=1e-12)
+    # The number the RAW series would have produced is a different number, so
+    # the assertion above really pins which sample was used.
+    raw_sharpe = _sharpe_periodic(np.array(raw), TRADING_PERIODS_PER_YEAR)
+    assert raw_sharpe is not None
+    assert result.metrics["sharpe"].value != pytest.approx(raw_sharpe, rel=1e-6)
+    # And the reconciled series is exactly the one the frozen NAV implies:
+    # nav[j+1] == nav[j] * (1 + reconciled[j]) across the WHOLE series.
+    navs = [row["gross_nav"] for row in result.nav_series]
+    for previous, following, reconciled in zip(navs[:-1], navs[1:], [0.0, -1.0, 0.0], strict=True):
+        assert following == pytest.approx(previous * (1.0 + reconciled), abs=1e-12)
 
 
 def test_a_non_finite_source_series_suppresses_every_metric_derived_from_it() -> None:
@@ -986,10 +1331,80 @@ def test_a_non_finite_cost_rate_is_rejected_at_the_gate(field: str, bad: float) 
 
 
 def test_the_cost_gate_covers_every_field_of_the_cost_model() -> None:
-    """The gated field set is read off the dataclass, so it cannot fall behind a
-    rate added upstream."""
+    """Every field of the REAL cost model is refused when non-finite -- checked
+    by enumerating the dataclass, so a rate added upstream is covered by this
+    test on the day it appears rather than by a hand-maintained list."""
 
-    assert set(_COST_MODEL_FIELDS) == {item.name for item in dataclasses.fields(TransactionCostModel)}
+    positions, prices = _vector_a_inputs()
+    field_names = tuple(item.name for item in dataclasses.fields(TransactionCostModel))
+    assert field_names, "the cost model must carry at least one gated rate"
+    for name in field_names:
+        for bad in (float("nan"), float("inf")):
+            with pytest.raises(PositionSeriesInputError) as excinfo:
+                run_position_series_backtest(
+                    positions, prices, transaction_costs=TransactionCostModel(**{name: bad})
+                )
+            assert excinfo.value.code == INVALID_COST_MODEL
+            assert [item["field"] for item in excinfo.value.details["invalid_fields"]] == [name]
+    # ... and the declared field tuple is the one that set is walked from.
+    assert set(_COST_MODEL_FIELDS) == set(field_names)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ExtendedCostModel(TransactionCostModel):
+    """A cost model carrying rates this module has never heard of.
+
+    Stands in for the upstream contract growing a field: the gate must refuse a
+    non-finite value in one WITHOUT this module being edited, because it reads
+    the field set off the model it is handed rather than off three literals.
+    """
+
+    financing_bps: float = 0.0
+    exchange_fee_bps: float = 0.0
+
+
+def _extended_costs(**overrides: float) -> _ExtendedCostModel:
+    values: dict[str, float] = {
+        "commission_bps": A_COSTS.commission_bps,
+        "slippage_bps": A_COSTS.slippage_bps,
+        "short_borrow_bps_annual": A_COSTS.short_borrow_bps_annual,
+    }
+    values.update(overrides)
+    return _ExtendedCostModel(**values)
+
+
+def test_the_cost_gate_refuses_every_field_of_an_extended_cost_model() -> None:
+    """Field-by-field rejection behavior against a SYNTHETIC extended model.
+
+    The previous form of this test compared the module's own field tuple to the
+    dataclass it is derived from -- true by construction, and green even if the
+    gate had walked an empty set. This asserts the OUTCOME instead: for every
+    field of a model the gate has never seen, a non-finite value is refused with
+    ``INVALID_COST_MODEL`` naming exactly that field. One bad field at a time,
+    so no other field can be the one carrying the refusal.
+    """
+
+    positions, prices = _vector_a_inputs()
+    extended_fields = tuple(item.name for item in dataclasses.fields(_ExtendedCostModel))
+    assert {"financing_bps", "exchange_fee_bps"} <= set(extended_fields)
+
+    # A clean extended model runs, and prices identically to its base: the extra
+    # rates are GATED, never silently charged.
+    baseline = run_position_series_backtest(positions, prices, transaction_costs=A_COSTS)
+    extended_ok = run_position_series_backtest(
+        positions, prices, transaction_costs=_extended_costs(financing_bps=25.0, exchange_fee_bps=3.0)
+    )
+    assert extended_ok.period_rows == baseline.period_rows
+
+    for name in extended_fields:
+        for bad in (float("nan"), float("inf")):
+            with pytest.raises(PositionSeriesInputError) as excinfo:
+                run_position_series_backtest(
+                    positions, prices, transaction_costs=_extended_costs(**{name: bad})
+                )
+            assert excinfo.value.code == INVALID_COST_MODEL, name
+            assert [item["field"] for item in excinfo.value.details["invalid_fields"]] == [name]
+            assert "finite, non-negative" in str(excinfo.value)
 
 
 def test_the_audit_scenario_a_nan_commission_is_rejected_not_propagated() -> None:

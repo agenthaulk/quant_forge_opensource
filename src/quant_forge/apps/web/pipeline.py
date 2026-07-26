@@ -498,6 +498,35 @@ def _transition(record: PipelineRecord, to_status: str, **extra: Any) -> Pipelin
     return record.with_updates(**changes)
 
 
+def _assert_stage_exists(record: PipelineRecord, stage_id: str, *, operation: str) -> None:
+    """Refuse a stage id this record's KIND does not have, and say so on the server.
+
+    Shared by :func:`_advance_stage` and :func:`_reset_stage` so the two cannot
+    diverge on what a mis-addressed stage means. ``PipelineStageError`` names an
+    INTERNAL contract break -- a kind routed down another kind's code path -- and
+    subclasses ``ValueError``, so the route layer's existing invalid-request
+    mapping turns it into a clean 400 for the caller. That mapping does NOT log,
+    which is why the fault is logged HERE: a 400 body alone would leave a
+    mis-routed kind invisible to the operator who has to fix it.
+    """
+
+    stage_ids = tuple(stage.stage_id for stage in record.stages)
+    if stage_id in stage_ids:
+        return
+    LOGGER.error(
+        "pipeline stage contract break: cannot %s stage_id=%r on pipeline=%s (kind=%s, stages=%s)",
+        operation,
+        stage_id,
+        record.pipeline_id,
+        record.kind,
+        stage_ids,
+    )
+    raise PipelineStageError(
+        f"stage_id {stage_id!r} does not exist on pipeline {record.pipeline_id!r} "
+        f"(kind={record.kind!r}, stages={stage_ids})"
+    )
+
+
 def _advance_stage(
     record: PipelineRecord,
     stage_id: str,
@@ -516,11 +545,7 @@ def _advance_stage(
     left its initial state -- a status the UI reads as truth.
     """
 
-    if stage_id not in {stage.stage_id for stage in record.stages}:
-        raise PipelineStageError(
-            f"stage_id {stage_id!r} does not exist on pipeline {record.pipeline_id!r} "
-            f"(kind={record.kind!r}, stages={tuple(stage.stage_id for stage in record.stages)})"
-        )
+    _assert_stage_exists(record, stage_id, operation="advance")
     new_stages = tuple(
         StageRecord(
             stage_id=stage.stage_id,
@@ -541,6 +566,24 @@ def _advance_stage(
 
 
 def _reset_stage(record: PipelineRecord, stage_id: str) -> PipelineRecord:
+    """Clear one stage back to ``pending`` (no status, no timestamps, no job), by id.
+
+    SYMMETRIC with :func:`_advance_stage`: an id that is not on THIS record's
+    stage set is the same structured failure here, not a silent no-op. The
+    asymmetry was a live hole on the retry path -- ``retry_pipeline`` resets the
+    kind's run stage and then re-arms ``confirm``, so a mis-routed kind would
+    have had its run stage silently NOT reset and gone on to re-confirm over a
+    stage row still holding the failed attempt's ``failed`` status, timestamps
+    and child job id, which the aggregate then reports as the current attempt's.
+
+    Both existing call sites address a stage the kind provably has:
+    ``_kind_plan(record.kind).run_stage_id`` (the drift guard in
+    ``tests/test_web_pipeline_aggregate.py`` asserts every plan's run stage is
+    on its own kind's stage set) and the literal ``"confirm"`` (in every kind's
+    stage set -- it is the shared human gate; see ``specs/pipeline.py``).
+    """
+
+    _assert_stage_exists(record, stage_id, operation="reset")
     new_stages = tuple(
         StageRecord(stage_id=stage.stage_id) if stage.stage_id == stage_id else stage for stage in record.stages
     )
@@ -2141,6 +2184,12 @@ def create_pipeline_as_fallback(
     which is then terminalized (aborted) -- atomically from the caller's
     point of view, so there is no window where both the new draft and the
     old failure are simultaneously "live" without the lineage link recorded.
+
+    Reject-by-kind, the SAME named guard ``fork_pipeline_from_failure`` applies:
+    this exit re-parses an IDEA TEXT into a factor, which is factor_study's
+    contract and nothing else's. rd_optimize is seeded from an already-resolved
+    factor and carries no idea text (and no ``parse`` stage to advance), so a
+    fallback on one is refused by name here.
     """
 
     # P2-F3 (agent sidecar clarify -- documented decision, NOT built here): the
@@ -2160,6 +2209,19 @@ def create_pipeline_as_fallback(
     with store.lock:
         old = store.load(parent_pipeline_id)
         old = _reconcile(old, store=store, job_manager=job_manager, config=config)
+        # Reject-by-kind, checked FIRST -- ahead of the status gate (so the
+        # reason names the real cause, exactly as /fork does) and ahead of the
+        # parse workflow (so a kind this exit does not serve never spends a
+        # server-side parse before being refused). Reaching the body would also
+        # advance a "parse" stage that only factor_study has, turning a wrong
+        # kind into a PipelineStageError deep inside a half-built record instead
+        # of a named refusal at the door.
+        if old.kind != "factor_study":
+            raise PipelineConflictError(
+                f"/fallback-rule-parse is not available for kind={old.kind}; "
+                "re-parsing an idea text into a factor is factor_study's exit -- pipeline B (rd_optimize) "
+                "is seeded from an already-resolved factor and has no idea text to re-parse"
+            )
         if old.status != "paused_failure":
             raise PipelineConflictError(f"pipeline {parent_pipeline_id} is not paused (status={old.status})")
         text = _source_text_for(old)
