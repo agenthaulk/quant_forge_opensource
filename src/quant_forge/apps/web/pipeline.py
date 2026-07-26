@@ -228,7 +228,7 @@ capture_planning_influence = _default_capture_planning_influence
 
 
 # ---------------------------------------------------------------------------
-# Kind config. Both pipeline kinds share the aggregate (record, journal,
+# Kind config. Every pipeline kind shares the aggregate (record, journal,
 # idempotent confirm, rejoin, expiry, attempt lineage, freeze); they differ
 # ONLY in their compute/terminal stage ids and their compute-stage side
 # effects. `_KindPlan` is the single place that divergence is declared, so the
@@ -237,9 +237,9 @@ capture_planning_influence = _default_capture_planning_influence
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class _KindPlan:
-    run_stage_id: str  # the stage a child job runs under ("compute" | "run")
+    run_stage_id: str  # the stage a child job runs under ("compute" | "run" | "backtest")
     terminal_stage_id: str  # the TERMINAL display stage ("report" | "leaderboard")
-    publishes: bool  # factor_study publishes a canonical factor on success; rd does not
+    publishes: bool  # factor_study publishes a canonical factor on success; rd/timing do not
     run_job_ref_kind: str  # artifact_ref.kind counting durable launches for attempt numbering
 
 
@@ -249,6 +249,13 @@ _KIND_PLANS: dict[str, _KindPlan] = {
     ),
     "rd_optimize": _KindPlan(
         run_stage_id="run", terminal_stage_id="leaderboard", publishes=False, run_job_ref_kind="run_job"
+    ),
+    # timing (specs/pipeline.py::TIMING_STAGE_IDS) runs the position-series
+    # backtest under "backtest" and terminates on "report". It publishes no
+    # canonical factor: a position-series study evaluates a caller-supplied
+    # weight series, it does not mint a registry factor definition.
+    "timing": _KindPlan(
+        run_stage_id="backtest", terminal_stage_id="report", publishes=False, run_job_ref_kind="backtest_job"
     ),
 }
 

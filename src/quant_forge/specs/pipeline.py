@@ -8,7 +8,7 @@ statuses and starts its worker immediately) with a real, persisted status
 that can sit `awaiting_confirm` indefinitely with NO worker thread parked on
 a human.
 
-Two kinds are constructible (P3 schema addition, landing exactly as the P1
+Three kinds are constructible (P3 schema addition, landing exactly as the P1
 F14 note below promised — a reviewed schema change, not a today-inert
 placeholder that could be built by accident):
 
@@ -17,8 +17,11 @@ placeholder that could be built by accident):
   seeded from a completed report or a registry factor, never auto-bridged
   from A (spec §2.1). Its N rounds run inside ONE job (spec §2.2), so it is
   three truth-mapped stages, not one-per-round.
+* ``timing`` (信号准备→确认→回测→报告, report TERMINAL), the position-series
+  study backed by
+  :func:`quant_forge.backtesting.position_series.run_position_series_backtest`.
 
-Both kinds share the SAME status graph (``LEGAL_TRANSITIONS`` is keyed by
+All kinds share the SAME status graph (``LEGAL_TRANSITIONS`` is keyed by
 status, not kind) and the SAME idempotent-confirm / rejoin / expiry
 machinery in :mod:`quant_forge.apps.web.pipeline`; only their stage ids and
 their compute-stage side effects differ.
@@ -45,6 +48,7 @@ __all__ = [
     "TERMINAL_PIPELINE_STATUSES",
     "FACTOR_STUDY_STAGE_IDS",
     "RD_OPTIMIZE_STAGE_IDS",
+    "TIMING_STAGE_IDS",
     "STAGE_IDS_BY_KIND",
     "LEGAL_TRANSITIONS",
     "PipelineKind",
@@ -69,8 +73,8 @@ PIPELINE_SCHEMA_VERSION = "qf.pipeline.v1"
 # kinds share the status graph in LEGAL_TRANSITIONS; only stage ids and the
 # compute-stage side effects (publish vs. no-publish) differ, and those live
 # in apps/web/pipeline.py, not in this pure type layer.
-PipelineKind = Literal["factor_study", "rd_optimize"]
-PIPELINE_KINDS: frozenset[str] = frozenset({"factor_study", "rd_optimize"})
+PipelineKind = Literal["factor_study", "rd_optimize", "timing"]
+PIPELINE_KINDS: frozenset[str] = frozenset({"factor_study", "rd_optimize", "timing"})
 
 PipelineStatus = Literal[
     "draft",
@@ -112,9 +116,26 @@ FACTOR_STUDY_STAGE_IDS: tuple[str, ...] = ("parse", "confirm", "compute", "repor
 # mirroring `report` for factor_study.
 RD_OPTIMIZE_STAGE_IDS: tuple[str, ...] = ("confirm", "run", "leaderboard")
 
+# timing = 信号准备 → 确认 → 回测 → 报告. The position-series (single- or
+# multi-instrument) study: `signal_prepare` resolves the target-weight series
+# the run will trade, `backtest` is ONE stage backed by ONE job running
+# `backtesting.position_series.run_position_series_backtest`, and `report` is
+# TERMINAL, mirroring factor_study's shape.
+#
+# The `confirm` stage is NOT optional padding: the shared machinery in
+# apps/web/pipeline.py advances, resets, and re-arms a stage literally named
+# "confirm" on every create / confirm / retry / fork path, and the
+# awaiting_confirm status is the server-side human gate itself. A kind without
+# it could not traverse the shared status graph, so the honest minimal timing
+# stage set is four ids, not three. Honest stage granularity (D11) still
+# applies: no per-parameter or per-segment stages exist until the backend emits
+# real events for them.
+TIMING_STAGE_IDS: tuple[str, ...] = ("signal_prepare", "confirm", "backtest", "report")
+
 STAGE_IDS_BY_KIND: dict[str, tuple[str, ...]] = {
     "factor_study": FACTOR_STUDY_STAGE_IDS,
     "rd_optimize": RD_OPTIMIZE_STAGE_IDS,
+    "timing": TIMING_STAGE_IDS,
 }
 
 # Legal transitions (spec §2.3). Keyed by FROM status; value is the set of

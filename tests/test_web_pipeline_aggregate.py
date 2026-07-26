@@ -32,6 +32,8 @@ from quant_forge.apps.web.pipeline import (
     PipelineConflictError,
     PipelineNotFoundError,
     PipelineStore,
+    _KIND_PLANS,
+    _kind_plan,
     _working_factor_id_for,
     cancel_pipeline,
     confirm_pipeline,
@@ -60,6 +62,7 @@ from quant_forge.specs.pipeline import (
     LEGAL_TRANSITIONS,
     PIPELINE_KINDS,
     RD_OPTIMIZE_STAGE_IDS,
+    TIMING_STAGE_IDS,
     ConfirmState,
     PipelineRecord,
     can_transition,
@@ -148,12 +151,12 @@ def test_legal_transitions_cover_every_status_and_terminal_statuses_are_closed()
 
 
 def test_rd_optimize_is_now_a_first_class_kind_with_three_stages() -> None:
-    assert PIPELINE_KINDS == frozenset({"factor_study", "rd_optimize"})
+    assert PIPELINE_KINDS == frozenset({"factor_study", "rd_optimize", "timing"})
     assert RD_OPTIMIZE_STAGE_IDS == ("confirm", "run", "leaderboard")
     stages = initial_stages_for("rd_optimize")
     assert tuple(stage.stage_id for stage in stages) == RD_OPTIMIZE_STAGE_IDS
     # An unknown kind is STILL a hard error -- the vocabulary is closed to the
-    # two real kinds, not opened wide.
+    # three real kinds, not opened wide.
     with pytest.raises(ValueError, match="unknown pipeline kind"):
         initial_stages_for("totally_made_up_kind")
 
@@ -200,6 +203,75 @@ def test_pipeline_record_from_dict_round_trips_rd_optimize() -> None:
     assert record.kind == "rd_optimize"
     assert record.to_dict()["kind"] == "rd_optimize"
     assert record.planning_influence_hash == ""
+
+
+# ---------------------------------------------------------------------------
+# timing: the position-series study kind (upstream batch 3). Same schema
+# addition discipline as rd_optimize -- a reviewed vocabulary entry with its
+# own stage ids and its own kind plan, sharing the one status graph.
+# ---------------------------------------------------------------------------
+
+
+def test_timing_is_a_first_class_kind_with_its_own_stages() -> None:
+    assert TIMING_STAGE_IDS == ("signal_prepare", "confirm", "backtest", "report")
+    stages = initial_stages_for("timing")
+    assert tuple(stage.stage_id for stage in stages) == TIMING_STAGE_IDS
+    # The shared machinery advances / resets / re-arms a stage literally named
+    # "confirm" on every create, confirm, retry and fork path, so the stage set
+    # must carry it: the human gate is not optional padding.
+    assert "confirm" in TIMING_STAGE_IDS
+
+    record = PipelineRecord(
+        pipeline_id="PL_" + "c" * 32,
+        kind="timing",
+        created_at="2026-01-01T00:00:00Z",
+        expires_at="2026-01-02T00:00:00Z",
+        status="draft",
+        stages=initial_stages_for("timing"),
+        input_hash="deadbeef",
+        confirm=ConfirmState(nonce="n"),
+    )
+    assert record.kind == "timing"
+    with pytest.raises(ValueError, match="stages must map 1:1"):
+        PipelineRecord(
+            pipeline_id="PL_" + "d" * 32,
+            kind="timing",
+            created_at="2026-01-01T00:00:00Z",
+            expires_at="2026-01-02T00:00:00Z",
+            status="draft",
+            stages=initial_stages_for("rd_optimize"),
+            input_hash="deadbeef",
+            confirm=ConfirmState(nonce="n"),
+        )
+
+    payload = {
+        "pipeline_id": "PL_" + "c" * 32,
+        "kind": "timing",
+        "created_at": "2026-01-01T00:00:00Z",
+        "expires_at": "2026-01-02T00:00:00Z",
+        "status": "draft",
+        "stages": [{"stage_id": stage_id, "status": "pending"} for stage_id in TIMING_STAGE_IDS],
+        "input_hash": "deadbeef",
+        "confirm": {"nonce": "n", "version": 1},
+    }
+    assert PipelineRecord.from_dict(payload).to_dict()["kind"] == "timing"
+
+
+def test_every_pipeline_kind_declares_a_kind_plan() -> None:
+    # The kind vocabulary and the kind-plan table cannot drift: a kind with no
+    # plan would raise deep inside the shared reconciliation path instead of at
+    # the schema boundary.
+    assert set(_KIND_PLANS) == set(PIPELINE_KINDS)
+    plan = _kind_plan("timing")
+    assert plan.run_stage_id == "backtest"
+    assert plan.terminal_stage_id == "report"
+    assert plan.publishes is False
+    assert plan.run_job_ref_kind == "backtest_job"
+    # Every plan's stage ids are real stage ids of that kind.
+    for kind, kind_plan in _KIND_PLANS.items():
+        stage_ids = tuple(stage.stage_id for stage in initial_stages_for(kind))
+        assert kind_plan.run_stage_id in stage_ids, kind
+        assert kind_plan.terminal_stage_id in stage_ids, kind
 
 
 # ---------------------------------------------------------------------------
