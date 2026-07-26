@@ -65,20 +65,63 @@ by ``execution_price`` (``close`` or ``open``).
   the realized short notional.
 * NAV compounds the period returns: ``nav[0] = 1.0`` on the first execution bar
   and ``nav[j+1] = nav[j] * (1 + return[j])``.
-* The weights targeted for the LAST bar are never established (no interval
-  follows it), so no closing trade is charged there. The unestablished book is
-  reported as ``diagnostics["unexecuted_terminal_weights"]`` and disclosed in
-  ``assumptions``.
+
+Terminal-bar settlement
+-----------------------
+An execution bar that EXISTS on the calendar establishes its target book, and
+the LAST bar is an execution bar like any other. So when ``W[n-1]`` differs from
+``W[n-2]`` the trade is executed at bar ``n-1``'s execution price and its
+``sum_i |W[n-1][i] - W[n-2][i]|`` trade cost is charged; no holding or borrow
+interval follows it (there is no bar ``n``), so its gross return, price
+relatives and borrow accrual are all exactly zero. It is emitted as a period row
+with ``is_terminal_settlement=True`` and ``entry_date == exit_date ==`` the last
+bar, so the ``nav_series``/``period_rows`` alignment (one NAV row per period plus
+the base) is unchanged and the cost is visible in the same series every other
+cost is. A terminal bar whose book does NOT change trades nothing and emits no
+settlement row.
+
+A signal on one of the last ``delay`` bars has an execution bar BEYOND the
+calendar and therefore executes nothing at all. Those books are disclosed in
+full -- every leg, including the legs targeted flat, because "close this short"
+is exactly as unexecuted as "open this long" -- via
+``diagnostics["unexecuted_terminal_weights"]`` (the latest such book),
+``diagnostics["unexecuted_signal_books"]`` (all of them) and
+``diagnostics["unexecuted_signal_dates"]``.
+
+Capital exhaustion (compounding terminates)
+-------------------------------------------
+A NAV step that lands at or below zero FREEZES that channel's NAV at exactly
+``0.0``: the book has no capital left, so compounding terminates there. The
+recurrence ``nav[j+1] = nav[j] * (1 + return[j])`` still holds verbatim (``0.0``
+multiplies to ``0.0``), and the period-return rows AFTER the exhaustion bar are
+truncated in meaning -- they report the book's arithmetic return but no longer
+move any capital, and the exhaustion bar is named in
+``diagnostics["gross_capital_exhausted_period"]`` /
+``["net_capital_exhausted_period"]`` with the ``CAPITAL_EXHAUSTED`` warning code.
+Without the freeze a levered wipe-out carries a NEGATIVE NAV forward and a
+subsequent LOSS raises it (``-0.20 * (1 - 0.20) = -0.16``), reporting a recovery
+no book can make and a drawdown past ``-1.0``. With it, ``max_drawdown`` is
+bounded below by ``-1.0`` structurally -- by the NAV series it reads, not by a
+clamp on a second copy of the drawdown formula.
 
 Fail-closed input gate
 ----------------------
 ``execution_price="open"`` against a panel with no ``open`` column raises
 :class:`PositionSeriesInputError` (code ``EXECUTION_PRICE_COLUMN_UNAVAILABLE``);
 it never falls back to ``close``. Likewise a non-finite or non-positive
-execution price on a bar where the instrument carries a non-zero weight raises
-(``UNMARKABLE_HELD_POSITION``) instead of imputing a return -- mapping an
-unavailable price to a flat position is the caller's (data layer's) decision,
-made explicit as a ``0.0`` target weight.
+execution price on a bar where the instrument carries a non-zero weight (or
+trades at the terminal settlement) raises (``UNMARKABLE_HELD_POSITION``) instead
+of imputing a return -- mapping an unavailable price to a flat position is the
+caller's (data layer's) decision, made explicit as a ``0.0`` target weight.
+
+The gate is TOTAL over every number that enters the math. ``trade_date`` is
+parsed with an explicit ``format="ISO8601"`` (never an inferred format, which
+can read the same column two different ways) and anything that does not parse --
+on EITHER frame -- is ``INVALID_TRADE_DATE``. Every numeric field of the cost
+model is checked finite and non-negative (``INVALID_COST_MODEL``):
+``TransactionCostModel.__post_init__`` rejects negative rates, but ``NaN < 0``
+and ``inf < 0`` are both ``False``, so a non-finite rate would otherwise reach
+the cost math intact and turn every downstream return, NAV and metric into NaN.
 
 Honest metrics
 --------------
@@ -86,13 +129,20 @@ Summary metrics are :class:`~quant_forge.core.contracts.MetricValue` with the
 kernel's tri-state vocabulary. Annualized return is suppressed to ``None`` /
 ``insufficient_sample`` below the same half-year basis the engine uses
 (:data:`~quant_forge.backtesting.service.MIN_ANNUALIZATION_EXPOSURE_DAYS`,
-rescaled to the configured ``periods_per_year``); Sharpe is suppressed below two
-periods or at zero dispersion. No metric is ever faked as ``0.0``.
+rescaled to the configured ``periods_per_year`` and rounded UP, so a frequency
+that lands mid-bar cannot report an annualization off a basis short of the half
+year); Sharpe is suppressed below two periods or at zero dispersion. A source
+series carrying a non-finite value suppresses every metric derived from it to
+``None`` / ``unavailable_source_series`` + ``NON_FINITE_RETURN_SERIES`` -- the
+same rule ``service.py``'s ``max_drawdown`` block applies. No metric is ever
+faked as ``0.0``.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
 from typing import Any, Literal
 
 import numpy as np
@@ -111,9 +161,12 @@ from quant_forge.core.contracts import (
 )
 
 __all__ = [
+    "CAPITAL_EXHAUSTED",
+    "NON_FINITE_RETURN_SERIES",
     "POSITION_SERIES_ERROR_CODES",
     "POSITION_SERIES_ROLE",
     "SAME_PERIOD_EXECUTION",
+    "TERMINAL_BAR_SETTLEMENT",
     "TRADING_PERIODS_PER_YEAR",
     "PositionSeriesBacktestResult",
     "PositionSeriesInputError",
@@ -130,6 +183,15 @@ TRADING_PERIODS_PER_YEAR = 252.0
 POSITION_COLUMNS: tuple[str, str, str] = ("trade_date", "instrument", "target_weight")
 REQUIRED_PRICE_COLUMNS: tuple[str, str] = ("trade_date", "instrument")
 EXECUTION_PRICE_CHOICES: tuple[str, str] = ("close", "open")
+# EVERY field of TransactionCostModel, read off the dataclass itself rather than
+# hand-listed, so a rate added upstream is gated the day it appears instead of
+# slipping past a subset someone forgot to extend.
+_COST_MODEL_FIELDS: tuple[str, ...] = tuple(item.name for item in dataclass_fields(TransactionCostModel))
+# ISO 8601 is the ONLY accepted spelling of a trade date, stated explicitly so
+# pandas never infers a format per call -- an inference that reads 03/04/2026 as
+# March 4 or April 3 depending on the rest of the column, and silently reads a
+# bare integer as a nanosecond epoch.
+_TRADE_DATE_FORMAT = "ISO8601"
 
 # Structured precondition codes. Closed vocabulary in BOTH directions -- every
 # raise uses one of these AND every one of these is reachable -- asserted by
@@ -149,6 +211,8 @@ NON_FINITE_TARGET_WEIGHT = "NON_FINITE_TARGET_WEIGHT"
 SIGNAL_DATE_OUTSIDE_CALENDAR = "SIGNAL_DATE_OUTSIDE_CALENDAR"
 CALENDAR_TOO_SHORT = "CALENDAR_TOO_SHORT"
 UNMARKABLE_HELD_POSITION = "UNMARKABLE_HELD_POSITION"
+INVALID_COST_MODEL = "INVALID_COST_MODEL"
+INVALID_TRADE_DATE = "INVALID_TRADE_DATE"
 
 POSITION_SERIES_ERROR_CODES: tuple[str, ...] = (
     MISSING_POSITION_COLUMNS,
@@ -165,13 +229,18 @@ POSITION_SERIES_ERROR_CODES: tuple[str, ...] = (
     SIGNAL_DATE_OUTSIDE_CALENDAR,
     CALENDAR_TOO_SHORT,
     UNMARKABLE_HELD_POSITION,
+    INVALID_COST_MODEL,
+    INVALID_TRADE_DATE,
 )
 
 # Disclosure codes. The two annualization/Sharpe codes are the ENGINE's own
 # spellings (imported above), so a reader sees one vocabulary across both
-# entries; SAME_PERIOD_EXECUTION is new because the engine has no zero-delay
-# mode to disclose.
+# entries; the three below are new because the engine has no zero-delay mode,
+# no terminal-bar settlement and no per-channel NAV floor to disclose.
 SAME_PERIOD_EXECUTION = "SAME_PERIOD_EXECUTION"
+TERMINAL_BAR_SETTLEMENT = "TERMINAL_BAR_SETTLEMENT"
+CAPITAL_EXHAUSTED = "CAPITAL_EXHAUSTED"
+NON_FINITE_RETURN_SERIES = "NON_FINITE_RETURN_SERIES"
 
 # How many offending rows an error payload lists before truncating; a bounded
 # sample keeps the message actionable without echoing an entire panel.
@@ -209,6 +278,13 @@ class PositionSeriesPeriod:
     ``entry_date`` minus the configured delay); ``carried_forward`` marks the
     periods where that book is older than the delay alone would imply because
     the position table has no row for the intervening bar.
+
+    ``is_terminal_settlement`` marks the ZERO-LENGTH row that executes the last
+    bar's target book (``entry_date == exit_date``, gross return / price
+    relatives / borrow all exactly zero, trade cost only); see the module
+    docstring. Rows after a capital-exhaustion bar still report the book's
+    arithmetic return, but the NAV they carry is frozen at ``0.0``, so those
+    returns move nothing.
     """
 
     period_id: int
@@ -231,17 +307,23 @@ class PositionSeriesPeriod:
     gross_nav: float
     net_nav: float
     carried_forward: bool
+    is_terminal_settlement: bool = False
 
 
 @dataclass(frozen=True)
 class PositionSeriesBacktestResult:
     """Structured position-series backtest output.
 
-    ``nav_series`` has one row per execution bar INCLUDING the ``1.0`` base at
-    the first bar, so it is one longer than ``period_rows``; ``period_rows`` is
-    simultaneously the period-return series, the held-position series, and the
-    per-period turnover series (one row carries all three), which keeps the
-    three from ever drifting out of alignment.
+    ``nav_series`` carries the ``1.0`` base at the first execution bar followed
+    by one row per period, so it is always exactly one longer than
+    ``period_rows`` and ``period_rows[j].net_nav == nav_series[j + 1]["net_nav"]``;
+    ``period_rows`` is simultaneously the period-return series, the held-position
+    series, and the per-period turnover series (one row carries all three), which
+    keeps the three from ever drifting out of alignment. When the last bar
+    settles a changed book (module docstring, "Terminal-bar settlement") that
+    zero-length row is the final entry of both, so the last two ``nav_series``
+    rows share the terminal ``trade_date``: the pre-trade mark and the
+    post-trade mark of the same bar.
     """
 
     periods: int
@@ -313,10 +395,49 @@ def _minimum_annualization_periods(periods_per_year: float) -> int:
     Derived FROM ``MIN_ANNUALIZATION_EXPOSURE_DAYS`` (126 of 252 trading days)
     so the daily case reproduces the engine's gate exactly and an intraday
     frequency scales to the same wall-clock half year.
+
+    Rounded UP, never to nearest: a frequency whose half year lands mid-bar
+    (``253`` bars/year -> ``126.5``, ``365`` -> ``182.5``) must require the bar
+    that COMPLETES the half year, and ``round`` would hand back a basis one bar
+    short of it -- ``round(126.5) == 126`` under banker's rounding, so the gate
+    would pass a sample that has not reached the horizon it annualizes from.
     """
 
     scaled = periods_per_year * MIN_ANNUALIZATION_EXPOSURE_DAYS / TRADING_PERIODS_PER_YEAR
-    return max(1, int(round(scaled)))
+    return max(1, int(math.ceil(scaled)))
+
+
+def _is_finite_non_negative(value: object) -> bool:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    return bool(np.isfinite(number)) and number >= 0.0
+
+
+def _validated_cost_model(costs: TransactionCostModel) -> TransactionCostModel:
+    """Total input gate over EVERY numeric field of the cost model.
+
+    ``TransactionCostModel.__post_init__`` rejects negative rates, but ``NaN < 0``
+    and ``inf < 0`` are both ``False``, so a non-finite rate constructs cleanly
+    and would reach the cost math intact -- turning every trade cost, net period
+    return, NAV and derived metric into NaN, with the fault surfacing far from
+    where it entered. Naming it here keeps the failure structured and local.
+    """
+
+    offenders = [
+        {"field": name, "value": repr(getattr(costs, name, None))}
+        for name in _COST_MODEL_FIELDS
+        if not _is_finite_non_negative(getattr(costs, name, None))
+    ]
+    if offenders:
+        raise PositionSeriesInputError(
+            "every transaction-cost rate must be a finite, non-negative number of basis points; "
+            "a cost that cannot be quoted is the caller's decision to express as an explicit 0.0",
+            code=INVALID_COST_MODEL,
+            details={"invalid_fields": offenders},
+        )
+    return costs
 
 
 # ---------------------------------------------------------------------------
@@ -345,9 +466,58 @@ def _normalized_frame(
             details={"frame": label, "missing_columns": missing, "present_columns": list(frame.columns)},
         )
     normalized = frame.copy()
-    normalized["trade_date"] = pd.to_datetime(normalized["trade_date"])
+    normalized["trade_date"] = _parsed_trade_dates(normalized["trade_date"], label=label)
     normalized["instrument"] = normalized["instrument"].astype(str)
     return normalized
+
+
+def _parsed_trade_dates(column: pd.Series, *, label: str) -> pd.Series:
+    """Parse ``trade_date`` under an EXPLICIT format, on BOTH frames.
+
+    A bare ``pd.to_datetime`` infers a format from whatever the column happens
+    to contain, so the same calendar can parse two different ways on two
+    different inputs (day-first vs month-first, integers as nanosecond epochs)
+    and an unparsable value raises an untyped pandas error. Here the format is
+    pinned to ISO 8601 and anything that does not parse -- including a null,
+    which is a date the caller did not supply -- is a structured
+    ``INVALID_TRADE_DATE`` naming the offending values.
+    """
+
+    try:
+        parsed = pd.to_datetime(column, format=_TRADE_DATE_FORMAT)
+    except (ValueError, TypeError) as exc:
+        raise PositionSeriesInputError(
+            f"{label}.trade_date must parse as ISO 8601 timestamps; no format is inferred",
+            code=INVALID_TRADE_DATE,
+            details={
+                "frame": label,
+                "format": _TRADE_DATE_FORMAT,
+                "sample": _unparsable_trade_dates(column),
+            },
+        ) from exc
+    missing = parsed.isna()
+    if bool(missing.any()):
+        raise PositionSeriesInputError(
+            f"{label}.trade_date carries {int(missing.sum())} null date(s); every row must be dated",
+            code=INVALID_TRADE_DATE,
+            details={
+                "frame": label,
+                "format": _TRADE_DATE_FORMAT,
+                "null_count": int(missing.sum()),
+            },
+        )
+    return parsed
+
+
+def _unparsable_trade_dates(column: pd.Series) -> list[str]:
+    """A bounded sample of the values that failed to parse (best effort)."""
+
+    try:
+        coerced = pd.to_datetime(column, format=_TRADE_DATE_FORMAT, errors="coerce")
+    except (ValueError, TypeError):
+        return [repr(value) for value in column.head(_ERROR_SAMPLE_LIMIT).tolist()]
+    offending = coerced.isna()
+    return [repr(value) for value in column[offending].head(_ERROR_SAMPLE_LIMIT).tolist()]
 
 
 def _reject_duplicates(frame: pd.DataFrame, *, label: str, code: str) -> None:
@@ -448,19 +618,25 @@ def _assert_marked(
     instruments: list[str],
     price_column: str,
 ) -> None:
-    """Every bar that bounds a held position must carry a usable price.
+    """Every bar that bounds a held position or executes a trade must carry a
+    usable price.
 
     A weight is live over ``[j, j + 1]``, so both ends must be finite and
     strictly positive; otherwise the price relative is undefined and the honest
-    answer is a structured failure, not an imputed return.
+    answer is a structured failure, not an imputed return. The LAST bar is an
+    execution bar too: a leg whose target changes there trades at that bar's
+    price even though no interval follows, so it is required to be markable on
+    the same terms.
     """
 
     live = np.zeros(price_matrix.shape, dtype=bool)
-    period_count = price_matrix.shape[0] - 1
-    for bar_index in range(period_count):
+    last_bar = price_matrix.shape[0] - 1
+    for bar_index in range(last_bar):
         carrying = held[bar_index] != 0.0
         live[bar_index] |= carrying
         live[bar_index + 1] |= carrying
+    if last_bar >= 1:
+        live[last_bar] |= held[last_bar] != held[last_bar - 1]
     usable = np.isfinite(price_matrix) & (price_matrix > 0.0)
     offending = live & ~usable
     if not bool(offending.any()):
@@ -476,11 +652,33 @@ def _assert_marked(
         for row, column in list(zip(rows, columns, strict=True))[:_ERROR_SAMPLE_LIMIT]
     ]
     raise PositionSeriesInputError(
-        f"a non-zero position is held across a bar with no usable {price_column!r} price "
-        "(a finite, strictly positive quote is required at both ends of every holding interval)",
+        f"a position is held across, or traded on, a bar with no usable {price_column!r} price "
+        "(a finite, strictly positive quote is required at both ends of every holding interval "
+        "and on every bar a leg's target changes)",
         code=UNMARKABLE_HELD_POSITION,
         details={"unmarkable_count": int(offending.sum()), "sample": sample},
     )
+
+
+def _compounded(nav: float, period_return: float) -> float:
+    """One NAV compounding step, with compounding TERMINATED at zero equity.
+
+    An equity that reaches zero or below has no capital left to compound: the
+    NAV is frozen at exactly ``0.0`` and every later step multiplies ``0.0``, so
+    the recurrence ``nav[j+1] = nav[j] * (1 + return[j])`` still holds verbatim
+    while the series can never go negative and a later LOSS can never raise it
+    (``-0.20 * (1 - 0.20) = -0.16`` is a recovery no book can make). A
+    non-finite step is propagated untouched rather than floored to ``0.0`` --
+    faking it as a wipe-out would hide the fault the metric tri-state exists to
+    report.
+    """
+
+    if nav <= 0.0:
+        return 0.0
+    stepped = nav * (1.0 + period_return)
+    if not np.isfinite(stepped):
+        return float(stepped)
+    return float(stepped) if stepped > 0.0 else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +712,8 @@ def run_position_series_backtest(
         transaction_costs: Reused verbatim from the engine's cost contract.
             ``commission_bps`` + ``slippage_bps`` charge traded notional;
             ``short_borrow_bps_annual`` accrues on held short notional,
-            de-annualized by ``periods_per_year``.
+            de-annualized by ``periods_per_year``. Every rate must be finite and
+            non-negative (``INVALID_COST_MODEL``).
         execution_price: ``"close"`` or ``"open"``. A requested column that the
             panel does not carry is a structured error, never a silent fallback.
         execution_delay_periods: Bars between a signal bar and its execution
@@ -534,7 +733,7 @@ def run_position_series_backtest(
             ``code`` from :data:`POSITION_SERIES_ERROR_CODES`.
     """
 
-    costs = transaction_costs or TransactionCostModel()
+    costs = _validated_cost_model(transaction_costs or TransactionCostModel())
     if not isinstance(execution_delay_periods, (int, np.integer)) or isinstance(execution_delay_periods, bool):
         raise PositionSeriesInputError(
             f"execution_delay_periods must be an integer, got {type(execution_delay_periods).__name__}",
@@ -643,6 +842,8 @@ def run_position_series_backtest(
     net_nav = 1.0
     previous_weights = np.zeros(len(instruments), dtype=float)
     carried_forward_periods = 0
+    gross_exhausted_period: int | None = None
+    net_exhausted_period: int | None = None
     for bar_index in range(bar_count - 1):
         weights = held[bar_index]
         carrying = weights != 0.0
@@ -659,8 +860,12 @@ def run_position_series_backtest(
         borrow_cost = short_notional * borrow_rate_per_period
         transaction_cost = trade_cost + borrow_cost
         net_period_return = gross_period_return - transaction_cost
-        gross_nav *= 1.0 + gross_period_return
-        net_nav *= 1.0 + net_period_return
+        gross_nav = _compounded(gross_nav, gross_period_return)
+        net_nav = _compounded(net_nav, net_period_return)
+        if gross_nav == 0.0 and gross_exhausted_period is None:
+            gross_exhausted_period = bar_index
+        if net_nav == 0.0 and net_exhausted_period is None:
+            net_exhausted_period = bar_index
         source_bar = held_sources[bar_index]
         is_carried = source_bar is not None and source_bar < bar_index - delay
         if is_carried:
@@ -706,7 +911,72 @@ def run_position_series_backtest(
         )
         previous_weights = weights
 
+    # Terminal-bar settlement. The last bar is an execution bar like any other:
+    # a target book that differs from the one held into it IS established there
+    # and pays its |dw| trade cost at that bar's execution price. What does NOT
+    # follow it is an interval, so the gross return, the price relatives and the
+    # borrow accrual of this row are all exactly zero -- and a terminal book
+    # that does not change trades nothing, so no row is emitted at all.
+    terminal_bar = bar_count - 1
+    terminal_weights_vector = held[terminal_bar]
+    terminal_delta = terminal_weights_vector - previous_weights
+    terminal_traded_notional = float(np.abs(terminal_delta).sum())
+    terminal_settlement_executed = terminal_traded_notional > 0.0
+    if terminal_settlement_executed:
+        terminal_trade_cost = float(terminal_traded_notional * trade_rate)
+        terminal_net_return = -terminal_trade_cost
+        net_nav = _compounded(net_nav, terminal_net_return)
+        if net_nav == 0.0 and net_exhausted_period is None:
+            net_exhausted_period = terminal_bar
+        terminal_source_bar = held_sources[terminal_bar]
+        terminal_is_carried = (
+            terminal_source_bar is not None and terminal_source_bar < terminal_bar - delay
+        )
+        if terminal_is_carried:
+            carried_forward_periods += 1
+        period_rows.append(
+            PositionSeriesPeriod(
+                period_id=terminal_bar,
+                signal_date=(
+                    timeline[terminal_source_bar].date().isoformat()
+                    if terminal_source_bar is not None
+                    else None
+                ),
+                entry_date=timeline[terminal_bar].date().isoformat(),
+                exit_date=timeline[terminal_bar].date().isoformat(),
+                weights={
+                    instrument: float(weight)
+                    for instrument, weight in zip(instruments, terminal_weights_vector, strict=True)
+                    if weight != 0.0
+                },
+                long_exposure=float(np.clip(terminal_weights_vector, 0.0, None).sum()),
+                short_exposure=float(np.clip(-terminal_weights_vector, 0.0, None).sum()),
+                gross_exposure=float(np.abs(terminal_weights_vector).sum()),
+                net_exposure=float(terminal_weights_vector.sum()),
+                price_relatives={},
+                gross_period_return=0.0,
+                net_period_return=terminal_net_return,
+                traded_notional=terminal_traded_notional,
+                turnover=terminal_traded_notional / 2.0,
+                trade_cost=terminal_trade_cost,
+                borrow_cost=0.0,
+                transaction_cost=terminal_trade_cost,
+                gross_nav=gross_nav,
+                net_nav=net_nav,
+                carried_forward=terminal_is_carried,
+                is_terminal_settlement=True,
+            )
+        )
+        nav_series.append(
+            {
+                "trade_date": timeline[terminal_bar].date().isoformat(),
+                "gross_nav": gross_nav,
+                "net_nav": net_nav,
+            }
+        )
+
     periods = len(period_rows)
+    holding_periods = bar_count - 1
     gross_returns = np.array([row.gross_period_return for row in period_rows], dtype=float)
     net_returns = np.array([row.net_period_return for row in period_rows], dtype=float)
     gross_cumulative_return = float(gross_nav - 1.0)
@@ -714,10 +984,47 @@ def run_position_series_backtest(
     minimum_periods = _minimum_annualization_periods(periods_per_year)
 
     metrics: dict[str, MetricValue] = {}
+    non_finite_channels: list[str] = []
     for prefix, returns, cumulative, nav_key in (
         ("", gross_returns, gross_cumulative_return, "gross_nav"),
         ("net_", net_returns, net_cumulative_return, "net_nav"),
     ):
+        # The NAV base (1.0 at the first execution bar) is excluded here because
+        # ``service._max_drawdown`` prepends its own 1.0 start; passing both
+        # would double the base point without changing the result.
+        drawdown_navs = np.array([float(row[nav_key]) for row in nav_series[1:]], dtype=float)
+        # Tri-state gate on the SOURCE SERIES, ahead of every statistic derived
+        # from it (annualized return, Sharpe, drawdown, terminal equity). A
+        # non-finite return or NAV -- an overflow on an extreme book, say --
+        # makes each of them unknowable, and the honest report is null + the
+        # kernel's ``unavailable_source_series`` status, never a 0.0 standing in
+        # for a number nobody has.
+        series_is_finite = bool(
+            np.isfinite(returns).all()
+            and np.isfinite(drawdown_navs).all()
+            and np.isfinite(cumulative)
+        )
+        if not series_is_finite:
+            non_finite_channels.append(nav_key)
+            for suffix, unit, minimum, method, source in (
+                ("annualized_return", "return", minimum_periods, "geometric_annualization_period_basis",
+                 "position_series_period_returns"),
+                ("sharpe", "ratio", 2, "period_return_mean_over_std_scaled",
+                 "position_series_period_returns"),
+                ("max_drawdown", "return", 1, "peak_to_trough_nav", f"position_series_{nav_key}"),
+            ):
+                metrics[f"{prefix}{suffix}"] = MetricValue(
+                    value=None,
+                    unit=unit,
+                    status="unavailable_source_series",
+                    observation_count=periods,
+                    minimum_required=minimum,
+                    method=method,
+                    source_series=source,
+                    sample_role=sample_role,
+                    warning_codes=(NON_FINITE_RETURN_SERIES,),
+                )
+            continue
         # Same reportability rule as ``service._annualization_metric``: the
         # value is suppressed below the half-year basis UNLESS the book was
         # wiped out, which is -100% annualized over any horizon. The
@@ -750,19 +1057,24 @@ def run_position_series_backtest(
             sample_role=sample_role,
             warning_codes=() if sharpe is not None else (INSUFFICIENT_SHARPE_OBSERVATIONS,),
         )
-        # The NAV base (1.0 at the first execution bar) is excluded here because
-        # ``service._max_drawdown`` prepends its own 1.0 start; passing both
-        # would double the base point without changing the result.
-        drawdown_navs = np.array([float(row[nav_key]) for row in nav_series[1:]], dtype=float)
+        # ``service._max_drawdown`` is reused verbatim -- there is no second copy
+        # of the drawdown math here, and no clamp on top of it. The -1.0 floor is
+        # STRUCTURAL: ``_compounded`` never lets a NAV go below 0.0, so the worst
+        # ratio the engine's own formula can return off this series is
+        # ``0.0 / peak - 1 == -1.0``. Status follows ``service.py``'s own
+        # convention for this metric: available when a value exists, otherwise
+        # ``unavailable_source_series`` (taken above).
+        max_drawdown = float(_max_drawdown(drawdown_navs)) if len(drawdown_navs) else None
         metrics[f"{prefix}max_drawdown"] = MetricValue(
-            value=float(_max_drawdown(drawdown_navs)),
+            value=max_drawdown,
             unit="return",
-            status="available",
+            status="available" if max_drawdown is not None else "unavailable_source_series",
             observation_count=periods,
             minimum_required=1,
             method="peak_to_trough_nav",
             source_series=f"position_series_{nav_key}",
             sample_role=sample_role,
+            warning_codes=() if max_drawdown is not None else (NON_FINITE_RETURN_SERIES,),
         )
 
     warning_code_items: list[str] = []
@@ -782,16 +1094,57 @@ def run_position_series_backtest(
             "the position table has no row for the intervening bar; each such period reports its actual "
             "signal_date and carried_forward=True"
         )
-    terminal_weights = {
-        instrument: float(weight)
-        for instrument, weight in zip(instruments, held[bar_count - 1], strict=True)
-        if weight != 0.0
-    }
+    if terminal_settlement_executed:
+        warning_code_items.append(TERMINAL_BAR_SETTLEMENT)
+        warning_items.append(
+            f"the target book of the final bar differs from the one held into it, so it was ESTABLISHED "
+            f"there: {terminal_traded_notional:.10g} of traded notional charged at that bar's "
+            f"{price_column} price, with no holding or borrow interval following it"
+        )
+    for channel, exhausted_period in (("gross", gross_exhausted_period), ("net", net_exhausted_period)):
+        if exhausted_period is None:
+            continue
+        if CAPITAL_EXHAUSTED not in warning_code_items:
+            warning_code_items.append(CAPITAL_EXHAUSTED)
+        warning_items.append(
+            f"{channel} equity reached zero at period {exhausted_period}; compounding terminates there and "
+            f"{channel}_nav is frozen at 0.0, so every later period return is reported but moves no capital"
+        )
+    if non_finite_channels:
+        warning_items.append(
+            "a non-finite value entered the "
+            + ", ".join(sorted(non_finite_channels))
+            + " series, so every statistic derived from it is reported as null + "
+            "unavailable_source_series rather than a fabricated number"
+        )
     # A signal on one of the last `delay` bars has no execution bar on this
     # calendar at all, so it can move nothing. Disclosed rather than silently
-    # dropped: a caller whose whole tail of signals does nothing must be able
-    # to see it in the result.
-    unexecutable_signal_bars = int(np.count_nonzero(signal_positions + delay > bar_count - 1))
+    # dropped -- and disclosed IN FULL: every leg of every such book, including
+    # the legs targeted flat, because "close this short" is exactly as
+    # unexecuted as "open this long" and a non-zero filter would hide half of
+    # what did not happen.
+    unexecutable_slots = [
+        slot for slot, position in enumerate(signal_positions) if int(position) + delay > bar_count - 1
+    ]
+    unexecutable_signal_bars = len(unexecutable_slots)
+    unexecuted_signal_dates = tuple(
+        timeline[int(signal_positions[slot])].date().isoformat() for slot in unexecutable_slots
+    )
+    unexecuted_signal_books = tuple(
+        {
+            "trade_date": timeline[int(signal_positions[slot])].date().isoformat(),
+            "target_weights": {
+                instrument: float(weight)
+                for instrument, weight in zip(instruments, signal_weights[slot], strict=True)
+            },
+        }
+        for slot in unexecutable_slots
+    )
+    terminal_weights: dict[str, float] = (
+        dict(unexecuted_signal_books[-1]["target_weights"])  # type: ignore[arg-type]
+        if unexecuted_signal_books
+        else {}
+    )
     if unexecutable_signal_bars:
         warning_items.append(
             f"{unexecutable_signal_bars} signal bar(s) fall within the last {delay} bar(s) of the calendar, "
@@ -843,12 +1196,24 @@ def run_position_series_backtest(
         diagnostics={
             "bar_count": bar_count,
             "signal_bar_count": int(len(signal_positions)),
+            "holding_periods": holding_periods,
             "carried_forward_periods": carried_forward_periods,
             "unexecutable_signal_bars": unexecutable_signal_bars,
             "long_periods": int(sum(1 for row in period_rows if row.net_exposure > 0.0)),
             "short_periods": int(sum(1 for row in period_rows if row.net_exposure < 0.0)),
             "flat_periods": int(sum(1 for row in period_rows if row.gross_exposure == 0.0)),
+            # The COMPLETE target book(s) that never reached an execution bar --
+            # every leg, zero-weight legs included. ``unexecuted_terminal_weights``
+            # is the latest of them (the book that would ultimately have been
+            # held); ``unexecuted_signal_books`` carries all of them.
             "unexecuted_terminal_weights": terminal_weights,
+            "unexecuted_signal_books": unexecuted_signal_books,
+            "unexecuted_signal_dates": unexecuted_signal_dates,
+            "terminal_settlement_executed": terminal_settlement_executed,
+            "terminal_settlement_traded_notional": terminal_traded_notional,
+            "gross_capital_exhausted_period": gross_exhausted_period,
+            "net_capital_exhausted_period": net_exhausted_period,
+            "non_finite_metric_source_series": tuple(non_finite_channels),
             "minimum_annualization_periods": minimum_periods,
         },
         warning_codes=tuple(dict.fromkeys(warning_code_items)),
@@ -866,6 +1231,11 @@ def _assumptions(*, execution_price: str, delay: int) -> tuple[str, ...]:
         f"period returns are {execution_price}-to-{execution_price} price relatives of the execution bars",
         "transaction costs are configurable research assumptions",
         "short borrow accrues on held short notional, de-annualized by periods_per_year",
-        "the target book of the final bar is never established and carries no closing trade cost",
+        "a target book whose execution bar exists on the calendar is established there, the FINAL bar "
+        "included: its |dw| trade cost is charged at that bar's execution price and no holding or borrow "
+        "interval follows it",
+        "a signal whose execution bar falls beyond the calendar establishes nothing; its complete target "
+        "book is disclosed in diagnostics rather than charged or held",
+        "equity at or below zero terminates compounding: NAV is frozen at 0.0 from that period on",
         "annualization spans every evaluated bar, including bars the book is flat",
     )

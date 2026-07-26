@@ -30,6 +30,7 @@ versions of the same math.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 
 import numpy as np
@@ -42,23 +43,30 @@ from quant_forge.backtesting import (
 )
 from quant_forge.backtesting.position_series import (
     CALENDAR_TOO_SHORT,
+    CAPITAL_EXHAUSTED,
     DUPLICATE_POSITION_ROWS,
     DUPLICATE_PRICE_ROWS,
     EMPTY_POSITION_SERIES,
     EMPTY_PRICE_PANEL,
     EXECUTION_PRICE_COLUMN_UNAVAILABLE,
+    INVALID_COST_MODEL,
     INVALID_EXECUTION_DELAY,
     INVALID_EXECUTION_PRICE,
     INVALID_PERIODS_PER_YEAR,
+    INVALID_TRADE_DATE,
     MISSING_POSITION_COLUMNS,
     MISSING_PRICE_COLUMNS,
+    NON_FINITE_RETURN_SERIES,
     NON_FINITE_TARGET_WEIGHT,
     POSITION_SERIES_ERROR_CODES,
     SAME_PERIOD_EXECUTION,
     SIGNAL_DATE_OUTSIDE_CALENDAR,
+    TERMINAL_BAR_SETTLEMENT,
     TRADING_PERIODS_PER_YEAR,
     UNMARKABLE_HELD_POSITION,
+    _COST_MODEL_FIELDS,
     _annualized_return_periodic,
+    _compounded,
     _minimum_annualization_periods,
     _sharpe_periodic,
 )
@@ -76,9 +84,11 @@ DATES_6 = pd.bdate_range("2026-01-05", periods=6)
 DATES_5 = pd.bdate_range("2026-01-05", periods=5)
 DATES_4 = pd.bdate_range("2026-01-05", periods=4)
 
-# 2520 bps a year is exactly 0.001 of notional per trading day (252 bars), so a
-# borrow accrual stays hand-checkable.
-BORROW_BPS_ONE_BP_PER_DAY = 2520.0
+# 2520 bps a year over a 252-bar year is exactly 10 bp -- 0.001 of notional --
+# per bar, so a borrow accrual stays hand-checkable. The name states the
+# per-PERIOD rate the arithmetic below actually uses (2520 / 252 = 10 bp); an
+# earlier spelling claimed 1 bp, which no expected value in this file matches.
+BORROW_BPS_TEN_BP_PER_PERIOD = 2520.0
 
 
 def _prices(dates: pd.DatetimeIndex, **columns: dict[str, list[float]]) -> pd.DataFrame:
@@ -111,7 +121,7 @@ def _positions(pairs: list[tuple[pd.Timestamp, str, float]]) -> pd.DataFrame:
 #   +0.20, +0.25, -0.20, -0.20, +0.25
 A_CLOSES = [100.0, 120.0, 150.0, 120.0, 96.0, 120.0]
 A_COSTS = TransactionCostModel(
-    commission_bps=10.0, slippage_bps=5.0, short_borrow_bps_annual=BORROW_BPS_ONE_BP_PER_DAY
+    commission_bps=10.0, slippage_bps=5.0, short_borrow_bps_annual=BORROW_BPS_TEN_BP_PER_PERIOD
 )
 
 
@@ -319,7 +329,7 @@ def test_open_execution_against_a_panel_without_an_open_column_fails_closed() ->
 C_CLOSES_A = [100.0, 110.0, 99.0, 108.9]  # relatives +0.10, -0.10, +0.10
 C_CLOSES_B = [200.0, 180.0, 198.0, 178.2]  # relatives -0.10, +0.10, -0.10
 C_COSTS = TransactionCostModel(
-    commission_bps=8.0, slippage_bps=2.0, short_borrow_bps_annual=BORROW_BPS_ONE_BP_PER_DAY
+    commission_bps=8.0, slippage_bps=2.0, short_borrow_bps_annual=BORROW_BPS_TEN_BP_PER_PERIOD
 )
 
 
@@ -338,25 +348,62 @@ def test_vector_c_multi_instrument_fractional_weights() -> None:
     result = run_position_series_backtest(positions, prices, transaction_costs=C_COSTS)
 
     assert result.instruments == ("AAA", "BBB")
-    assert result.periods == 3
-    # P1: 0.5*(-0.10) + (-0.5)*(+0.10) = -0.10 ; P2: (-1.0)*(-0.10) = +0.10
+    # Three holding intervals PLUS the terminal-bar settlement: bar 2's signal
+    # (AAA +1.0 / BBB flat) executes on bar 3, which exists on the calendar, so
+    # that book is established and charged there.
+    assert result.diagnostics["holding_periods"] == 3
+    assert result.periods == 4
+    assert [row.is_terminal_settlement for row in result.period_rows] == [False, False, False, True]
+    settlement = result.period_rows[3]
+    assert settlement.entry_date == settlement.exit_date == DATES_4[3].date().isoformat()
+    assert settlement.weights == {"AAA": 1.0}
+    assert settlement.price_relatives == {}
+
+    # P1: 0.5*(-0.10) + (-0.5)*(+0.10) = -0.10 ; P2: (-1.0)*(-0.10) = +0.10 ;
+    # the settlement has no interval, so its gross return is a true zero.
     assert [row.gross_period_return for row in result.period_rows] == pytest.approx(
-        [0.0, -0.10, 0.10], rel=1e-9
+        [0.0, -0.10, 0.10, 0.0], rel=1e-9
     )
-    assert [row.traded_notional for row in result.period_rows] == pytest.approx([0.0, 1.0, 1.0], rel=REL)
-    assert [row.short_exposure for row in result.period_rows] == pytest.approx([0.0, 0.5, 1.0], rel=REL)
-    # borrow accrual is linear in the short notional actually held
+    # Terminal traded notional: |1.0 - 0.0| (AAA opened) + |0.0 - (-1.0)| (BBB
+    # covered) = 2.0, so 2.0 + 2.0 = 4.0 over the run.
+    assert [row.traded_notional for row in result.period_rows] == pytest.approx(
+        [0.0, 1.0, 1.0, 2.0], rel=REL
+    )
+    assert result.traded_notional_total == pytest.approx(4.0, rel=REL)
+    assert [row.short_exposure for row in result.period_rows] == pytest.approx(
+        [0.0, 0.5, 1.0, 0.0], rel=REL
+    )
+    # borrow accrual is linear in the short notional actually held, and the
+    # settlement holds nothing over any interval, so it accrues exactly nothing
     assert [row.borrow_cost for row in result.period_rows] == pytest.approx(
-        [0.0, 0.0005, 0.0010], rel=REL
+        [0.0, 0.0005, 0.0010, 0.0], rel=REL
     )
+    # 10 bps on traded notional: 0.0010, 0.0010, and 2.0 * 0.0010 = 0.0020
     assert [row.trade_cost for row in result.period_rows] == pytest.approx(
-        [0.0, 0.0010, 0.0010], rel=REL
+        [0.0, 0.0010, 0.0010, 0.0020], rel=REL
     )
+    assert result.trade_cost_total == pytest.approx(0.0040, rel=REL)
+    assert result.borrow_cost_total == pytest.approx(0.0015, rel=REL)
     assert [row.net_period_return for row in result.period_rows] == pytest.approx(
-        [0.0, -0.1015, 0.0980], rel=1e-9
+        [0.0, -0.1015, 0.0980, -0.0020], rel=1e-9
     )
+    # Gross is untouched by the settlement (it earns nothing and costs nothing
+    # gross), so the gross book still ends at 0.99.
     assert result.gross_cumulative_return == pytest.approx(-0.01, rel=1e-9)
-    assert result.net_cumulative_return == pytest.approx(0.8985 * 1.0980 - 1.0, rel=1e-9)
+    # Net compounds the settlement as its own step, exactly as every other cost
+    # compounds: 1.0 * 0.8985 * 1.0980 * 0.9980 = 0.984579894.
+    assert result.net_cumulative_return == pytest.approx(0.8985 * 1.0980 * 0.9980 - 1.0, rel=1e-9)
+    assert result.cost_reconciliation["net_terminal_equity"] == pytest.approx(0.984579894, rel=1e-9)
+    # NAV stays one row longer than the period series; the last two rows are the
+    # pre-trade and post-trade marks of the same terminal bar.
+    assert len(result.nav_series) == result.periods + 1
+    assert [row["trade_date"] for row in result.nav_series[-2:]] == [
+        DATES_4[3].date().isoformat(),
+        DATES_4[3].date().isoformat(),
+    ]
+    assert [row["net_nav"] for row in result.nav_series[-2:]] == pytest.approx(
+        [0.986553, 0.984579894], rel=1e-9
+    )
     # A weight of exactly zero is a real flat leg: it never appears in the held
     # book and its price relative is not reported as if it had been earned.
     assert result.period_rows[2].weights == {"BBB": -1.0}
@@ -443,11 +490,13 @@ def test_a_wiped_out_book_reports_minus_one_regardless_of_the_short_basis() -> N
     basis too short to annualize a surviving book -- while the short-history
     disclosure still fires."""
 
-    # A 2x long book into a -60% bar: 1 + 2*(-0.6) = -0.2 terminal equity.
+    # A 2x long book into a -60% bar: 1 + 2*(-0.6) = -0.2 arithmetic equity, so
+    # the book is wiped out and compounding terminates at 0.0 (see
+    # test_capital_exhaustion_freezes_nav_at_zero_and_floors_drawdown).
     prices = _prices(DATES_4, close={"CU": [100.0, 100.0, 40.0, 40.0]})
     positions = _positions([(DATES_4[0], "CU", 2.0)])
     result = run_position_series_backtest(positions, prices)
-    assert result.gross_cumulative_return == pytest.approx(-1.2, rel=1e-9)
+    assert result.gross_cumulative_return == pytest.approx(-1.0, rel=1e-9)
     annualized = result.metrics["annualized_return"]
     assert annualized.value == -1.0
     assert annualized.status == "available"
@@ -478,28 +527,44 @@ def test_metric_provenance_covers_every_metric() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_no_lookahead_future_price_cannot_affect_earlier_navs() -> None:
+@pytest.mark.parametrize("delay", [0, 1])
+def test_no_lookahead_future_price_cannot_affect_earlier_navs(delay: int) -> None:
+    """Perturbing the bar-3 close may move periods 2 and 3 onward (bar 3 bounds
+    them) and NOTHING earlier, at EITHER execution delay -- the price window a
+    period consumes is fixed by the period, not by the signal delay."""
+
     positions, prices = _vector_a_inputs()
-    baseline = run_position_series_backtest(positions, prices, transaction_costs=A_COSTS)
+    baseline = run_position_series_backtest(
+        positions, prices, transaction_costs=A_COSTS, execution_delay_periods=delay
+    )
 
     perturbed_closes = list(A_CLOSES)
     perturbed_closes[3] = 999.0
     perturbed = run_position_series_backtest(
-        positions, _prices(DATES_6, close={"CU": perturbed_closes}), transaction_costs=A_COSTS
+        positions,
+        _prices(DATES_6, close={"CU": perturbed_closes}),
+        transaction_costs=A_COSTS,
+        execution_delay_periods=delay,
     )
-    # Bar 3 bounds periods 2 and 3 only; everything strictly earlier is
-    # byte-identical, and the later periods DID move (the vector is live).
+    # Strictly earlier than the perturbed bar: byte-identical.
     assert perturbed.period_rows[:2] == baseline.period_rows[:2]
     assert perturbed.nav_series[:3] == baseline.nav_series[:3]
+    # From the window the bar bounds: the vector is live, so it MOVED.
     assert perturbed.period_rows[2].gross_period_return != baseline.period_rows[2].gross_period_return
 
 
-def test_no_lookahead_signal_cannot_affect_earlier_periods() -> None:
-    positions, prices = _vector_a_inputs()
-    baseline = run_position_series_backtest(positions, prices, transaction_costs=A_COSTS)
+@pytest.mark.parametrize("delay", [0, 1])
+def test_no_lookahead_signal_cannot_affect_earlier_periods(delay: int) -> None:
+    """Flipping the bar-2 signal may move the period that first HOLDS it --
+    period ``2 + delay`` -- and nothing before it. Both directions are asserted
+    at both delays: unchanged before the window, changed at the window."""
 
-    # Flip the bar-2 signal (+1 instead of -1). It executes on bar 3, so only
-    # periods 3 and 4 may move.
+    positions, prices = _vector_a_inputs()
+    baseline = run_position_series_backtest(
+        positions, prices, transaction_costs=A_COSTS, execution_delay_periods=delay
+    )
+
+    # Flip the bar-2 signal (+1 instead of -1).
     flipped = _positions(
         [
             (DATES_6[0], "CU", 1.0),
@@ -509,36 +574,220 @@ def test_no_lookahead_signal_cannot_affect_earlier_periods() -> None:
             (DATES_6[4], "CU", 0.0),
         ]
     )
-    result = run_position_series_backtest(flipped, prices, transaction_costs=A_COSTS)
-    assert result.period_rows[:3] == baseline.period_rows[:3]
-    assert result.nav_series[:4] == baseline.nav_series[:4]
-    assert result.period_rows[3].net_exposure == 1.0
+    result = run_position_series_backtest(
+        flipped, prices, transaction_costs=A_COSTS, execution_delay_periods=delay
+    )
+    first_affected = 2 + delay
+    assert result.period_rows[:first_affected] == baseline.period_rows[:first_affected]
+    assert result.nav_series[: first_affected + 1] == baseline.nav_series[: first_affected + 1]
+    assert result.period_rows[first_affected].net_exposure == 1.0
+    assert baseline.period_rows[first_affected].net_exposure == -1.0
 
-    # The book targeted for the FINAL bar is never established (no interval
-    # follows it): every period row is unchanged and the unestablished book is
-    # disclosed rather than charged as a free closing trade.
+
+# ---------------------------------------------------------------------------
+# Terminal-bar settlement: an execution bar that EXISTS trades; one that does
+# not exist is disclosed in full.
+# ---------------------------------------------------------------------------
+
+
+def test_a_target_book_whose_execution_bar_is_the_last_bar_is_established_there() -> None:
+    """The final bar is an execution bar like any other. A book that changes
+    there IS traded: the |dw| cost is charged at that bar's execution price, and
+    the row carries no holding interval, so no return and no borrow."""
+
+    positions, prices = _vector_a_inputs()
+    baseline = run_position_series_backtest(positions, prices, transaction_costs=A_COSTS)
+
     terminal_target = _positions(
         [
             (DATES_6[0], "CU", 1.0),
             (DATES_6[1], "CU", 1.0),
             (DATES_6[2], "CU", -1.0),
             (DATES_6[3], "CU", 0.0),
-            (DATES_6[4], "CU", -1.0),  # would establish on bar 5; no interval follows
+            (DATES_6[4], "CU", -1.0),  # establishes on bar 5, the last bar
         ]
     )
     with_terminal = run_position_series_backtest(terminal_target, prices, transaction_costs=A_COSTS)
-    assert with_terminal.period_rows == baseline.period_rows
-    assert with_terminal.transaction_cost_total == pytest.approx(baseline.transaction_cost_total, rel=REL)
-    assert with_terminal.diagnostics["unexecuted_terminal_weights"] == {"CU": -1.0}
-    assert any("final bar is never established" in item for item in with_terminal.assumptions)
 
-    # A signal whose execution bar falls beyond the calendar entirely is
-    # counted and disclosed, never silently dropped.
+    # Every HOLDING interval is untouched -- a trade on the last bar cannot
+    # reach backwards -- and the settlement is appended after them.
+    assert with_terminal.period_rows[:5] == baseline.period_rows
+    assert with_terminal.periods == baseline.periods + 1
+    assert with_terminal.diagnostics["holding_periods"] == baseline.diagnostics["holding_periods"]
+    settlement = with_terminal.period_rows[5]
+    assert settlement.is_terminal_settlement is True
+    assert settlement.entry_date == settlement.exit_date == DATES_6[5].date().isoformat()
+    assert settlement.weights == {"CU": -1.0}
+    assert settlement.gross_period_return == 0.0
+    assert settlement.borrow_cost == 0.0
+    # |-1.0 - 0.0| = 1.0 of notional at (10 + 5) bps
+    assert settlement.traded_notional == pytest.approx(1.0, rel=REL)
+    assert settlement.trade_cost == pytest.approx(0.0015, rel=REL)
+    assert settlement.net_period_return == pytest.approx(-0.0015, rel=REL)
+    assert with_terminal.transaction_cost_total == pytest.approx(
+        baseline.transaction_cost_total + 0.0015, rel=REL
+    )
+    # Compounded as its own step on top of the baseline's terminal equity.
+    assert with_terminal.cost_reconciliation["net_terminal_equity"] == pytest.approx(
+        baseline.cost_reconciliation["net_terminal_equity"] * (1.0 - 0.0015), rel=REL
+    )
+    assert with_terminal.cost_reconciliation["gross_terminal_equity"] == pytest.approx(
+        baseline.cost_reconciliation["gross_terminal_equity"], rel=REL
+    )
+    assert TERMINAL_BAR_SETTLEMENT in with_terminal.warning_codes
+    # It executed, so nothing is left unexecuted.
+    assert with_terminal.diagnostics["unexecuted_terminal_weights"] == {}
+    assert with_terminal.diagnostics["unexecuted_signal_books"] == ()
+    assert any("FINAL bar included" in item for item in with_terminal.assumptions)
+
+    # A terminal book that does NOT change trades nothing: no settlement row, no
+    # cost, no warning -- baseline itself is that case.
+    assert baseline.diagnostics["terminal_settlement_executed"] is False
+    assert baseline.diagnostics["terminal_settlement_traded_notional"] == 0.0
+    assert TERMINAL_BAR_SETTLEMENT not in baseline.warning_codes
+    assert all(row.is_terminal_settlement is False for row in baseline.period_rows)
+
+
+def test_a_signal_whose_execution_bar_is_beyond_the_calendar_discloses_every_leg() -> None:
+    """An execution bar that does not exist executes nothing, and the whole
+    unexecuted book is disclosed -- every leg, the legs targeted flat
+    included, because 'close this short' is exactly as unexecuted as 'open this
+    long' and a non-zero filter would hide half of what did not happen."""
+
+    positions, prices = _vector_a_inputs()
+    baseline = run_position_series_backtest(positions, prices, transaction_costs=A_COSTS)
+
     beyond = pd.concat([positions, _positions([(DATES_6[5], "CU", -1.0)])], ignore_index=True)
     unexecutable = run_position_series_backtest(beyond, prices, transaction_costs=A_COSTS)
     assert unexecutable.period_rows == baseline.period_rows
+    assert unexecutable.transaction_cost_total == pytest.approx(baseline.transaction_cost_total, rel=REL)
     assert unexecutable.diagnostics["unexecutable_signal_bars"] == 1
+    assert unexecutable.diagnostics["unexecuted_signal_dates"] == (DATES_6[5].date().isoformat(),)
+    assert unexecutable.diagnostics["unexecuted_terminal_weights"] == {"CU": -1.0}
+    assert unexecutable.diagnostics["unexecuted_signal_books"] == (
+        {"trade_date": DATES_6[5].date().isoformat(), "target_weights": {"CU": -1.0}},
+    )
     assert any("execution bar does not exist" in item for item in unexecutable.warnings)
+
+    # The flat legs of an unexecuted book are disclosed too: BBB going to 0.0 is
+    # a short that never got covered, and dropping it from the disclosure would
+    # report only half the unexecuted book.
+    two_name_prices = _prices(DATES_4, close={"AAA": [100.0] * 4, "BBB": [100.0] * 4})
+    two_name_positions = _positions(
+        [
+            (DATES_4[0], "AAA", 0.0),
+            (DATES_4[0], "BBB", -1.0),
+            (DATES_4[3], "AAA", 1.0),  # never executes: bar 3 + delay 1 is off-calendar
+            (DATES_4[3], "BBB", 0.0),  # the leg an earlier disclosure dropped
+        ]
+    )
+    partial = run_position_series_backtest(two_name_positions, two_name_prices)
+    assert partial.diagnostics["unexecuted_terminal_weights"] == {"AAA": 1.0, "BBB": 0.0}
+
+
+def test_a_leg_that_only_trades_on_the_terminal_bar_must_still_be_markable() -> None:
+    """The terminal settlement executes at that bar's price, so a leg opening
+    there needs a usable quote even though it was flat over every interval."""
+
+    prices = _prices(
+        DATES_4,
+        close={"AAA": [100.0, 110.0, 121.0, 133.1], "BBB": [50.0, 55.0, 60.0, float("nan")]},
+    )
+    positions = _positions(
+        [(DATES_4[0], "AAA", 1.0), (DATES_4[2], "AAA", 0.0), (DATES_4[2], "BBB", 1.0)]
+    )
+    with pytest.raises(PositionSeriesInputError) as excinfo:
+        run_position_series_backtest(positions, prices)
+    assert excinfo.value.code == UNMARKABLE_HELD_POSITION
+    assert excinfo.value.details["sample"][0]["instrument"] == "BBB"
+
+
+# ---------------------------------------------------------------------------
+# Capital exhaustion: compounding terminates, it does not go negative.
+# ---------------------------------------------------------------------------
+
+
+def test_capital_exhaustion_freezes_nav_at_zero_and_floors_drawdown() -> None:
+    """The reported scenario: a 2x book into -60% then -10%.
+
+    Arithmetic compounding carries -0.20 forward and the SECOND loss RAISES it
+    to -0.16 -- a recovery no book can make, off a NAV that is already
+    impossible, with a drawdown past -1.0. Equity at or below zero must instead
+    terminate compounding at exactly 0.0.
+    """
+
+    prices = _prices(DATES_4, close={"CU": [100.0, 100.0, 40.0, 36.0]})
+    positions = _positions([(DATES_4[0], "CU", 2.0)])
+    result = run_position_series_backtest(positions, prices)
+
+    # The period returns are reported verbatim -- the book really did lose 120%
+    # and then 20% -- but the NAV they move is frozen from the wipe-out on.
+    assert [row.gross_period_return for row in result.period_rows] == pytest.approx(
+        [0.0, -1.20, -0.20], rel=1e-9
+    )
+    navs = [row["gross_nav"] for row in result.nav_series]
+    assert navs == pytest.approx([1.0, 1.0, 0.0, 0.0], rel=REL)
+    assert all(value >= 0.0 for value in navs), "NAV must never go negative"
+    # No loss may lift the cumulative: the series is monotone non-increasing
+    # from the wipe-out onward.
+    assert navs[3] <= navs[2]
+    assert result.gross_cumulative_return == pytest.approx(-1.0, rel=1e-9)
+    assert result.net_cumulative_return == pytest.approx(-1.0, rel=1e-9)
+
+    drawdown = result.metrics["max_drawdown"]
+    assert drawdown.status == "available"
+    assert drawdown.value == pytest.approx(-1.0, rel=REL)
+    assert drawdown.value >= -1.0, "max_drawdown is bounded below by -1.0"
+    assert result.metrics["net_max_drawdown"].value >= -1.0
+
+    assert result.diagnostics["gross_capital_exhausted_period"] == 1
+    assert result.diagnostics["net_capital_exhausted_period"] == 1
+    assert CAPITAL_EXHAUSTED in result.warning_codes
+    assert any("compounding terminates" in item for item in result.warnings)
+    assert any("terminates compounding" in item for item in result.assumptions)
+
+
+def test_the_compounding_step_floors_at_zero_but_never_fakes_a_non_finite_one() -> None:
+    """A non-finite step must PROPAGATE so the metric tri-state can report it;
+    flooring it to 0.0 would disguise an unknown as a wipe-out."""
+
+    assert _compounded(1.0, 0.10) == pytest.approx(1.10, rel=REL)
+    assert _compounded(1.0, -1.0) == 0.0
+    assert _compounded(1.0, -1.5) == 0.0
+    assert _compounded(0.0, 5.0) == 0.0  # frozen: no later gain revives it
+    assert math.isnan(_compounded(1.0, float("nan")))
+    assert math.isinf(_compounded(1.0, float("inf")))
+
+
+def test_a_non_finite_source_series_suppresses_every_metric_derived_from_it() -> None:
+    """An overflowing book leaves no knowable Sharpe, annualized return,
+    drawdown or terminal value. Each is reported null + the kernel's
+    ``unavailable_source_series`` status -- never available, never 0.0."""
+
+    # A finite, strictly positive panel (so the mark gate passes) and a finite
+    # weight, whose PRODUCT overflows the float range: weight 1e10 against a
+    # price relative of ~1e308.
+    prices = _prices(DATES_4, close={"CU": [1.0, 1e308, 1e308, 1e308]})
+    positions = _positions([(DATES_4[0], "CU", 1e10)])
+    with np.errstate(over="ignore", invalid="ignore"):
+        result = run_position_series_backtest(positions, prices, execution_delay_periods=0)
+
+    assert result.diagnostics["non_finite_metric_source_series"] == ("gross_nav", "net_nav")
+    for key in (
+        "annualized_return",
+        "net_annualized_return",
+        "sharpe",
+        "net_sharpe",
+        "max_drawdown",
+        "net_max_drawdown",
+    ):
+        metric = result.metrics[key]
+        assert metric.value is None, key
+        assert metric.status == "unavailable_source_series", key
+        assert NON_FINITE_RETURN_SERIES in metric.warning_codes, key
+    assert NON_FINITE_RETURN_SERIES in result.warning_codes
+    # Provenance still describes every metric, including the suppressed ones.
+    assert set(result.metric_provenance) == set(result.metrics)
 
 
 def test_execution_delay_zero_is_disclosed_and_shifts_the_book_one_bar_earlier() -> None:
@@ -614,6 +863,20 @@ def test_annualization_gate_is_derived_from_the_engine_constant_and_scales() -> 
     assert _minimum_annualization_periods(0.5) == 1
 
 
+def test_an_odd_frequency_rounds_the_annualization_gate_UP_not_to_nearest() -> None:
+    """A half year that lands mid-bar must require the bar that COMPLETES it.
+
+    Rounding to nearest hands back a basis one bar SHORT of the half year --
+    and under banker's rounding ``round(126.5) == 126``, so the gate would let a
+    253-bar-a-year series annualize off 126 bars of a 126.5-bar half year.
+    """
+
+    # 253 * 126 / 252 = 126.5 -> 127, not 126.
+    assert _minimum_annualization_periods(253.0) == 127
+    # 365 * 126 / 252 = 182.5 -> 183, not 182.
+    assert _minimum_annualization_periods(365.0) == 183
+
+
 def test_periods_per_year_drives_annualization_and_borrow_de_annualization() -> None:
     positions, prices = _vector_a_inputs()
     intraday = run_position_series_backtest(
@@ -626,7 +889,7 @@ def test_periods_per_year_drives_annualization_and_borrow_de_annualization() -> 
     assert intraday.metrics["annualized_return"].value == pytest.approx(1.20 ** (8.0 / 5.0) - 1.0, rel=REL)
     # The same annual borrow rate over a coarser bar accrues proportionally more.
     assert intraday.borrow_cost_total == pytest.approx(
-        BORROW_BPS_ONE_BP_PER_DAY / 10_000.0 / 8.0, rel=REL
+        BORROW_BPS_TEN_BP_PER_PERIOD / 10_000.0 / 8.0, rel=REL
     )
 
 
@@ -666,6 +929,14 @@ def test_every_precondition_failure_carries_a_code_from_the_closed_set() -> None
             positions,
             _prices(DATES_6, close={"CU": [100.0, 120.0, float("nan"), 120.0, 96.0, 120.0]}),
         ),
+        _raise_code(
+            positions,
+            prices,
+            transaction_costs=TransactionCostModel(commission_bps=float("nan")),
+        ),
+        # BOTH frames are gated, so both directions are exercised here.
+        _raise_code(positions.assign(trade_date="not-a-date"), prices),
+        _raise_code(positions, prices.assign(trade_date="not-a-date")),
     }
     # Every declared code is reachable, and nothing is raised outside the set.
     assert observed == set(POSITION_SERIES_ERROR_CODES)
@@ -684,7 +955,114 @@ def test_every_precondition_failure_carries_a_code_from_the_closed_set() -> None
         SIGNAL_DATE_OUTSIDE_CALENDAR,
         CALENDAR_TOO_SHORT,
         UNMARKABLE_HELD_POSITION,
+        INVALID_COST_MODEL,
+        INVALID_TRADE_DATE,
     }
+
+
+# ---------------------------------------------------------------------------
+# The gate is TOTAL over the numbers that enter the math: cost rates and dates.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["commission_bps", "slippage_bps", "short_borrow_bps_annual"],
+)
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_a_non_finite_cost_rate_is_rejected_at_the_gate(field: str, bad: float) -> None:
+    """``TransactionCostModel.__post_init__`` rejects negative rates, but
+    ``NaN < 0`` and ``inf < 0`` are both False, so a non-finite rate constructs
+    cleanly. It must be refused HERE rather than reaching the cost math and
+    turning every downstream return, NAV and metric into a NaN reported as if
+    it were a number."""
+
+    positions, prices = _vector_a_inputs()
+    costs = TransactionCostModel(**{field: bad})
+    with pytest.raises(PositionSeriesInputError) as excinfo:
+        run_position_series_backtest(positions, prices, transaction_costs=costs)
+    assert excinfo.value.code == INVALID_COST_MODEL
+    assert [item["field"] for item in excinfo.value.details["invalid_fields"]] == [field]
+
+
+def test_the_cost_gate_covers_every_field_of_the_cost_model() -> None:
+    """The gated field set is read off the dataclass, so it cannot fall behind a
+    rate added upstream."""
+
+    assert set(_COST_MODEL_FIELDS) == {item.name for item in dataclasses.fields(TransactionCostModel)}
+
+
+def test_the_audit_scenario_a_nan_commission_is_rejected_not_propagated() -> None:
+    """Regression for the reported scenario: commission_bps=NaN. The expected
+    behavior is refusal at the input gate -- not a run that completes and
+    reports NaN costs, NaN NAVs and metrics marked available."""
+
+    positions, prices = _vector_a_inputs()
+    with pytest.raises(PositionSeriesInputError) as excinfo:
+        run_position_series_backtest(
+            positions,
+            prices,
+            transaction_costs=TransactionCostModel(commission_bps=float("nan"), slippage_bps=5.0),
+        )
+    assert excinfo.value.code == INVALID_COST_MODEL
+    assert "finite, non-negative" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("frame", ["positions", "prices"])
+def test_an_unparsable_trade_date_is_rejected_on_either_frame(frame: str) -> None:
+    positions, prices = _vector_a_inputs()
+    if frame == "positions":
+        positions = positions.assign(trade_date=["2026-01-05", "nope", "2026-01-07", "2026-01-08", "2026-01-09"])
+    else:
+        prices = prices.assign(trade_date=["nope"] * len(prices))
+    with pytest.raises(PositionSeriesInputError) as excinfo:
+        run_position_series_backtest(positions, prices)
+    assert excinfo.value.code == INVALID_TRADE_DATE
+    assert excinfo.value.details["frame"] == frame
+    assert excinfo.value.details["format"] == "ISO8601"
+    assert "'nope'" in excinfo.value.details["sample"]
+
+
+@pytest.mark.parametrize("frame", ["positions", "prices"])
+def test_a_null_trade_date_is_rejected_on_either_frame(frame: str) -> None:
+    """A row with no date is a date that did not parse, not a row to drop."""
+
+    positions, prices = _vector_a_inputs()
+    if frame == "positions":
+        positions = positions.assign(trade_date=[DATES_6[0], None, DATES_6[2], DATES_6[3], DATES_6[4]])
+    else:
+        prices = prices.assign(trade_date=[None] * len(prices))
+    with pytest.raises(PositionSeriesInputError) as excinfo:
+        run_position_series_backtest(positions, prices)
+    assert excinfo.value.code == INVALID_TRADE_DATE
+    assert excinfo.value.details["frame"] == frame
+
+
+def test_the_trade_date_format_is_explicit_so_no_shape_is_inferred() -> None:
+    """The same calendar spelled as ISO strings, ``date`` objects and
+    ``Timestamp``s parses identically -- and an integer, which an inferred
+    parse would silently read as a nanosecond epoch, is refused."""
+
+    _, prices = _vector_a_inputs()
+    baseline = run_position_series_backtest(*_vector_a_inputs(), transaction_costs=A_COSTS)
+    for spelling in (
+        [date.date().isoformat() for date in DATES_6[:5]],
+        [date.date() for date in DATES_6[:5]],
+        list(DATES_6[:5]),
+    ):
+        positions = _positions(
+            [(DATES_6[0], "CU", 1.0), (DATES_6[1], "CU", 1.0), (DATES_6[2], "CU", -1.0),
+             (DATES_6[3], "CU", 0.0), (DATES_6[4], "CU", 0.0)]
+        ).assign(trade_date=spelling)
+        assert run_position_series_backtest(
+            positions, prices, transaction_costs=A_COSTS
+        ).period_rows == baseline.period_rows
+
+    with pytest.raises(PositionSeriesInputError) as excinfo:
+        run_position_series_backtest(
+            _positions([(DATES_6[0], "CU", 1.0)]).assign(trade_date=[0]), prices
+        )
+    assert excinfo.value.code == INVALID_TRADE_DATE
 
 
 def test_an_unmarkable_bar_under_a_zero_weight_is_not_an_error() -> None:

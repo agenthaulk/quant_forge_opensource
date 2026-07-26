@@ -8,18 +8,26 @@ statuses and starts its worker immediately) with a real, persisted status
 that can sit `awaiting_confirm` indefinitely with NO worker thread parked on
 a human.
 
-Three kinds are constructible (P3 schema addition, landing exactly as the P1
-F14 note below promised — a reviewed schema change, not a today-inert
-placeholder that could be built by accident):
+The kind vocabulary carries three kinds (P3 schema addition, landing exactly as
+the P1 F14 note below promised — a reviewed schema change, not a today-inert
+placeholder that could be built by accident). TWO of them are constructible:
 
-* ``factor_study`` (pipeline A: 解析→假设确认→计算→报告, report TERMINAL);
+* ``factor_study`` (pipeline A: 解析→假设确认→计算→报告, report TERMINAL), built
+  by ``apps/web/pipeline.py::create_pipeline`` from a completed parse job;
 * ``rd_optimize`` (pipeline B: RD 确认→RD 运行→排行榜, leaderboard TERMINAL),
-  seeded from a completed report or a registry factor, never auto-bridged
-  from A (spec §2.1). Its N rounds run inside ONE job (spec §2.2), so it is
-  three truth-mapped stages, not one-per-round.
-* ``timing`` (信号准备→确认→回测→报告, report TERMINAL), the position-series
-  study backed by
-  :func:`quant_forge.backtesting.position_series.run_position_series_backtest`.
+  built by ``apps/web/pipeline.py::create_rd_pipeline``, seeded from a completed
+  report or a registry factor, never auto-bridged from A (spec §2.1). Its N
+  rounds run inside ONE job (spec §2.2), so it is three truth-mapped stages, not
+  one-per-round.
+* ``timing`` (信号准备→确认→回测→报告, report TERMINAL) contributes its stage
+  vocabulary (:data:`TIMING_STAGE_IDS`) and its ``_KindPlan`` row ONLY. This
+  layer offers no constructor and no confirm launch for it — a confirm on a
+  timing record is refused by name rather than routed down another kind's body
+  — and its construction path belongs to the downstream app that owns the
+  position-series inputs.
+  :func:`quant_forge.backtesting.position_series.run_position_series_backtest`
+  is the computation it will run once that path exists; it is not a
+  construction path this module or the kernel-app layer provides today.
 
 All kinds share the SAME status graph (``LEGAL_TRANSITIONS`` is keyed by
 status, not kind) and the SAME idempotent-confirm / rejoin / expiry

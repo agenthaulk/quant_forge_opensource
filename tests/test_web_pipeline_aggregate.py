@@ -21,6 +21,7 @@ to cross-reference:
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 import time
 
@@ -31,8 +32,10 @@ from quant_forge.apps.web.jobs import _WebJobManager
 from quant_forge.apps.web.pipeline import (
     PipelineConflictError,
     PipelineNotFoundError,
+    PipelineStageError,
     PipelineStore,
     _KIND_PLANS,
+    _advance_stage,
     _kind_plan,
     _working_factor_id_for,
     cancel_pipeline,
@@ -272,6 +275,105 @@ def test_every_pipeline_kind_declares_a_kind_plan() -> None:
         stage_ids = tuple(stage.stage_id for stage in initial_stages_for(kind))
         assert kind_plan.run_stage_id in stage_ids, kind
         assert kind_plan.terminal_stage_id in stage_ids, kind
+
+
+def test_the_confirm_launch_body_is_declared_on_the_plan_not_matched_on_the_kind() -> None:
+    """The confirm dispatch reads ``_KindPlan.confirm_launch``. A kind whose
+    plan declares no launch has no confirm path at all -- it must NOT fall
+    through into another kind's body, which would run the wrong workflow and
+    address a stage id its stage set does not contain."""
+
+    assert _kind_plan("factor_study").confirm_launch == "validate_idea"
+    assert _kind_plan("rd_optimize").confirm_launch == "research_run_once"
+    assert _kind_plan("timing").confirm_launch == ""
+    for kind, kind_plan in _KIND_PLANS.items():
+        if not kind_plan.confirm_launch:
+            continue
+        # A declared launch must address a stage this kind really has.
+        stage_ids = tuple(stage.stage_id for stage in initial_stages_for(kind))
+        assert kind_plan.run_stage_id in stage_ids, kind
+
+
+def test_confirming_a_kind_with_no_launch_path_is_refused_by_name(tmp_path, monkeypatch) -> None:
+    """Before this was plan-driven, ONLY ``kind == "rd_optimize"`` was branched
+    on, so any third kind fell through into factor_study's body and launched
+    validate_idea against a stage set that has no "compute". The plan now
+    decides, and a kind with no declared launch is refused by name."""
+
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(
+        store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config()
+    )
+    # Strip the launch declaration off this record's plan: everything else about
+    # the pipeline is a real, fully-provenanced factor_study aggregate.
+    monkeypatch.setitem(
+        _KIND_PLANS,
+        "factor_study",
+        dataclasses.replace(_kind_plan("factor_study"), confirm_launch=""),
+    )
+    with pytest.raises(PipelineConflictError, match="no confirm launch path"):
+        confirm_pipeline(
+            config,
+            store,
+            pipeline.pipeline_id,
+            nonce=pipeline.confirm.nonce,
+            version=pipeline.confirm.version,
+            job_manager=job_manager,
+            rd_config=_rd_config(),
+        )
+    # Refused, not half-launched: nothing advanced, nothing was persisted as
+    # running, no child job was reserved.
+    reloaded = store.load(pipeline.pipeline_id)
+    assert reloaded.status == "awaiting_confirm"
+    assert reloaded.confirm.confirmed_at is None
+    assert all(ref.kind != "compute_job" for ref in reloaded.artifact_refs)
+
+
+def test_advancing_a_stage_a_kind_does_not_have_is_a_structured_failure() -> None:
+    """A silent no-op here would let a caller persist a "running" record whose
+    stage strip never left its initial state -- a status the UI reads as
+    truth."""
+
+    record = PipelineRecord(
+        pipeline_id="PL_" + "f" * 32,
+        kind="timing",
+        created_at="2026-01-01T00:00:00Z",
+        expires_at="2099-01-02T00:00:00Z",
+        status="draft",
+        stages=initial_stages_for("timing"),
+        input_hash="deadbeef",
+        confirm=ConfirmState(nonce="n"),
+    )
+    # "compute" is factor_study's run stage; timing's is "backtest".
+    with pytest.raises(PipelineStageError, match="compute"):
+        _advance_stage(record, "compute", status="active")
+    with pytest.raises(PipelineStageError, match="typo_stage"):
+        _advance_stage(record, "typo_stage", status="active")
+    # The kind's own run stage still advances normally.
+    advanced = _advance_stage(record, _kind_plan("timing").run_stage_id, status="active")
+    assert advanced.stage("backtest").status == "active"
+
+
+def test_create_pipeline_names_the_right_constructor_for_the_kinds_it_refuses(tmp_path) -> None:
+    """The refusal describes the kind vocabulary truthfully: rd_optimize IS
+    constructible (elsewhere), and timing has no constructor at this layer."""
+
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    for kind in ("rd_optimize", "timing"):
+        with pytest.raises(ValueError) as excinfo:
+            create_pipeline(
+                store,
+                job_manager=job_manager,
+                parse_job_id=parse_job["job_id"],
+                rd_config=_rd_config(),
+                kind=kind,
+            )
+        message = str(excinfo.value)
+        assert "create_pipeline builds kind='factor_study' only" in message
+        assert "create_rd_pipeline" in message
+        assert "kind='timing' has no" in message
 
 
 # ---------------------------------------------------------------------------
