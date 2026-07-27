@@ -232,6 +232,33 @@ def test_conditional_grammar_is_pointwise_pit_safe() -> None:
         np.testing.assert_allclose(full[:-1], changed[:-1], equal_nan=True, err_msg=formula)
 
 
+def test_rolling_mask_alignment_with_null_instrument_label() -> None:
+    # A groupby-rolling operand omits rows whose instrument label is null; the
+    # conditional nodes must realign those rows to NaN by index instead of
+    # combining shortened arrays positionally (which would shift or broadcast).
+    panel = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "instrument": ["A", None],
+            "close": [10.0, 20.0],
+        }
+    )
+    np.testing.assert_allclose(_scores(panel, "ts_sum(close, 1) - close"), [0.0, np.nan], equal_nan=True)
+    np.testing.assert_allclose(_scores(panel, "ts_sum(close, 1) > close"), [0.0, np.nan], equal_nan=True)
+    np.testing.assert_allclose(
+        _scores(panel, "where(ts_sum(close, 1) > 5, 1, -1)"), [1.0, np.nan], equal_nan=True
+    )
+    np.testing.assert_allclose(
+        _scores(panel, "and_(ts_sum(close, 1) > 5, close > 5)"), [1.0, np.nan], equal_nan=True
+    )
+    # not_ is pinned separately: its pre-fix symptom was a length error rather
+    # than a silent broadcast, so it exercises the single-operand path.
+    np.testing.assert_allclose(_scores(panel, "not_(ts_sum(close, 1))"), [0.0, np.nan], equal_nan=True)
+    np.testing.assert_allclose(
+        _scores(panel, "or_(ts_sum(close, 1) > 5, close > 50)"), [1.0, np.nan], equal_nan=True
+    )
+
+
 # ---------------------------------------------------------------------------
 # Grammar bounds and rejections
 # ---------------------------------------------------------------------------
@@ -255,6 +282,12 @@ def test_ternary_expression_is_rejected() -> None:
 
 def test_identity_and_membership_comparisons_are_rejected() -> None:
     for formula in ("close is volume", "close in volume"):
+        with pytest.raises(FormulaParseError):
+            parse_formula_node(formula)
+
+
+def test_non_numeric_constants_in_comparisons_are_rejected() -> None:
+    for formula in ("close > True", "close > None", "close == False"):
         with pytest.raises(FormulaParseError):
             parse_formula_node(formula)
 

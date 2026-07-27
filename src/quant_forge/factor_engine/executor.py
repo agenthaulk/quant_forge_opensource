@@ -63,6 +63,18 @@ def _eval_expression(panel: pd.DataFrame, expression: str) -> pd.Series:
     return _eval_node(panel, parse_formula_node(expression))
 
 
+def _aligned_float_array(panel: pd.DataFrame, values: pd.Series) -> np.ndarray:
+    """Positional float view of ``values`` aligned to ``panel.index``.
+
+    Operand series can drop rows relative to the panel (a groupby-rolling
+    operator omits rows whose instrument label is null); realigning first means
+    those rows come back as NaN instead of shifting every later position, and
+    the conversion itself maps pd.NA (division-guard output) to NaN.
+    """
+
+    return values.reindex(panel.index).to_numpy(dtype="float64", na_value=np.nan)
+
+
 def _eval_node(panel: pd.DataFrame, node: ast.AST) -> pd.Series:
     if isinstance(node, ast.Constant):
         value = numeric_constant(node)
@@ -93,8 +105,8 @@ def _eval_node(panel: pd.DataFrame, node: ast.AST) -> pd.Series:
         # comparison against a missing value is unknown, never silently False.
         # Equality is exact float equality (the intended operands are 0/1 masks
         # and integer-valued counts such as ts_sum(mask, n) == n).
-        left = _eval_node(panel, node.left).to_numpy(dtype="float64", na_value=np.nan)
-        right = _eval_node(panel, node.comparators[0]).to_numpy(dtype="float64", na_value=np.nan)
+        left = _aligned_float_array(panel, _eval_node(panel, node.left))
+        right = _aligned_float_array(panel, _eval_node(panel, node.comparators[0]))
         op = node.ops[0]
         if isinstance(op, ast.Gt):
             raw = left > right
@@ -210,9 +222,9 @@ def _eval_node(panel: pd.DataFrame, node: ast.AST) -> pd.Series:
             # always evaluated — the grammar is pure, so evaluation order can
             # carry no side effects. A NaN condition yields NaN; a NaN in the
             # selected arm passes through.
-            cond = _eval_node(panel, args[0]).to_numpy(dtype="float64", na_value=np.nan)
-            first = _eval_node(panel, args[1]).to_numpy(dtype="float64", na_value=np.nan)
-            second = _eval_node(panel, args[2]).to_numpy(dtype="float64", na_value=np.nan)
+            cond = _aligned_float_array(panel, _eval_node(panel, args[0]))
+            first = _aligned_float_array(panel, _eval_node(panel, args[1]))
+            second = _aligned_float_array(panel, _eval_node(panel, args[2]))
             chosen = np.where(cond > 0, first, second)
             return pd.Series(np.where(np.isnan(cond), np.nan, chosen), index=panel.index)
         if operator in {"and_", "or_"}:
@@ -222,8 +234,8 @@ def _eval_node(panel: pd.DataFrame, node: ast.AST) -> pd.Series:
             # unknown: a determinate arm decides alone (and_ with a false arm is
             # 0, or_ with a true arm is 1, regardless of the other arm being
             # NaN); every remaining NaN case stays NaN.
-            first = _eval_node(panel, args[0]).to_numpy(dtype="float64", na_value=np.nan)
-            second = _eval_node(panel, args[1]).to_numpy(dtype="float64", na_value=np.nan)
+            first = _aligned_float_array(panel, _eval_node(panel, args[0]))
+            second = _aligned_float_array(panel, _eval_node(panel, args[1]))
             first_truth = np.where(np.isnan(first), np.nan, (first > 0).astype(float))
             second_truth = np.where(np.isnan(second), np.nan, (second > 0).astype(float))
             if operator == "and_":
@@ -240,7 +252,7 @@ def _eval_node(panel: pd.DataFrame, node: ast.AST) -> pd.Series:
                 )
             return pd.Series(values, index=panel.index)
         if operator == "not_":
-            values = _one_series_arg(panel, operator, args).to_numpy(dtype="float64", na_value=np.nan)
+            values = _aligned_float_array(panel, _one_series_arg(panel, operator, args))
             return pd.Series(
                 np.where(np.isnan(values), np.nan, (values <= 0).astype(float)),
                 index=panel.index,

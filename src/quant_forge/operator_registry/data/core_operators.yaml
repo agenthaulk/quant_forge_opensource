@@ -348,7 +348,7 @@ operators:
     llm: {preferred_name: ts_sum, allow_generation: true, forbid_alias_generation: true}
   - name: where
     signature: where(cond, a, b)
-    description: Elementwise conditional selection over truthiness cond > 0, so where(cond, a, b) is a where cond > 0 and b where cond <= 0; a NaN condition yields NaN, and a NaN in the selected arm passes through. Both arms are always evaluated (the grammar is pure).
+    description: Elementwise conditional selection over truthiness cond > 0, so where(cond, a, b) is a where cond > 0 and b where cond <= 0; a NaN condition yields NaN, and a NaN in the selected arm passes through. Both arms are always evaluated (the grammar is pure), so a cross-sectional arm (rank, zscore, scale, group_neutralize, residualize) is computed over the full cross-section before selection, never over the condition-true subset alone.
     category: elementwise
     family: conditional
     args:
