@@ -21,6 +21,8 @@ to cross-reference:
 
 from __future__ import annotations
 
+import dataclasses
+import logging
 import threading
 import time
 
@@ -31,7 +33,12 @@ from quant_forge.apps.web.jobs import _WebJobManager
 from quant_forge.apps.web.pipeline import (
     PipelineConflictError,
     PipelineNotFoundError,
+    PipelineStageError,
     PipelineStore,
+    _KIND_PLANS,
+    _advance_stage,
+    _kind_plan,
+    _reset_stage,
     _working_factor_id_for,
     cancel_pipeline,
     confirm_pipeline,
@@ -60,6 +67,7 @@ from quant_forge.specs.pipeline import (
     LEGAL_TRANSITIONS,
     PIPELINE_KINDS,
     RD_OPTIMIZE_STAGE_IDS,
+    TIMING_STAGE_IDS,
     ConfirmState,
     PipelineRecord,
     can_transition,
@@ -148,12 +156,12 @@ def test_legal_transitions_cover_every_status_and_terminal_statuses_are_closed()
 
 
 def test_rd_optimize_is_now_a_first_class_kind_with_three_stages() -> None:
-    assert PIPELINE_KINDS == frozenset({"factor_study", "rd_optimize"})
+    assert PIPELINE_KINDS == frozenset({"factor_study", "rd_optimize", "timing"})
     assert RD_OPTIMIZE_STAGE_IDS == ("confirm", "run", "leaderboard")
     stages = initial_stages_for("rd_optimize")
     assert tuple(stage.stage_id for stage in stages) == RD_OPTIMIZE_STAGE_IDS
     # An unknown kind is STILL a hard error -- the vocabulary is closed to the
-    # two real kinds, not opened wide.
+    # three real kinds, not opened wide.
     with pytest.raises(ValueError, match="unknown pipeline kind"):
         initial_stages_for("totally_made_up_kind")
 
@@ -200,6 +208,174 @@ def test_pipeline_record_from_dict_round_trips_rd_optimize() -> None:
     assert record.kind == "rd_optimize"
     assert record.to_dict()["kind"] == "rd_optimize"
     assert record.planning_influence_hash == ""
+
+
+# ---------------------------------------------------------------------------
+# timing: the position-series study kind (upstream batch 3). Same schema
+# addition discipline as rd_optimize -- a reviewed vocabulary entry with its
+# own stage ids and its own kind plan, sharing the one status graph.
+# ---------------------------------------------------------------------------
+
+
+def test_timing_is_a_first_class_kind_with_its_own_stages() -> None:
+    assert TIMING_STAGE_IDS == ("signal_prepare", "confirm", "backtest", "report")
+    stages = initial_stages_for("timing")
+    assert tuple(stage.stage_id for stage in stages) == TIMING_STAGE_IDS
+    # The shared machinery advances / resets / re-arms a stage literally named
+    # "confirm" on every create, confirm, retry and fork path, so the stage set
+    # must carry it: the human gate is not optional padding.
+    assert "confirm" in TIMING_STAGE_IDS
+
+    record = PipelineRecord(
+        pipeline_id="PL_" + "c" * 32,
+        kind="timing",
+        created_at="2026-01-01T00:00:00Z",
+        expires_at="2026-01-02T00:00:00Z",
+        status="draft",
+        stages=initial_stages_for("timing"),
+        input_hash="deadbeef",
+        confirm=ConfirmState(nonce="n"),
+    )
+    assert record.kind == "timing"
+    with pytest.raises(ValueError, match="stages must map 1:1"):
+        PipelineRecord(
+            pipeline_id="PL_" + "d" * 32,
+            kind="timing",
+            created_at="2026-01-01T00:00:00Z",
+            expires_at="2026-01-02T00:00:00Z",
+            status="draft",
+            stages=initial_stages_for("rd_optimize"),
+            input_hash="deadbeef",
+            confirm=ConfirmState(nonce="n"),
+        )
+
+    payload = {
+        "pipeline_id": "PL_" + "c" * 32,
+        "kind": "timing",
+        "created_at": "2026-01-01T00:00:00Z",
+        "expires_at": "2026-01-02T00:00:00Z",
+        "status": "draft",
+        "stages": [{"stage_id": stage_id, "status": "pending"} for stage_id in TIMING_STAGE_IDS],
+        "input_hash": "deadbeef",
+        "confirm": {"nonce": "n", "version": 1},
+    }
+    assert PipelineRecord.from_dict(payload).to_dict()["kind"] == "timing"
+
+
+def test_every_pipeline_kind_declares_a_kind_plan() -> None:
+    # The kind vocabulary and the kind-plan table cannot drift: a kind with no
+    # plan would raise deep inside the shared reconciliation path instead of at
+    # the schema boundary.
+    assert set(_KIND_PLANS) == set(PIPELINE_KINDS)
+    plan = _kind_plan("timing")
+    assert plan.run_stage_id == "backtest"
+    assert plan.terminal_stage_id == "report"
+    assert plan.publishes is False
+    assert plan.run_job_ref_kind == "backtest_job"
+    # Every plan's stage ids are real stage ids of that kind.
+    for kind, kind_plan in _KIND_PLANS.items():
+        stage_ids = tuple(stage.stage_id for stage in initial_stages_for(kind))
+        assert kind_plan.run_stage_id in stage_ids, kind
+        assert kind_plan.terminal_stage_id in stage_ids, kind
+
+
+def test_the_confirm_launch_body_is_declared_on_the_plan_not_matched_on_the_kind() -> None:
+    """The confirm dispatch reads ``_KindPlan.confirm_launch``. A kind whose
+    plan declares no launch has no confirm path at all -- it must NOT fall
+    through into another kind's body, which would run the wrong workflow and
+    address a stage id its stage set does not contain."""
+
+    assert _kind_plan("factor_study").confirm_launch == "validate_idea"
+    assert _kind_plan("rd_optimize").confirm_launch == "research_run_once"
+    assert _kind_plan("timing").confirm_launch == ""
+    for kind, kind_plan in _KIND_PLANS.items():
+        if not kind_plan.confirm_launch:
+            continue
+        # A declared launch must address a stage this kind really has.
+        stage_ids = tuple(stage.stage_id for stage in initial_stages_for(kind))
+        assert kind_plan.run_stage_id in stage_ids, kind
+
+
+def test_confirming_a_kind_with_no_launch_path_is_refused_by_name(tmp_path, monkeypatch) -> None:
+    """Before this was plan-driven, ONLY ``kind == "rd_optimize"`` was branched
+    on, so any third kind fell through into factor_study's body and launched
+    validate_idea against a stage set that has no "compute". The plan now
+    decides, and a kind with no declared launch is refused by name."""
+
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(
+        store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config()
+    )
+    # Strip the launch declaration off this record's plan: everything else about
+    # the pipeline is a real, fully-provenanced factor_study aggregate.
+    monkeypatch.setitem(
+        _KIND_PLANS,
+        "factor_study",
+        dataclasses.replace(_kind_plan("factor_study"), confirm_launch=""),
+    )
+    with pytest.raises(PipelineConflictError, match="no confirm launch path"):
+        confirm_pipeline(
+            config,
+            store,
+            pipeline.pipeline_id,
+            nonce=pipeline.confirm.nonce,
+            version=pipeline.confirm.version,
+            job_manager=job_manager,
+            rd_config=_rd_config(),
+        )
+    # Refused, not half-launched: nothing advanced, nothing was persisted as
+    # running, no child job was reserved.
+    reloaded = store.load(pipeline.pipeline_id)
+    assert reloaded.status == "awaiting_confirm"
+    assert reloaded.confirm.confirmed_at is None
+    assert all(ref.kind != "compute_job" for ref in reloaded.artifact_refs)
+
+
+def test_advancing_a_stage_a_kind_does_not_have_is_a_structured_failure() -> None:
+    """A silent no-op here would let a caller persist a "running" record whose
+    stage strip never left its initial state -- a status the UI reads as
+    truth."""
+
+    record = PipelineRecord(
+        pipeline_id="PL_" + "f" * 32,
+        kind="timing",
+        created_at="2026-01-01T00:00:00Z",
+        expires_at="2099-01-02T00:00:00Z",
+        status="draft",
+        stages=initial_stages_for("timing"),
+        input_hash="deadbeef",
+        confirm=ConfirmState(nonce="n"),
+    )
+    # "compute" is factor_study's run stage; timing's is "backtest".
+    with pytest.raises(PipelineStageError, match="compute"):
+        _advance_stage(record, "compute", status="active")
+    with pytest.raises(PipelineStageError, match="typo_stage"):
+        _advance_stage(record, "typo_stage", status="active")
+    # The kind's own run stage still advances normally.
+    advanced = _advance_stage(record, _kind_plan("timing").run_stage_id, status="active")
+    assert advanced.stage("backtest").status == "active"
+
+
+def test_create_pipeline_names_the_right_constructor_for_the_kinds_it_refuses(tmp_path) -> None:
+    """The refusal describes the kind vocabulary truthfully: rd_optimize IS
+    constructible (elsewhere), and timing has no constructor at this layer."""
+
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    for kind in ("rd_optimize", "timing"):
+        with pytest.raises(ValueError) as excinfo:
+            create_pipeline(
+                store,
+                job_manager=job_manager,
+                parse_job_id=parse_job["job_id"],
+                rd_config=_rd_config(),
+                kind=kind,
+            )
+        message = str(excinfo.value)
+        assert "create_pipeline builds kind='factor_study' only" in message
+        assert "create_rd_pipeline" in message
+        assert "kind='timing' has no" in message
 
 
 # ---------------------------------------------------------------------------
@@ -2271,6 +2447,255 @@ def test_f7_rd_optimize_fork_route_is_rejected(tmp_path) -> None:
     pipeline = create_rd_pipeline(store, job_manager=job_manager, config=config, seed_factor_id=seed, rd_config=_rd_config(), rounds=1)
     with pytest.raises(PipelineConflictError, match="not available for kind=rd_optimize"):
         fork_pipeline_from_failure(store, pipeline.pipeline_id, job_manager=job_manager, config=config, rd_config=_rd_config())
+
+
+def test_f7_rd_optimize_rule_fallback_route_is_rejected_before_it_parses(tmp_path, monkeypatch) -> None:
+    """Reject-by-kind on /fallback-rule-parse, the twin of /fork's own guard.
+
+    This exit re-parses an IDEA TEXT into a factor -- factor_study's contract.
+    An rd_optimize pipeline is seeded from an already-resolved factor, carries
+    no idea text, and has no ``parse`` stage for the body to advance, so
+    reaching the body would have spent a server-side parse and then broken on a
+    stage id its kind does not have. The refusal is named, and it happens BEFORE
+    the parse workflow runs and before the status gate (so the reason names the
+    real cause, exactly as /fork does).
+    """
+
+    config, store, job_manager = _new_env(tmp_path)
+    seed = _seed_factor_id(config, job_manager)
+    pipeline = create_rd_pipeline(
+        store, job_manager=job_manager, config=config, seed_factor_id=seed, rd_config=_rd_config(), rounds=1
+    )
+
+    parse_calls: list[str] = []
+
+    def _recording_parse(_config, text, **kwargs):
+        parse_calls.append(text)
+        raise AssertionError("the parse workflow must not run for a kind this exit does not serve")
+
+    monkeypatch.setattr(web_server, "run_idea_parse_workflow", _recording_parse)
+
+    with pytest.raises(PipelineConflictError, match="not available for kind=rd_optimize") as excinfo:
+        create_pipeline_as_fallback(
+            store,
+            job_manager=job_manager,
+            rd_config=_rd_config(),
+            parent_pipeline_id=pipeline.pipeline_id,
+            config=config,
+        )
+    # Refused BY KIND, not by status: this pipeline has never failed, so a
+    # status-first ordering would have blamed "not paused" instead.
+    assert pipeline.status != "paused_failure"
+    assert "not paused" not in str(excinfo.value)
+    assert parse_calls == [], "the refusal must precede the parse workflow"
+    # PipelineConflictError subclasses ValueError, which is what the route layer
+    # maps to a 400 -- the guard adds a reason, not a new status class.
+    assert isinstance(excinfo.value, ValueError)
+    # Nothing was mutated: no child pipeline, and the parent is untouched.
+    unchanged = store.load(pipeline.pipeline_id)
+    assert unchanged.status == pipeline.status
+    assert unchanged.revision == pipeline.revision
+    assert store.list_ids() == [pipeline.pipeline_id]
+
+
+def test_resetting_a_stage_a_kind_does_not_have_is_a_structured_failure() -> None:
+    """``_reset_stage`` is SYMMETRIC with ``_advance_stage``.
+
+    A silent no-op here was a live hole on the retry path: ``retry_pipeline``
+    resets the kind's run stage and then re-arms confirm, so a mis-routed kind
+    would have gone on to re-confirm over a run-stage row still holding the
+    FAILED attempt's status, timestamps and child job id -- which the aggregate
+    then reports as the current attempt's.
+    """
+
+    record = PipelineRecord(
+        pipeline_id="PL_" + "e" * 32,
+        kind="timing",
+        created_at="2026-01-01T00:00:00Z",
+        expires_at="2099-01-02T00:00:00Z",
+        status="draft",
+        stages=initial_stages_for("timing"),
+        input_hash="deadbeef",
+        confirm=ConfirmState(nonce="n"),
+    )
+    # "compute" is factor_study's run stage; timing's is "backtest".
+    with pytest.raises(PipelineStageError, match="compute"):
+        _reset_stage(record, "compute")
+    with pytest.raises(PipelineStageError, match="typo_stage"):
+        _reset_stage(record, "typo_stage")
+
+    # The kind's own stages still reset normally, clearing status AND the
+    # previous attempt's timestamps/job id.
+    ran = _advance_stage(
+        record, "backtest", status="failed", started_at="2026-01-01T00:00:01Z",
+        ended_at="2026-01-01T00:00:02Z", child_job_id="JOB_1",
+    )
+    cleared = _reset_stage(ran, "backtest")
+    assert cleared.stage("backtest").status == "pending"
+    assert cleared.stage("backtest").child_job_id is None
+    assert cleared.stage("backtest").started_at is None
+    assert cleared.stage("backtest").ended_at is None
+    # Every OTHER stage is left exactly as it was.
+    assert cleared.stage("confirm") == ran.stage("confirm")
+
+
+def test_the_sync_launch_failure_branch_addresses_the_plans_run_stage(tmp_path, monkeypatch) -> None:
+    """Plan substitution over the SYNCHRONOUS launch-failure branch.
+
+    A launch that fails AFTER the durable "running" save is reconciled to
+    paused_failure inside the same response, and every stage/ref id that branch
+    touches has to come from the kind plan rather than from the ``"compute"`` /
+    ``"compute_job"`` literals it used to hardcode. Swapping the plan to another
+    stage the SAME kind really has moves the whole branch with it; the literals
+    would have recorded the failure against a stage the plan no longer names.
+    """
+
+    config, store, job_manager = _new_env(tmp_path)
+    parse_job = _parsed_job_with_request(config, job_manager)
+    pipeline = create_pipeline(
+        store, job_manager=job_manager, parse_job_id=parse_job["job_id"], rd_config=_rd_config()
+    )
+    monkeypatch.setitem(
+        _KIND_PLANS,
+        "factor_study",
+        dataclasses.replace(
+            _kind_plan("factor_study"), run_stage_id="report", run_job_ref_kind="probe_compute_job"
+        ),
+    )
+
+    def _refuse_to_start(*args, **kwargs):
+        raise RuntimeError("synthetic launch failure")
+
+    monkeypatch.setattr(job_manager, "start", _refuse_to_start)
+
+    failed = confirm_pipeline(
+        config, store, pipeline.pipeline_id,
+        nonce=pipeline.confirm.nonce, version=pipeline.confirm.version,
+        job_manager=job_manager, rd_config=_rd_config(),
+    )
+
+    assert failed.status == "paused_failure"
+    assert failed.failure is not None
+    # The failure is recorded against the PLAN's run stage, and that stage row
+    # is the one marked failed ...
+    assert failed.failure.stage_id == "report"
+    assert failed.failure.reason_code.startswith("LAUNCH_FAILED: ")
+    assert failed.stage("report").status == "failed"
+    # ... while the stage the old literal named is untouched.
+    assert failed.stage("compute").status == "pending"
+    assert failed.stage("compute").child_job_id is None
+    # The attempt-counting artifact ref is the plan's kind too.
+    assert [ref.kind for ref in failed.artifact_refs if ref.kind.endswith("_job")] == ["probe_compute_job"]
+    assert failed.attempt.number == 1
+    assert failed.failed_attempts == 1
+    # Durably persisted, not merely returned.
+    assert store.load(pipeline.pipeline_id).stage("report").status == "failed"
+
+
+def test_the_rd_retry_reconfirm_path_addresses_the_plans_run_stage(tmp_path, monkeypatch) -> None:
+    """Plan substitution across the RD failure -> retry -> reconfirm round trip.
+
+    Three plan-driven seams have to agree on ONE stage id for the round trip to
+    stay coherent: ``_reconcile`` folds the failed child job into the plan's run
+    stage, ``retry_pipeline`` RESETS that same stage before re-arming confirm,
+    and ``_confirm_rd_pipeline`` re-advances it on the new launch. Substituting
+    the plan moves all three together; any one of them still reading the
+    ``"run"`` / ``"run_job"`` literal would leave the retry re-confirming over a
+    stage row that still holds the failed attempt's status and job id.
+    """
+
+    import quant_forge.apps.web.pipeline as pl
+
+    config, store, job_manager = _new_env(tmp_path)
+    seed = _seed_factor_id(config, job_manager)
+    monkeypatch.setattr(
+        pl, "run_research_once_workflow", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("rd boom"))
+    )
+    monkeypatch.setitem(
+        _KIND_PLANS,
+        "rd_optimize",
+        dataclasses.replace(
+            _kind_plan("rd_optimize"), run_stage_id="leaderboard", run_job_ref_kind="probe_run_job"
+        ),
+    )
+
+    pipeline = create_rd_pipeline(
+        store, job_manager=job_manager, config=config, seed_factor_id=seed,
+        rd_config=_rd_config(), rounds=1, candidates_per_round=1,
+    )
+    confirmed = _confirm(config, store, pipeline, job_manager)
+    # The launch addressed the PLAN's stage and ref kind, not the literals.
+    assert confirmed.stage("leaderboard").status == "active"
+    assert confirmed.stage("leaderboard").child_job_id is not None
+    assert confirmed.stage("run").status == "pending"
+    assert [ref.kind for ref in confirmed.artifact_refs] == ["probe_run_job"]
+    assert confirmed.attempt.number == 1
+
+    first_job_id = confirmed.stage("leaderboard").child_job_id
+    _wait_job(job_manager, first_job_id, timeout=30.0)
+    failed = get_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    # Reconciliation folded the failed child job into the plan's stage.
+    assert failed.status == "paused_failure"
+    assert failed.failure is not None and failed.failure.stage_id == "leaderboard"
+    assert failed.stage("leaderboard").status == "failed"
+    assert failed.stage("run").status == "pending"
+
+    retried = retry_pipeline(store, pipeline.pipeline_id, job_manager=job_manager, config=config)
+    # The retry RESET the plan's stage: the failed attempt's status, timestamps
+    # and child job id are gone, so the reconfirm cannot inherit them.
+    assert retried.status == "awaiting_confirm"
+    assert retried.stage("leaderboard").status == "pending"
+    assert retried.stage("leaderboard").child_job_id is None
+    assert retried.stage("leaderboard").ended_at is None
+    assert retried.stage("confirm").status == "active"
+
+    reconfirmed = confirm_pipeline(
+        config, store, pipeline.pipeline_id,
+        nonce=retried.confirm.nonce, version=retried.confirm.version,
+        job_manager=job_manager, rd_config=_rd_config(),
+    )
+    assert reconfirmed.status == "running"
+    assert reconfirmed.stage("leaderboard").status == "active"
+    assert reconfirmed.stage("leaderboard").child_job_id not in (None, first_job_id)
+    assert reconfirmed.stage("run").status == "pending"
+    # attempt.number counts durable launches through the PLAN's ref kind.
+    assert [ref.kind for ref in reconfirmed.artifact_refs] == ["probe_run_job", "probe_run_job"]
+    assert reconfirmed.attempt.number == 2
+    _wait_job(job_manager, reconfirmed.stage("leaderboard").child_job_id, timeout=30.0)
+
+
+def test_a_stage_contract_break_is_logged_server_side_not_only_returned(caplog) -> None:
+    """The route layer maps ``PipelineStageError`` (a ``ValueError``) to a 400
+    carrying the message and logs nothing, so an INTERNAL contract break -- a
+    kind routed down another kind's code path -- would otherwise be visible only
+    to the client that tripped it. Both stage helpers log it where it is
+    detected, naming the operation, the stage, the pipeline and the kind.
+    """
+
+    record = PipelineRecord(
+        pipeline_id="PL_" + "d" * 32,
+        kind="rd_optimize",
+        created_at="2026-01-01T00:00:00Z",
+        expires_at="2099-01-02T00:00:00Z",
+        status="draft",
+        stages=initial_stages_for("rd_optimize"),
+        input_hash="deadbeef",
+        confirm=ConfirmState(nonce="n"),
+    )
+    for operation, call in (
+        ("advance", lambda: _advance_stage(record, "compute", status="active")),
+        ("reset", lambda: _reset_stage(record, "compute")),
+    ):
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="quant_forge.apps.web.pipeline"):
+            with pytest.raises(PipelineStageError):
+                call()
+        messages = [item.getMessage() for item in caplog.records if item.levelno >= logging.ERROR]
+        assert len(messages) == 1, operation
+        assert operation in messages[0]
+        assert "compute" in messages[0]
+        assert record.pipeline_id in messages[0]
+        assert "rd_optimize" in messages[0]
 
 
 @pytest.mark.parametrize("bad_candidates", [0, -1, 11, 99])

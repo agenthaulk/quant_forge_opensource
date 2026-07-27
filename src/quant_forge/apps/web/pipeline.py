@@ -228,7 +228,7 @@ capture_planning_influence = _default_capture_planning_influence
 
 
 # ---------------------------------------------------------------------------
-# Kind config. Both pipeline kinds share the aggregate (record, journal,
+# Kind config. Every pipeline kind shares the aggregate (record, journal,
 # idempotent confirm, rejoin, expiry, attempt lineage, freeze); they differ
 # ONLY in their compute/terminal stage ids and their compute-stage side
 # effects. `_KindPlan` is the single place that divergence is declared, so the
@@ -237,18 +237,43 @@ capture_planning_influence = _default_capture_planning_influence
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class _KindPlan:
-    run_stage_id: str  # the stage a child job runs under ("compute" | "run")
+    run_stage_id: str  # the stage a child job runs under ("compute" | "run" | "backtest")
     terminal_stage_id: str  # the TERMINAL display stage ("report" | "leaderboard")
-    publishes: bool  # factor_study publishes a canonical factor on success; rd does not
+    publishes: bool  # factor_study publishes a canonical factor on success; rd/timing do not
     run_job_ref_kind: str  # artifact_ref.kind counting durable launches for attempt numbering
+    # Which confirm launch body this kind dispatches to. Empty means the kind
+    # has NO confirm path in this build, and its confirm is a structured refusal
+    # rather than a fall-through into another kind's body -- a fall-through
+    # would run the wrong workflow and advance a stage id that kind does not
+    # even have.
+    confirm_launch: str = ""
 
 
 _KIND_PLANS: dict[str, _KindPlan] = {
     "factor_study": _KindPlan(
-        run_stage_id="compute", terminal_stage_id="report", publishes=True, run_job_ref_kind="compute_job"
+        run_stage_id="compute",
+        terminal_stage_id="report",
+        publishes=True,
+        run_job_ref_kind="compute_job",
+        confirm_launch="validate_idea",
     ),
     "rd_optimize": _KindPlan(
-        run_stage_id="run", terminal_stage_id="leaderboard", publishes=False, run_job_ref_kind="run_job"
+        run_stage_id="run",
+        terminal_stage_id="leaderboard",
+        publishes=False,
+        run_job_ref_kind="run_job",
+        confirm_launch="research_run_once",
+    ),
+    # timing (specs/pipeline.py::TIMING_STAGE_IDS) runs the position-series
+    # backtest under "backtest" and terminates on "report". It publishes no
+    # canonical factor: a position-series study evaluates a caller-supplied
+    # weight series, it does not mint a registry factor definition. Its stage
+    # vocabulary and plan row are in place; its CONSTRUCTION and its confirm
+    # launch belong to the downstream app and are not built at this layer, so
+    # ``confirm_launch`` stays empty and a confirm on a timing record is refused
+    # with a named reason instead of silently taking factor_study's path.
+    "timing": _KindPlan(
+        run_stage_id="backtest", terminal_stage_id="report", publishes=False, run_job_ref_kind="backtest_job"
     ),
 }
 
@@ -266,6 +291,15 @@ class PipelineNotFoundError(KeyError):
 
 class PipelineConflictError(ValueError):
     """Illegal transition or a stale/mismatched idempotency token."""
+
+
+class PipelineStageError(ValueError):
+    """A stage id addressed on a record whose kind has no such stage.
+
+    Subclasses ``ValueError`` so existing invalid-request mappings keep working,
+    but it names an INTERNAL contract break (a kind routed down another kind's
+    code path), which is why it is raised rather than quietly ignored.
+    """
 
 
 def _validate_pipeline_id(pipeline_id: str) -> None:
@@ -464,6 +498,35 @@ def _transition(record: PipelineRecord, to_status: str, **extra: Any) -> Pipelin
     return record.with_updates(**changes)
 
 
+def _assert_stage_exists(record: PipelineRecord, stage_id: str, *, operation: str) -> None:
+    """Refuse a stage id this record's KIND does not have, and say so on the server.
+
+    Shared by :func:`_advance_stage` and :func:`_reset_stage` so the two cannot
+    diverge on what a mis-addressed stage means. ``PipelineStageError`` names an
+    INTERNAL contract break -- a kind routed down another kind's code path -- and
+    subclasses ``ValueError``, so the route layer's existing invalid-request
+    mapping turns it into a clean 400 for the caller. That mapping does NOT log,
+    which is why the fault is logged HERE: a 400 body alone would leave a
+    mis-routed kind invisible to the operator who has to fix it.
+    """
+
+    stage_ids = tuple(stage.stage_id for stage in record.stages)
+    if stage_id in stage_ids:
+        return
+    LOGGER.error(
+        "pipeline stage contract break: cannot %s stage_id=%r on pipeline=%s (kind=%s, stages=%s)",
+        operation,
+        stage_id,
+        record.pipeline_id,
+        record.kind,
+        stage_ids,
+    )
+    raise PipelineStageError(
+        f"stage_id {stage_id!r} does not exist on pipeline {record.pipeline_id!r} "
+        f"(kind={record.kind!r}, stages={stage_ids})"
+    )
+
+
 def _advance_stage(
     record: PipelineRecord,
     stage_id: str,
@@ -473,6 +536,16 @@ def _advance_stage(
     ended_at: str | None = None,
     child_job_id: str | None = None,
 ) -> PipelineRecord:
+    """Set one stage's status/timestamps, by id.
+
+    An id that is not on THIS record's stage set is a structured failure, not a
+    silent no-op: the stage sets differ per kind, so a stage id that belongs to
+    another kind (or a typo) would otherwise return an unchanged record and the
+    caller would go on to persist a "running" pipeline whose stage strip never
+    left its initial state -- a status the UI reads as truth.
+    """
+
+    _assert_stage_exists(record, stage_id, operation="advance")
     new_stages = tuple(
         StageRecord(
             stage_id=stage.stage_id,
@@ -493,6 +566,24 @@ def _advance_stage(
 
 
 def _reset_stage(record: PipelineRecord, stage_id: str) -> PipelineRecord:
+    """Clear one stage back to ``pending`` (no status, no timestamps, no job), by id.
+
+    SYMMETRIC with :func:`_advance_stage`: an id that is not on THIS record's
+    stage set is the same structured failure here, not a silent no-op. The
+    asymmetry was a live hole on the retry path -- ``retry_pipeline`` resets the
+    kind's run stage and then re-arms ``confirm``, so a mis-routed kind would
+    have had its run stage silently NOT reset and gone on to re-confirm over a
+    stage row still holding the failed attempt's ``failed`` status, timestamps
+    and child job id, which the aggregate then reports as the current attempt's.
+
+    Both existing call sites address a stage the kind provably has:
+    ``_kind_plan(record.kind).run_stage_id`` (the drift guard in
+    ``tests/test_web_pipeline_aggregate.py`` asserts every plan's run stage is
+    on its own kind's stage set) and the literal ``"confirm"`` (in every kind's
+    stage set -- it is the shared human gate; see ``specs/pipeline.py``).
+    """
+
+    _assert_stage_exists(record, stage_id, operation="reset")
     new_stages = tuple(
         StageRecord(stage_id=stage.stage_id) if stage.stage_id == stage_id else stage for stage in record.stages
     )
@@ -912,9 +1003,16 @@ def create_pipeline(
     """
 
     if kind != "factor_study":
+        # This entry constructs pipeline A only. It is not a claim about the
+        # kind vocabulary: rd_optimize is constructed by ``create_rd_pipeline``
+        # (a seeded factor id, not a parse job), and timing has no constructor
+        # at this layer at all -- its stage ids and kind plan are in place, its
+        # construction path belongs to the downstream app. Naming the right
+        # entry beats a wrong claim that the kind does not exist.
         raise ValueError(
-            "only kind='factor_study' pipelines are constructible in this build "
-            "(kind='rd_optimize' is not part of the P1 schema at all -- see specs/pipeline.py)"
+            f"create_pipeline builds kind='factor_study' only, got {kind!r}; "
+            "kind='rd_optimize' is built by create_rd_pipeline, and kind='timing' has no "
+            "constructor in this build (see specs/pipeline.py for the kind vocabulary)"
         )
     parse_job = job_manager.get(parse_job_id)
     if parse_job.get("kind") != "parse_idea":
@@ -1444,13 +1542,17 @@ def confirm_pipeline(
     with store.lock:
         record = store.load(pipeline_id)
         record = _reconcile(record, store=store, job_manager=job_manager, config=config)
-        if record.kind == "rd_optimize":
-            # Pipeline B has a distinct launch (a research job; no canonical
-            # publish, no working-factor row, no CAS). It shares the SAME
-            # idempotent-confirm token, exactly-once launch, attempt lineage,
-            # and rejoin machinery, so it dispatches to its own confirm body
-            # with this already-loaded+reconciled record, under the same
-            # (reentrant) store lock.
+        # Dispatch off the KIND PLAN, not off a hardcoded kind literal. Pipeline
+        # B has a distinct launch (a research job; no canonical publish, no
+        # working-factor row, no CAS) but shares the SAME idempotent-confirm
+        # token, exactly-once launch, attempt lineage and rejoin machinery, so
+        # it dispatches to its own confirm body with this already-loaded +
+        # reconciled record under the same (reentrant) store lock. A kind whose
+        # plan declares NO confirm launch is refused by name here: falling
+        # through to the factor_study body would run validate_idea for it and
+        # address a "compute" stage its stage set does not contain.
+        plan = _kind_plan(record.kind)
+        if plan.confirm_launch == "research_run_once":
             return _confirm_rd_pipeline(
                 config,
                 store,
@@ -1460,6 +1562,11 @@ def confirm_pipeline(
                 job_manager=job_manager,
                 rd_config=rd_config,
                 parameters=parameters,
+            )
+        if plan.confirm_launch != "validate_idea":
+            raise PipelineConflictError(
+                f"pipeline kind {record.kind!r} has no confirm launch path in this build; "
+                "its stage vocabulary and kind plan are in place but nothing here can start its run"
             )
         if record.confirm.nonce == nonce and record.confirm.version == version and record.confirm.confirmed_at is not None:
             replay_effective = _flat_parameters_only({**dict(record.parameters), **(parameters or {})})
@@ -1518,7 +1625,7 @@ def confirm_pipeline(
         # (phase-review F1) -- a fresh pipeline's first confirm has zero
         # compute_job refs yet, so its launch is attempt 1; a post-retry
         # reconfirm already has one (or more), so it becomes attempt 2, 3, ...
-        prior_launches = sum(1 for ref in record.artifact_refs if ref.kind == "compute_job")
+        prior_launches = sum(1 for ref in record.artifact_refs if ref.kind == plan.run_job_ref_kind)
         child_job_id = job_manager.reserve_id()
         now = _utc_now()
         attempt_number = prior_launches + 1
@@ -1528,7 +1635,8 @@ def confirm_pipeline(
             confirm=ConfirmState(nonce=record.confirm.nonce, version=record.confirm.version, confirmed_at=now),
             provenance=tuple(entry.to_dict() for entry in provenance),
             attempt=AttemptState(number=attempt_number, parent_run_id=record.attempt.parent_run_id),
-            artifact_refs=record.artifact_refs + (ArtifactRef(kind="compute_job", job_id=child_job_id),),
+            artifact_refs=record.artifact_refs
+            + (ArtifactRef(kind=plan.run_job_ref_kind, job_id=child_job_id),),
             # CAS baseline for the completion-time publish (re-verify RV-F1):
             # whatever the canonical registry row holds at THIS freeze moment
             # is what publish may later replace -- any concurrent change in
@@ -1538,7 +1646,9 @@ def confirm_pipeline(
             ),
         )
         running_record = _advance_stage(running_record, "confirm", status="completed", ended_at=now)
-        running_record = _advance_stage(running_record, "compute", status="active", started_at=now, child_job_id=child_job_id)
+        running_record = _advance_stage(
+            running_record, plan.run_stage_id, status="active", started_at=now, child_job_id=child_job_id
+        )
         running_record = _transition(running_record, "running")
         running_record = store.save(
             running_record,
@@ -1594,11 +1704,15 @@ def confirm_pipeline(
         except Exception as exc:
             LOGGER.warning("job launch failed for pipeline %s after durable save", pipeline_id, exc_info=True)
             failed_record = _with_cleanup(running_record, config)
-            failed_record = _advance_stage(failed_record, "compute", status="failed", ended_at=_utc_now())
+            failed_record = _advance_stage(
+                failed_record, plan.run_stage_id, status="failed", ended_at=_utc_now()
+            )
             failed_record = _transition(
                 failed_record,
                 "paused_failure",
-                failure=FailureState(stage_id="compute", reason_code=f"LAUNCH_FAILED: {exc}"[:200]),
+                failure=FailureState(
+                    stage_id=plan.run_stage_id, reason_code=f"LAUNCH_FAILED: {exc}"[:200]
+                ),
                 failed_attempts=failed_record.failed_attempts + 1,
             )
             return store.save(failed_record, event="launch_failed")
@@ -1632,6 +1746,7 @@ def _confirm_rd_pipeline(
     """
 
     pipeline_id = record.pipeline_id
+    plan = _kind_plan(record.kind)
     if record.confirm.nonce == nonce and record.confirm.version == version and record.confirm.confirmed_at is not None:
         replay_effective = _rd_parameters_only({**dict(record.parameters), **(parameters or {})})
         if replay_effective == (record.confirmed_parameters or {}):
@@ -1678,7 +1793,7 @@ def _confirm_rd_pipeline(
     # Exactly-once launch: reserve -> durably save "running" -> start. attempt
     # counts prior durable launches of THIS pipeline's run job (never a bare
     # retry click), the SAME contract as factor_study's compute_job counting.
-    prior_launches = sum(1 for ref in record.artifact_refs if ref.kind == "run_job")
+    prior_launches = sum(1 for ref in record.artifact_refs if ref.kind == plan.run_job_ref_kind)
     child_job_id = job_manager.reserve_id()
     now = _utc_now()
     attempt_number = prior_launches + 1
@@ -1692,10 +1807,13 @@ def _confirm_rd_pipeline(
         confirm=ConfirmState(nonce=record.confirm.nonce, version=record.confirm.version, confirmed_at=now),
         provenance=tuple(entry.to_dict() for entry in provenance),
         attempt=AttemptState(number=attempt_number, parent_run_id=record.attempt.parent_run_id),
-        artifact_refs=record.artifact_refs + (ArtifactRef(kind="run_job", job_id=child_job_id),),
+        artifact_refs=record.artifact_refs
+        + (ArtifactRef(kind=plan.run_job_ref_kind, job_id=child_job_id),),
     )
     running_record = _advance_stage(running_record, "confirm", status="completed", ended_at=now)
-    running_record = _advance_stage(running_record, "run", status="active", started_at=now, child_job_id=child_job_id)
+    running_record = _advance_stage(
+        running_record, plan.run_stage_id, status="active", started_at=now, child_job_id=child_job_id
+    )
     running_record = _transition(running_record, "running")
     running_record = store.save(
         running_record,
@@ -1736,11 +1854,15 @@ def _confirm_rd_pipeline(
         job_manager.start("research_run_once", _run_and_mark, job_id=child_job_id)
     except Exception as exc:
         LOGGER.warning("rd job launch failed for pipeline %s after durable save", pipeline_id, exc_info=True)
-        failed_record = _advance_stage(running_record, "run", status="failed", ended_at=_utc_now())
+        failed_record = _advance_stage(
+            running_record, plan.run_stage_id, status="failed", ended_at=_utc_now()
+        )
         failed_record = _transition(
             failed_record,
             "paused_failure",
-            failure=FailureState(stage_id="run", reason_code=f"LAUNCH_FAILED: {exc}"[:200]),
+            failure=FailureState(
+                stage_id=plan.run_stage_id, reason_code=f"LAUNCH_FAILED: {exc}"[:200]
+            ),
             failed_attempts=failed_record.failed_attempts + 1,
         )
         return store.save(failed_record, event="launch_failed")
@@ -2062,6 +2184,12 @@ def create_pipeline_as_fallback(
     which is then terminalized (aborted) -- atomically from the caller's
     point of view, so there is no window where both the new draft and the
     old failure are simultaneously "live" without the lineage link recorded.
+
+    Reject-by-kind, the SAME named guard ``fork_pipeline_from_failure`` applies:
+    this exit re-parses an IDEA TEXT into a factor, which is factor_study's
+    contract and nothing else's. rd_optimize is seeded from an already-resolved
+    factor and carries no idea text (and no ``parse`` stage to advance), so a
+    fallback on one is refused by name here.
     """
 
     # P2-F3 (agent sidecar clarify -- documented decision, NOT built here): the
@@ -2081,6 +2209,19 @@ def create_pipeline_as_fallback(
     with store.lock:
         old = store.load(parent_pipeline_id)
         old = _reconcile(old, store=store, job_manager=job_manager, config=config)
+        # Reject-by-kind, checked FIRST -- ahead of the status gate (so the
+        # reason names the real cause, exactly as /fork does) and ahead of the
+        # parse workflow (so a kind this exit does not serve never spends a
+        # server-side parse before being refused). Reaching the body would also
+        # advance a "parse" stage that only factor_study has, turning a wrong
+        # kind into a PipelineStageError deep inside a half-built record instead
+        # of a named refusal at the door.
+        if old.kind != "factor_study":
+            raise PipelineConflictError(
+                f"/fallback-rule-parse is not available for kind={old.kind}; "
+                "re-parsing an idea text into a factor is factor_study's exit -- pipeline B (rd_optimize) "
+                "is seeded from an already-resolved factor and has no idea text to re-parse"
+            )
         if old.status != "paused_failure":
             raise PipelineConflictError(f"pipeline {parent_pipeline_id} is not paused (status={old.status})")
         text = _source_text_for(old)

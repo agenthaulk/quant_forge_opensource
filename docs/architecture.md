@@ -28,7 +28,7 @@ Local Data Provider
 | `quant_forge.factor_library` | `factor_root` source of truth, mounted precomputed factor discovery, and factor-value store normalization. |
 | `quant_forge.factor_engine` | Safe formula execution, mounted daily factor-value reuse, and shared score preparation over local panels. |
 | `quant_forge.evaluation` | Deterministic single-factor metrics. |
-| `quant_forge.backtesting` | Lightweight next-day factor backtest. |
+| `quant_forge.backtesting` | Lightweight next-day factor backtest (cross-sectional), plus `position_series`: an independent entry that backtests a caller-supplied target-weight series (single- or multi-instrument, directional, close- or open-priced). |
 | `quant_forge.research_loop` | Local RD loop: hypotheses, candidate scoring, smoke gates, Markdown reports, in-process web scheduling, and the local research-outcome memory (see "Self-Evolution Research Memory"). |
 | `quant_forge.workbench` | Use-case orchestration. |
 | `quant_forge.mcp` | Read-only catalogs for agents and LLM tooling. |
