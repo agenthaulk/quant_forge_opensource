@@ -15,6 +15,7 @@ MAX_FORMULA_CHARS = 2000
 
 SUPPORTED_OPERATORS = {
     "abs",
+    "and_",
     "correlation",
     "covariance",
     "decay_linear",
@@ -22,7 +23,9 @@ SUPPORTED_OPERATORS = {
     "delta",
     "group_neutralize",
     "log",
+    "not_",
     "ntile",
+    "or_",
     "rank",
     "residualize",
     "scale",
@@ -36,11 +39,19 @@ SUPPORTED_OPERATORS = {
     "ts_min",
     "ts_rank",
     "ts_sum",
+    "where",
     "winsorize",
     "wq_max",
     "wq_min",
     "zscore",
 }
+
+# Comparison grammar (conditional-selection batch): exactly one comparison link
+# per Compare node (chained ``a < b < c`` is rejected), producing a 0/1 mask
+# series with NaN propagation. Comparisons are grammar-level like arithmetic
+# BinOp — they carry no registry entry; the conditional operators ``where`` /
+# ``and_`` / ``or_`` / ``not_`` are registry operators like any other call.
+COMPARISON_OPS = (ast.Gt, ast.Lt, ast.GtE, ast.LtE, ast.Eq, ast.NotEq)
 
 
 class FormulaParseError(ValueError):
@@ -163,6 +174,17 @@ def _validate_safe_node(node: ast.AST) -> None:
         _validate_safe_node(node.left)
         _validate_safe_node(node.right)
         return
+    if isinstance(node, ast.Compare):
+        # One comparison link only: chained comparisons (a < b < c) desugar to an
+        # implicit boolean AND whose NaN semantics would be ambiguous; the closed
+        # grammar requires explicit and_/or_ composition instead.
+        if len(node.ops) != 1 or len(node.comparators) != 1:
+            raise FormulaParseError("chained comparisons are not part of the formula grammar")
+        if not isinstance(node.ops[0], COMPARISON_OPS):
+            raise FormulaParseError("formula validation failed")
+        _validate_safe_node(node.left)
+        _validate_safe_node(node.comparators[0])
+        return
     if isinstance(node, ast.Call):
         if not isinstance(node.func, ast.Name) or node.keywords:
             raise FormulaParseError("formula validation failed")
@@ -220,6 +242,22 @@ def _collect_formula_parts(
             errors=errors,
             known_operators=known_operators,
         )
+        return
+    if isinstance(node, ast.Compare):
+        _collect_formula_parts(
+            node.left,
+            operators=operators,
+            fields=fields,
+            errors=errors,
+            known_operators=known_operators,
+        )
+        _collect_formula_parts(
+            node.comparators[0],
+            operators=operators,
+            fields=fields,
+            errors=errors,
+            known_operators=known_operators,
+        )
 
 
 def _node_lookback_rows(node: ast.AST) -> int:
@@ -244,6 +282,8 @@ def _node_lookback_rows(node: ast.AST) -> int:
         return max(_node_lookback_rows(node.left), _node_lookback_rows(node.right))
     if isinstance(node, ast.UnaryOp):
         return _node_lookback_rows(node.operand)
+    if isinstance(node, ast.Compare):
+        return max(_node_lookback_rows(node.left), _node_lookback_rows(node.comparators[0]))
     return 0
 
 
@@ -266,8 +306,12 @@ def _validate_operator_signature(
 ) -> bool:
     if operator not in known_operators:
         return True
-    if operator in {"rank", "zscore", "abs", "log", "sign"}:
+    if operator in {"rank", "zscore", "abs", "log", "sign", "not_"}:
         return _expect_arity(operator, args, 1, errors)
+    if operator in {"and_", "or_"}:
+        return _expect_arity(operator, args, 2, errors)
+    if operator == "where":
+        return _expect_arity(operator, args, 3, errors)
     if operator in {
         "delay",
         "delta",

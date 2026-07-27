@@ -16,6 +16,20 @@ operators:
     audit_status: core_reviewed
     pit_safety: {uses_future_data: false, alignment: t}
     llm: {preferred_name: abs, allow_generation: true, forbid_alias_generation: true}
+  - name: and_
+    signature: and_(x, y)
+    description: Elementwise Kleene conjunction over truthiness x > 0; a determinate false arm yields 0 even when the other arm is NaN, every remaining NaN case stays NaN.
+    category: elementwise
+    family: conditional
+    args:
+      - {name: x, type: series, role: input}
+      - {name: y, type: series, role: input}
+    examples: [and_(close > delay(close, 1), volume > delay(volume, 1))]
+    execution_status: implemented
+    audit_status: core_reviewed
+    numeric_behavior: {scope: pointwise, output_domain: zero_one_nan}
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: and_, allow_generation: true, forbid_alias_generation: true}
   - name: correlation
     signature: correlation(x, y, window)
     description: Rolling time-series correlation by instrument.
@@ -114,6 +128,18 @@ operators:
     audit_status: core_reviewed
     pit_safety: {uses_future_data: false, alignment: t}
     llm: {preferred_name: log, allow_generation: true, forbid_alias_generation: true}
+  - name: not_
+    signature: not_(x)
+    description: Elementwise negation over truthiness x > 0, so not_(x) is 1 where x <= 0 and 0 where x > 0; NaN input stays NaN.
+    category: elementwise
+    family: conditional
+    args: [{name: x, type: series, role: input}]
+    examples: [not_(close > delay(close, 1))]
+    execution_status: implemented
+    audit_status: core_reviewed
+    numeric_behavior: {scope: pointwise, output_domain: zero_one_nan}
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: not_, allow_generation: true, forbid_alias_generation: true}
   - name: ntile
     signature: ntile(x, buckets)
     description: Cross-sectional quantile bucketing by trade date; labels 1 to n from low to high.
@@ -128,6 +154,20 @@ operators:
     numeric_behavior: {scope: by_trade_date}
     pit_safety: {uses_future_data: false, alignment: t}
     llm: {preferred_name: ntile, allow_generation: true, forbid_alias_generation: true}
+  - name: or_
+    signature: or_(x, y)
+    description: Elementwise Kleene disjunction over truthiness x > 0; a determinate true arm yields 1 even when the other arm is NaN, every remaining NaN case stays NaN.
+    category: elementwise
+    family: conditional
+    args:
+      - {name: x, type: series, role: input}
+      - {name: y, type: series, role: input}
+    examples: [or_(close > delay(close, 5), volume > delay(volume, 5))]
+    execution_status: implemented
+    audit_status: core_reviewed
+    numeric_behavior: {scope: pointwise, output_domain: zero_one_nan}
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: or_, allow_generation: true, forbid_alias_generation: true}
   - name: rank
     signature: rank(x)
     description: Cross-sectional percentile rank by trade date.
@@ -306,6 +346,21 @@ operators:
     audit_status: core_reviewed
     pit_safety: {uses_future_data: false, alignment: t}
     llm: {preferred_name: ts_sum, allow_generation: true, forbid_alias_generation: true}
+  - name: where
+    signature: where(cond, a, b)
+    description: Elementwise conditional selection over truthiness cond > 0, so where(cond, a, b) is a where cond > 0 and b where cond <= 0; a NaN condition yields NaN, and a NaN in the selected arm passes through. Both arms are always evaluated (the grammar is pure).
+    category: elementwise
+    family: conditional
+    args:
+      - {name: cond, type: series, role: input}
+      - {name: a, type: series, role: input}
+      - {name: b, type: series, role: input}
+    examples: ["where(close > delay(close, 5), 1, -1)", "where(ts_sum(delta(close, 1) > 0, 3) == 3, rank(volume), 0)"]
+    execution_status: implemented
+    audit_status: core_reviewed
+    numeric_behavior: {scope: pointwise, output_domain: passthrough}
+    pit_safety: {uses_future_data: false, alignment: t}
+    llm: {preferred_name: where, allow_generation: true, forbid_alias_generation: true}
   - name: winsorize
     signature: winsorize(x, quantile)
     description: Cross-sectional quantile winsorization by trade date; clips to the [q, 1-q] bounds.

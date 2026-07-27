@@ -312,7 +312,8 @@ def test_execute_factor_formula_supports_grouped_arithmetic() -> None:
     "formula",
     [
         "rank(close).__class__",
-        "close > volume",
+        "1 < close < 3",
+        "close > volume > market_cap",
         "[close]",
         "rank(close, window=2)",
         "rank(close ** 2)",

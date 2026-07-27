@@ -88,6 +88,30 @@ def _eval_node(panel: pd.DataFrame, node: ast.AST) -> pd.Series:
             return left * right
         if isinstance(node.op, ast.Div):
             return left / right.replace(0, pd.NA)
+    if isinstance(node, ast.Compare):
+        # Single-link comparison producing a 0/1 mask with NaN propagation: a
+        # comparison against a missing value is unknown, never silently False.
+        # Equality is exact float equality (the intended operands are 0/1 masks
+        # and integer-valued counts such as ts_sum(mask, n) == n).
+        left = _eval_node(panel, node.left).to_numpy(dtype="float64", na_value=np.nan)
+        right = _eval_node(panel, node.comparators[0]).to_numpy(dtype="float64", na_value=np.nan)
+        op = node.ops[0]
+        if isinstance(op, ast.Gt):
+            raw = left > right
+        elif isinstance(op, ast.Lt):
+            raw = left < right
+        elif isinstance(op, ast.GtE):
+            raw = left >= right
+        elif isinstance(op, ast.LtE):
+            raw = left <= right
+        elif isinstance(op, ast.Eq):
+            raw = left == right
+        elif isinstance(op, ast.NotEq):
+            raw = left != right
+        else:
+            raise ValueError("formula validation failed")
+        valid = ~(np.isnan(left) | np.isnan(right))
+        return pd.Series(np.where(valid, raw.astype(float), np.nan), index=panel.index)
     if isinstance(node, ast.Call):
         operator = node.func.id
         args = list(node.args)
@@ -178,6 +202,49 @@ def _eval_node(panel: pd.DataFrame, node: ast.AST) -> pd.Series:
             right = _eval_node(panel, args[1])
             func = np.minimum if operator == "wq_min" else np.maximum
             return pd.Series(func(left, right), index=panel.index)
+        if operator == "where":
+            if len(args) != 3:
+                raise ValueError("where expects 3 arguments")
+            # Truthiness is cond > 0 (comparison masks are 0/1; sign-style
+            # conditions treat only the positive arm as true). Both arms are
+            # always evaluated — the grammar is pure, so evaluation order can
+            # carry no side effects. A NaN condition yields NaN; a NaN in the
+            # selected arm passes through.
+            cond = _eval_node(panel, args[0]).to_numpy(dtype="float64", na_value=np.nan)
+            first = _eval_node(panel, args[1]).to_numpy(dtype="float64", na_value=np.nan)
+            second = _eval_node(panel, args[2]).to_numpy(dtype="float64", na_value=np.nan)
+            chosen = np.where(cond > 0, first, second)
+            return pd.Series(np.where(np.isnan(cond), np.nan, chosen), index=panel.index)
+        if operator in {"and_", "or_"}:
+            if len(args) != 2:
+                raise ValueError(f"{operator} expects 2 arguments")
+            # Kleene strong logic over truthiness t(v) = v > 0 with NaN as
+            # unknown: a determinate arm decides alone (and_ with a false arm is
+            # 0, or_ with a true arm is 1, regardless of the other arm being
+            # NaN); every remaining NaN case stays NaN.
+            first = _eval_node(panel, args[0]).to_numpy(dtype="float64", na_value=np.nan)
+            second = _eval_node(panel, args[1]).to_numpy(dtype="float64", na_value=np.nan)
+            first_truth = np.where(np.isnan(first), np.nan, (first > 0).astype(float))
+            second_truth = np.where(np.isnan(second), np.nan, (second > 0).astype(float))
+            if operator == "and_":
+                values = np.where(
+                    (first_truth == 0) | (second_truth == 0),
+                    0.0,
+                    np.where((first_truth == 1) & (second_truth == 1), 1.0, np.nan),
+                )
+            else:
+                values = np.where(
+                    (first_truth == 1) | (second_truth == 1),
+                    1.0,
+                    np.where((first_truth == 0) & (second_truth == 0), 0.0, np.nan),
+                )
+            return pd.Series(values, index=panel.index)
+        if operator == "not_":
+            values = _one_series_arg(panel, operator, args).to_numpy(dtype="float64", na_value=np.nan)
+            return pd.Series(
+                np.where(np.isnan(values), np.nan, (values <= 0).astype(float)),
+                index=panel.index,
+            )
     raise ValueError("formula validation failed")
 
 
